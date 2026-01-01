@@ -1,1 +1,4 @@
 target
+.gradle/
+build/
+Cargo.lock

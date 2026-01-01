@@ -1,0 +1,14 @@
+[package]
+name = "beam-model-rs"
+version = "2.70.0"
+edition = "2024"
+
+[dependencies]
+prost = "0.14.1"
+prost-types = "0.14.1"
+tonic = "0.14.2"
+tonic-prost-build = "0.14.2"
+
+
+[build-dependencies]
+tonic-prost-build = "0.14.2"
