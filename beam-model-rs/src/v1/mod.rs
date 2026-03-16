@@ -37,12 +37,7 @@ pub mod org {
     }
 }
 
-pub use org::apache::beam::model::pipeline::v1::*;
-
-pub use org::apache::beam::model::fn_execution::v1::*;
-
-pub use org::apache::beam::model::job_management::v1::*;
-
-pub use org::apache::beam::model::expansion::v1::*;
-
-pub use org::apache::beam::model::interactive::v1::*;
+pub use org::apache::beam::model::{
+    expansion::v1::*, fn_execution::v1::*, interactive::v1::*, job_management::v1::*,
+    pipeline::v1::*,
+};

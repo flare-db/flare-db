@@ -88,7 +88,7 @@ public class FlareRunner extends PipelineRunner<FlarePipelineJob> {
                     channelFactory.forDescriptor(artifactStagingEndpoint), ManagedChannel::shutdown)) {
 
                 ArtifactStagingService.offer(
-                        new ArtifactRetrievalService(),
+                        new ArtifactRetrievalService(new FlareArtifactResolver(options)),
                         ArtifactStagingServiceGrpc.newStub(artifactChannel.get()),
                         stagingSessionToken);
             } catch (CloseableResource.CloseException e) {

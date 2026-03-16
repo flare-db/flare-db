@@ -1,0 +1,3 @@
+[workspace]
+members = ["beam-model-rs", "flare"]
+resolver = "2"

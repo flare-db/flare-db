@@ -1,0 +1,31 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug flare (cargo run)",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--package",
+                    "flare",
+                    "--bin",
+                    "flare"
+                ],
+                "filter": {
+                    "name": "flare",
+                    "kind": "bin"
+                }
+            },
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "RUST_LOG": "debug",
+                "RUST_BACKTRACE": "1"
+            },
+            "sourceLanguages": [
+                "rust"
+            ]
+        }
+    ]
+}

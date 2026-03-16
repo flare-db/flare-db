@@ -1,0 +1,66 @@
+package cloud.langbeam.flare;
+
+import java.io.File;
+import java.util.Collections;
+import java.util.List;
+
+import org.apache.beam.model.pipeline.v1.RunnerApi;
+import org.apache.beam.sdk.options.PipelineOptions;
+import org.apache.beam.sdk.util.construction.ArtifactResolver;
+
+public class FlareArtifactResolver implements ArtifactResolver{
+
+     private final String uberJarPath;
+    
+    public FlareArtifactResolver(PipelineOptions options) {
+        FlarePipelineOptions flareOptions = options.as(FlarePipelineOptions.class);
+        this.uberJarPath = flareOptions.getUberJar();
+        
+        if (uberJarPath == null || uberJarPath.isEmpty()) {
+            throw new IllegalArgumentException("UberJar path must be specified via --uberJar option");
+        }
+        
+        File jarFile = new File(uberJarPath);
+        if (!jarFile.exists()) {
+            throw new IllegalArgumentException("UberJar not found: " + uberJarPath);
+        }
+        if (!jarFile.isFile()) {
+            throw new IllegalArgumentException("UberJar path is not a file: " + uberJarPath);
+        }
+        
+        System.out.println("Will stage uber JAR: " + uberJarPath);
+    }
+
+
+    @Override
+    public void register(ResolutionFn fn) {
+        throw new UnsupportedOperationException("Not supported yet.");
+    }
+
+    @Override
+    public RunnerApi.Pipeline resolveArtifacts(RunnerApi.Pipeline pipeline) {
+        throw new UnsupportedOperationException("Not supported yet.");
+    }
+
+    @Override
+    public List<RunnerApi.ArtifactInformation> resolveArtifacts(List<RunnerApi.ArtifactInformation> artifacts) {
+        // Runner sends empty list, we return the uber JAR
+        if (artifacts.isEmpty()) {
+            RunnerApi.ArtifactFilePayload payload = RunnerApi.ArtifactFilePayload.newBuilder()
+                .setPath(uberJarPath)
+                .build();
+            
+            RunnerApi.ArtifactInformation artifact = RunnerApi.ArtifactInformation.newBuilder()
+                .setTypeUrn("beam:artifact:type:file:v1")
+                .setTypePayload(payload.toByteString())
+                .setRoleUrn("beam:artifact:role:staging_to:v1")
+                .build();
+            
+            return Collections.singletonList(artifact);
+        }
+        
+        // Otherwise return as-is
+        return artifacts;
+    }
+    
+}

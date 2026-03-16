@@ -1,0 +1,17 @@
+[package]
+name = "flare"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+beam-model-rs = { path = "../beam-model-rs" }
+tokio-stream = "0.1.18"
+tonic = "0.14.2"
+tokio = { version = "1.38", features = ["macros", "rt-multi-thread", "fs"] }
+dashmap = "6.1.0"
+prost = "0.14.3"
+petgraph = "0.8.3"
+log = "0.4.29"
+indexmap = "2.13.0"
+thiserror = "2.0.18"
+env_logger = "0.11.9"
