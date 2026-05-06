@@ -1,6 +1,7 @@
+use crate::errors::BeamTranslationError;
 use crate::fusion::fuser::GreedyPipelineFuser;
-use crate::fusion::pipeline::{PTransformNode, QueryablePipeline};
-use crate::fusion::stage::CollectionConsumers;
+use crate::fusion::pipeline::{FusedPipeline, PTransformNode, QueryablePipeline};
+use crate::fusion::stage::{CollectionConsumers, ExecutableStage};
 use beam_model_rs::v1::Pipeline;
 use std::collections::{BTreeSet, HashSet};
 // Job is just container for tasks()
@@ -18,16 +19,18 @@ impl Job {
     }
 }
 #[derive(Clone, Debug)]
-pub struct JobGraph {}
+pub struct JobGraph {
+    pipeline: FusedPipeline,
+}
 
 impl JobGraph {
     pub fn create(pipeline: &Pipeline) -> Self {
-        fuse_pipeline(pipeline);
-        JobGraph {}
+        let p = fuse_pipeline(pipeline).unwrap();
+        Self { pipeline: p }
     }
 }
 
-pub fn fuse_pipeline(p: &Pipeline) {
+pub fn fuse_pipeline(p: &Pipeline) -> Result<FusedPipeline, BeamTranslationError> {
     let comps = p.components.as_ref().unwrap();
 
     let fuser = GreedyPipelineFuser::with(QueryablePipeline::new(comps));
@@ -42,5 +45,6 @@ pub fn fuse_pipeline(p: &Pipeline) {
         root_consumers.extend(descendants.get_fusible().iter().cloned());
     }
 
-    let _ = fuser.fuse_pipeline(unfused_root, root_consumers);
+    let fused_pipeline = fuser.fuse_pipeline(unfused_root, root_consumers);
+    return fused_pipeline;
 }

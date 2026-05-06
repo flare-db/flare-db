@@ -80,7 +80,6 @@ impl GreedyPipelineFuser {
                 unfused_pt.extend(descendant_consumers.get_unfusible().iter().cloned());
 
                 let siblings = self.group_siblings(descendant_consumers.get_fusible());
-
                 pending_siblings.extend(siblings);
             }
         }
@@ -297,7 +296,7 @@ impl GreedyStageFuser {
             }
         }
 
-        Ok(ExecutableStage::from(
+        let stage = ExecutableStage::from(
             pipeline.components().clone(),
             env,
             HashSet::<WireCoderSetting>::new(),
@@ -307,7 +306,9 @@ impl GreedyStageFuser {
             timers,
             materialized_pcols,
             fused_transforms,
-        ))
+        );
+
+        Ok(sanitize_dangling_ptransform_inputs(stage))
     }
 }
 
@@ -585,6 +586,91 @@ fn any_sideinputs(consumer: &PTransformNode, pipeline: &QueryablePipeline) -> bo
     return false;
 }
 
+/// Remove dangling transform inputs from a stage and drop dangling PCollections
+/// from stage components.
+///
+/// Valid inputs are:
+/// 1. Explicit stage input PCollection
+/// 2. Explicit stage output PCollections
+/// 3. Side-input PCollections
+/// 4. Timer PCollections
+/// 5. Outputs produced by transforms within the stage
+fn sanitize_dangling_ptransform_inputs(stage: ExecutableStage) -> ExecutableStage {
+    let mut possible_inputs: HashSet<String> = HashSet::new();
+    possible_inputs.insert(stage.input_pcol().id.clone());
+    possible_inputs.extend(stage.output_pcols().iter().map(|p| p.id.clone()));
+    possible_inputs.extend(
+        stage
+            .side_inputs()
+            .iter()
+            .map(|side_input| side_input.collection().id.clone()),
+    );
+    possible_inputs.extend(stage.timers().iter().filter_map(|timer| {
+        timer
+            .transform()
+            .node()
+            .inputs
+            .get(timer.local_name())
+            .cloned()
+    }));
+    possible_inputs.extend(
+        stage
+            .transforms()
+            .iter()
+            .flat_map(|transform| transform.transform.outputs.values().cloned()),
+    );
+
+    let dangling_inputs: HashSet<String> = stage
+        .transforms()
+        .iter()
+        .flat_map(|transform| transform.transform.inputs.values().cloned())
+        .filter(|input| !possible_inputs.contains(input))
+        .collect();
+
+    if dangling_inputs.is_empty() {
+        return stage;
+    }
+
+    let sanitized_transforms: IndexSet<PTransformNode> = stage
+        .transforms()
+        .iter()
+        .map(|transform_node| {
+            let mut sanitized_transform = transform_node.transform.clone();
+            sanitized_transform
+                .inputs
+                .retain(|_, input_id| !dangling_inputs.contains(input_id));
+
+            PTransformNode {
+                id: transform_node.id.clone(),
+                transform: sanitized_transform,
+            }
+        })
+        .collect();
+
+    let mut sanitized_components = stage.components();
+    sanitized_components.transforms.clear();
+    for transform_node in &sanitized_transforms {
+        sanitized_components
+            .transforms
+            .insert(transform_node.id.clone(), transform_node.transform.clone());
+    }
+    sanitized_components
+        .pcollections
+        .retain(|id, _| !dangling_inputs.contains(id));
+
+    ExecutableStage::from(
+        sanitized_components,
+        stage.environment(),
+        stage.wire_coder(),
+        stage.input_pcol(),
+        stage.side_inputs(),
+        stage.user_states(),
+        stage.timers(),
+        stage.output_pcols(),
+        sanitized_transforms,
+    )
+}
+
 pub struct DeduplicationResult {
     /// Updated pipeline components (with synthetic partial PCollections + Flattens injected).
     pub components: Components,
@@ -610,6 +696,7 @@ impl DeduplicationResult {
                     .cloned()
                     .unwrap_or_else(|| s.clone())
             })
+            .map(|s| sanitize_dangling_ptransform_inputs(s))
             .collect()
     }
 

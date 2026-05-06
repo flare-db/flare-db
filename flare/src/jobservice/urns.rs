@@ -1,4 +1,7 @@
 pub mod beam_urns {
+    use std::collections::HashMap;
+    use std::sync::LazyLock;
+
     // Primitives
     pub const CREATE_TRANSFORM: &str = "beam:transform:create:v1";
     pub const PAR_DO_TRANSFORM: &str = "beam:transform:pardo:v1";

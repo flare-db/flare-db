@@ -7,7 +7,12 @@ edition = "2024"
 beam-model-rs = { path = "../beam-model-rs" }
 tokio-stream = "0.1.18"
 tonic = "0.14.2"
-tokio = { version = "1.38", features = ["macros", "rt-multi-thread", "fs"] }
+tokio = { version = "1.38", features = [
+    "macros",
+    "rt-multi-thread",
+    "fs",
+    "process",
+] }
 dashmap = "6.1.0"
 prost = "0.14.3"
 petgraph = "0.8.3"
@@ -15,3 +20,8 @@ log = "0.4.29"
 indexmap = "2.13.0"
 thiserror = "2.0.18"
 env_logger = "0.11.9"
+anyhow = "1.0.102"
+[dependencies.uuid]
+version = "1.23.1"
+# Lets you generate random UUIDs
+features = ["v4"]

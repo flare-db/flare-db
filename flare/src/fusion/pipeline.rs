@@ -1,21 +1,124 @@
 use beam_model_rs::v1::executable_stage_payload::{SideInputId, TimerId, UserStateId};
 use beam_model_rs::v1::{Components, Environment, PCollection, PTransform, ParDoPayload};
-use indexmap::IndexSet;
+use indexmap::{IndexMap, IndexSet};
 use petgraph::{Graph, graph::NodeIndex};
 use prost::Message;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
+use uuid::Uuid;
 
 use crate::errors::BeamTranslationError;
 use crate::fusion::refs::{SideInputRef, TimerRef, UserStateRef};
 use crate::fusion::stage::ExecutableStage;
 use crate::jobservice::urns;
+use crate::transforms::FlareTransform;
+use crate::transforms::gbk::GroupByKey;
+use crate::transforms::impluse::Impulse;
 
-/*
-Components components,
-      Set<ExecutableStage> environmentalStages,
-      Set<PipelineNode.PTransformNode> runnerStages,
-      Set<String> requirements */
+pub struct ExecutablePipeline {
+    graph: Graph<ExecutableNode, Consumer>,
+    worker_ids: HashMap<Uuid, NodeIndex>,
+    runner_ids: HashMap<String, NodeIndex>,
+}
+
+impl ExecutablePipeline {
+    pub fn from(
+        sdk_stages: IndexSet<ExecutableStage>,
+        runner_stages: IndexSet<PTransformNode>,
+    ) -> Self {
+        let ep = Self {
+            graph: Graph::new(),
+            worker_ids: HashMap::new(),
+            runner_ids: HashMap::new(),
+        };
+
+        ep
+    }
+
+    fn build_graph(
+        &mut self,
+        sdk_stages: IndexSet<ExecutableStage>,
+        runner_stages: IndexSet<PTransformNode>,
+        components: &Components,
+    ) {
+        self.graph = Graph::<ExecutableNode, Consumer>::new();
+        self.worker_ids.clear();
+        self.runner_ids.clear();
+
+        if let Some(root) = Self::get_root(&runner_stages) {
+            if let Some(spec) = root.transform.spec.as_ref() {
+                let urn = &spec.urn;
+
+                let runner_idx =
+                    self.graph
+                        .add_node(ExecutableNode::Runner(RunnerTransform::from_urn(
+                            urn,
+                            root.transform.inputs.clone(),
+                            root.transform.outputs.clone(),
+                        )));
+
+                self.runner_ids.insert(root.id.clone(), runner_idx);
+
+                // Asuming root is always Impluse and it is typically consumed by only one ExecutableStage
+                for (_output_key, output_id) in root.node().outputs.iter() {
+                    if let Some(consumer_stage) = sdk_stages
+                        .iter()
+                        .find(|stage| stage.input_pcol().id == *output_id)
+                    {
+                        // use consumer_stage here
+                        let worker_idx = self
+                            .graph
+                            .add_node(ExecutableNode::Worker(consumer_stage.clone()));
+
+                        self.worker_ids.insert(consumer_stage.id(), worker_idx);
+
+                        self.graph
+                            .add_edge(runner_idx, worker_idx, Consumer::Direct);
+                    }
+                }
+            }
+        }
+    }
+
+    fn get_root(runner_stages: &IndexSet<PTransformNode>) -> Option<&PTransformNode> {
+        for pt in runner_stages.iter() {
+            if pt.node().inputs.is_empty() {
+                return Some(pt);
+            }
+        }
+        None
+        /* `PTransformNode` value */
+    }
+}
+
+pub enum ExecutableNode {
+    Worker(ExecutableStage),
+    Runner(RunnerTransform),
+}
+pub enum RunnerTransform {
+    Impulse(Impulse),
+    GBK(GroupByKey),
+}
+impl RunnerTransform {
+    pub fn from_urn(
+        urn: &str,
+        inputs: HashMap<String, String>,
+        outputs: HashMap<String, String>,
+    ) -> Self {
+        match urn {
+            "beam:transform:impulse:v1" => RunnerTransform::Impulse(Impulse::with(inputs, outputs)),
+
+            "beam:transform:gbk:v1" => RunnerTransform::GBK(GroupByKey::with(inputs, outputs)),
+            _ => panic!("Unknown URN"),
+        }
+    }
+}
+
+pub enum Consumer {
+    Direct,
+}
+
+#[derive(Debug, Clone)]
 pub struct FusedPipeline {
     components: Components,
     sdk_stages: IndexSet<ExecutableStage>,
@@ -36,6 +139,16 @@ impl FusedPipeline {
             runner_stages,
             // requirements,
         }
+    }
+
+    pub fn sdk_stages(&self) -> &IndexSet<ExecutableStage> {
+        &self.sdk_stages
+    }
+
+    pub fn runner_stages(&self) -> &IndexSet<PTransformNode> {
+        &self.runner_stages
+
+        // TODO: return runner native transfroms for the urn
     }
 }
 pub struct QueryablePipeline {

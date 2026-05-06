@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{process::Stdio, sync::Arc, time::Duration};
 
 use beam_model_rs::v1::{
     ApiServiceDescriptor, CancelJobRequest, CancelJobResponse, DescribePipelineOptionsRequest,
@@ -9,10 +9,13 @@ use beam_model_rs::v1::{
     job_service_server::JobService,
 };
 use dashmap::DashMap;
+use tokio::{process::Command, time::timeout};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Response;
 use tonic::Status;
 
+use crate::engine::executor::StageExecutor;
+use crate::jobservice::artifact::ArtifactStore;
 use crate::jobservice::job::Job;
 use crate::jobservice::job::JobGraph;
 
@@ -39,16 +42,117 @@ impl JobStore {
         self.jobs.iter().next().map(|entry| entry.key().clone())
     }
 }
+
+#[derive(Clone, Debug)]
+pub struct HarnessLaunchConfig {
+    pub worker_jar: String,
+    pub logs_dir: String,
+    pub control_url: String,
+    pub pipeline_options: String,
+    pub connect_timeout_secs: u64,
+}
+
 #[derive(Clone)]
 pub struct FlareJobService {
     job_store: JobStore,
+    executor: StageExecutor,
+    artifact_store: Arc<ArtifactStore>,
+    harness_cfg: HarnessLaunchConfig,
 }
 
 impl FlareJobService {
-    pub fn new() -> Self {
+    pub fn with(
+        executor: StageExecutor,
+        artifact_store: Arc<ArtifactStore>,
+        harness_cfg: HarnessLaunchConfig,
+    ) -> Self {
         Self {
             job_store: JobStore::new(),
+            executor,
+            artifact_store,
+            harness_cfg,
         }
+    }
+
+    async fn spawn_harness(&self, job_id: &str) -> Result<(), Status> {
+        let staged_jar = self.artifact_store.staged_path();
+        let worker_jar = &self.harness_cfg.worker_jar;
+
+        let worker_exists = tokio::fs::try_exists(worker_jar)
+            .await
+            .map_err(|e| Status::internal(format!("failed to stat worker jar: {}", e)))?;
+        if !worker_exists {
+            return Err(Status::internal(format!(
+                "worker jar not found at {}",
+                worker_jar
+            )));
+        }
+
+        let staged_exists = tokio::fs::try_exists(&staged_jar)
+            .await
+            .map_err(|e| Status::internal(format!("failed to stat staged artifact: {}", e)))?;
+        if !staged_exists {
+            return Err(Status::internal(format!(
+                "staged artifact not found at {}",
+                staged_jar
+            )));
+        }
+
+        tokio::fs::create_dir_all(&self.harness_cfg.logs_dir)
+            .await
+            .map_err(|e| Status::internal(format!("failed to create logs dir: {}", e)))?;
+
+        let log_path = format!(
+            "{}/worker-harness-{}.log",
+            self.harness_cfg.logs_dir, job_id
+        );
+        let stdout_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .map_err(|e| Status::internal(format!("failed to open harness log file: {}", e)))?;
+        let stderr_file = stdout_file
+            .try_clone()
+            .map_err(|e| Status::internal(format!("failed to clone harness log handle: {}", e)))?;
+
+        let classpath = format!("{}:{}", worker_jar, staged_jar);
+        let mut cmd = Command::new("java");
+        cmd.arg("-cp")
+            .arg(&classpath)
+            .arg("org.apache.beam.fn.harness.FnHarness")
+            .env("HARNESS_ID", job_id)
+            .env(
+                "CONTROL_API_SERVICE_DESCRIPTOR",
+                format!(r#"url: "{}""#, self.harness_cfg.control_url),
+            )
+            .env(
+                "LOGGING_API_SERVICE_DESCRIPTOR",
+                format!(r#"url: "{}""#, self.harness_cfg.control_url),
+            )
+            .env(
+                "DATA_API_SERVICE_DESCRIPTOR",
+                format!(r#"url: "{}""#, self.harness_cfg.control_url),
+            )
+            .env(
+                "STATE_API_SERVICE_DESCRIPTOR",
+                format!(r#"url: "{}""#, self.harness_cfg.control_url),
+            )
+            .env("PIPELINE_OPTIONS", &self.harness_cfg.pipeline_options)
+            .stdout(Stdio::from(stdout_file))
+            .stderr(Stdio::from(stderr_file));
+
+        let child = cmd
+            .spawn()
+            .map_err(|e| Status::internal(format!("failed to spawn harness: {}", e)))?;
+        log::info!(
+            "spawned harness: job_id={}, pid={:?}, classpath={}, log={}",
+            job_id,
+            child.id(),
+            classpath,
+            log_path
+        );
+
+        Ok(())
     }
 }
 
@@ -80,11 +184,12 @@ impl JobService for FlareJobService {
         Self: 'async_trait,
     {
         Box::pin(async move {
-            let pipeline = request
-                .get_ref()
-                .pipeline
-                .as_ref()
-                .ok_or_else(|| Status::invalid_argument("Pipeline is missing"))?;
+            log::info!("prepare request received");
+
+            let pipeline = request.get_ref().pipeline.as_ref().ok_or_else(|| {
+                log::warn!("prepare request rejected: pipeline is missing");
+                Status::invalid_argument("Pipeline is missing")
+            })?;
 
             //println!("pipeline proto: {:#?}", pipeline);
             /* let text: String = format!("{:#?}", pipeline);
@@ -98,10 +203,11 @@ impl JobService for FlareJobService {
             */
             //println!("Pipeline context written to {}", path.display());
             let job = Job::new(pipeline);
-            self.job_store.add_job(job.job_id, job.job_graph);
+            let job_id = job.job_id;
+            self.job_store.add_job(job_id.clone(), job.job_graph);
 
             let response = PrepareJobResponse {
-                preparation_id: self.job_store.first_job_id().unwrap_or_default(),
+                preparation_id: job_id.clone(),
                 artifact_staging_endpoint: Some(ApiServiceDescriptor {
                     url: String::from("127.0.0.1:8099"),
                     authentication: None,
@@ -109,6 +215,7 @@ impl JobService for FlareJobService {
                 staging_session_token: "token".to_string(),
             };
 
+            log::info!("prepare request succeeded: preparation_id={}", job_id);
             Ok(Response::new(response))
         })
     }
@@ -135,7 +242,86 @@ impl JobService for FlareJobService {
         'life0: 'async_trait,
         Self: 'async_trait,
     {
-        todo!()
+        Box::pin(async move {
+            log::info!("run request received");
+            let preparation_id = request.get_ref().preparation_id.clone();
+            if preparation_id.is_empty() {
+                log::warn!("run request rejected: preparation_id is required");
+                return Err(Status::invalid_argument("preparation_id is required"));
+            }
+
+            let job_graph = self.job_store.get_job(&preparation_id).ok_or_else(|| {
+                log::warn!(
+                    "run request rejected: unknown preparation_id={}",
+                    preparation_id
+                );
+                Status::not_found(format!("unknown preparation_id: {}", preparation_id))
+            })?;
+
+            self.spawn_harness(&preparation_id).await?;
+
+            let mut executor = self.executor.clone();
+            timeout(
+                Duration::from_secs(self.harness_cfg.connect_timeout_secs),
+                executor.wait_connected(),
+            )
+            .await
+            .map_err(|_| {
+                Status::internal(format!(
+                    "harness did not connect within {}s for job {}",
+                    self.harness_cfg.connect_timeout_secs, preparation_id
+                ))
+            })?
+            .map_err(|e| {
+                Status::internal(format!(
+                    "failed waiting for harness connection for job {}: {}",
+                    preparation_id, e
+                ))
+            })?;
+
+            /*
+            let sdk_stages = job_graph.sdk_stages();
+            log::info!(
+                "starting job execution: preparation_id={}, total_stages={}",
+                preparation_id,
+                sdk_stages.len()
+            );
+
+            for (stage_idx, stage) in sdk_stages.iter().enumerate() {
+                let stage_id = format!("{}-stage-{}", preparation_id, stage_idx);
+                log::info!(
+                    "executing stage: preparation_id={}, stage_idx={}, stage_id={}",
+                    preparation_id,
+                    stage_idx,
+                    stage_id
+                );
+                executor.execute(stage, &stage_id).await.map_err(|err| {
+                    log::error!(
+                        "stage execution failed: preparation_id={}, stage_idx={}, stage_id={}, error={}",
+                        preparation_id,
+                        stage_idx,
+                        stage_id,
+                        err
+                    );
+                    Status::internal(format!(
+                        "failed to execute stage {} for job {}: {}",
+                        stage_idx, preparation_id, err
+                    ))
+                })?;
+                log::info!(
+                    "stage execution completed: preparation_id={}, stage_idx={}, stage_id={}",
+                    preparation_id,
+                    stage_idx,
+                    stage_id
+                );
+            }
+            */
+
+            log::info!("job execution completed: preparation_id={}", preparation_id);
+            Ok(Response::new(RunJobResponse {
+                job_id: preparation_id,
+            }))
+        })
     }
 
     #[doc = " Get a list of all invoked jobs"]

@@ -14,10 +14,8 @@ pub struct FlareArtifactStagingService {
     store: Arc<ArtifactStore>,
 }
 impl FlareArtifactStagingService {
-    pub fn new(store: ArtifactStore) -> Self {
-        Self {
-            store: Arc::new(store),
-        }
+    pub fn new(store: Arc<ArtifactStore>) -> Self {
+        Self { store }
     }
 }
 // stream that will send requests back to the client
@@ -169,12 +167,11 @@ impl ArtifactStore {
         // ensure directory exists
         fs::create_dir_all(path).await?;
 
-        let file = if !fs::try_exists(&staging_path).await? {
-            println!("creating file {}", staging_path);
-            Some(File::create(&staging_path).await?)
-        } else {
-            None
-        };
+        // Always (re)create the staged artifact file for this session.
+        // Previous behavior left `file=None` when file already existed, causing
+        // "file not initialized" at write time.
+        println!("creating file {}", staging_path);
+        let file = Some(File::create(&staging_path).await?);
 
         Ok(Self {
             path: path.to_string(),
@@ -190,8 +187,13 @@ impl ArtifactStore {
         })?;
 
         file.write_all(chunk).await?;
+        file.flush().await?;
 
         Ok(())
+    }
+
+    pub fn staged_path(&self) -> String {
+        format!("{}/{}", self.path, self.file_name)
     }
 
     pub fn fetch_artiafct(&self) {}
