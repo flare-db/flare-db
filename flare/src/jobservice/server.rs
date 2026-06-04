@@ -9,39 +9,17 @@ use beam_model_rs::v1::{
     job_service_server::JobService,
 };
 use dashmap::DashMap;
-use tokio::{process::Command, time::timeout};
+use tokio::{process::Command, sync::Mutex, time::timeout};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Response;
 use tonic::Status;
+use uuid::Uuid;
 
 use crate::engine::executor::StageExecutor;
+use crate::fusion::pipeline::ExecutableGraph;
 use crate::jobservice::artifact::ArtifactStore;
 use crate::jobservice::job::Job;
-use crate::jobservice::job::JobGraph;
-
-#[derive(Clone)]
-pub struct JobStore {
-    jobs: Arc<DashMap<String, JobGraph>>, // make Arc<JobGraph> to clone the pointer instread of entire jobgraph
-}
-
-impl JobStore {
-    pub fn new() -> Self {
-        Self {
-            jobs: Arc::new(DashMap::new()),
-        }
-    }
-
-    pub fn add_job(&self, id: String, graph: JobGraph) {
-        self.jobs.insert(id, graph);
-    }
-
-    pub fn get_job(&self, id: &str) -> Option<JobGraph> {
-        self.jobs.get(id).map(|entry| entry.value().clone())
-    }
-    pub fn first_job_id(&self) -> Option<String> {
-        self.jobs.iter().next().map(|entry| entry.key().clone())
-    }
-}
+use crate::jobservice::job::JobStore;
 
 #[derive(Clone, Debug)]
 pub struct HarnessLaunchConfig {
@@ -55,7 +33,7 @@ pub struct HarnessLaunchConfig {
 #[derive(Clone)]
 pub struct FlareJobService {
     job_store: JobStore,
-    executor: StageExecutor,
+    executor: Arc<Mutex<StageExecutor>>,
     artifact_store: Arc<ArtifactStore>,
     harness_cfg: HarnessLaunchConfig,
 }
@@ -68,7 +46,7 @@ impl FlareJobService {
     ) -> Self {
         Self {
             job_store: JobStore::new(),
-            executor,
+            executor: Arc::new(Mutex::new(executor)),
             artifact_store,
             harness_cfg,
         }
@@ -204,7 +182,7 @@ impl JobService for FlareJobService {
             //println!("Pipeline context written to {}", path.display());
             let job = Job::new(pipeline);
             let job_id = job.job_id;
-            self.job_store.add_job(job_id.clone(), job.job_graph);
+            self.job_store.add_job(&job_id, job.graph);
 
             let response = PrepareJobResponse {
                 preparation_id: job_id.clone(),
@@ -260,10 +238,13 @@ impl JobService for FlareJobService {
 
             self.spawn_harness(&preparation_id).await?;
 
-            let mut executor = self.executor.clone();
+            let executor = self.executor.clone();
             timeout(
                 Duration::from_secs(self.harness_cfg.connect_timeout_secs),
-                executor.wait_connected(),
+                async {
+                    let executor = executor.lock().await;
+                    executor.wait_connected().await
+                },
             )
             .await
             .map_err(|_| {
@@ -278,6 +259,18 @@ impl JobService for FlareJobService {
                     preparation_id, e
                 ))
             })?;
+
+            executor
+                .lock()
+                .await
+                .execute_pipeline(job_graph.as_ref())
+                .await
+                .map_err(|e| {
+                    Status::internal(format!(
+                        "failed to execute pipeline for job {}: {}",
+                        preparation_id, e
+                    ))
+                })?;
 
             /*
             let sdk_stages = job_graph.sdk_stages();

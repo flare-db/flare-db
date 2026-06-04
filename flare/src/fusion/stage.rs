@@ -12,7 +12,7 @@ use std::hash::{Hash, Hasher};
 
 #[derive(Clone, Debug)]
 pub struct ExecutableStage {
-    id: Uuid,
+    id: String,
     components: Components,
     environment: Environment,
     wire_coder: HashSet<WireCoderSetting>,
@@ -28,8 +28,29 @@ impl ExecutableStage {
     pub fn get_output_pcols(&self) -> &IndexSet<PCollectionNode> {
         &self.output_pcols
     }
+
+    pub fn get_output_pcol_ids(&self) -> HashSet<String> {
+        self.output_pcols
+            .iter()
+            .map(|pcol| pcol.collection.unique_name.clone())
+            .collect()
+    }
 }
 
+impl PartialEq for ExecutableStage {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for ExecutableStage {}
+
+impl Hash for ExecutableStage {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+    }
+}
+/*
 impl PartialEq for ExecutableStage {
     fn eq(&self, other: &Self) -> bool {
         self.components.encode_to_vec() == other.components.encode_to_vec()
@@ -81,6 +102,7 @@ impl Hash for ExecutableStage {
         }
     }
 }
+*/
 impl ExecutableStage {
     pub fn from(
         components: Components,
@@ -94,7 +116,7 @@ impl ExecutableStage {
         transforms: IndexSet<PTransformNode>,
     ) -> Self {
         Self {
-            id: Uuid::new_v4(),
+            id: Uuid::new_v4().to_string(),
             components,
             environment,
             wire_coder,
@@ -107,7 +129,7 @@ impl ExecutableStage {
         }
     }
 
-    pub fn id(&self) -> Uuid {
+    pub fn id(&self) -> String {
         self.id.clone()
     }
 

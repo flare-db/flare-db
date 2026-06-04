@@ -1,6 +1,4 @@
 pub mod beam_urns {
-    use std::collections::HashMap;
-    use std::sync::LazyLock;
 
     // Primitives
     pub const CREATE_TRANSFORM: &str = "beam:transform:create:v1";
@@ -15,6 +13,12 @@ pub mod beam_urns {
     pub const MERGE_WINDOWS_TRANSFORM: &str = "beam:transform:merge_windows:v1";
     pub const TO_STRING_TRANSFORM: &str = "beam:transform:to_string:v1";
     pub const MANAGED_TRANSFORM: &str = "beam:transform:managed:v1";
+
+    //Primary
+    pub const BEAM_SOURCE: &str = "beam:runner:source:v1";
+
+    // coders
+    pub const BYTES_CODER: &str = "beam:coder:bytes:v1";
 
     //Deprecated
     pub const CREATE_VIEW_TRANSFORM: &str = "beam:transform:create_view:v1";

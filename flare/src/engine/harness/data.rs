@@ -1,13 +1,17 @@
-use std::sync::Arc;
+use std::sync::{Arc, mpsc::Receiver};
 
 use anyhow::anyhow;
-use beam_model_rs::v1::{Elements, beam_fn_data_server::BeamFnData};
-use log::{info, warn};
+use beam_model_rs::v1::{
+    Elements,
+    beam_fn_data_server::BeamFnData,
+    elements::{Data, Timers},
+};
+use dashmap::{DashMap, mapref::one::Ref};
+use log::info;
 use tokio::sync::{
     Mutex,
-    mpsc::{self, Sender},
+    mpsc::{self, Sender, UnboundedReceiver, UnboundedSender},
 };
-use tokio::time::{Duration, Instant, sleep};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Response, Status};
 
@@ -29,8 +33,9 @@ pub async fn start_data_server() -> Result<(DataChannel, FlareDataService), anyh
     };
 
     let channel = DataChannel {
-        outgoing: tx,
-        stream,
+        outgoing: Arc::new(tx),
+        worker_stream: stream,
+        runner_stream: Arc::new(ElementStreamMultiplexer::new()),
     };
     Ok((channel, service))
 }
@@ -45,9 +50,9 @@ impl BeamFnData for FlareDataService {
     type DataStream = ReceiverStream<Result<Elements, Status>>;
 
     #[doc = " Used to send data between harnesses."]
-    #[must_use]
+    //#[must_use]
     #[allow(
-        elided_named_lifetimes,
+        //elided_named_lifetimes,
         clippy::type_complexity,
         clippy::type_repetition_in_bounds
     )]
@@ -85,8 +90,9 @@ impl BeamFnData for FlareDataService {
 
 #[derive(Clone)]
 pub struct DataChannel {
-    outgoing: Sender<Result<Elements, Status>>,
-    stream: Arc<DataInner>,
+    outgoing: Arc<Sender<Result<Elements, Status>>>,
+    worker_stream: Arc<DataInner>,
+    runner_stream: Arc<ElementStreamMultiplexer>,
 }
 
 impl DataChannel {
@@ -97,41 +103,199 @@ impl DataChannel {
             .map_err(|e| anyhow!("failed to send data-plane elements to harness: {}", e))
     }
 
-    pub async fn stream_elements(&self) -> Vec<Elements> {
-        let mut elements = Vec::<Elements>::new();
-        let deadline = Instant::now() + Duration::from_secs(2);
+    pub async fn send_stream(&self, receiver: Mutex<UnboundedReceiver<Elements>>) {
+        let outgoing_stream = self.outgoing.clone();
+        tokio::spawn(async move {
+            loop {
+                let payload = {
+                    let mut receiver_lock = receiver.lock().await;
+                    receiver_lock.recv().await
+                };
 
-        loop {
-            let mut g: tokio::sync::MutexGuard<'_, Option<tonic::Streaming<Elements>>> =
-                self.stream.incoming.lock().await;
-            if let Some(stream) = &mut *g {
-                while let Some(item) = stream.message().await.unwrap() {
-                    let is_last = item.data.iter().any(|data| data.is_last)
-                        || item.timers.iter().any(|timer| timer.is_last);
-                    elements.push(item);
+                if let Some(elements) = payload {
+                    outgoing_stream.send(Ok(elements)).await.map_err(|e| {
+                        anyhow!("failed to send data-plane elements to harness: {}", e)
+                    });
+                }
+            }
+        });
+    }
 
-                    if is_last {
-                        info!("received end-of-stream marker on data channel");
-                        break;
+    pub fn stream_elements(&self) {
+        let worker_data_stream = self.worker_stream.clone();
+        let runner_stream = self.runner_stream.clone();
+        info!("Streaming elements from harness");
+
+        tokio::spawn(async move {
+            let mut guard = worker_data_stream.incoming.lock().await;
+
+            // I am not sure if Data and Timers in elements are realted or not
+            // So, for now i am senning it as individual playload, if realted
+            // we could modify the code later.
+            if let Some(stream) = &mut *guard {
+                while let Some(elements) = stream.message().await.unwrap() {
+                    info!(
+                        "Received Elements from harness: data={}, timers={}",
+                        elements.data.len(),
+                        elements.timers.len()
+                    );
+                    for data in elements.data {
+                        info!(
+                            "Routing data from harness: instruction_id={}, transform_id={}, is_last={}, bytes={}",
+                            data.instruction_id,
+                            data.transform_id,
+                            data.is_last,
+                            data.data.len()
+                        );
+                        let data_key = DataKey {
+                            instruction_id: data.instruction_id.clone(),
+                            transform_id: data.transform_id.clone(),
+                        };
+
+                        let element_key = ElementKey::Data(data_key.clone());
+
+                        let sender = Self::get_sender(element_key, &runner_stream);
+
+                        let _ = sender.send(ElementStreamPayload::Data(DataChunk {
+                            key: data_key,
+                            data,
+                        }));
+                    }
+
+                    for timers in elements.timers {
+                        let timers_key = TimersKey {
+                            instruction_id: timers.instruction_id.clone(),
+                            // transform_id: timers.transform_id.clone(),
+                            // timer_family_id: timers.timer_family_id.clone(),
+                        };
+
+                        let element_key = ElementKey::Timers(timers_key.clone());
+
+                        let sender = Self::get_sender(element_key, &runner_stream);
+
+                        let _ = sender.send(ElementStreamPayload::Timers(TimerChunk {
+                            key: timers_key,
+                            timers,
+                        }));
                     }
                 }
-                break;
             }
+        });
+    }
+    fn get_sender(
+        key: ElementKey,
+        inner_stream: &ElementStreamMultiplexer,
+    ) -> UnboundedSender<ElementStreamPayload> {
+        let (sender, _receiver) = Self::get_or_create_stream(key, inner_stream);
+        sender
+    }
 
-            if Instant::now() >= deadline {
-                warn!("data stream not connected yet; returning no elements");
-                break;
-            }
-            drop(g);
-            sleep(Duration::from_millis(20)).await;
+    fn get_or_create_stream(
+        key: ElementKey,
+        inner_stream: &ElementStreamMultiplexer,
+    ) -> (
+        UnboundedSender<ElementStreamPayload>,
+        Arc<Mutex<UnboundedReceiver<ElementStreamPayload>>>,
+    ) {
+        if let Some(sender) = inner_stream.senders().get(&key) {
+            let receiver = inner_stream
+                .receivers()
+                .get(&key)
+                .expect("sender exists without matching receiver");
+
+            return (sender.value().clone(), Arc::clone(receiver.value()));
         }
 
-        info!("stream_elements collected {} message(s)", elements.len());
-        elements
+        let (tx, rx) = mpsc::unbounded_channel();
+        let receiver = Arc::new(Mutex::new(rx));
+
+        inner_stream.senders().insert(key.clone(), tx.clone());
+        inner_stream.receivers().insert(key, Arc::clone(&receiver));
+
+        (tx, receiver)
     }
+
+    pub fn get_receiver(
+        &self,
+        key: DataKey,
+    ) -> Arc<Mutex<UnboundedReceiver<ElementStreamPayload>>> {
+        let element_key = ElementKey::Data(key);
+
+        let (_sender, receiver) = Self::get_or_create_stream(element_key, &self.runner_stream);
+
+        receiver
+    }
+}
+
+#[derive(PartialEq, Eq, Hash, Clone, Debug)]
+pub struct DataKey {
+    pub(crate) instruction_id: String,
+    pub(crate) transform_id: String,
+}
+
+#[derive(PartialEq, Eq, Hash, Clone)]
+pub struct TimersKey {
+    pub(crate) instruction_id: String,
+    // pub(crate) transform_id: String,
+    // pub(crate) timer_family_id: String,
+}
+
+#[derive(PartialEq, Eq, Hash, Clone)]
+pub enum ElementKey {
+    Data(DataKey),
+    Timers(TimersKey),
+}
+pub struct ElementStreamMultiplexer {
+    senders: DashMap<ElementKey, UnboundedSender<ElementStreamPayload>>,
+    receivers: DashMap<ElementKey, Arc<Mutex<UnboundedReceiver<ElementStreamPayload>>>>,
+}
+
+impl ElementStreamMultiplexer {
+    pub fn new() -> Self {
+        Self {
+            senders: DashMap::new(),
+            receivers: DashMap::new(),
+        }
+    }
+
+    pub fn senders(&self) -> &DashMap<ElementKey, UnboundedSender<ElementStreamPayload>> {
+        &self.senders
+    }
+
+    pub fn receivers(
+        &self,
+    ) -> &DashMap<ElementKey, Arc<Mutex<UnboundedReceiver<ElementStreamPayload>>>> {
+        &self.receivers
+    }
+}
+
+#[derive(Clone)]
+pub enum ElementStreamPayload {
+    // assuming we might need the data and timers in order
+    Data(DataChunk),
+    Timers(TimerChunk),
+}
+
+#[derive(Eq, Hash, PartialEq, Clone)]
+pub struct DataChunk {
+    pub(crate) key: DataKey,
+    pub(crate) data: Data,
+}
+
+#[derive(Eq, Hash, PartialEq, Clone)]
+pub struct TimerChunk {
+    pub(crate) key: TimersKey,
+    pub(crate) timers: Timers,
 }
 
 // Flare control(process bundle request) -> harness
 //                                            | prcessed elements
 //                                    data channel(processed elements)
 // Flare --> inputs elements to harness ->    |
+
+/*
+one background task drains tonic stream
+routes elements by instruction_id
+bundle sessions receive their own outputs asynchronously
+
+That’s much closer to real runner architecture. */

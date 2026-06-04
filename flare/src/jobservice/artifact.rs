@@ -90,7 +90,7 @@ impl ArtifactStagingService for FlareArtifactStagingService {
                                                 if let Some(artifact_response_wrapper::Response::GetArtifactResponse(res)) = artifact_response.response{
 
                                                     // Save the artifact data
-                                                    println!("Received {} bytes of artifact data", res.data.len());
+                                                    //println!("Received {} bytes of artifact data", res.data.len());
                                                     if let Err(e) = store.stage_artifact(&res.data).await{
                                                         eprintln!("artifact write failed: {}", e);
                                                         return;

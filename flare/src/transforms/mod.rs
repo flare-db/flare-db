@@ -1,27 +1,99 @@
-use std::{any::Any, collections::HashMap, sync::LazyLock};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
-use beam_model_rs::v1::Elements;
+use beam_model_rs::v1::{
+    Coder, Components, Environment, PCollection, PTransform, WindowingStrategy,
+};
+use uuid::Uuid;
 
-use crate::{errors::TransformError, transforms::impluse::Impulse};
+use crate::{
+    engine::executor::ElementStore,
+    jobservice::urns::beam_urns,
+    transforms::{gbk::GroupByKey, impluse::Impulse},
+};
 
 pub mod gbk;
 pub mod impluse;
 
 pub trait FlareTransform {
-    type Context: TransformContext;
     fn urn() -> &'static str
     where
         Self: Sized;
 
-    fn with(inputs: HashMap<String, String>, outputs: HashMap<String, String>) -> Self;
+    fn id(&self) -> String;
 
-    fn execute(&self, ctx: &Self::Context) -> Result<Elements, TransformError>;
+    fn with(
+        id: String,
+        inputs: HashMap<String, String>,
+        outputs: HashMap<String, String>,
+        name: String,
+    ) -> Self
+    where
+        Self: Sized;
+
+    fn execute(&self, ctx: ExecutionContext);
+    //-> Result<Elements, TransformError>;
+
+    fn output_pcol_ids(&self) -> HashSet<String>;
+
+    fn unique_name(&self) -> String;
+
+    fn windowing_strategies(&self) -> HashMap<String, WindowingStrategy>;
+
+    fn coders(&self) -> HashMap<String, Coder>;
+
+    fn environments(&self) -> HashMap<String, Environment>;
+
+    fn transfrom_spec(&self) -> HashMap<String, PTransform>;
+
+    fn pcollections(&self, components: &Components) -> HashMap<String, PCollection>;
+
+    // TODO: add methods needed to build the ProcessBundleDescriptor object.
 }
 
-pub trait TransformContext {}
+// Idea: TransformConfig as input to with as we start adding more parameters
 
-pub enum RunnerTransfrom {
-    Impulse(Impulse),
-    //GBK(GBK),
-    // more later
+/*pub struct TransformConfig {
+    pub id: String,
+    pub name: String,
+    pub inputs: HashMap<String, String>,
+    pub outputs: HashMap<String, String>,
+    pub display_name: Option<String>,
+    pub environment_id: Option<String>,
+    pub side_inputs: HashMap<String, String>,
+} */
+
+pub struct ExecutionContext {
+    //pub instruction_id: String,
+    ///pub transform_id: String,
+    pub store: Arc<ElementStore>,
+    pub pcollection_id: String,
+    pub consumer_transfrom_id: String, //pub coder: String,
+}
+pub type FlareRunnerTransform = Arc<dyn FlareTransform + Send + Sync>;
+
+pub fn from_urn(
+    urn: &str,
+    name: String,
+    inputs: HashMap<String, String>,
+    outputs: HashMap<String, String>,
+) -> FlareRunnerTransform {
+    match urn {
+        beam_urns::IMPULSE_TRANSFORM => Arc::new(Impulse::with(
+            Uuid::new_v4().to_string(),
+            inputs,
+            outputs,
+            name,
+        )),
+
+        beam_urns::GROUP_BY_KEY_TRANSFORM => Arc::new(GroupByKey::with(
+            Uuid::new_v4().to_string(),
+            inputs,
+            outputs,
+            name,
+        )),
+        _ => panic!("Unknown URN {}", urn),
+    }
 }

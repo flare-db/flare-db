@@ -2,19 +2,18 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use anyhow::{Result, anyhow};
 use beam_model_rs::v1::{
-    GetProcessBundleDescriptorRequest, InstructionRequest, InstructionResponse,
-    ProcessBundleDescriptor, ProcessBundleRequest, ProcessBundleResponse, RegisterRequest,
-    beam_fn_control_server::{BeamFnControl, BeamFnControlServer},
-    instruction_request,
+    ApiServiceDescriptor, GetProcessBundleDescriptorRequest, InstructionRequest,
+    InstructionResponse, ProcessBundleDescriptor, ProcessBundleRequest, ProcessBundleResponse,
+    RegisterRequest, beam_fn_control_server::BeamFnControl, instruction_request,
 };
+use log::info;
 use tokio::sync::{Mutex, mpsc};
-use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
-use tonic::transport::Server;
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Response, Status};
 
 //type Result<T> = std::result::Result<T, HarnessError>;
 
-// ─── shared inner state ───────────────────────────────────────────────────────
+// shared inner state
 // Arc so both FlareControlService (owned by tonic)
 // and ControlChannel (owned by stage_executor) see the same state
 
@@ -30,7 +29,7 @@ pub struct ControlInner {
     pub descriptors: Mutex<HashMap<String, ProcessBundleDescriptor>>,
 }
 
-// ─── entry point ─────────────────────────────────────────────────────────────
+// entry point
 
 pub async fn start_control_server() -> Result<(ControlChannel, FlareControlService)> {
     let (tx, rx) = mpsc::channel::<Result<InstructionRequest, Status>>(32);
@@ -67,9 +66,8 @@ impl BeamFnControl for FlareControlService {
 
     #[doc = " Instructions sent by the runner to the SDK requesting different types"]
     #[doc = " of work."]
-    #[must_use]
     #[allow(
-        elided_named_lifetimes,
+        mismatched_lifetime_syntaxes,
         clippy::type_complexity,
         clippy::type_repetition_in_bounds
     )]
@@ -115,9 +113,8 @@ impl BeamFnControl for FlareControlService {
 
     #[doc = " Used to get the full process bundle descriptors for bundles one"]
     #[doc = " is asked to process."]
-    #[must_use]
     #[allow(
-        elided_named_lifetimes,
+        mismatched_lifetime_syntaxes,
         clippy::type_complexity,
         clippy::type_repetition_in_bounds
     )]
@@ -158,12 +155,9 @@ pub enum ControlResponse {
     BundleRegistered,
     ProcessBundleSuccess(ProcessBundleResponse),
     ProcessBundleError(String),
+    BundleDone,
 }
-// ─── ControlChannel ──────────────────────────────────────────────────────────
-//
-// This is what stage_executor.rs holds and uses.
-// Clean API — no tonic types leak out.
-//
+// ControlChannel
 // Flare → harness:  request_tx  (InstructionRequests)
 // harness → Flare:  inner.incoming (InstructionResponses, read directly)
 #[derive(Clone)]
@@ -177,7 +171,7 @@ pub struct ControlChannel {
 }
 
 impl ControlChannel {
-    // ── wait for harness to connect ───────────────────────────────────────────
+    // wait for harness to connect
     // poll until control() fires and stores the incoming stream
     pub async fn wait_connected(&self) -> Result<()> {
         loop {
@@ -188,7 +182,7 @@ impl ControlChannel {
         }
     }
 
-    // ── register stage descriptor with harness ────────────────────────────────
+    // register stage descriptor with harness
     // sends InstructionRequest { register: descriptor }
     // waits for InstructionResponse ack
     // called once per stage at startup
@@ -238,12 +232,17 @@ impl ControlChannel {
         }
     }
 
-    // ── tell harness to start a bundle ───────────────────────────────────────
+    // tell harness to start a bundle
     // sends InstructionRequest { process_bundle: descriptor_id }
     // returns bundle_id so caller can match the response later
     // called every bundle
-    pub async fn process_bundle(&mut self, descriptor_id: &String) -> Result<String> {
+    pub async fn send_process_bundle_request(&mut self, descriptor_id: &String) -> Result<String> {
         let id = self.next_id();
+
+        let endpoint = ApiServiceDescriptor {
+            url: "127.0.0.1:8099".to_string(),
+            ..Default::default()
+        };
 
         self.outgoing
             .send(Ok(InstructionRequest {
@@ -262,13 +261,14 @@ impl ControlChannel {
         Ok(id)
     }
 
-    // ── wait for harness to confirm bundle complete ───────────────────────────
+    // wait for harness to confirm bundle complete
     // blocks until ProcessBundleResponse arrives on control channel
     // called after sending elements on data channel
     pub async fn recv_process_bundle_response(
         &mut self,
         bundle_id: &str,
     ) -> Result<ControlResponse> {
+        info!("Polling for process bundle response");
         let response = self.recv_response().await?;
 
         if response.instruction_id != bundle_id {
@@ -295,7 +295,7 @@ impl ControlChannel {
         }
     }
 
-    // ── read next InstructionResponse from harness ───────────────────────────
+    // read next InstructionResponse from harness
     // reads directly from the persisted gRPC stream
     // no intermediate mpsc, no spawned tasks
     // if stream dies → returns Err immediately, no deadlock
@@ -313,7 +313,7 @@ impl ControlChannel {
             .ok_or_else(|| anyhow!("harness disconnected"))
     }
 
-    // ── generate unique instruction ids ──────────────────────────────────────
+    // generate unique instruction ids
     fn next_id(&mut self) -> String {
         self.next_id += 1;
         self.next_id.to_string()
