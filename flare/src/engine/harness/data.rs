@@ -1,4 +1,4 @@
-use std::sync::{Arc, mpsc::Receiver};
+use std::{sync::Arc, time::Duration};
 
 use anyhow::anyhow;
 use beam_model_rs::v1::{
@@ -6,8 +6,8 @@ use beam_model_rs::v1::{
     beam_fn_data_server::BeamFnData,
     elements::{Data, Timers},
 };
-use dashmap::{DashMap, mapref::one::Ref};
-use log::info;
+use dashmap::DashMap;
+use log::{error, info};
 use tokio::sync::{
     Mutex,
     mpsc::{self, Sender, UnboundedReceiver, UnboundedSender},
@@ -103,36 +103,24 @@ impl DataChannel {
             .map_err(|e| anyhow!("failed to send data-plane elements to harness: {}", e))
     }
 
-    pub async fn send_stream(&self, receiver: Mutex<UnboundedReceiver<Elements>>) {
-        let outgoing_stream = self.outgoing.clone();
-        tokio::spawn(async move {
-            loop {
-                let payload = {
-                    let mut receiver_lock = receiver.lock().await;
-                    receiver_lock.recv().await
-                };
-
-                if let Some(elements) = payload {
-                    outgoing_stream.send(Ok(elements)).await.map_err(|e| {
-                        anyhow!("failed to send data-plane elements to harness: {}", e)
-                    });
-                }
-            }
-        });
-    }
-
     pub fn stream_elements(&self) {
         let worker_data_stream = self.worker_stream.clone();
         let runner_stream = self.runner_stream.clone();
         info!("Streaming elements from harness");
 
         tokio::spawn(async move {
-            let mut guard = worker_data_stream.incoming.lock().await;
+            loop {
+                let mut guard = worker_data_stream.incoming.lock().await;
 
-            // I am not sure if Data and Timers in elements are realted or not
-            // So, for now i am senning it as individual playload, if realted
-            // we could modify the code later.
-            if let Some(stream) = &mut *guard {
+                let Some(stream) = &mut *guard else {
+                    drop(guard);
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    continue;
+                };
+
+                // I am not sure if Data and Timers in elements are realted or not
+                // So, for now i am senning it as individual playload, if realted
+                // we could modify the code later.
                 while let Some(elements) = stream.message().await.unwrap() {
                     info!(
                         "Received Elements from harness: data={}, timers={}",
@@ -179,6 +167,9 @@ impl DataChannel {
                         }));
                     }
                 }
+
+                info!("BeamFnData stream from harness closed");
+                break;
             }
         });
     }
@@ -297,5 +288,4 @@ pub struct TimerChunk {
 one background task drains tonic stream
 routes elements by instruction_id
 bundle sessions receive their own outputs asynchronously
-
-That’s much closer to real runner architecture. */
+ */

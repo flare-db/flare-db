@@ -1,10 +1,14 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::{Error, anyhow};
-use beam_model_rs::v1::{ApiServiceDescriptor, Elements, ProcessBundleDescriptor, elements};
+use beam_model_rs::v1::{
+    ApiServiceDescriptor, Coder, Elements, FunctionSpec, PTransform, ProcessBundleDescriptor,
+    RemoteGrpcPort, elements,
+};
 use bytes::{Buf, BytesMut};
 use dashmap::DashMap;
 use log::{error, info};
@@ -17,7 +21,7 @@ use tokio::sync::{
 
 use crate::{
     engine::{
-        coders::{BeamValue, StandardCoders},
+        coders::{BeamCoder, BeamValue, StandardBeamCoders, WindowedValueCoder},
         harness::{
             control::{ControlChannel, ControlResponse},
             data::{DataChannel, DataKey, ElementStreamPayload},
@@ -27,6 +31,7 @@ use crate::{
         pipeline::{ConsumerMetaData, ExecutableGraph, ExecutableNode},
         stage::ExecutableStage,
     },
+    jobservice::urns::beam_urns,
     transforms::ExecutionContext,
 };
 
@@ -34,20 +39,16 @@ pub struct StageExecutor {
     control: ControlChannel,
     data: DataChannel,
     store: Arc<ElementStore>,
-    writer_stream_sender: UnboundedSender<Elements>,
     graph: Option<ExecutableGraph>, // ows the Scheduler and asks it to give the next element to execute in
                                     // execute_pipeline and calls execute_node to execute that node
 }
 
 impl StageExecutor {
     pub fn new(control: ControlChannel, data: DataChannel) -> Self {
-        let (tx, rx) = mpsc::unbounded_channel();
-        data.send_stream(Mutex::new(rx));
         Self {
             control,
             data,
             store: Arc::new(ElementStore::new()),
-            writer_stream_sender: tx,
             graph: None,
         }
     }
@@ -70,6 +71,7 @@ impl StageExecutor {
         self.graph = Some(pipeline_graph.clone());
 
         // Root node = node with no incoming edges
+        // we might alredy have a root node stored somehwere
         let root = graph
             .node_indices()
             .find(|&idx| {
@@ -105,10 +107,13 @@ impl StageExecutor {
                     continue;
                 }
 
+                // previous stage -> current stage
                 let incoming_edge = graph
                     .edges_directed(idx, Direction::Incoming)
                     .next()
                     .map(|e| e.weight().clone());
+
+                // current stage -> next stage
                 let outgoing_edge = graph
                     .edges_directed(idx, Direction::Outgoing)
                     .next()
@@ -148,11 +153,8 @@ impl StageExecutor {
         node: ExecutableNode,
         input_edge_metadata: Option<ConsumerMetaData>,
         output_edge_metadata: Option<ConsumerMetaData>,
-        instruction_id: Option<String>,
+        _instruction_id: Option<String>,
     ) -> anyhow::Result<ControlResponse> {
-        // return node reponse instred of control res
-        // create execution context for runner / worker node
-
         match node {
             ExecutableNode::Worker(executable_stage) => {
                 info!("Executing worker node");
@@ -180,36 +182,30 @@ impl StageExecutor {
                             }
                             let output_meta_data = output_edge_metadata;
                             if let Some(meta_data) = &output_meta_data {
-                                info!("Output edge metadata: {:?}", meta_data.clone());
+                                info!("Output edge metadata: {:?}", meta_data);
                             }
 
-                            let stage_input = executable_stage.input_pcol();
-                            let input_pcollection_id = stage_input.id().clone();
-                            let input_coder_id = stage_input.node().coder_id.clone();
-                            let input_consumer_transform_id =
-                                Self::get_stage_input_consumer_transform_id(
-                                    &executable_stage,
-                                    &input_pcollection_id,
-                                )?;
-                            let input_instruction_id = instruction_id.clone();
-                            let store = self.store.clone();
-                            let input_stream = self.data.clone();
-                            let input_instruction_id_for_log = input_instruction_id.clone();
+                            let instruction_id_log = instruction_id.clone();
 
+                            let input_ctx = ProcessInputContext {
+                                input_stream: self.data.clone(),
+                                store: self.store.clone(),
+                                input_instruction_id: instruction_id.clone(),
+                                input_pcollection_id: executable_stage.input_pcol().id().clone(),
+                                consumer_transform_id: Self::stage_source_transform_id(
+                                    &executable_stage,
+                                ),
+                                input_coder_id: executable_stage
+                                    .input_pcol()
+                                    .node()
+                                    .coder_id
+                                    .clone(),
+                            };
                             tokio::spawn(async move {
-                                if let Err(err) = Self::process_input_elements(
-                                    input_stream,
-                                    store,
-                                    input_instruction_id,
-                                    input_consumer_transform_id,
-                                    input_pcollection_id,
-                                    input_coder_id,
-                                )
-                                .await
-                                {
+                                if let Err(err) = Self::process_input_elements(input_ctx).await {
                                     error!(
                                         "Failed to send input elements for instruction {}: {}",
-                                        input_instruction_id_for_log, err
+                                        instruction_id_log, err
                                     );
                                 }
                             });
@@ -219,7 +215,10 @@ impl StageExecutor {
                             if let Some(output_meta_data) = output_meta_data {
                                 let data_key = DataKey {
                                     instruction_id: instruction_id.clone(),
-                                    transform_id: output_meta_data.producer_transform_id.clone(),
+                                    transform_id: Self::stage_sink_transform_id(
+                                        &executable_stage,
+                                        &output_meta_data.produced_pcol_id,
+                                    ),
                                 };
                                 // pass data_key to get resiciver
                                 info!("Data Key: {:?}", data_key);
@@ -227,30 +226,64 @@ impl StageExecutor {
 
                                 let store = self.store.clone();
 
-                                let decode_task = tokio::spawn(async move {
+                                let mut decode_task = tokio::spawn(async move {
                                     Self::process_output_elements(receiver, output_meta_data, store)
                                         .await
                                 });
 
-                                let (decode_result, bundle_response) =
-                                    tokio::join!(decode_task, bundle_response_future);
-
-                                decode_result?;
-                                let proces_bundle_response = bundle_response?;
+                                let timeout_id = instruction_id.clone();
+                                let proces_bundle_response = tokio::time::timeout(
+                                    Duration::from_secs(60),
+                                    async {
+                                        tokio::pin!(bundle_response_future);
+                                        tokio::select! {
+                                            bundle_response = &mut bundle_response_future => {
+                                                match bundle_response {
+                                                    Ok(response) => {
+                                                        decode_task.await.map_err(|err| {
+                                                            anyhow!("output decode task failed: {}", err)
+                                                        })??;
+                                                        Ok(response)
+                                                    }
+                                                    Err(err) => {
+                                                        decode_task.abort();
+                                                        Err(err)
+                                                    }
+                                                }
+                                            }
+                                            decode_result = &mut decode_task => {
+                                                decode_result.map_err(|err| {
+                                                    anyhow!("output decode task failed: {}", err)
+                                                })??;
+                                                bundle_response_future.await
+                                            }
+                                        }
+                                    },
+                                )
+                                .await
+                                .map_err(|_| {
+                                    anyhow!(
+                                        "timed out waiting for SDK bundle {} output data and control response",
+                                        timeout_id
+                                    )
+                                })??;
 
                                 return Ok(proces_bundle_response);
                             }
 
-                            let proces_bundle_response = bundle_response_future.await?;
+                            let timeout_id = instruction_id.clone();
+                            let proces_bundle_response = tokio::time::timeout(
+                                Duration::from_secs(60),
+                                bundle_response_future,
+                            )
+                            .await
+                            .map_err(|_| {
+                                anyhow!(
+                                    "timed out waiting for SDK bundle {} control response",
+                                    timeout_id
+                                )
+                            })??;
                             return Ok(proces_bundle_response);
-                            //TODO return back instruction id as a callback
-
-                            // return Ok(proces_bundle_response);
-
-                            // get recivert, start reading elements from channel
-                            // and persist it for sending it to next stage inputs
-
-                            //let elements = self.data.stream_elements();
                         } else {
                             Ok(ControlResponse::ProcessBundleError(
                                 "Error wile registring bundle".to_string(),
@@ -261,8 +294,6 @@ impl StageExecutor {
                         return Err(anyhow!("Error while processing bundle {}", err));
                     }
                 }
-
-                //Ok(())
             }
             ExecutableNode::Runner(runner_transform) => {
                 info!("Executing runner node");
@@ -278,9 +309,6 @@ impl StageExecutor {
                         url: "127.0.0.1:8099".to_string(),
                         ..Default::default()
                     };
-
-                    // TODO : build process bundle descriptor for the runner transfrom
-                    // send register request to harness and then execute the runner transfrom
 
                     let descriptor = ProcessBundleDescriptor {
                         id: runner_transform.id(),
@@ -320,27 +348,144 @@ impl StageExecutor {
         }
     }
 
-    fn get_stage_input_consumer_transform_id(
+    fn stage_source_transform_id(stage: &ExecutableStage) -> String {
+        format!("{}/source", stage.id())
+    }
+
+    fn stage_sink_transform_id(stage: &ExecutableStage, pcollection_id: &str) -> String {
+        format!("{}/sink/{}", stage.id(), pcollection_id)
+    }
+
+    fn remote_grpc_port(endpoint: ApiServiceDescriptor, coder_id: String) -> RemoteGrpcPort {
+        RemoteGrpcPort {
+            api_service_descriptor: Some(endpoint),
+            coder_id,
+        }
+    }
+
+    fn global_window_coder_id(stage: &ExecutableStage) -> String {
+        format!("{}/global_window", stage.id())
+    }
+
+    fn windowed_value_coder_id(stage: &ExecutableStage, pcollection_id: &str) -> String {
+        format!("{}/windowed_value/{}", stage.id(), pcollection_id)
+    }
+
+    fn insert_windowed_value_coder(
+        coders: &mut HashMap<String, Coder>,
+        windowed_value_coder_id: String,
+        element_coder_id: String,
+        global_window_coder_id: String,
+    ) {
+        coders
+            .entry(global_window_coder_id.clone())
+            .or_insert(Coder {
+                spec: Some(FunctionSpec {
+                    urn: beam_urns::GLOBAL_WINDOW_CODER.to_string(),
+                    payload: Vec::new(),
+                }),
+                component_coder_ids: Vec::new(),
+            });
+
+        coders.insert(
+            windowed_value_coder_id,
+            Coder {
+                spec: Some(FunctionSpec {
+                    urn: beam_urns::WINDOWED_VALUE_CODER.to_string(),
+                    payload: Vec::new(),
+                }),
+                component_coder_ids: vec![element_coder_id, global_window_coder_id],
+            },
+        );
+    }
+
+    fn add_stage_data_boundary_coders(
         stage: &ExecutableStage,
-        stage_input_id: &str,
-    ) -> anyhow::Result<String> {
-        stage
-            .transforms()
-            .into_iter()
-            .find(|transform| {
-                transform
-                    .node()
-                    .inputs
-                    .values()
-                    .any(|input| input == stage_input_id)
-            })
-            .map(|transform| transform.node().unique_name.clone())
-            .ok_or_else(|| {
-                anyhow!(
-                    "consumer transform not found for stage input pcollection {}",
-                    stage_input_id
-                )
-            })
+        coders: &mut HashMap<String, Coder>,
+    ) {
+        let global_window_coder_id = Self::global_window_coder_id(stage);
+        let input_pcol = stage.input_pcol();
+
+        Self::insert_windowed_value_coder(
+            coders,
+            Self::windowed_value_coder_id(stage, input_pcol.id()),
+            input_pcol.node().coder_id.clone(),
+            global_window_coder_id.clone(),
+        );
+
+        for output_pcol in stage.output_pcols() {
+            Self::insert_windowed_value_coder(
+                coders,
+                Self::windowed_value_coder_id(stage, output_pcol.id()),
+                output_pcol.node().coder_id.clone(),
+                global_window_coder_id.clone(),
+            );
+        }
+    }
+
+    /// Add stage's source and sink boundary( basically tells the worker where a stage begins and ends)
+    fn stage_transforms_with_data_boundaries(
+        stage: &ExecutableStage,
+        endpoint: ApiServiceDescriptor,
+    ) -> HashMap<String, PTransform> {
+        let mut transforms = stage.ptmap();
+
+        let input_pcol = stage.input_pcol();
+        let source_id = Self::stage_source_transform_id(stage);
+        let input_element_coder_id = input_pcol.node().coder_id.clone();
+        let input_wire_coder_id = Self::windowed_value_coder_id(stage, input_pcol.id());
+        info!(
+            "Adding SDK stage source transform: id={}, output_pcollection={}, element_coder_id={}, wire_coder_id={}",
+            source_id,
+            input_pcol.id(),
+            input_element_coder_id,
+            input_wire_coder_id
+        );
+        transforms.insert(
+            source_id.clone(),
+            PTransform {
+                unique_name: source_id.clone(),
+                spec: Some(FunctionSpec {
+                    urn: beam_urns::BEAM_SOURCE.to_string(),
+                    payload: Self::remote_grpc_port(endpoint.clone(), input_wire_coder_id)
+                        .encode_to_vec(),
+                }),
+                inputs: HashMap::new(),
+                outputs: HashMap::from([("local_output".to_string(), input_pcol.id().clone())]),
+                ..Default::default()
+            },
+        );
+
+        for output_pcol in stage.output_pcols() {
+            let sink_id = Self::stage_sink_transform_id(stage, output_pcol.id());
+            let output_element_coder_id = output_pcol.node().coder_id.clone();
+            let output_wire_coder_id = Self::windowed_value_coder_id(stage, output_pcol.id());
+            info!(
+                "Adding SDK stage sink transform: id={}, input_pcollection={}, element_coder_id={}, wire_coder_id={}",
+                sink_id,
+                output_pcol.id(),
+                output_element_coder_id,
+                output_wire_coder_id
+            );
+            transforms.insert(
+                sink_id.clone(),
+                PTransform {
+                    unique_name: sink_id.clone(),
+                    spec: Some(FunctionSpec {
+                        urn: beam_urns::BEAM_SINK.to_string(),
+                        payload: Self::remote_grpc_port(endpoint.clone(), output_wire_coder_id)
+                            .encode_to_vec(),
+                    }),
+                    // it may not be right to add the "local_input".to_string() as key, we need to
+                    // get the actualcollection's key from compos and insert
+                    inputs: HashMap::from([("local_input".to_string(), output_pcol.id().clone())]),
+                    outputs: HashMap::new(),
+                    ..Default::default()
+                },
+            );
+        }
+
+        transforms
     }
 
     pub async fn register_bundle(
@@ -352,13 +497,18 @@ impl StageExecutor {
             ..Default::default()
         };
 
+        let transforms = Self::stage_transforms_with_data_boundaries(stage, endpoint.clone());
+        let mut components = stage.components();
+        Self::add_stage_data_boundary_coders(stage, &mut components.coders);
+
+        // ToDo: validate if we need to pass stage scoped or pipeline scoped values
         let descriptor = ProcessBundleDescriptor {
             id: stage.id().to_string(),
-            transforms: stage.ptmap(),
-            pcollections: stage.components().pcollections,
-            windowing_strategies: stage.components().windowing_strategies,
-            coders: stage.components().coders,
-            environments: stage.components().environments,
+            transforms,
+            pcollections: components.pcollections,
+            windowing_strategies: components.windowing_strategies,
+            coders: components.coders,
+            environments: components.environments,
             state_api_service_descriptor: Some(endpoint.clone()),
             timer_api_service_descriptor: Some(endpoint),
         };
@@ -375,7 +525,7 @@ impl StageExecutor {
         receiver: Arc<Mutex<UnboundedReceiver<ElementStreamPayload>>>,
         edge_metadata: ConsumerMetaData,
         store: Arc<ElementStore>,
-    ) {
+    ) -> anyhow::Result<()> {
         info!("Spawaned task to process stage's output elements");
         let mut stream_buffer = BytesMut::new();
 
@@ -401,13 +551,14 @@ impl StageExecutor {
 
                     if data_chunk.data.is_last {
                         info!("Last data chunk");
-                        let coder = StandardCoders::from_urn(&edge_metadata.coder_id);
+                        let element_coder = StandardBeamCoders::from_urn(&edge_metadata.coder_id);
+                        let windowed_value_coder = WindowedValueCoder::new(element_coder);
 
                         let mut decoded = Vec::<BeamValue>::new();
                         let mut buf = stream_buffer.freeze();
 
                         while buf.has_remaining() {
-                            decoded.push(coder.decode(&mut buf));
+                            decoded.push(windowed_value_coder.decode(&mut buf).value);
                         }
 
                         let req = NewCollectionRequest {
@@ -417,7 +568,7 @@ impl StageExecutor {
 
                         store.insert_new_collection(req);
 
-                        break;
+                        return Ok(());
                     }
                 }
 
@@ -427,61 +578,65 @@ impl StageExecutor {
                 }
             }
         }
+
+        Ok(())
     }
 
-    pub async fn process_input_elements(
-        input_stream: DataChannel,
-        store: Arc<ElementStore>,
-        instruction_id: String,
-        consumer_transform_id: String,
-        pcollection_id: String,
-        coder_id: String,
-    ) -> anyhow::Result<()> {
+    // Sends current stage's input elements to worker
+    pub async fn process_input_elements(ctx: ProcessInputContext) -> anyhow::Result<()> {
         info!("Spawnned task to send stage's input elemenets to worker");
         info!(
             "Sending input elements: instruction_id={}, transform_id={}",
-            instruction_id, consumer_transform_id,
+            ctx.input_instruction_id, ctx.consumer_transform_id,
         );
-        let request = GetCollectionRequest { pcollection_id };
+        let request = GetCollectionRequest {
+            pcollection_id: ctx.input_pcollection_id,
+        };
 
-        let elements = store.get_collection(request);
-        info!("Input coder: {}", coder_id);
+        let elements = ctx.store.get_collection(request);
+        info!("Input element coder: {}", ctx.input_coder_id);
 
-        let coder = StandardCoders::from_urn(coder_id.as_str());
+        let element_coder = StandardBeamCoders::from_urn(ctx.input_coder_id.as_str());
+        let windowed_value_coder = WindowedValueCoder::new(element_coder);
         let mut encoded = BytesMut::new();
 
         for element in &elements {
-            info!("Starting to encode");
-            coder.encode(element, &mut encoded);
+            info!("Starting to encode WindowedValue");
+            windowed_value_coder.encode_value(element, &mut encoded);
         }
 
         let elements = Elements {
             data: vec![elements::Data {
-                instruction_id,
-                transform_id: consumer_transform_id,
+                instruction_id: ctx.input_instruction_id,
+                transform_id: ctx.consumer_transform_id,
                 data: encoded.freeze().to_vec(),
                 is_last: true,
             }],
             timers: Vec::new(),
         };
 
-        input_stream.send_elements(elements).await?;
+        ctx.input_stream.send_elements(elements).await?;
         info!("Finished sending input elements to worker");
         Ok(())
     }
 }
 // decode the data chunks.
 
+pub struct ProcessInputContext {
+    input_stream: DataChannel,
+    store: Arc<ElementStore>,
+    input_instruction_id: String,
+    consumer_transform_id: String,
+    input_pcollection_id: String,
+    input_coder_id: String,
+}
 // transform_id in the data payload is the the id of the transfrom that produced the pcollection
 // so we could use transform_id to get the pcol id that it producted and then get the
 // decoder for that pcol and decode and process the elemenets.
 // decoing should be async task so we can spwan parallel task to the job
 // check out how beam does decoding
 pub struct ElementStore {
-    // {transfrom_id -> {pcol_id, pcol values}}
-    // transfrom_id is nothing but a stage and a stage can produce multiple
-    // pcollections so, transfrom_id maps to list of pcollection_id that it prodoced
-    // and its pcollections
+    // {pcol_id -> [pcol values]}
     data: Arc<DashMap<String, Vec<BeamValue>>>,
 }
 
@@ -518,65 +673,3 @@ pub struct NewCollectionRequest {
 pub struct GetCollectionRequest {
     pcollection_id: String,
 }
-
-// TODO
-// let execute() handle the instruction
-// persist the bundle id and instruction
-// and add data fn in executor to just listen to data that harness is sending
-// store it inmemory in hashmap of bundleid and elmeennts
-// once all elemeents are scived start next stage and pass the stored elements as input to it.
-
-/*
-pub fn log_data(elements: &[Elements]) {
-     info!("Logging elements: total_messages={}", elements.len());
-     for (idx, msg) in elements.iter().enumerate() {
-         info!(
-             "elements message {}: data_entries={}, timer_entries={}",
-             idx,
-             msg.data.len(),
-             msg.timers.len()
-         );
-         for data in &msg.data {
-             let decoded = Self::decode_strings(&data.data);
-             log::info!(
-                 "[data] instruction={} transform={} is_last={} elements={:?}",
-                 data.instruction_id,
-                 data.transform_id,
-                 data.is_last,
-                 decoded,
-             );
-         }
-         for timer in &msg.timers {
-             info!(
-                 "[timer] instruction={} transform={} timer_family_id={} is_last={}",
-                 timer.instruction_id, timer.transform_id, timer.timer_family_id, timer.is_last
-             );
-         }
-     }
- }
-
- fn decode_strings(raw: &[u8]) -> Vec<String> {
-     info!("decoing strings");
-     use std::io::{Cursor, Read};
-
-     let mut cursor = Cursor::new(raw);
-     let mut out = Vec::new();
-
-     while cursor.position() < raw.len() as u64 {
-         let mut len_buf = [0u8; 4];
-         if cursor.read_exact(&mut len_buf).is_err() {
-             break;
-         }
-         let len = u32::from_be_bytes(len_buf) as usize;
-         let mut buf = vec![0u8; len];
-         if cursor.read_exact(&mut buf).is_err() {
-             break;
-         }
-         match String::from_utf8(buf) {
-             Ok(s) => out.push(s),
-             Err(_) => out.push("<invalid utf8>".to_string()),
-         }
-     }
-
-     out
- } */

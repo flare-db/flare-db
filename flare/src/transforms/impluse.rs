@@ -11,11 +11,9 @@ use crate::jobservice::urns::beam_urns;
 use crate::transforms::{ExecutionContext, FlareTransform};
 use std::collections::{HashMap, HashSet};
 
-/// Impulse always produces exactly one element: an empty byte[]
-/// in a GlobalWindow at MIN_TIMESTAMP. Wire format is always
-/// beam:coder:windowed_value:v1:
-///
-///   timestamp(8) | windows(iterable) | pane(1) | element(1)
+/// Impulse produces exactly one logical element: an empty byte[].
+/// The Fn Data boundary is responsible for wrapping this logical value in
+/// a WindowedValue before sending it to an SDK harness.
 #[derive(Clone)]
 pub struct Impulse {
     name: String,
@@ -50,10 +48,10 @@ impl FlareTransform for Impulse {
 
     fn execute(&self, ctx: ExecutionContext) {
         info!("Executing impluse transfrom");
-        let elements = vec![BeamValue::Bytes(encode_windowed_empty_bytes())];
+        let elements = vec![BeamValue::Bytes(Vec::new())];
         let request = NewCollectionRequest {
             pcollection_id: ctx.pcollection_id.clone(),
-            elements: elements,
+            elements,
         };
 
         ctx.store.insert_new_collection(request);
@@ -120,7 +118,7 @@ impl FlareTransform for Impulse {
 
         let mut transforms = HashMap::<String, PTransform>::new();
         transforms.insert(
-            "Create-Values-Impulse".clone().to_string(),
+            "Create-Values-Impulse".to_string(),
             PTransform {
                 spec: Some(FunctionSpec {
                     urn: beam_urns::BEAM_SOURCE.to_string(),
@@ -159,44 +157,4 @@ impl FlareTransform for Impulse {
     fn id(&self) -> String {
         self.id.to_string().clone()
     }
-}
-
-/*Ok(Elements {
-    data: vec![elements::Data {
-        //instruction_id: ctx.instruction_id.to_string(),
-        transform_id: ctx.transform_id.to_string(),
-        data: encode_windowed_empty_bytes(),
-        is_last: true,
-    }],
-    timers: Vec::new(),
-})*/
-
-/// beam:coder:windowed_value:v1 wire layout:
-///
-///   timestamp  — 8 bytes big-endian shifted by Long.MIN_VALUE
-///   windows    — fixed32(1) + GlobalWindow (empty)
-///   pane       — 0xD0 (first, last, on-time)
-///   element    — 0x00 (empty byte[] = varint(0))
-///
-/// MIN_TIMESTAMP = Long.MIN_VALUE + 1 = -9223372036854775807
-/// encoded_ts   = (MIN_TIMESTAMP ^ Long.MIN_VALUE) = 1
-///              → [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]
-fn encode_windowed_empty_bytes() -> Vec<u8> {
-    let mut buf = Vec::with_capacity(14);
-
-    // 1. timestamp: MIN_TIMESTAMP
-    let min_timestamp: i64 = i64::MIN + 1;
-    let encoded_ts = (min_timestamp ^ i64::MIN) as u64;
-    buf.extend_from_slice(&encoded_ts.to_be_bytes());
-
-    // 2. windows: iterable of 1 GlobalWindow (GlobalWindow = empty)
-    buf.extend_from_slice(&1u32.to_be_bytes());
-
-    // 3. pane: first + last + on-time = 0xD0
-    buf.push(0xD0);
-
-    // 4. element: empty byte[] nested = varint(0) = 0x00
-    buf.push(0x00);
-
-    buf
 }
