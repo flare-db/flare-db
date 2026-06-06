@@ -3,6 +3,7 @@ use beam_model_rs::v1::{
     artifact_request_wrapper, artifact_response_wrapper,
     artifact_staging_service_server::ArtifactStagingService,
 };
+use log::info;
 use std::{pin::Pin, sync::Arc};
 use tokio::fs::{self, File};
 use tokio::io::AsyncWriteExt;
@@ -14,10 +15,8 @@ pub struct FlareArtifactStagingService {
     store: Arc<ArtifactStore>,
 }
 impl FlareArtifactStagingService {
-    pub fn new(store: ArtifactStore) -> Self {
-        Self {
-            store: Arc::new(store),
-        }
+    pub fn new(store: Arc<ArtifactStore>) -> Self {
+        Self { store }
     }
 }
 // stream that will send requests back to the client
@@ -43,7 +42,7 @@ impl ArtifactStagingService for FlareArtifactStagingService {
                     let staging_token = warapper.staging_token;
                     // TODO: Validate staging token
 
-                    println!("got staging token");
+                    info!("Received staging token");
 
                     let resolve_request = ArtifactRequestWrapper {
                         request: Some(artifact_request_wrapper::Request::ResolveArtifact(
@@ -67,11 +66,10 @@ impl ArtifactStagingService for FlareArtifactStagingService {
                                 ),
                             ) = response.response
                             {
-                                println!("got resolve response");
-                                // println!("got resolve artfacts reponse {:#?}", resolve_response);
+                                info!("Received resolve response from client");
+
                                 for artifact_info in resolve_response.replacements {
-                                    //println!("artifacts info {:#?}",artifact_info);
-                                    println!("got artifacts info");
+                                    info!("Fetched artfacts info");
                                     let get_request = ArtifactRequestWrapper {
                                         request: Some(
                                             artifact_request_wrapper::Request::GetArtifact(
@@ -92,13 +90,12 @@ impl ArtifactStagingService for FlareArtifactStagingService {
                                                 if let Some(artifact_response_wrapper::Response::GetArtifactResponse(res)) = artifact_response.response{
 
                                                     // Save the artifact data
-                                                    println!("Received {} bytes of artifact data", res.data.len());
                                                     if let Err(e) = store.stage_artifact(&res.data).await{
                                                         eprintln!("artifact write failed: {}", e);
                                                         return;
                                                     }
                                                     if artifact_response.is_last {
-                                                        println!("Artifact transfer complete");
+                                                        info!("Artifacts staging complete");
                                                         break;
                                                     }
                                                 }else {
@@ -145,7 +142,7 @@ impl ArtifactStagingService for FlareArtifactStagingService {
                 }
             }
 
-            println!("Artifact staging complete");
+            info!("Artifact staging complete");
         });
 
         let output_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
@@ -169,12 +166,11 @@ impl ArtifactStore {
         // ensure directory exists
         fs::create_dir_all(path).await?;
 
-        let file = if !fs::try_exists(&staging_path).await? {
-            println!("creating file {}", staging_path);
-            Some(File::create(&staging_path).await?)
-        } else {
-            None
-        };
+        // Always (re)create the staged artifact file for this session.
+        // Previous behavior left `file=None` when file already existed, causing
+        // "file not initialized" at write time.
+        println!("creating file {}", staging_path);
+        let file = Some(File::create(&staging_path).await?);
 
         Ok(Self {
             path: path.to_string(),
@@ -190,8 +186,13 @@ impl ArtifactStore {
         })?;
 
         file.write_all(chunk).await?;
+        file.flush().await?;
 
         Ok(())
+    }
+
+    pub fn staged_path(&self) -> String {
+        format!("{}/{}", self.path, self.file_name)
     }
 
     pub fn fetch_artiafct(&self) {}

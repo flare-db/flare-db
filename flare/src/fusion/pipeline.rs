@@ -1,21 +1,329 @@
+use crate::errors::BeamTranslationError;
+use crate::fusion::refs::{SideInputRef, TimerRef, UserStateRef};
+use crate::fusion::stage::ExecutableStage;
+use crate::jobservice::urns;
+use crate::transforms::{FlareRunnerTransform, from_urn};
 use beam_model_rs::v1::executable_stage_payload::{SideInputId, TimerId, UserStateId};
 use beam_model_rs::v1::{Components, Environment, PCollection, PTransform, ParDoPayload};
 use indexmap::IndexSet;
+use log::info;
 use petgraph::{Graph, graph::NodeIndex};
 use prost::Message;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 
-use crate::errors::BeamTranslationError;
-use crate::fusion::refs::{SideInputRef, TimerRef, UserStateRef};
-use crate::fusion::stage::ExecutableStage;
-use crate::jobservice::urns;
+#[derive(Clone)]
+pub struct ExecutableGraph {
+    graph: Graph<ExecutableNode, ConsumerMetaData>,
+    node_indices: HashMap<String, NodeIndex>,
+    pub(crate) components: Components,
+    root_metadata: Option<ConsumerMetaData>,
+}
 
-/*
-Components components,
-      Set<ExecutableStage> environmentalStages,
-      Set<PipelineNode.PTransformNode> runnerStages,
-      Set<String> requirements */
+#[derive(Clone)]
+struct ConsumerLink {
+    node: ExecutableNode,
+    transform_id: String,
+}
+
+impl ExecutableGraph {
+    pub fn from(
+        sdk_stages: IndexSet<ExecutableStage>,
+        runner_stages: IndexSet<PTransformNode>,
+        components: Components,
+    ) -> Self {
+        let mut ep = Self {
+            graph: Graph::new(),
+            node_indices: HashMap::new(),
+            components: components.clone(),
+            root_metadata: None,
+        };
+
+        ep.build_executable_graph(sdk_stages, runner_stages);
+        ep
+    }
+
+    fn build_executable_graph(
+        &mut self,
+        sdk_stages: IndexSet<ExecutableStage>,
+        runner_stages: IndexSet<PTransformNode>,
+    ) {
+        info!("Building graph");
+        self.graph = Graph::<ExecutableNode, ConsumerMetaData>::new();
+        self.node_indices.clear();
+
+        // Map each PCollection to all of its consumer transform links.
+        let mut consumer_map: HashMap<String, Vec<ConsumerLink>> = HashMap::new();
+
+        for stage in sdk_stages.iter() {
+            let stage_input_id = stage.input_pcol().id.clone();
+            let worker_node = ExecutableNode::Worker(stage.clone());
+
+            for transform in stage.transforms() {
+                if transform
+                    .node()
+                    .inputs
+                    .values()
+                    .any(|input| input == &stage_input_id)
+                {
+                    consumer_map
+                        .entry(stage_input_id.clone())
+                        .or_default()
+                        .push(ConsumerLink {
+                            node: worker_node.clone(),
+                            transform_id: transform.node().unique_name.clone(),
+                        });
+                }
+            }
+        }
+
+        for stage in runner_stages.iter() {
+            if let Some(spec) = stage.node().spec.as_ref() {
+                let runner_node = ExecutableNode::Runner(from_urn(
+                    &spec.urn,
+                    stage.node().unique_name.clone(),
+                    stage.node().inputs.clone(),
+                    stage.node().outputs.clone(),
+                ));
+
+                for input_id in stage.node().inputs.values() {
+                    consumer_map
+                        .entry(input_id.clone())
+                        .or_default()
+                        .push(ConsumerLink {
+                            node: runner_node.clone(),
+                            transform_id: stage.node().unique_name.clone(),
+                        });
+                }
+            }
+        }
+
+        let mut work_queue = VecDeque::<ExecutableNode>::new();
+        info!("Created work queue");
+        // Create Root node and immidate consumer pair
+        if let Some(root) = Self::get_root(&runner_stages) {
+            if let Some(spec) = root.transform.spec.as_ref() {
+                let urn = &spec.urn;
+                info!("Root node urn: {}", urn);
+                let root_node = ExecutableNode::Runner(from_urn(
+                    urn,
+                    root.node().unique_name.clone(),
+                    root.transform.inputs.clone(),
+                    root.transform.outputs.clone(),
+                ));
+
+                let runner_index = self.graph.add_node(root_node.clone());
+
+                self.node_indices
+                    .insert(root_node.id().clone(), runner_index);
+
+                for (_output_key, output_id) in root.node().outputs.iter() {
+                    if let Some(consumer_links) = consumer_map.get(output_id).cloned() {
+                        for consumer_link in consumer_links {
+                            let consumer_index = self.ensure_node_exists(&consumer_link.node);
+
+                            let edge = self.build_consumer_metadata(
+                                output_id,
+                                &consumer_link.transform_id,
+                                &sdk_stages,
+                                &runner_stages,
+                            );
+
+                            self.root_metadata.get_or_insert_with(|| edge.clone());
+
+                            self.graph.add_edge(runner_index, consumer_index, edge);
+                            work_queue.push_back(consumer_link.node);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Build rest of all downstream nodes (either a executable stage or a runner transfrom)
+        //
+        // A ExecutableStage can produce multiple outputs since ES is basically a set of
+        // fused transforms and sometimes the satge might give out multiple PCollection outputs
+        // cause there are downstream stages/runner transforms that consume those collections.
+        // So, its not always per stage per output PCollection.
+        while let Some(producer_node) = work_queue.pop_front() {
+            // create or get node if it exists
+            let producer_index = self.ensure_node_exists(&producer_node);
+
+            // Itterate over the set of output PCollection that a stage(node) might produce
+            for output_pcol in producer_node.output_pcols() {
+                // get all consumer nodes of that PCollection
+                if let Some(consumer_links) = consumer_map.get(&output_pcol).cloned() {
+                    for consumer_link in consumer_links {
+                        let consumer_index = self.ensure_node_exists(&consumer_link.node);
+
+                        // Create edge metadata for this producer -> consumer edge.
+                        let edge = self.build_consumer_metadata(
+                            &output_pcol,
+                            &consumer_link.transform_id,
+                            &sdk_stages,
+                            &runner_stages,
+                        );
+
+                        // Connect the producer and consumer nodes with PCollection metadata
+                        self.graph.add_edge(producer_index, consumer_index, edge);
+                        // Add consumer node to queue to itterate and do the same for its downstream nodes.
+                        work_queue.push_back(consumer_link.node);
+                    }
+                }
+            }
+        }
+    }
+
+    fn ensure_node_exists(&mut self, node: &ExecutableNode) -> NodeIndex {
+        if let Some(&index) = self.node_indices.get(&node.id()) {
+            return index;
+        }
+
+        let index = self.graph.add_node(node.clone());
+
+        self.node_indices.insert(node.id().clone(), index);
+
+        index
+    }
+
+    fn get_root(runner_stages: &IndexSet<PTransformNode>) -> Option<&PTransformNode> {
+        info!("fetching root node");
+        for pt in runner_stages.iter() {
+            if pt.node().inputs.is_empty() {
+                info!("Root transfrom: {}", pt.id);
+                return Some(pt);
+            }
+        }
+        None
+        /* `PTransformNode` value */
+    }
+
+    pub fn get_root_metadata(&self) -> &ConsumerMetaData {
+        self.root_metadata
+            .as_ref()
+            .expect("Root metadata not initialized")
+    }
+
+    fn build_consumer_metadata(
+        &self,
+        output_pcol: &String,
+        consumer_transform_id: &String,
+        sdk_stages: &IndexSet<ExecutableStage>,
+        runner_stages: &IndexSet<PTransformNode>,
+    ) -> ConsumerMetaData {
+        let producer_pt_id = Self::get_producer_transform(sdk_stages, runner_stages, output_pcol);
+
+        let pcollection = self
+            .components
+            .pcollections
+            .get(output_pcol)
+            .expect("Output PCollection not found");
+
+        ConsumerMetaData {
+            producer_transform_id: producer_pt_id,
+            produced_pcol_id: output_pcol.clone(),
+            coder_id: pcollection.coder_id.clone(),
+            consumer_transfrom_id: consumer_transform_id.clone(),
+        }
+    }
+
+    fn get_producer_transform(
+        sdk_stages: &IndexSet<ExecutableStage>,
+        runner_stages: &IndexSet<PTransformNode>,
+        output_pcol: &str,
+    ) -> String {
+        sdk_stages
+            .iter()
+            .flat_map(|stage| stage.transforms())
+            .find(|transform| {
+                transform
+                    .node()
+                    .outputs
+                    .values()
+                    .any(|output| output == output_pcol)
+            })
+            .map(|transform| transform.node().unique_name.clone())
+            .or_else(|| {
+                runner_stages
+                    .iter()
+                    .find(|transform| {
+                        transform
+                            .node()
+                            .outputs
+                            .values()
+                            .any(|output| output == output_pcol)
+                    })
+                    .map(|transform| transform.node().unique_name.clone())
+            })
+            .expect("Producer transform not found")
+    }
+
+    pub fn get_executable_graph(&self) -> &Graph<ExecutableNode, ConsumerMetaData> {
+        &self.graph
+    }
+}
+
+#[derive(Clone)]
+pub enum ExecutableNode {
+    Worker(ExecutableStage),
+    Runner(FlareRunnerTransform),
+}
+
+impl ExecutableNode {
+    pub fn output_pcols(&self) -> HashSet<String> {
+        match self {
+            ExecutableNode::Worker(s) => s.get_output_pcol_ids(),
+            ExecutableNode::Runner(r) => r.output_pcol_ids(),
+        }
+    }
+
+    pub fn id(&self) -> String {
+        match self {
+            ExecutableNode::Worker(e) => e.id(),
+            ExecutableNode::Runner(r) => r.id(),
+        }
+    }
+}
+
+impl Hash for ExecutableNode {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self {
+            ExecutableNode::Worker(s) => s.id().hash(state),
+            ExecutableNode::Runner(r) => r.id().hash(state),
+        }
+    }
+
+    fn hash_slice<H: Hasher>(data: &[Self], state: &mut H)
+    where
+        Self: Sized,
+    {
+        for piece in data {
+            piece.hash(state)
+        }
+    }
+}
+
+impl PartialEq for ExecutableNode {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (ExecutableNode::Worker(a), ExecutableNode::Worker(b)) => a.id() == b.id(),
+            (ExecutableNode::Runner(a), ExecutableNode::Runner(b)) => a.id() == b.id(),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for ExecutableNode {}
+
+#[derive(Clone, Debug)]
+pub struct ConsumerMetaData {
+    pub(crate) producer_transform_id: String,
+    pub(crate) produced_pcol_id: String,
+    pub(crate) coder_id: String,
+    pub(crate) consumer_transfrom_id: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct FusedPipeline {
     components: Components,
     sdk_stages: IndexSet<ExecutableStage>,
@@ -36,6 +344,14 @@ impl FusedPipeline {
             runner_stages,
             // requirements,
         }
+    }
+
+    pub fn sdk_stages(&self) -> &IndexSet<ExecutableStage> {
+        &self.sdk_stages
+    }
+
+    pub fn runner_stages(&self) -> &IndexSet<PTransformNode> {
+        &self.runner_stages
     }
 }
 pub struct QueryablePipeline {
@@ -100,7 +416,7 @@ impl QueryablePipeline {
                         let consumed_idx = if let Some(&idx) = self.pcollection_ids.get(input_id) {
                             idx // already created as someone's output — reuse it
                         } else {
-                            let idx =
+                            let idx: NodeIndex =
                                 self.graph
                                     .add_node(PipelineNode::Collection(PCollectionNode {
                                         id: input_id.clone(),

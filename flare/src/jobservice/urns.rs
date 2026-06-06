@@ -1,4 +1,5 @@
 pub mod beam_urns {
+
     // Primitives
     pub const CREATE_TRANSFORM: &str = "beam:transform:create:v1";
     pub const PAR_DO_TRANSFORM: &str = "beam:transform:pardo:v1";
@@ -12,6 +13,19 @@ pub mod beam_urns {
     pub const MERGE_WINDOWS_TRANSFORM: &str = "beam:transform:merge_windows:v1";
     pub const TO_STRING_TRANSFORM: &str = "beam:transform:to_string:v1";
     pub const MANAGED_TRANSFORM: &str = "beam:transform:managed:v1";
+
+    //Primary
+    pub const BEAM_SOURCE: &str = "beam:runner:source:v1";
+    pub const BEAM_SINK: &str = "beam:runner:sink:v1";
+
+    // coders
+    pub const BYTES_CODER: &str = "beam:coder:bytes:v1";
+    pub const STRING_UTF8_CODER: &str = "beam:coder:string_utf8:v1";
+    pub const KV_CODER: &str = "beam:coder:kv:v1";
+    pub const BOOL_CODER: &str = "beam:coder:bool:v1";
+    pub const VARINT_CODER: &str = "beam:coder:varint:v1";
+    pub const GLOBAL_WINDOW_CODER: &str = "beam:coder:global_window:v1";
+    pub const WINDOWED_VALUE_CODER: &str = "beam:coder:windowed_value:v1";
 
     //Deprecated
     pub const CREATE_VIEW_TRANSFORM: &str = "beam:transform:create_view:v1";

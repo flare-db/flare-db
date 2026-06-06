@@ -1,16 +1,17 @@
 use beam_model_rs::v1::executable_stage_payload::WireCoderSetting;
-use beam_model_rs::v1::{Components, Environment};
+use beam_model_rs::v1::{Components, Environment, PCollection, PTransform};
 use indexmap::IndexSet;
-use prost::Message;
+use uuid::Uuid;
 
 use crate::fusion::pipeline::{PCollectionNode, PTransformNode};
 use crate::fusion::refs::{SideInputRef, TimerRef, UserStateRef};
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 #[derive(Clone, Debug)]
 pub struct ExecutableStage {
+    id: String,
     components: Components,
     environment: Environment,
     wire_coder: HashSet<WireCoderSetting>,
@@ -26,8 +27,29 @@ impl ExecutableStage {
     pub fn get_output_pcols(&self) -> &IndexSet<PCollectionNode> {
         &self.output_pcols
     }
+
+    pub fn get_output_pcol_ids(&self) -> HashSet<String> {
+        self.output_pcols
+            .iter()
+            .map(|pcol| pcol.collection.unique_name.clone())
+            .collect()
+    }
 }
 
+impl PartialEq for ExecutableStage {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for ExecutableStage {}
+
+impl Hash for ExecutableStage {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+    }
+}
+/*
 impl PartialEq for ExecutableStage {
     fn eq(&self, other: &Self) -> bool {
         self.components.encode_to_vec() == other.components.encode_to_vec()
@@ -79,6 +101,7 @@ impl Hash for ExecutableStage {
         }
     }
 }
+*/
 impl ExecutableStage {
     pub fn from(
         components: Components,
@@ -92,6 +115,7 @@ impl ExecutableStage {
         transforms: IndexSet<PTransformNode>,
     ) -> Self {
         Self {
+            id: Uuid::new_v4().to_string(),
             components,
             environment,
             wire_coder,
@@ -102,6 +126,10 @@ impl ExecutableStage {
             output_pcols,
             transforms,
         }
+    }
+
+    pub fn id(&self) -> String {
+        self.id.clone()
     }
 
     pub fn transforms(&self) -> IndexSet<PTransformNode> {
@@ -138,6 +166,20 @@ impl ExecutableStage {
 
     pub fn output_pcols(&self) -> IndexSet<PCollectionNode> {
         self.output_pcols.clone()
+    }
+
+    pub fn ptmap(&self) -> HashMap<String, PTransform> {
+        let mut pt_map = HashMap::<String, PTransform>::new();
+        for t in &self.transforms {
+            pt_map.insert(t.id.clone(), t.transform.clone());
+        }
+
+        pt_map
+    }
+
+    pub fn pcolmap(&self) {
+        let pcol_map = HashMap::<String, PCollection>::new();
+        //self.
     }
 }
 

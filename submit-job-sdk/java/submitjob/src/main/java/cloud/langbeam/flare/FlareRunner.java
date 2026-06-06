@@ -24,8 +24,11 @@ import org.apache.beam.sdk.util.construction.PipelineOptionsTranslation;
 import org.apache.beam.sdk.util.construction.PipelineTranslation;
 import org.apache.beam.vendor.grpc.v1p69p0.com.google.protobuf.ByteString;
 import org.apache.beam.vendor.grpc.v1p69p0.io.grpc.ManagedChannel;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public class FlareRunner extends PipelineRunner<FlarePipelineJob> {
+    private static final Logger LOG = LoggerFactory.getLogger(FlareRunner.class);
 
     private final FlarePipelineOptions options;
 
@@ -79,7 +82,7 @@ public class FlareRunner extends PipelineRunner<FlarePipelineJob> {
                     .withDeadlineAfter(jobServerTimeout, TimeUnit.SECONDS)
                     .withWaitForReady()
                     .prepare(prepareJobRequest);
-            // LOG.info("PrepareJobResponse: {}", prepareJobResponse);
+            LOG.info("PrepareJobResponse received for jobName={}", options.getJobName());
 
             ApiServiceDescriptor artifactStagingEndpoint = prepareJobResponse.getArtifactStagingEndpoint();
             String stagingSessionToken = prepareJobResponse.getStagingSessionToken();
@@ -92,7 +95,7 @@ public class FlareRunner extends PipelineRunner<FlarePipelineJob> {
                         ArtifactStagingServiceGrpc.newStub(artifactChannel.get()),
                         stagingSessionToken);
             } catch (CloseableResource.CloseException e) {
-                // LOG.warn("Error closing artifact staging channel", e);
+                LOG.warn("Error closing artifact staging channel", e);
                 // CloseExceptions should only be thrown while closing the channel.
             } catch (Exception e) {
                 throw new RuntimeException("Error staging files.", e);
@@ -102,12 +105,13 @@ public class FlareRunner extends PipelineRunner<FlarePipelineJob> {
                     .setPreparationId(prepareJobResponse.getPreparationId())
                     .build();
 
+            LOG.info("Created run job request: {}", runJobRequest);
             // Run the job and wait for a result, we don't set a timeout here because
             // it may take a long time for a job to complete and streaming
             // jobs never return a response.
             RunJobResponse runJobResponse = jobService.run(runJobRequest);
 
-            // LOG.info("RunJobResponse: {}", runJobResponse);
+            LOG.info("RunJobResponse received for jobName={}", options.getJobName());
             ByteString jobId = runJobResponse.getJobIdBytes();
 
             return new FlarePipelineJob(jobId);

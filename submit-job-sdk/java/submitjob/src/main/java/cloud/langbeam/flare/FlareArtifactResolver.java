@@ -7,8 +7,11 @@ import java.util.List;
 import org.apache.beam.model.pipeline.v1.RunnerApi;
 import org.apache.beam.sdk.options.PipelineOptions;
 import org.apache.beam.sdk.util.construction.ArtifactResolver;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public class FlareArtifactResolver implements ArtifactResolver{
+    private static final Logger LOG = LoggerFactory.getLogger(FlareArtifactResolver.class);
 
      private final String uberJarPath;
     
@@ -28,7 +31,7 @@ public class FlareArtifactResolver implements ArtifactResolver{
             throw new IllegalArgumentException("UberJar path is not a file: " + uberJarPath);
         }
         
-        System.out.println("Will stage uber JAR: " + uberJarPath);
+        LOG.info("Will stage uber JAR: {}", uberJarPath);
     }
 
 

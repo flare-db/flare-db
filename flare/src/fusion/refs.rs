@@ -52,15 +52,15 @@ impl SideInputRef {
         })
     }
 
-    fn get_pcol(&self) -> &PCollectionNode {
+    pub fn collection(&self) -> &PCollectionNode {
         &self.pcol
     }
 
-    fn get_pt(&self) -> &PTransformNode {
+    pub fn transform(&self) -> &PTransformNode {
         &self.pt
     }
 
-    fn get_name(&self) -> &str {
+    pub fn local_name(&self) -> &str {
         &self.name
     }
 }
@@ -89,10 +89,10 @@ impl TimerRef {
         })
     }
 
-    fn get_pt(&self) -> &PTransformNode {
+    pub fn transform(&self) -> &PTransformNode {
         &self.pt
     }
-    fn get_name(&self) -> &str {
+    pub fn local_name(&self) -> &str {
         &self.name
     }
 }
