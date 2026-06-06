@@ -1,7 +1,8 @@
 <div align="center">
-  <img src="./assets/flare-logo-wb.png" alt="Flare Logo" width="500"/>
-  <p><strong>A Rust-based Apache Beam native portable runner</strong></p>
+  <img src="./assets/flaredb-readme.png" alt="Flare Logo" width="500"/>
 </div>
+
+<h2 align="center">Apache Beam native streaming database</h2>
 
 Flare implements the Apache Beam portability APIs and executes Beam
 pipelines using a lightweight Rust runtime.
