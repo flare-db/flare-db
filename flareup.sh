@@ -54,10 +54,9 @@ if ! port_ready; then
     exit 1
 fi
 
-echo "Flare server ready."
+echo "FlareDB server ready."
 echo ""
-echo "  Flare log : tail -f \"${FLARE_LOG}\""
-echo "  Worker logs will be created per job by flare run() in ${LOG_DIR}"
+echo "  FlareDB log : tail -f \"${FLARE_LOG}\""
+echo "  Worker logs : ${LOG_DIR}"
 echo ""
-echo "Flare is ready. Submit a job; harness will be spawned after artifact staging."
 wait "${SERVER_PID}"

@@ -8,15 +8,12 @@ use beam_model_rs::v1::{
     PrepareJobRequest, PrepareJobResponse, RunJobRequest, RunJobResponse,
     job_service_server::JobService,
 };
-use dashmap::DashMap;
 use tokio::{process::Command, sync::Mutex, time::timeout};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Response;
 use tonic::Status;
-use uuid::Uuid;
 
 use crate::engine::executor::StageExecutor;
-use crate::fusion::pipeline::ExecutableGraph;
 use crate::jobservice::artifact::ArtifactStore;
 use crate::jobservice::job::Job;
 use crate::jobservice::job::JobStore;
@@ -137,9 +134,9 @@ impl FlareJobService {
 impl JobService for FlareJobService {
     #[doc = " Prepare a job for execution. The job will not be executed until a call is made to run with the"]
     #[doc = " returned preparationId."]
-    #[must_use]
+    
     #[allow(
-        elided_named_lifetimes,
+        mismatched_lifetime_syntaxes,
         clippy::type_complexity,
         clippy::type_repetition_in_bounds
     )]
@@ -199,9 +196,9 @@ impl JobService for FlareJobService {
     }
 
     #[doc = " Submit the job for execution"]
-    #[must_use]
+    
     #[allow(
-        elided_named_lifetimes,
+        mismatched_lifetime_syntaxes,
         clippy::type_complexity,
         clippy::type_repetition_in_bounds
     )]
@@ -342,9 +339,9 @@ impl JobService for FlareJobService {
     }
 
     #[doc = " Get the current state of the job"]
-    #[must_use]
+    
     #[allow(
-        elided_named_lifetimes,
+        mismatched_lifetime_syntaxes,
         clippy::type_complexity,
         clippy::type_repetition_in_bounds
     )]
@@ -367,9 +364,9 @@ impl JobService for FlareJobService {
     }
 
     #[doc = " Get the job\'s pipeline"]
-    #[must_use]
+    
     #[allow(
-        elided_named_lifetimes,
+        mismatched_lifetime_syntaxes,
         clippy::type_complexity,
         clippy::type_repetition_in_bounds
     )]
@@ -395,9 +392,9 @@ impl JobService for FlareJobService {
     }
 
     #[doc = " Cancel the job"]
-    #[must_use]
+    
     #[allow(
-        elided_named_lifetimes,
+        mismatched_lifetime_syntaxes,
         clippy::type_complexity,
         clippy::type_repetition_in_bounds
     )]
@@ -420,9 +417,9 @@ impl JobService for FlareJobService {
     }
 
     #[doc = " Drain the job"]
-    #[must_use]
+    
     #[allow(
-        elided_named_lifetimes,
+        mismatched_lifetime_syntaxes,
         clippy::type_complexity,
         clippy::type_repetition_in_bounds
     )]
@@ -447,9 +444,9 @@ impl JobService for FlareJobService {
     #[doc = " Server streaming response type for the GetStateStream method."]
     // type GetStateStreamStream;
     #[doc = " Subscribe to a stream of state changes of the job, will immediately return the current state of the job as the first response."]
-    #[must_use]
+    
     #[allow(
-        elided_named_lifetimes,
+        mismatched_lifetime_syntaxes,
         clippy::type_complexity,
         clippy::type_repetition_in_bounds
     )]
@@ -477,9 +474,9 @@ impl JobService for FlareJobService {
     #[doc = " Server streaming response type for the GetMessageStream method."]
     // type GetMessageStreamStream;
     #[doc = " Subscribe to a stream of state changes and messages from the job"]
-    #[must_use]
+    
     #[allow(
-        elided_named_lifetimes,
+        mismatched_lifetime_syntaxes,
         clippy::type_complexity,
         clippy::type_repetition_in_bounds
     )]
@@ -505,9 +502,9 @@ impl JobService for FlareJobService {
     }
 
     #[doc = " Fetch metrics for a given job"]
-    #[must_use]
+    
     #[allow(
-        elided_named_lifetimes,
+        mismatched_lifetime_syntaxes,
         clippy::type_complexity,
         clippy::type_repetition_in_bounds
     )]
@@ -533,9 +530,9 @@ impl JobService for FlareJobService {
     }
 
     #[doc = " Get the supported pipeline options of the runner"]
-    #[must_use]
+    
     #[allow(
-        elided_named_lifetimes,
+        mismatched_lifetime_syntaxes,
         clippy::type_complexity,
         clippy::type_repetition_in_bounds
     )]

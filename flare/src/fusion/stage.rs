@@ -1,7 +1,6 @@
 use beam_model_rs::v1::executable_stage_payload::WireCoderSetting;
 use beam_model_rs::v1::{Components, Environment, PCollection, PTransform};
 use indexmap::IndexSet;
-use prost::Message;
 use uuid::Uuid;
 
 use crate::fusion::pipeline::{PCollectionNode, PTransformNode};
@@ -179,7 +178,7 @@ impl ExecutableStage {
     }
 
     pub fn pcolmap(&self) {
-        let mut pcol_map = HashMap::<String, PCollection>::new();
+        let pcol_map = HashMap::<String, PCollection>::new();
         //self.
     }
 }

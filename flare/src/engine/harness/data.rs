@@ -7,7 +7,7 @@ use beam_model_rs::v1::{
     elements::{Data, Timers},
 };
 use dashmap::DashMap;
-use log::{error, info};
+use log::info;
 use tokio::sync::{
     Mutex,
     mpsc::{self, Sender, UnboundedReceiver, UnboundedSender},

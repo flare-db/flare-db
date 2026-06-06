@@ -16,7 +16,7 @@ use petgraph::{Direction, graph::NodeIndex};
 use prost::Message;
 use tokio::sync::{
     Mutex,
-    mpsc::{self, UnboundedReceiver, UnboundedSender},
+    mpsc::UnboundedReceiver,
 };
 
 use crate::{

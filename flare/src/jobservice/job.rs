@@ -1,8 +1,8 @@
 use crate::errors::BeamTranslationError;
 use crate::fusion::fuser::GreedyPipelineFuser;
 use crate::fusion::pipeline::{ExecutableGraph, FusedPipeline, PTransformNode, QueryablePipeline};
-use crate::fusion::stage::{CollectionConsumers, ExecutableStage};
-use beam_model_rs::v1::{Pipeline, executable_stage_payload};
+use crate::fusion::stage::CollectionConsumers;
+use beam_model_rs::v1::Pipeline;
 use dashmap::DashMap;
 use log::info;
 use std::collections::{BTreeSet, HashSet};
