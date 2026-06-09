@@ -134,7 +134,6 @@ impl FlareJobService {
 impl JobService for FlareJobService {
     #[doc = " Prepare a job for execution. The job will not be executed until a call is made to run with the"]
     #[doc = " returned preparationId."]
-    
     #[allow(
         mismatched_lifetime_syntaxes,
         clippy::type_complexity,
@@ -196,7 +195,6 @@ impl JobService for FlareJobService {
     }
 
     #[doc = " Submit the job for execution"]
-    
     #[allow(
         mismatched_lifetime_syntaxes,
         clippy::type_complexity,
@@ -339,7 +337,6 @@ impl JobService for FlareJobService {
     }
 
     #[doc = " Get the current state of the job"]
-    
     #[allow(
         mismatched_lifetime_syntaxes,
         clippy::type_complexity,
@@ -364,7 +361,6 @@ impl JobService for FlareJobService {
     }
 
     #[doc = " Get the job\'s pipeline"]
-    
     #[allow(
         mismatched_lifetime_syntaxes,
         clippy::type_complexity,
@@ -392,7 +388,6 @@ impl JobService for FlareJobService {
     }
 
     #[doc = " Cancel the job"]
-    
     #[allow(
         mismatched_lifetime_syntaxes,
         clippy::type_complexity,
@@ -417,7 +412,6 @@ impl JobService for FlareJobService {
     }
 
     #[doc = " Drain the job"]
-    
     #[allow(
         mismatched_lifetime_syntaxes,
         clippy::type_complexity,
@@ -444,7 +438,6 @@ impl JobService for FlareJobService {
     #[doc = " Server streaming response type for the GetStateStream method."]
     // type GetStateStreamStream;
     #[doc = " Subscribe to a stream of state changes of the job, will immediately return the current state of the job as the first response."]
-    
     #[allow(
         mismatched_lifetime_syntaxes,
         clippy::type_complexity,
@@ -474,7 +467,6 @@ impl JobService for FlareJobService {
     #[doc = " Server streaming response type for the GetMessageStream method."]
     // type GetMessageStreamStream;
     #[doc = " Subscribe to a stream of state changes and messages from the job"]
-    
     #[allow(
         mismatched_lifetime_syntaxes,
         clippy::type_complexity,
@@ -502,7 +494,6 @@ impl JobService for FlareJobService {
     }
 
     #[doc = " Fetch metrics for a given job"]
-    
     #[allow(
         mismatched_lifetime_syntaxes,
         clippy::type_complexity,
@@ -530,7 +521,6 @@ impl JobService for FlareJobService {
     }
 
     #[doc = " Get the supported pipeline options of the runner"]
-    
     #[allow(
         mismatched_lifetime_syntaxes,
         clippy::type_complexity,

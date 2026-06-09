@@ -14,10 +14,7 @@ use dashmap::DashMap;
 use log::{error, info};
 use petgraph::{Direction, graph::NodeIndex};
 use prost::Message;
-use tokio::sync::{
-    Mutex,
-    mpsc::UnboundedReceiver,
-};
+use tokio::sync::{Mutex, mpsc::UnboundedReceiver};
 
 use crate::{
     engine::{
@@ -39,6 +36,7 @@ pub struct StageExecutor {
     control: ControlChannel,
     data: DataChannel,
     store: Arc<ElementStore>,
+    pipeline_coders: Arc<HashMap<String, Coder>>,
     graph: Option<ExecutableGraph>, // ows the Scheduler and asks it to give the next element to execute in
                                     // execute_pipeline and calls execute_node to execute that node
 }
@@ -49,6 +47,7 @@ impl StageExecutor {
             control,
             data,
             store: Arc::new(ElementStore::new()),
+            pipeline_coders: Arc::new(HashMap::new()),
             graph: None,
         }
     }
@@ -68,6 +67,7 @@ impl StageExecutor {
 
         let graph = pipeline_graph.get_executable_graph();
 
+        self.pipeline_coders = Arc::new(pipeline_graph.components.coders.clone());
         self.graph = Some(pipeline_graph.clone());
 
         // Root node = node with no incoming edges
@@ -187,6 +187,11 @@ impl StageExecutor {
 
                             let instruction_id_log = instruction_id.clone();
 
+                            let input_coder_id =
+                                executable_stage.input_pcol().node().coder_id.clone();
+
+                            let pipeline_coders = self.pipeline_coders.clone();
+
                             let input_ctx = ProcessInputContext {
                                 input_stream: self.data.clone(),
                                 store: self.store.clone(),
@@ -195,11 +200,9 @@ impl StageExecutor {
                                 consumer_transform_id: Self::stage_source_transform_id(
                                     &executable_stage,
                                 ),
-                                input_coder_id: executable_stage
-                                    .input_pcol()
-                                    .node()
-                                    .coder_id
-                                    .clone(),
+                                input_coder_id,
+                                input_component_coder_ids: None,
+                                pipeline_coders: pipeline_coders.clone(),
                             };
                             tokio::spawn(async move {
                                 if let Err(err) = Self::process_input_elements(input_ctx).await {
@@ -225,10 +228,16 @@ impl StageExecutor {
                                 let receiver = self.data.get_receiver(data_key);
 
                                 let store = self.store.clone();
+                                let coders = pipeline_coders.clone();
 
                                 let mut decode_task = tokio::spawn(async move {
-                                    Self::process_output_elements(receiver, output_meta_data, store)
-                                        .await
+                                    Self::process_output_elements(
+                                        receiver,
+                                        output_meta_data,
+                                        store,
+                                        coders,
+                                    )
+                                    .await
                                 });
 
                                 let timeout_id = instruction_id.clone();
@@ -525,6 +534,7 @@ impl StageExecutor {
         receiver: Arc<Mutex<UnboundedReceiver<ElementStreamPayload>>>,
         edge_metadata: ConsumerMetaData,
         store: Arc<ElementStore>,
+        pipeline_coders: Arc<HashMap<String, Coder>>,
     ) -> anyhow::Result<()> {
         info!("Spawaned task to process stage's output elements");
         let mut stream_buffer = BytesMut::new();
@@ -542,7 +552,6 @@ impl StageExecutor {
                 info!("payload is empty");
                 break;
             };
-            info!("Got payload");
 
             match payload {
                 ElementStreamPayload::Data(data_chunk) => {
@@ -551,7 +560,11 @@ impl StageExecutor {
 
                     if data_chunk.data.is_last {
                         info!("Last data chunk");
-                        let element_coder = StandardBeamCoders::from_urn(&edge_metadata.coder_id);
+                        let element_coder = StandardBeamCoders::from_urn(
+                            &edge_metadata.coder_id,
+                            edge_metadata.component_coder,
+                            Some(pipeline_coders.as_ref()),
+                        );
                         let windowed_value_coder = WindowedValueCoder::new(element_coder);
 
                         let mut decoded = Vec::<BeamValue>::new();
@@ -596,7 +609,11 @@ impl StageExecutor {
         let elements = ctx.store.get_collection(request);
         info!("Input element coder: {}", ctx.input_coder_id);
 
-        let element_coder = StandardBeamCoders::from_urn(ctx.input_coder_id.as_str());
+        let element_coder = StandardBeamCoders::from_urn(
+            ctx.input_coder_id.as_str(),
+            ctx.input_component_coder_ids.clone(),
+            Some(ctx.pipeline_coders.as_ref()),
+        );
         let windowed_value_coder = WindowedValueCoder::new(element_coder);
         let mut encoded = BytesMut::new();
 
@@ -620,7 +637,6 @@ impl StageExecutor {
         Ok(())
     }
 }
-// decode the data chunks.
 
 pub struct ProcessInputContext {
     input_stream: DataChannel,
@@ -629,6 +645,8 @@ pub struct ProcessInputContext {
     consumer_transform_id: String,
     input_pcollection_id: String,
     input_coder_id: String,
+    input_component_coder_ids: Option<Vec<String>>,
+    pipeline_coders: Arc<HashMap<String, Coder>>,
 }
 // transform_id in the data payload is the the id of the transfrom that produced the pcollection
 // so we could use transform_id to get the pcol id that it producted and then get the
@@ -659,6 +677,27 @@ impl ElementStore {
             .map(|elements| elements.clone())
             .unwrap_or_default()
     }
+
+    pub fn update_collection(&self, request: UpdateCollectionRequest) {
+        let UpdateCollectionRequest {
+            pcollection_id,
+            key,
+            value,
+        } = request;
+
+        let mut collection = self.data.entry(pcollection_id).or_insert(Vec::new());
+
+        for element in collection.iter_mut() {
+            if let BeamValue::Gbk(existing_key, values) = element {
+                if existing_key.as_ref() == &key {
+                    values.push(value);
+                    return;
+                }
+            }
+        }
+
+        collection.push(BeamValue::Gbk(Box::new(key), vec![value]));
+    }
 }
 
 #[derive(Debug)]
@@ -671,5 +710,11 @@ pub struct NewCollectionRequest {
 
 #[derive(Debug)]
 pub struct GetCollectionRequest {
-    pcollection_id: String,
+    pub(crate) pcollection_id: String,
+}
+
+pub struct UpdateCollectionRequest {
+    pub(crate) pcollection_id: String,
+    pub(crate) key: BeamValue,
+    pub(crate) value: BeamValue,
 }

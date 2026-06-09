@@ -1,3 +1,6 @@
+use beam_model_rs::v1::Coder;
+use std::collections::HashMap;
+
 use bytes::{Buf, BufMut};
 use log::info;
 
@@ -6,13 +9,15 @@ use crate::jobservice::urns::beam_urns;
 /// Beam's minimum timestamp in millis (`BoundedWindow.TIMESTAMP_MIN_VALUE`).
 pub const BEAM_MIN_TIMESTAMP_MILLIS: i64 = -9_223_372_036_854_775;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum BeamValue {
     String(String),
     Bytes(Vec<u8>),
     Int64(i64),
     Bool(bool),
     Kv(Box<BeamValue>, Box<BeamValue>),
+    Iterable(Vec<BeamValue>),
+    Gbk(Box<BeamValue>, Vec<BeamValue>),
 }
 
 #[derive(Debug, Clone)]
@@ -21,29 +26,65 @@ pub enum StandardBeamCoders {
     Bytes(BytesCoder),
     VarInt(VarIntCoder),
     Bool(BoolCoder),
+    Iterable(IterableCoder),
     Kv(Box<StandardBeamCoders>, Box<StandardBeamCoders>),
 }
 
 impl StandardBeamCoders {
-    pub fn from_urn(id: &str) -> Self {
-        match id {
-            "ByteArrayCoder" | "BytesCoder" | "coder/bytes" | beam_urns::BYTES_CODER => {
-                StandardBeamCoders::Bytes(BytesCoder)
+    pub fn from_urn(
+        id: &str,
+        component_coder_ids: Option<Vec<String>>,
+        pipeline_coders: Option<&HashMap<String, Coder>>,
+    ) -> Self {
+        // Lookup and get the correct coder since coder_id is not unique to urn
+        let pipeline_coder = pipeline_coders.and_then(|coders| coders.get(id));
+
+        let urn = pipeline_coder
+            .and_then(|coder| coder.spec.as_ref())
+            .map(|spec| spec.urn.as_str())
+            .unwrap_or(id);
+        info!("coder urn: {}", urn);
+
+        let component_coder_ids = component_coder_ids
+            .or_else(|| pipeline_coder.map(|coder| coder.component_coder_ids.clone()));
+
+        match urn {
+            beam_urns::BYTES_CODER => StandardBeamCoders::Bytes(BytesCoder),
+            beam_urns::STRING_UTF8_CODER => StandardBeamCoders::StringUtf8(StringUtf8Coder),
+            beam_urns::VARINT_CODER => StandardBeamCoders::VarInt(VarIntCoder),
+            beam_urns::BOOL_CODER => StandardBeamCoders::Bool(BoolCoder),
+            beam_urns::ITERABLE_CODER => {
+                let ids = component_coder_ids
+                    .as_ref()
+                    .expect("IterableCoder requires one component coder id");
+                assert_eq!(
+                    ids.len(),
+                    1,
+                    "IterableCoder requires exactly one component coder"
+                );
+
+                StandardBeamCoders::Iterable(IterableCoder::new(StandardBeamCoders::from_urn(
+                    &ids[0],
+                    None,
+                    pipeline_coders,
+                )))
             }
-            "StringUtf8Coder" | "StringUtf8" | beam_urns::STRING_UTF8_CODER => {
-                StandardBeamCoders::StringUtf8(StringUtf8Coder)
+            beam_urns::KV_CODER => {
+                let ids = component_coder_ids
+                    .as_ref()
+                    .expect("KvCoder requires component coder ids");
+                assert_eq!(
+                    ids.len(),
+                    2,
+                    "KvCoder requires exactly two component coders"
+                );
+
+                StandardBeamCoders::Kv(
+                    Box::new(StandardBeamCoders::from_urn(&ids[0], None, pipeline_coders)),
+                    Box::new(StandardBeamCoders::from_urn(&ids[1], None, pipeline_coders)),
+                )
             }
-            "VarIntCoder" | "VarintCoder" | "VarInt" | beam_urns::VARINT_CODER => {
-                StandardBeamCoders::VarInt(VarIntCoder)
-            }
-            "BooleanCoder" | "BoolCoder" | beam_urns::BOOL_CODER => {
-                StandardBeamCoders::Bool(BoolCoder)
-            }
-            "KvCoder" | beam_urns::KV_CODER => StandardBeamCoders::Kv(
-                Box::new(StandardBeamCoders::Bytes(BytesCoder)),
-                Box::new(StandardBeamCoders::Bytes(BytesCoder)),
-            ),
-            _ => panic!("Unknown URN: {}", id),
+            _ => panic!("Unknown URN: {}", urn),
         }
     }
 
@@ -62,9 +103,16 @@ impl StandardBeamCoders {
                 coder.encode(value, buf)
             }
             (StandardBeamCoders::Bool(coder), BeamValue::Bool(value)) => coder.encode(value, buf),
+            (StandardBeamCoders::Iterable(coder), BeamValue::Iterable(values)) => {
+                coder.encode(values, buf)
+            }
             (StandardBeamCoders::Kv(key_coder, value_coder), BeamValue::Kv(key, value)) => {
                 key_coder.encode_nested(key, buf);
                 value_coder.encode_nested(value, buf);
+            }
+            (StandardBeamCoders::Kv(key_coder, value_coder), BeamValue::Gbk(key, values)) => {
+                key_coder.encode_nested(key, buf);
+                value_coder.encode_nested(&BeamValue::Iterable(values.clone()), buf);
             }
             _ => panic!("Mismatched coder and value type"),
         }
@@ -82,6 +130,7 @@ impl StandardBeamCoders {
             StandardBeamCoders::Bytes(coder) => BeamValue::Bytes(coder.decode(buf)),
             StandardBeamCoders::VarInt(coder) => BeamValue::Int64(coder.decode(buf)),
             StandardBeamCoders::Bool(coder) => BeamValue::Bool(coder.decode(buf)),
+            StandardBeamCoders::Iterable(coder) => BeamValue::Iterable(coder.decode(buf)),
             StandardBeamCoders::Kv(key_coder, value_coder) => BeamValue::Kv(
                 Box::new(key_coder.decode_nested(buf)),
                 Box::new(value_coder.decode_nested(buf)),
@@ -137,11 +186,11 @@ pub struct VarIntCoder;
 
 impl BeamCoder<i64> for VarIntCoder {
     fn encode(&self, val: &i64, buf: &mut impl BufMut) {
-        encode_varint(*val as u64, buf);
+        encode_signed_varint(*val, buf);
     }
 
     fn decode(&self, buf: &mut impl Buf) -> i64 {
-        decode_varint(buf) as i64
+        decode_signed_varint(buf)
     }
 }
 
@@ -155,6 +204,57 @@ impl BeamCoder<bool> for BoolCoder {
 
     fn decode(&self, buf: &mut impl Buf) -> bool {
         buf.get_u8() != 0
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct IterableCoder {
+    element_coder: Box<StandardBeamCoders>,
+}
+
+impl IterableCoder {
+    pub fn new(element_coder: StandardBeamCoders) -> Self {
+        Self {
+            element_coder: Box::new(element_coder),
+        }
+    }
+}
+
+impl BeamCoder<Vec<BeamValue>> for IterableCoder {
+    fn encode(&self, val: &Vec<BeamValue>, buf: &mut impl BufMut) {
+        let count = i32::try_from(val.len()).expect("IterableCoder length exceeds i32::MAX");
+        buf.put_i32(count);
+
+        for element in val {
+            self.element_coder.encode_nested(element, buf);
+        }
+    }
+
+    fn decode(&self, buf: &mut impl Buf) -> Vec<BeamValue> {
+        let count = buf.get_i32();
+        let mut values = Vec::new();
+
+        if count >= 0 {
+            for _ in 0..count {
+                values.push(self.element_coder.decode_nested(buf));
+            }
+            return values;
+        }
+
+        assert_eq!(count, -1, "IterableCoder length must be non-negative or -1");
+
+        loop {
+            let chunk_count = decode_varint(buf);
+            if chunk_count == 0 {
+                break;
+            }
+
+            for _ in 0..chunk_count {
+                values.push(self.element_coder.decode_nested(buf));
+            }
+        }
+
+        values
     }
 }
 
@@ -177,7 +277,7 @@ impl WindowedValue {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BeamWindow {
     Global,
 }
@@ -337,10 +437,10 @@ fn encode_pane_info(pane: &PaneInfo, buf: &mut impl BufMut) {
     buf.put_u8(first_byte);
 
     if has_non_speculative_index {
-        encode_varint(pane.index as u64, buf);
-        encode_varint(pane.non_speculative_index as u64, buf);
+        encode_signed_varint(pane.index, buf);
+        encode_signed_varint(pane.non_speculative_index, buf);
     } else if has_index {
-        encode_varint(pane.index as u64, buf);
+        encode_signed_varint(pane.index, buf);
     }
 }
 
@@ -352,13 +452,13 @@ fn decode_pane_info(buf: &mut impl Buf) -> PaneInfo {
     let is_last = (first_byte & 0x02) != 0;
 
     let index = if encoding >= 1 {
-        decode_varint(buf) as i64
+        decode_signed_varint(buf)
     } else {
         0
     };
 
     let non_speculative_index = if encoding >= 2 {
-        decode_varint(buf) as i64
+        decode_signed_varint(buf)
     } else if timing == PaneTiming::Early {
         -1
     } else {
@@ -372,6 +472,14 @@ fn decode_pane_info(buf: &mut impl Buf) -> PaneInfo {
         index,
         non_speculative_index,
     }
+}
+
+fn encode_signed_varint(value: i64, buf: &mut impl BufMut) {
+    encode_varint(value as u64, buf);
+}
+
+fn decode_signed_varint(buf: &mut impl Buf) -> i64 {
+    decode_varint(buf) as i64
 }
 
 fn encode_varint(mut value: u64, buf: &mut impl BufMut) {
@@ -414,6 +522,92 @@ fn decode_varint(buf: &mut impl Buf) -> u64 {
 mod tests {
     use super::*;
 
+    use bytes::{Bytes, BytesMut};
+
+    #[test]
+    fn encodes_varints_from_standard_coders_yaml() {
+        let coder = VarIntCoder;
+
+        for (value, expected) in [
+            (0, vec![0x00]),
+            (1, vec![0x01]),
+            (10, vec![0x0A]),
+            (200, vec![0xC8, 0x01]),
+            (1000, vec![0xE8, 0x07]),
+            (9001, vec![0xA9, 0x46]),
+            (
+                -1,
+                vec![0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01],
+            ),
+        ] {
+            let mut encoded = BytesMut::new();
+            coder.encode(&value, &mut encoded);
+            assert_eq!(encoded.to_vec(), expected, "encoding {value}");
+
+            let mut encoded = Bytes::from(expected);
+            assert_eq!(coder.decode(&mut encoded), value, "decoding {value}");
+        }
+    }
+
+    #[test]
+    fn encodes_iterable_varints_with_known_length() {
+        let coder = StandardBeamCoders::from_urn(
+            beam_urns::ITERABLE_CODER,
+            Some(vec![beam_urns::VARINT_CODER.to_string()]),
+            None,
+        );
+        let value = BeamValue::Iterable(vec![
+            BeamValue::Int64(1),
+            BeamValue::Int64(10),
+            BeamValue::Int64(200),
+            BeamValue::Int64(1000),
+        ]);
+        let mut encoded = BytesMut::new();
+
+        coder.encode(&value, &mut encoded);
+
+        assert_eq!(
+            encoded.to_vec(),
+            vec![0x00, 0x00, 0x00, 0x04, 0x01, 0x0A, 0xC8, 0x01, 0xE8, 0x07]
+        );
+    }
+
+    #[test]
+    fn decodes_iterable_bytes_with_known_length() {
+        let coder = StandardBeamCoders::from_urn(
+            beam_urns::ITERABLE_CODER,
+            Some(vec![beam_urns::BYTES_CODER.to_string()]),
+            None,
+        );
+        let mut encoded = Bytes::from_static(b"\0\0\0\x02\x04ab\0c\x04de\0f");
+
+        assert_eq!(
+            coder.decode(&mut encoded),
+            BeamValue::Iterable(vec![
+                BeamValue::Bytes(b"ab\0c".to_vec()),
+                BeamValue::Bytes(b"de\0f".to_vec()),
+            ])
+        );
+    }
+
+    #[test]
+    fn decodes_iterable_bytes_with_unknown_length_chunks() {
+        let coder = StandardBeamCoders::from_urn(
+            beam_urns::ITERABLE_CODER,
+            Some(vec![beam_urns::BYTES_CODER.to_string()]),
+            None,
+        );
+        let mut encoded = Bytes::from_static(b"\xff\xff\xff\xff\x02\x04ab\0c\x04de\0f\0");
+
+        assert_eq!(
+            coder.decode(&mut encoded),
+            BeamValue::Iterable(vec![
+                BeamValue::Bytes(b"ab\0c".to_vec()),
+                BeamValue::Bytes(b"de\0f".to_vec()),
+            ])
+        );
+    }
+
     #[test]
     fn encodes_global_windowed_empty_bytes() {
         let coder = WindowedValueCoder::new(StandardBeamCoders::Bytes(BytesCoder));
@@ -421,7 +615,7 @@ mod tests {
 
         coder.encode_value(&BeamValue::Bytes(Vec::new()), &mut encoded);
 
-        // From standard_coders.yaml for ParamWindowedValueCoder with
+        // ParamWindowedValueCoder with
         // BoundedWindow.TIMESTAMP_MIN_VALUE, GlobalWindow, PaneInfo.NO_FIRING,
         // and an empty byte[] element.
         assert_eq!(
