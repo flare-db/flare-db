@@ -27,6 +27,7 @@ pub mod beam_urns {
     pub const ITERABLE_CODER: &str = "beam:coder:iterable:v1";
     pub const GLOBAL_WINDOW_CODER: &str = "beam:coder:global_window:v1";
     pub const WINDOWED_VALUE_CODER: &str = "beam:coder:windowed_value:v1";
+    pub const JAVA_SDK_CODER: &str = "beam:coders:javasdk:0.1";
 
     //Deprecated
     pub const CREATE_VIEW_TRANSFORM: &str = "beam:transform:create_view:v1";

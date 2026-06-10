@@ -69,7 +69,8 @@ pub struct ExecutionContext {
     //pub instruction_id: String,
     ///pub transform_id: String,
     pub store: Arc<ElementStore>,
-    pub pcollection_id: String,
+    pub input_pcollection_id: Option<String>,
+    pub output_pcollection_id: String,
     pub consumer_transfrom_id: String, //pub coder: String,
 }
 pub type FlareRunnerTransform = Arc<dyn FlareTransform + Send + Sync>;

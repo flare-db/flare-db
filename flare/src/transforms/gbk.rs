@@ -44,8 +44,13 @@ impl FlareTransform for GroupByKey {
     }
 
     fn execute(&self, ctx: ExecutionContext) {
+        let Some(input_pcollection_id) = ctx.input_pcollection_id.clone() else {
+            error!("GroupByKey requires an input PCollection");
+            return;
+        };
+
         let request = GetCollectionRequest {
-            pcollection_id: ctx.pcollection_id.clone(),
+            pcollection_id: input_pcollection_id,
         };
 
         let elemnets = ctx.store.get_collection(request);
@@ -54,7 +59,7 @@ impl FlareTransform for GroupByKey {
             match element {
                 BeamValue::Kv(key, value) => {
                     let request = UpdateCollectionRequest {
-                        pcollection_id: ctx.pcollection_id.clone(),
+                        pcollection_id: ctx.output_pcollection_id.clone(),
                         key: *key.clone(),
                         value: *value.clone(),
                     };

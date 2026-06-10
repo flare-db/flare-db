@@ -18,6 +18,7 @@ pub enum BeamValue {
     Kv(Box<BeamValue>, Box<BeamValue>),
     Iterable(Vec<BeamValue>),
     Gbk(Box<BeamValue>, Vec<BeamValue>),
+    Void,
 }
 
 #[derive(Debug, Clone)]
@@ -26,6 +27,7 @@ pub enum StandardBeamCoders {
     Bytes(BytesCoder),
     VarInt(VarIntCoder),
     Bool(BoolCoder),
+    Void(VoidCoder),
     Iterable(IterableCoder),
     Kv(Box<StandardBeamCoders>, Box<StandardBeamCoders>),
 }
@@ -43,7 +45,8 @@ impl StandardBeamCoders {
             .and_then(|coder| coder.spec.as_ref())
             .map(|spec| spec.urn.as_str())
             .unwrap_or(id);
-        info!("coder urn: {}", urn);
+
+        info!("Resolving coder: id={}, urn={}", id, urn);
 
         let component_coder_ids = component_coder_ids
             .or_else(|| pipeline_coder.map(|coder| coder.component_coder_ids.clone()));
@@ -53,6 +56,13 @@ impl StandardBeamCoders {
             beam_urns::STRING_UTF8_CODER => StandardBeamCoders::StringUtf8(StringUtf8Coder),
             beam_urns::VARINT_CODER => StandardBeamCoders::VarInt(VarIntCoder),
             beam_urns::BOOL_CODER => StandardBeamCoders::Bool(BoolCoder),
+            beam_urns::JAVA_SDK_CODER => {
+                if id == "VoidCoder" {
+                    StandardBeamCoders::Void(VoidCoder)
+                } else {
+                    StandardBeamCoders::Bytes(BytesCoder)
+                }
+            }
             beam_urns::ITERABLE_CODER => {
                 let ids = component_coder_ids
                     .as_ref()
@@ -103,6 +113,7 @@ impl StandardBeamCoders {
                 coder.encode(value, buf)
             }
             (StandardBeamCoders::Bool(coder), BeamValue::Bool(value)) => coder.encode(value, buf),
+            (StandardBeamCoders::Void(coder), BeamValue::Void) => coder.encode(val, buf),
             (StandardBeamCoders::Iterable(coder), BeamValue::Iterable(values)) => {
                 coder.encode(values, buf)
             }
@@ -124,12 +135,12 @@ impl StandardBeamCoders {
     }
 
     fn decode_nested(&self, buf: &mut impl Buf) -> BeamValue {
-        info!("Starting to decode");
         match self {
             StandardBeamCoders::StringUtf8(coder) => BeamValue::String(coder.decode(buf)),
             StandardBeamCoders::Bytes(coder) => BeamValue::Bytes(coder.decode(buf)),
             StandardBeamCoders::VarInt(coder) => BeamValue::Int64(coder.decode(buf)),
             StandardBeamCoders::Bool(coder) => BeamValue::Bool(coder.decode(buf)),
+            StandardBeamCoders::Void(coder) => coder.decode(buf),
             StandardBeamCoders::Iterable(coder) => BeamValue::Iterable(coder.decode(buf)),
             StandardBeamCoders::Kv(key_coder, value_coder) => BeamValue::Kv(
                 Box::new(key_coder.decode_nested(buf)),
@@ -155,7 +166,6 @@ impl BeamCoder<String> for StringUtf8Coder {
     }
 
     fn decode(&self, buf: &mut impl Buf) -> String {
-        info!("Decodeing String");
         let len = decode_varint(buf) as usize;
         let mut bytes = vec![0u8; len];
         buf.copy_to_slice(&mut bytes);
@@ -173,7 +183,6 @@ impl BeamCoder<Vec<u8>> for BytesCoder {
     }
 
     fn decode(&self, buf: &mut impl Buf) -> Vec<u8> {
-        info!("decoing bytes");
         let len = decode_varint(buf) as usize;
         let mut bytes = vec![0u8; len];
         buf.copy_to_slice(&mut bytes);
@@ -255,6 +264,20 @@ impl BeamCoder<Vec<BeamValue>> for IterableCoder {
         }
 
         values
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct VoidCoder;
+
+impl BeamCoder<BeamValue> for VoidCoder {
+    fn encode(&self, _value: &BeamValue, _buf: &mut impl BufMut) {
+        // Void encodes as nothing.
+    }
+
+    fn decode(&self, _buf: &mut impl Buf) -> BeamValue {
+        // Void encodes as zero bytes - nothing to read.
+        BeamValue::Void
     }
 }
 

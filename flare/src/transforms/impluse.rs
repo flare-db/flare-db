@@ -50,7 +50,7 @@ impl FlareTransform for Impulse {
         info!("Executing impluse transfrom");
         let elements = vec![BeamValue::Bytes(Vec::new())];
         let request = NewCollectionRequest {
-            pcollection_id: ctx.pcollection_id.clone(),
+            pcollection_id: ctx.output_pcollection_id.clone(),
             elements,
         };
 

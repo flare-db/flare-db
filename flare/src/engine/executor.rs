@@ -307,12 +307,22 @@ impl StageExecutor {
             ExecutableNode::Runner(runner_transform) => {
                 info!("Executing runner node");
                 if let Some(graph) = &self.graph {
-                    let meta = output_edge_metadata
+                    let input_pcollection_id = input_edge_metadata
+                        .as_ref()
+                        .map(|meta| meta.produced_pcol_id.clone());
+                    let output_pcollection_id = output_edge_metadata
+                        .as_ref()
+                        .map(|meta| meta.produced_pcol_id.clone())
+                        .or_else(|| runner_transform.output_pcol_ids().into_iter().next())
+                        .unwrap_or_else(|| graph.get_root_metadata().produced_pcol_id.clone());
+                    let consumer_transfrom_id = output_edge_metadata
                         .as_ref()
                         .or(input_edge_metadata.as_ref())
-                        .unwrap_or_else(|| graph.get_root_metadata());
+                        .map(|meta| meta.consumer_transfrom_id.clone())
+                        .unwrap_or_else(|| graph.get_root_metadata().consumer_transfrom_id.clone());
 
-                    info!("Runner node metadata: {:?}", meta);
+                    info!("Runner node input metadata: {:?}", input_edge_metadata);
+                    info!("Runner node output metadata: {:?}", output_edge_metadata);
 
                     let endpoint = ApiServiceDescriptor {
                         url: "127.0.0.1:8099".to_string(),
@@ -338,8 +348,9 @@ impl StageExecutor {
                                 info!("Runer bundle registred at worker");
                                 let ctx = ExecutionContext {
                                     store: self.store.clone(),
-                                    pcollection_id: meta.produced_pcol_id.clone(),
-                                    consumer_transfrom_id: meta.consumer_transfrom_id.clone(),
+                                    input_pcollection_id,
+                                    output_pcollection_id,
+                                    consumer_transfrom_id,
                                 };
 
                                 runner_transform.execute(ctx);
@@ -539,7 +550,11 @@ impl StageExecutor {
         info!("Spawaned task to process stage's output elements");
         let mut stream_buffer = BytesMut::new();
 
-        // we can't let the loop keep running all the time, use while let
+        info!(
+            "Decoding with coder_id={}, component_coders={:?}",
+            edge_metadata.coder_id, edge_metadata.component_coder
+        );
+
         loop {
             info!("Inside the process_output_elements loop ");
             let payload = {
@@ -618,7 +633,6 @@ impl StageExecutor {
         let mut encoded = BytesMut::new();
 
         for element in &elements {
-            info!("Starting to encode WindowedValue");
             windowed_value_coder.encode_value(element, &mut encoded);
         }
 
@@ -654,7 +668,7 @@ pub struct ProcessInputContext {
 // decoing should be async task so we can spwan parallel task to the job
 // check out how beam does decoding
 pub struct ElementStore {
-    // {pcol_id -> [pcol values]}
+    // {pcol_id -> [pcol elements]}
     data: Arc<DashMap<String, Vec<BeamValue>>>,
 }
 

@@ -165,17 +165,6 @@ impl JobService for FlareJobService {
                 Status::invalid_argument("Pipeline is missing")
             })?;
 
-            //println!("pipeline proto: {:#?}", pipeline);
-            /* let text: String = format!("{:#?}", pipeline);
-
-                        let path = std::env::current_dir()
-                            .map_err(|e| Status::internal(format!("Failed to get CWD: {e}")))?
-                            .join("beam_pipeline_context.txt");
-
-                        fs::write(&path, text)
-                            .map_err(|e| Status::internal(format!("Failed to write pipeline context: {e}")))?;
-            */
-            //println!("Pipeline context written to {}", path.display());
             let job = Job::new(pipeline);
             let job_id = job.job_id;
             self.job_store.add_job(&job_id, job.graph);
