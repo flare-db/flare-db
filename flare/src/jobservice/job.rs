@@ -4,8 +4,9 @@ use crate::fusion::pipeline::{ExecutableGraph, FusedPipeline, PTransformNode, Qu
 use crate::fusion::stage::CollectionConsumers;
 use beam_model_rs::v1::Pipeline;
 use dashmap::DashMap;
-use log::info;
+use log::{info, warn};
 use std::collections::{BTreeSet, HashSet};
+use std::fs;
 use std::sync::Arc;
 use uuid::Uuid;
 // Job is just container for tasks()
@@ -24,6 +25,9 @@ impl Job {
 
     fn create_job(pipeline: &Pipeline) -> ExecutableGraph {
         info!("Creating a new job");
+        if let Err(error) = fs::write("pipeline_proto_debug.txt", format!("{pipeline:#?}")) {
+            warn!("Failed to write formatted pipeline proto debug file: {error}");
+        }
         let fused_pipeline = fuse_pipeline(pipeline).unwrap();
         let executable_graph = ExecutableGraph::from(
             fused_pipeline.sdk_stages().clone(),

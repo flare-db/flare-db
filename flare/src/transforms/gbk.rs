@@ -1,10 +1,14 @@
-use std::collections::{HashMap, HashSet};
-
 use beam_model_rs::v1::{
     Coder, Components, Environment, FunctionSpec, PCollection, PTransform, WindowingStrategy,
 };
+use log::error;
+use std::collections::{HashMap, HashSet};
 
 use crate::{
+    engine::{
+        coders::BeamValue,
+        executor::{GetCollectionRequest, UpdateCollectionRequest},
+    },
     jobservice::urns::beam_urns,
     transforms::{ExecutionContext, FlareTransform},
 };
@@ -39,11 +43,34 @@ impl FlareTransform for GroupByKey {
         }
     }
 
-    fn execute(&self, _ctx: ExecutionContext) {
-        panic!(
-            "GroupByKey transform '{}' ({}) is accepted by Flare but execution is not implemented yet",
-            self.name, self.id
-        );
+    fn execute(&self, ctx: ExecutionContext) {
+        let Some(input_pcollection_id) = ctx.input_pcollection_id.clone() else {
+            error!("GroupByKey requires an input PCollection");
+            return;
+        };
+
+        let request = GetCollectionRequest {
+            pcollection_id: input_pcollection_id,
+        };
+
+        let elemnets = ctx.store.get_collection(request);
+
+        for element in elemnets.iter() {
+            match element {
+                BeamValue::Kv(key, value) => {
+                    let request = UpdateCollectionRequest {
+                        pcollection_id: ctx.output_pcollection_id.clone(),
+                        key: *key.clone(),
+                        value: *value.clone(),
+                    };
+                    ctx.store.update_collection(request);
+                }
+
+                _ => {
+                    error!("Invalid type for GroupByKey operation");
+                }
+            }
+        }
     }
 
     fn output_pcol_ids(&self) -> HashSet<String> {

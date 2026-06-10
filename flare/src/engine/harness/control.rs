@@ -315,7 +315,6 @@ impl ControlChannel {
 
     // generate unique instruction ids
     fn next_id(&mut self) -> String {
-        self.next_id += 1;
-        self.next_id.to_string()
+        uuid::Uuid::new_v4().to_string()
     }
 }

@@ -219,10 +219,17 @@ impl ExecutableGraph {
             .get(output_pcol)
             .expect("Output PCollection not found");
 
+        let component_coder_ids = self
+            .components
+            .coders
+            .get(&pcollection.coder_id)
+            .map(|coder| coder.component_coder_ids.clone());
+
         ConsumerMetaData {
             producer_transform_id: producer_pt_id,
             produced_pcol_id: output_pcol.clone(),
             coder_id: pcollection.coder_id.clone(),
+            component_coder: component_coder_ids,
             consumer_transfrom_id: consumer_transform_id.clone(),
         }
     }
@@ -320,6 +327,7 @@ pub struct ConsumerMetaData {
     pub(crate) producer_transform_id: String,
     pub(crate) produced_pcol_id: String,
     pub(crate) coder_id: String,
+    pub(crate) component_coder: Option<Vec<String>>,
     pub(crate) consumer_transfrom_id: String,
 }
 
