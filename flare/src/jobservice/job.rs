@@ -1,7 +1,8 @@
-use crate::errors::BeamTranslationError;
 use crate::fusion::fuser::GreedyPipelineFuser;
 use crate::fusion::pipeline::{ExecutableGraph, FusedPipeline, PTransformNode, QueryablePipeline};
 use crate::fusion::stage::CollectionConsumers;
+use crate::utils::errors::*;
+use crate::utils::visualization::executable_graph_to_dot;
 use beam_model_rs::v1::Pipeline;
 use dashmap::DashMap;
 use log::{info, warn};
@@ -25,15 +26,26 @@ impl Job {
 
     fn create_job(pipeline: &Pipeline) -> ExecutableGraph {
         info!("Creating a new job");
-        if let Err(error) = fs::write("pipeline_proto_debug.txt", format!("{pipeline:#?}")) {
-            warn!("Failed to write formatted pipeline proto debug file: {error}");
+
+        if let Err(error) = fs::create_dir_all("debug") {
+            warn!("Failed to create debug output directory: {error}");
         }
+
         let fused_pipeline = fuse_pipeline(pipeline).unwrap();
+        if let Err(error) = fs::write("debug/fused_pipeline.txt", format!("{fused_pipeline:#?}")) {
+            warn!("Failed to write formatted fused pipeline debug file: {error}");
+        }
         let executable_graph = ExecutableGraph::from(
             fused_pipeline.sdk_stages().clone(),
             fused_pipeline.runner_stages().clone(),
             pipeline.components.clone().unwrap(),
         );
+        if let Err(error) = fs::write(
+            "debug/executable_graph.dot",
+            executable_graph_to_dot(&executable_graph),
+        ) {
+            warn!("Failed to write executable graph DOT debug file: {error}");
+        }
         info!("Built executable graph");
         executable_graph
     }

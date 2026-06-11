@@ -10,7 +10,6 @@ use prost::Message;
 
 use crate::{
     check_argument,
-    errors::BeamTranslationError,
     fusion::{
         pipeline::{
             FusedPipeline, PCollectionNode, PTransformNode, PipelineEdge, QueryablePipeline,
@@ -19,6 +18,7 @@ use crate::{
         stage::{CollectionConsumers, DescendantConsumers, ExecutableStage, SiblingKey},
     },
     jobservice::urns,
+    utils::errors::*,
 };
 
 pub struct GreedyPipelineFuser {

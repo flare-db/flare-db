@@ -1,8 +1,8 @@
-use crate::errors::BeamTranslationError;
 use crate::fusion::refs::{SideInputRef, TimerRef, UserStateRef};
 use crate::fusion::stage::ExecutableStage;
 use crate::jobservice::urns;
 use crate::transforms::{FlareRunnerTransform, from_urn};
+use crate::utils::errors::*;
 use beam_model_rs::v1::executable_stage_payload::{SideInputId, TimerId, UserStateId};
 use beam_model_rs::v1::{Components, Environment, PCollection, PTransform, ParDoPayload};
 use indexmap::IndexSet;
@@ -277,6 +277,45 @@ pub enum ExecutableNode {
 }
 
 impl ExecutableNode {
+    pub fn debug_label(&self) -> String {
+        match self {
+            ExecutableNode::Worker(stage) => {
+                let mut transform_names: Vec<_> = stage
+                    .transforms()
+                    .iter()
+                    .map(|transform| transform.node().unique_name.clone())
+                    .collect();
+                transform_names.sort();
+
+                let mut output_pcols: Vec<_> = stage
+                    .output_pcols()
+                    .iter()
+                    .map(|pcollection| pcollection.id.clone())
+                    .collect();
+                output_pcols.sort();
+
+                format!(
+                    "Worker id={} input_pcol={} transforms={:?} output_pcols={:?}",
+                    stage.id(),
+                    stage.input_pcol().id,
+                    transform_names,
+                    output_pcols,
+                )
+            }
+            ExecutableNode::Runner(transform) => {
+                let mut output_pcols: Vec<_> = transform.output_pcol_ids().into_iter().collect();
+                output_pcols.sort();
+
+                format!(
+                    "Runner id={} name={} output_pcols={:?}",
+                    transform.id(),
+                    transform.unique_name(),
+                    output_pcols,
+                )
+            }
+        }
+    }
+
     pub fn output_pcols(&self) -> HashSet<String> {
         match self {
             ExecutableNode::Worker(s) => s.get_output_pcol_ids(),
