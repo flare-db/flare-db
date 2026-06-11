@@ -9,7 +9,7 @@ macro_rules! check_argument {
     // check_argument!(condition, "format string {}", value)
     ($cond:expr, $fmt:literal $(, $arg:expr)*) => {
         if !$cond {
-            return Err(crate::errors::BeamTranslationError::InvalidArgument(
+            return Err(BeamTranslationError::InvalidArgument(
                 format!($fmt $(, $arg)*)
             ).into());
         }

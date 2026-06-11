@@ -1,12 +1,10 @@
-use std::collections::HashSet;
-
 use crate::fusion::pipeline::{PCollectionNode, PTransformNode};
 use crate::jobservice::urns;
+use crate::utils::errors::*;
 use beam_model_rs::v1::executable_stage_payload::{SideInputId, TimerId, UserStateId};
 use beam_model_rs::v1::{Components, PTransform, ParDoPayload};
 use prost::Message;
-
-use crate::errors::BeamTranslationError;
+use std::collections::HashSet;
 
 #[derive(PartialEq, Eq, Hash, Clone, Debug)]
 pub struct SideInputRef {
