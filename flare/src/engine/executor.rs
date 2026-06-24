@@ -18,11 +18,12 @@ use tokio::sync::{Mutex, mpsc::UnboundedReceiver};
 
 use crate::{
     engine::{
-        coders::{BeamCoder, BeamValue, StandardBeamCoders, WindowedValueCoder},
+        coders::{BeamCoder, StandardBeamCoders, WindowedValueCoder},
         harness::{
             control::{ControlChannel, ControlResponse},
             data::{DataChannel, DataKey, ElementStreamPayload},
         },
+        store::{BeamValue, FlareElementStore},
     },
     fusion::{
         pipeline::{ConsumerMetaData, ExecutableGraph, ExecutableNode},
@@ -37,8 +38,8 @@ pub struct StageExecutor {
     data: DataChannel,
     store: Arc<ElementStore>,
     pipeline_coders: Arc<HashMap<String, Coder>>,
-    graph: Option<ExecutableGraph>, // ows the Scheduler and asks it to give the next element to execute in
-                                    // execute_pipeline and calls execute_node to execute that node
+    graph: Option<ExecutableGraph>,
+    db: Option<FlareElementStore>,
 }
 
 impl StageExecutor {
@@ -49,6 +50,7 @@ impl StageExecutor {
             store: Arc::new(ElementStore::new()),
             pipeline_coders: Arc::new(HashMap::new()),
             graph: None,
+            db: None,
         }
     }
 

@@ -13,6 +13,11 @@ tokio = { version = "1.38", features = [
     "fs",
     "process",
 ] }
+arrow-array = "57.3.1"
+arrow-buffer = "57.3.1"
+arrow-schema = "57.3.1"
+tonbo = "=0.4.0-a1"
+fusio = { version = "0.6.1", features = ["tokio"] }
 dashmap = "6.1.0"
 prost = "0.14.3"
 petgraph = "0.8.3"
@@ -25,5 +30,4 @@ bytes = "1.11.1"
 fs = "0.0.5"
 [dependencies.uuid]
 version = "1.23.1"
-# Lets you generate random UUIDs
 features = ["v4"]

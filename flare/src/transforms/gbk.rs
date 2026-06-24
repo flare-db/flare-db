@@ -5,10 +5,8 @@ use log::error;
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    engine::{
-        coders::BeamValue,
-        executor::{GetCollectionRequest, UpdateCollectionRequest},
-    },
+    engine::executor::{GetCollectionRequest, UpdateCollectionRequest},
+    engine::store::BeamValue,
     jobservice::urns::beam_urns,
     transforms::{ExecutionContext, FlareTransform},
 };

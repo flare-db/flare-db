@@ -5,8 +5,8 @@ use beam_model_rs::v1::{
 use log::info;
 use prost::Message;
 
-use crate::engine::coders::BeamValue;
 use crate::engine::executor::NewCollectionRequest;
+use crate::engine::store::BeamValue;
 use crate::jobservice::urns::beam_urns;
 use crate::transforms::{ExecutionContext, FlareTransform};
 use std::collections::{HashMap, HashSet};

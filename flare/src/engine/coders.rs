@@ -1,3 +1,4 @@
+use crate::engine::store::BeamValue;
 use beam_model_rs::v1::Coder;
 use std::collections::HashMap;
 
@@ -8,18 +9,6 @@ use crate::jobservice::urns::beam_urns;
 
 /// Beam's minimum timestamp in millis (`BoundedWindow.TIMESTAMP_MIN_VALUE`).
 pub const BEAM_MIN_TIMESTAMP_MILLIS: i64 = -9_223_372_036_854_775;
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum BeamValue {
-    String(String),
-    Bytes(Vec<u8>),
-    Int64(i64),
-    Bool(bool),
-    Kv(Box<BeamValue>, Box<BeamValue>),
-    Iterable(Vec<BeamValue>),
-    Gbk(Box<BeamValue>, Vec<BeamValue>),
-    Void,
-}
 
 #[derive(Debug, Clone)]
 pub enum StandardBeamCoders {
