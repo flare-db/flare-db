@@ -5,6 +5,7 @@ use arrow_array::{
 };
 use arrow_buffer::{OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field, Schema};
+use dashmap::DashMap;
 use fusio::disk::TokioFs;
 use fusio::executor::tokio::TokioExecutor;
 use std::sync::Arc;
@@ -71,24 +72,14 @@ impl BeamValue {
         matches!(self, BeamValue::Void)
     }
 
-    fn fields(&self, prefix: &str) -> Vec<Field> {
-        vec![Field::new(prefix, self.data_type(), self.is_nullable())]
-    }
-
-    pub fn schema(&self) -> Schema {
-        let mut fields = Vec::<Field>::new();
-
-        fields.push(Field::new("element_id", DataType::Utf8, false));
-        fields.push(Field::new("pcollection_id", DataType::Utf8, false));
-        fields.extend(self.fields("Elements"));
-
-        Schema::new(fields)
-    }
-
-    fn from_record_batch(batch: &RecordBatch, row: usize) -> Result<Self, ElementStoreError> {
+    fn from_record_batch(
+        batch: &RecordBatch,
+        row: usize,
+        pcol_id: &str,
+    ) -> Result<Self, ElementStoreError> {
         let column = batch
-            .column_by_name("Elements")
-            .ok_or_else(|| ElementStoreError::MissingField("Elements".to_string()))?;
+            .column_by_name(pcol_id)
+            .ok_or_else(|| ElementStoreError::MissingField(pcol_id.to_string()))?;
 
         Self::from_array_row(column.as_ref(), column.data_type(), row)
     }
@@ -451,12 +442,15 @@ fn values_to_array(
     }
 }
 
-pub fn from_record_batches(batches: &[RecordBatch]) -> Result<Vec<BeamValue>, ElementStoreError> {
+pub fn from_record_batches(
+    batches: &[RecordBatch],
+    pcol_id: &str,
+) -> Result<Vec<BeamValue>, ElementStoreError> {
     let mut values = Vec::new();
 
     for batch in batches {
         for row in 0..batch.num_rows() {
-            values.push(BeamValue::from_record_batch(batch, row)?);
+            values.push(BeamValue::from_record_batch(batch, row, pcol_id)?);
         }
     }
 
@@ -464,14 +458,13 @@ pub fn from_record_batches(batches: &[RecordBatch]) -> Result<Vec<BeamValue>, El
 }
 
 pub fn to_record_batch(
+    schema: Arc<Schema>,
     values: Vec<BeamValue>,
-    pcol_id: String,
+    pcol_id: &str,
 ) -> Result<RecordBatch, ElementStoreError> {
-    let first = values
-        .first()
-        .ok_or_else(|| ElementStoreError::InvalidData("empty values".to_string()))?;
-
-    let schema = Arc::new(first.schema());
+    if values.is_empty() {
+        return Err(ElementStoreError::InvalidData("empty values".to_string()));
+    }
 
     let mut columns: Vec<ArrayRef> = Vec::new();
 
@@ -486,11 +479,11 @@ pub fn to_record_batch(
             }
             "pcollection_id" => {
                 columns.push(Arc::new(StringArray::from(vec![
-                    pcol_id.clone();
+                    pcol_id.to_string();
                     values.len()
                 ])));
             }
-            "Elements" => {
+            name if name == pcol_id => {
                 columns.push(values_to_array(&values, field.data_type())?);
             }
             _ => return Err(ElementStoreError::UnknownField(field.name().to_string())),
@@ -500,29 +493,106 @@ pub fn to_record_batch(
     RecordBatch::try_new(schema, columns).map_err(|e| ElementStoreError::Schema(e.to_string()))
 }
 
+#[derive(Clone, Default)]
+pub struct FlareSchemaRegistry {
+    schemas: Arc<DashMap<String, Arc<Schema>>>,
+}
+
+impl FlareSchemaRegistry {
+    pub fn new() -> Self {
+        Self {
+            schemas: Arc::new(DashMap::new()),
+        }
+    }
+
+    pub fn get(&self, pcollection_id: &str) -> Option<Arc<Schema>> {
+        self.schemas.get(pcollection_id).map(|r| r.value().clone())
+    }
+
+    pub fn derive_and_register(&self, pcollection_id: &str, element: &BeamValue) -> Arc<Schema> {
+        let value_type = element.data_type();
+
+        let schema = Schema::new(vec![
+            Field::new("element_id", DataType::Utf8, false),
+            Field::new("pcollection_id", DataType::Utf8, false),
+            Field::new(pcollection_id, value_type, element.is_nullable()),
+        ]);
+
+        let arc_schema = Arc::new(schema);
+        self.schemas
+            .insert(pcollection_id.to_string(), arc_schema.clone());
+        arc_schema
+    }
+}
+
+#[derive(Clone)]
 pub struct FlareElementStore {
-    db: DB<TokioFs, TokioExecutor>,
+    registry: FlareSchemaRegistry,
+    open_dbs: Arc<DashMap<String, Arc<DB<TokioFs, TokioExecutor>>>>,
 }
 
 impl FlareElementStore {
-    pub async fn open(schema: Arc<Schema>) -> Result<Self, ElementStoreError> {
+    pub fn new(registry: FlareSchemaRegistry) -> Self {
+        Self {
+            registry,
+            open_dbs: Arc::new(DashMap::new()),
+        }
+    }
+
+    pub async fn resolve_db(
+        &self,
+        pcollection_id: &str,
+        element: Option<&BeamValue>,
+    ) -> Result<Arc<DB<TokioFs, TokioExecutor>>, ElementStoreError> {
+        if let Some(db) = self.open_dbs.get(pcollection_id) {
+            return Ok(db.value().clone());
+        }
+
+        let schema = match self.registry.get(pcollection_id) {
+            Some(s) => s,
+            None => {
+                if let Some(e) = element {
+                    self.registry.derive_and_register(pcollection_id, e)
+                } else {
+                    return Err(ElementStoreError::Schema(format!(
+                        "Schema not found for pcollection_id {}",
+                        pcollection_id
+                    )));
+                }
+            }
+        };
+
+        let db_dir = format!("{}/{}", "/home/ganesh/flare-db/tonbo/data7", pcollection_id);
+
         let db = DbBuilder::from_schema_key_name(schema, "element_id")
             .map_err(|e| ElementStoreError::Schema(e.to_string()))?
-            .on_disk("/home/ganesh/flare-db/tonbo/data4")
+            .on_disk(db_dir)
             .map_err(|e| ElementStoreError::Open(e.to_string()))?
             .open()
             .await
             .map_err(|e| ElementStoreError::Open(e.to_string()))?;
 
-        Ok(Self { db })
+        let db = Arc::new(db);
+        self.open_dbs.insert(pcollection_id.to_string(), db.clone());
+
+        Ok(db)
     }
 
-    async fn write_collection(&self, req: NewCollectionRequest) -> Result<(), ElementStoreError> {
-        let record_batch = to_record_batch(req.elements, req.pcollection_id)
+    pub async fn write_collection(
+        &self,
+        req: NewCollectionRequest,
+    ) -> Result<(), ElementStoreError> {
+        let element = req
+            .elements
+            .first()
+            .ok_or_else(|| ElementStoreError::InvalidData("empty values".to_string()))?;
+        let db = self.resolve_db(&req.pcollection_id, Some(element)).await?;
+        let schema = self.registry.get(&req.pcollection_id).unwrap();
+
+        let record_batch = to_record_batch(schema, req.elements, &req.pcollection_id)
             .map_err(|e| ElementStoreError::Schema(e.to_string()))?;
 
-        self.db
-            .ingest(record_batch)
+        db.ingest(record_batch)
             .await
             .map_err(|e| ElementStoreError::Write(e.to_string()))?;
 
@@ -533,20 +603,18 @@ impl FlareElementStore {
         &self,
         req: GetCollectionRequest,
     ) -> Result<Vec<BeamValue>, ElementStoreError> {
-        let filter = Expr::eq("pcollection_id", ScalarValue::from(req.pcollection_id));
+        let db = self.resolve_db(&req.pcollection_id, None).await?;
 
-        let batches = self
-            .db
+        let batches = db
             .scan()
-            .filter(filter)
             .collect()
             .await
             .map_err(|e| ElementStoreError::Read(e.to_string()))?;
 
-        Ok(from_record_batches(&batches).map_err(|e| ElementStoreError::Read(e.to_string()))?)
+        Ok(from_record_batches(&batches, &req.pcollection_id)?)
     }
 
-    async fn upsert_element() {}
+    pub async fn upsert_element(&self) {}
 }
 
 #[derive(Debug)]
@@ -574,8 +642,12 @@ mod tests {
 
     fn assert_roundtrip(values: Vec<BeamValue>) {
         let expected = values.clone();
-        let batch = to_record_batch(values, "pcol-1".to_string()).expect("encode record batch");
-        let decoded = from_record_batches(&[batch]).expect("decode record batches");
+
+        let registry = FlareSchemaRegistry::new();
+        let schema = registry.derive_and_register("pcol-1", &expected[0]);
+
+        let batch = to_record_batch(schema, values, "pcol-1").expect("encode record batch");
+        let decoded = from_record_batches(&[batch], "pcol-1").expect("decode record batches");
 
         assert_eq!(decoded, expected);
     }
