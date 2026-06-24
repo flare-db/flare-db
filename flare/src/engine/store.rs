@@ -7,12 +7,9 @@ use arrow_buffer::{OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field, Schema};
 use fusio::disk::TokioFs;
 use fusio::executor::tokio::TokioExecutor;
-use std::result::Result as StdResult;
 use std::sync::Arc;
 use tonbo::prelude::*;
 use uuid::Uuid;
-
-type StoreResult<T> = StdResult<T, ElementStoreError>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum BeamValue {
@@ -88,7 +85,7 @@ impl BeamValue {
         Schema::new(fields)
     }
 
-    fn from_record_batch(batch: &RecordBatch, row: usize) -> StoreResult<Self> {
+    fn from_record_batch(batch: &RecordBatch, row: usize) -> Result<Self, ElementStoreError> {
         let column = batch
             .column_by_name("Elements")
             .ok_or_else(|| ElementStoreError::MissingField("Elements".to_string()))?;
@@ -96,7 +93,11 @@ impl BeamValue {
         Self::from_array_row(column.as_ref(), column.data_type(), row)
     }
 
-    fn from_array_row(array: &dyn Array, data_type: &DataType, row: usize) -> StoreResult<Self> {
+    fn from_array_row(
+        array: &dyn Array,
+        data_type: &DataType,
+        row: usize,
+    ) -> Result<Self, ElementStoreError> {
         match data_type {
             DataType::Utf8 => {
                 let arr = array
@@ -224,7 +225,7 @@ impl BeamValue {
         list: &ListArray,
         row: usize,
         item_type: &DataType,
-    ) -> StoreResult<Vec<BeamValue>> {
+    ) -> Result<Vec<BeamValue>, ElementStoreError> {
         let offsets = list.value_offsets();
         let start = usize::try_from(offsets[row])
             .map_err(|_| ElementStoreError::OffsetOverflow("negative list offset".to_string()))?;
@@ -242,7 +243,7 @@ impl BeamValue {
     }
 }
 
-fn build_offsets(lengths: &[usize]) -> StoreResult<OffsetBuffer<i32>> {
+fn build_offsets(lengths: &[usize]) -> Result<OffsetBuffer<i32>, ElementStoreError> {
     let mut offsets = Vec::with_capacity(lengths.len() + 1);
     offsets.push(0_i32);
 
@@ -260,7 +261,10 @@ fn build_offsets(lengths: &[usize]) -> StoreResult<OffsetBuffer<i32>> {
     Ok(OffsetBuffer::new(ScalarBuffer::from(offsets)))
 }
 
-fn values_to_array(values: &[BeamValue], data_type: &DataType) -> StoreResult<ArrayRef> {
+fn values_to_array(
+    values: &[BeamValue],
+    data_type: &DataType,
+) -> Result<ArrayRef, ElementStoreError> {
     match data_type {
         DataType::Utf8 => {
             let strings = values
@@ -271,7 +275,7 @@ fn values_to_array(values: &[BeamValue], data_type: &DataType) -> StoreResult<Ar
                         "mixed BeamValue variants in batch: expected String".to_string(),
                     )),
                 })
-                .collect::<StoreResult<Vec<_>>>()?;
+                .collect::<Result<Vec<_>, ElementStoreError>>()?;
             Ok(Arc::new(StringArray::from(strings)))
         }
         DataType::Binary => {
@@ -283,7 +287,7 @@ fn values_to_array(values: &[BeamValue], data_type: &DataType) -> StoreResult<Ar
                         "mixed BeamValue variants in batch: expected Bytes".to_string(),
                     )),
                 })
-                .collect::<StoreResult<Vec<_>>>()?;
+                .collect::<Result<Vec<_>, ElementStoreError>>()?;
             Ok(Arc::new(BinaryArray::from(bytes)))
         }
         DataType::Int64 => {
@@ -295,7 +299,7 @@ fn values_to_array(values: &[BeamValue], data_type: &DataType) -> StoreResult<Ar
                         "mixed BeamValue variants in batch: expected Int64".to_string(),
                     )),
                 })
-                .collect::<StoreResult<Vec<_>>>()?;
+                .collect::<Result<Vec<_>, ElementStoreError>>()?;
             Ok(Arc::new(Int64Array::from(ints)))
         }
         DataType::Boolean => {
@@ -307,7 +311,7 @@ fn values_to_array(values: &[BeamValue], data_type: &DataType) -> StoreResult<Ar
                         "mixed BeamValue variants in batch: expected Bool".to_string(),
                     )),
                 })
-                .collect::<StoreResult<Vec<_>>>()?;
+                .collect::<Result<Vec<_>, ElementStoreError>>()?;
             Ok(Arc::new(BooleanArray::from(bools)))
         }
         DataType::Null => {
@@ -447,7 +451,7 @@ fn values_to_array(values: &[BeamValue], data_type: &DataType) -> StoreResult<Ar
     }
 }
 
-pub fn from_record_batches(batches: &[RecordBatch]) -> StoreResult<Vec<BeamValue>> {
+pub fn from_record_batches(batches: &[RecordBatch]) -> Result<Vec<BeamValue>, ElementStoreError> {
     let mut values = Vec::new();
 
     for batch in batches {
@@ -459,7 +463,10 @@ pub fn from_record_batches(batches: &[RecordBatch]) -> StoreResult<Vec<BeamValue
     Ok(values)
 }
 
-pub fn to_record_batch(values: Vec<BeamValue>, pcol_id: String) -> StoreResult<RecordBatch> {
+pub fn to_record_batch(
+    values: Vec<BeamValue>,
+    pcol_id: String,
+) -> Result<RecordBatch, ElementStoreError> {
     let first = values
         .first()
         .ok_or_else(|| ElementStoreError::InvalidData("empty values".to_string()))?;
@@ -498,7 +505,7 @@ pub struct FlareElementStore {
 }
 
 impl FlareElementStore {
-    pub async fn open(schema: Arc<Schema>) -> StoreResult<Self> {
+    pub async fn open(schema: Arc<Schema>) -> Result<Self, ElementStoreError> {
         let db = DbBuilder::from_schema_key_name(schema, "element_id")
             .map_err(|e| ElementStoreError::Schema(e.to_string()))?
             .on_disk("/home/ganesh/flare-db/tonbo/data4")
@@ -510,7 +517,7 @@ impl FlareElementStore {
         Ok(Self { db })
     }
 
-    async fn write_collection(&self, req: NewCollectionRequest) -> StoreResult<()> {
+    async fn write_collection(&self, req: NewCollectionRequest) -> Result<(), ElementStoreError> {
         let record_batch = to_record_batch(req.elements, req.pcollection_id)
             .map_err(|e| ElementStoreError::Schema(e.to_string()))?;
 
@@ -522,7 +529,10 @@ impl FlareElementStore {
         Ok(())
     }
 
-    pub async fn scan_collection(&self, req: GetCollectionRequest) -> StoreResult<Vec<BeamValue>> {
+    pub async fn scan_collection(
+        &self,
+        req: GetCollectionRequest,
+    ) -> Result<Vec<BeamValue>, ElementStoreError> {
         let filter = Expr::eq("pcollection_id", ScalarValue::from(req.pcollection_id));
 
         let batches = self
@@ -540,7 +550,7 @@ impl FlareElementStore {
 }
 
 #[derive(Debug)]
-struct NewCollectionRequest {
+pub struct NewCollectionRequest {
     // consumed pcollection id
     pub(crate) pcollection_id: String,
     // collection
@@ -548,11 +558,11 @@ struct NewCollectionRequest {
 }
 
 #[derive(Debug)]
-struct GetCollectionRequest {
+pub struct GetCollectionRequest {
     pub(crate) pcollection_id: String,
 }
 
-struct UpdateCollectionRequest {
+pub struct UpdateCollectionRequest {
     pub(crate) pcollection_id: String,
     pub(crate) key: BeamValue,
     pub(crate) value: BeamValue,
