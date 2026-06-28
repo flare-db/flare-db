@@ -1,23 +1,22 @@
 name: Publish Flare Runner SDK
-
 on:
   workflow_dispatch:
-
+  push:
+    branches:
+      - runnersdk
+    paths:
+      - "runner-sdk/java/flarerunner/**"
 permissions:
   contents: read
   packages: write
-
 jobs:
   publish:
     runs-on: ubuntu-latest
-
     defaults:
       run:
         working-directory: runner-sdk/java/flarerunner
-
     steps:
       - uses: actions/checkout@v4
-
       - name: Set up Java
         uses: actions/setup-java@v4
         with:
@@ -25,7 +24,6 @@ jobs:
           java-version: 17
           server-id: github
           settings-path: ${{ github.workspace }}
-
       - name: Publish package
         run: mvn -B clean deploy -s ${{ github.workspace }}/settings.xml
         env:
