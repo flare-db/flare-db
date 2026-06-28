@@ -888,9 +888,9 @@ mod beam_wire_tests {
         PrimitiveValue::String(s.to_string())
     }
 
-    fn bytes_value(v: &[u8]) -> PrimitiveValue {
+    /*  fn bytes_value(v: &[u8]) -> PrimitiveValue {
         PrimitiveValue::Bytes(v.to_vec())
-    }
+    }*/
 
     #[test]
     fn beam_varint_wire_encode() {

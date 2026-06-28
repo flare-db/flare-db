@@ -16,6 +16,7 @@ use std::collections::{HashMap, HashSet};
 /// The Fn Data boundary is responsible for wrapping this logical value in
 /// a WindowedValue before sending it to an SDK harness.
 #[derive(Clone)]
+#[warn(unused)]
 pub struct Impulse {
     name: String,
     id: String,

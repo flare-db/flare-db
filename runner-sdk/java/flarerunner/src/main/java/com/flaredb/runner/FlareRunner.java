@@ -1,4 +1,4 @@
-package cloud.langbeam.flare;
+package com.flaredb.runner;
 
 import java.util.concurrent.TimeUnit;
 

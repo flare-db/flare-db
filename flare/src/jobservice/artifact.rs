@@ -3,6 +3,7 @@ use beam_model_rs::v1::{
     artifact_request_wrapper, artifact_response_wrapper,
     artifact_staging_service_server::ArtifactStagingService,
 };
+use dashmap::DashSet;
 use log::info;
 use std::{pin::Pin, sync::Arc};
 use tokio::fs::{self, File};
@@ -13,10 +14,14 @@ use tonic::{Request, Response, Status, Streaming};
 
 pub struct FlareArtifactStagingService {
     store: Arc<ArtifactStore>,
+    staging_tokens: Arc<DashSet<String>>,
 }
 impl FlareArtifactStagingService {
-    pub fn new(store: Arc<ArtifactStore>) -> Self {
-        Self { store }
+    pub fn new(store: Arc<ArtifactStore>, staging_tokens: Arc<DashSet<String>>) -> Self {
+        Self {
+            store,
+            staging_tokens,
+        }
     }
 }
 // stream that will send requests back to the client
@@ -36,13 +41,19 @@ impl ArtifactStagingService for FlareArtifactStagingService {
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<ArtifactRequestWrapper, Status>>(32);
 
+        let staging_tokens = self.staging_tokens.clone();
         tokio::spawn(async move {
             match client_stream.next().await {
                 Some(Ok(warapper)) => {
                     let staging_token = warapper.staging_token;
-                    // TODO: Validate staging token
 
-                    info!("Received staging token");
+                    // Validate staging token
+                    if !staging_tokens.contains(&staging_token) {
+                        eprintln!("Invalid staging token: {}", staging_token);
+                        return;
+                    }
+
+                    info!("Received and validated staging token");
 
                     let resolve_request = ArtifactRequestWrapper {
                         request: Some(artifact_request_wrapper::Request::ResolveArtifact(
