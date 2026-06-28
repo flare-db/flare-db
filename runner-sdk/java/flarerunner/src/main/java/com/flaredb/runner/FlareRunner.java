@@ -1,7 +1,6 @@
 package com.flaredb.runner;
 
 import java.util.concurrent.TimeUnit;
-
 import org.apache.beam.model.jobmanagement.v1.ArtifactStagingServiceGrpc;
 import org.apache.beam.model.jobmanagement.v1.JobApi.PrepareJobRequest;
 import org.apache.beam.model.jobmanagement.v1.JobApi.PrepareJobResponse;
@@ -27,98 +26,138 @@ import org.apache.beam.vendor.grpc.v1p69p0.io.grpc.ManagedChannel;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+/**
+ * Apache Beam Runner implementation for executing pipelines on a FlareDB.
+ *
+ * <p>This runner translates a Beam {@link Pipeline} into the Beam Runner API, stages all required
+ * pipeline artifacts, submits the job to the configured FlareDB Job Service.
+ *
+ * <p>The runner communicates with a FlareDB Job Service using the Beam Job API over gRPC.
+ */
 public class FlareRunner extends PipelineRunner<FlarePipelineJob> {
-    private static final Logger LOG = LoggerFactory.getLogger(FlareRunner.class);
+  private static final Logger LOG = LoggerFactory.getLogger(FlareRunner.class);
 
-    private final FlarePipelineOptions options;
+  private final FlarePipelineOptions options;
 
-    private final ManagedChannelFactory channelFactory;
+  private final ManagedChannelFactory channelFactory;
 
-    private final String endpoint;
+  private final String endpoint;
 
-    private FlareRunner(FlarePipelineOptions options, String endpoint, ManagedChannelFactory channelFactory) {
+  private FlareRunner(
+      FlarePipelineOptions options, String endpoint, ManagedChannelFactory channelFactory) {
 
-        this.options = options;
-        this.endpoint = endpoint;
-        this.channelFactory = channelFactory;
+    this.options = options;
+    this.endpoint = endpoint;
+    this.channelFactory = channelFactory;
+  }
+
+  /***
+   * Creates Flare Runner using the supplied pipeline options
+   */
+  static FlareRunner create(PipelineOptions options, ManagedChannelFactory channelFactory) {
+    FlarePipelineOptions flarePipelineOptions =
+        PipelineOptionsValidator.validate(FlarePipelineOptions.class, options);
+
+    String endpoint = flarePipelineOptions.getJobEndpoint();
+
+    return new FlareRunner(flarePipelineOptions, endpoint, channelFactory);
+  }
+
+  /**
+   * Creates a Flare Runner using the default Beam gRPC channel factory.
+   *
+   * <p>The supplied {@link PipelineOptions} must implement {@link FlarePipelineOptions}.
+   *
+   * @param options Beam pipeline options
+   * @return a configured {@link FlareRunner}
+   */
+  public static FlareRunner fromOptions(PipelineOptions options) {
+
+    return create(options, ManagedChannelFactory.createDefault());
+  }
+
+  /**
+   * Executes the supplied Beam pipeline on a FlareDB.
+   *
+   * <p>The execution process performs the following steps:
+   *
+   * <ol>
+   *   <li>Translates the pipeline into the Beam Runner API representation.
+   *   <li>Submits a prepare request to the FlareDB Job Service.
+   *   <li>Stages all pipeline artifacts required for execution.
+   *   <li>Starts the prepared job.
+   *   <li>Returns a {@link FlarePipelineJob} representing the submitted job.
+   * </ol>
+   *
+   * @param pipeline the Beam pipeline to execute
+   * @return a handle representing the submitted FlareDB job
+   * @throws RuntimeException if job preparation, artifact staging, or submission fails
+   */
+  @Override
+  public FlarePipelineJob run(Pipeline pipeline) {
+
+    RunnerApi.Pipeline pipelineProto = PipelineTranslation.toProto(pipeline);
+
+    PrepareJobRequest prepareJobRequest =
+        PrepareJobRequest.newBuilder()
+            .setJobName(options.getJobName())
+            .setPipeline(pipelineProto)
+            .setPipelineOptions(PipelineOptionsTranslation.toProto(options))
+            .build();
+
+    ManagedChannel jobServiceChannel =
+        channelFactory.forDescriptor(ApiServiceDescriptor.newBuilder().setUrl(endpoint).build());
+
+    JobServiceBlockingStub jobService = JobServiceGrpc.newBlockingStub(jobServiceChannel);
+
+    try (CloseableResource<JobServiceBlockingStub> wrappedJobService =
+        CloseableResource.of(jobService, unused -> jobServiceChannel.shutdown())) {
+
+      final int jobServerTimeout = options.as(FlarePipelineOptions.class).getJobServerTimeout();
+      PrepareJobResponse prepareJobResponse =
+          jobService
+              .withDeadlineAfter(jobServerTimeout, TimeUnit.SECONDS)
+              .withWaitForReady()
+              .prepare(prepareJobRequest);
+      LOG.info("PrepareJobResponse received for jobName={}", options.getJobName());
+
+      ApiServiceDescriptor artifactStagingEndpoint =
+          prepareJobResponse.getArtifactStagingEndpoint();
+      String stagingSessionToken = prepareJobResponse.getStagingSessionToken();
+
+      try (CloseableResource<ManagedChannel> artifactChannel =
+          CloseableResource.of(
+              channelFactory.forDescriptor(artifactStagingEndpoint), ManagedChannel::shutdown)) {
+
+        ArtifactStagingService.offer(
+            new ArtifactRetrievalService(new FlareArtifactResolver(options)),
+            ArtifactStagingServiceGrpc.newStub(artifactChannel.get()),
+            stagingSessionToken);
+      } catch (CloseableResource.CloseException e) {
+        LOG.warn("Error closing artifact staging channel", e);
+        // CloseExceptions should only be thrown while closing the channel.
+      } catch (Exception e) {
+        throw new RuntimeException("Error staging files.", e);
+      }
+
+      RunJobRequest runJobRequest =
+          RunJobRequest.newBuilder()
+              .setPreparationId(prepareJobResponse.getPreparationId())
+              .build();
+
+      LOG.info("Created run job request: {}", runJobRequest);
+      // Run the job and wait for a result, we don't set a timeout here because
+      // it may take a long time for a job to complete and streaming
+      // jobs never return a response.
+      RunJobResponse runJobResponse = jobService.run(runJobRequest);
+
+      LOG.info("RunJobResponse received jobName={}", options.getJobName());
+      LOG.info("Job Eexecution Completed");
+      ByteString jobId = runJobResponse.getJobIdBytes();
+
+      return new FlarePipelineJob(jobId);
+    } catch (CloseException e) {
+      throw new RuntimeException(e);
     }
-
-    static FlareRunner create(PipelineOptions options, ManagedChannelFactory channelFactory) {
-        FlarePipelineOptions flarePipelineOptions = PipelineOptionsValidator.validate(
-                FlarePipelineOptions.class,
-                options);
-
-        String endpoint = flarePipelineOptions.getJobEndpoint();
-
-        return new FlareRunner(flarePipelineOptions, endpoint, channelFactory);
-    }
-
-    public static FlareRunner fromOptions(PipelineOptions options) {
-
-        return create(options, ManagedChannelFactory.createDefault());
-    }
-
-    @Override
-    public FlarePipelineJob run(Pipeline pipeline) {
-
-        RunnerApi.Pipeline pipelineProto = PipelineTranslation.toProto(pipeline);
-
-        PrepareJobRequest prepareJobRequest = PrepareJobRequest.newBuilder()
-                .setJobName(options.getJobName())
-                .setPipeline(pipelineProto)
-                .setPipelineOptions(PipelineOptionsTranslation.toProto(options))
-                .build();
-
-        ManagedChannel jobServiceChannel = channelFactory
-                .forDescriptor(ApiServiceDescriptor.newBuilder().setUrl(endpoint).build());
-
-        JobServiceBlockingStub jobService = JobServiceGrpc.newBlockingStub(jobServiceChannel);
-
-        try (CloseableResource<JobServiceBlockingStub> wrappedJobService = CloseableResource.of(jobService,
-                unused -> jobServiceChannel.shutdown())) {
-
-            final int jobServerTimeout = options.as(FlarePipelineOptions.class).getJobServerTimeout();
-            PrepareJobResponse prepareJobResponse = jobService
-                    .withDeadlineAfter(jobServerTimeout, TimeUnit.SECONDS)
-                    .withWaitForReady()
-                    .prepare(prepareJobRequest);
-            LOG.info("PrepareJobResponse received for jobName={}", options.getJobName());
-
-            ApiServiceDescriptor artifactStagingEndpoint = prepareJobResponse.getArtifactStagingEndpoint();
-            String stagingSessionToken = prepareJobResponse.getStagingSessionToken();
-
-            try (CloseableResource<ManagedChannel> artifactChannel = CloseableResource.of(
-                    channelFactory.forDescriptor(artifactStagingEndpoint), ManagedChannel::shutdown)) {
-
-                ArtifactStagingService.offer(
-                        new ArtifactRetrievalService(new FlareArtifactResolver(options)),
-                        ArtifactStagingServiceGrpc.newStub(artifactChannel.get()),
-                        stagingSessionToken);
-            } catch (CloseableResource.CloseException e) {
-                LOG.warn("Error closing artifact staging channel", e);
-                // CloseExceptions should only be thrown while closing the channel.
-            } catch (Exception e) {
-                throw new RuntimeException("Error staging files.", e);
-            }
-
-            RunJobRequest runJobRequest = RunJobRequest.newBuilder()
-                    .setPreparationId(prepareJobResponse.getPreparationId())
-                    .build();
-
-            LOG.info("Created run job request: {}", runJobRequest);
-            // Run the job and wait for a result, we don't set a timeout here because
-            // it may take a long time for a job to complete and streaming
-            // jobs never return a response.
-            RunJobResponse runJobResponse = jobService.run(runJobRequest);
-
-            LOG.info("RunJobResponse received jobName={}", options.getJobName());
-            LOG.info("Job Eexecution Completed");
-            ByteString jobId = runJobResponse.getJobIdBytes();
-
-            return new FlarePipelineJob(jobId);
-        } catch (CloseException e) {
-            throw new RuntimeException(e);
-        }
-    }
-
+  }
 }
