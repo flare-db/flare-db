@@ -3,13 +3,14 @@ use std::{
     sync::Arc,
 };
 
+use async_trait::async_trait;
 use beam_model_rs::v1::{
     Coder, Components, Environment, PCollection, PTransform, WindowingStrategy,
 };
 use uuid::Uuid;
 
 use crate::{
-    engine::executor::ElementStore,
+    engine::store::FlareElementStore,
     jobservice::urns::beam_urns,
     transforms::{gbk::GroupByKey, impluse::Impulse},
 };
@@ -17,6 +18,7 @@ use crate::{
 pub mod gbk;
 pub mod impluse;
 
+#[async_trait]
 pub trait FlareTransform {
     fn urn() -> &'static str
     where
@@ -33,7 +35,7 @@ pub trait FlareTransform {
     where
         Self: Sized;
 
-    fn execute(&self, ctx: ExecutionContext);
+    async fn execute(&self, ctx: ExecutionContext) -> Result<(), anyhow::Error>;
     //-> Result<Elements, TransformError>;
 
     fn output_pcol_ids(&self) -> HashSet<String>;
@@ -68,8 +70,8 @@ pub trait FlareTransform {
 pub struct ExecutionContext {
     //pub instruction_id: String,
     ///pub transform_id: String,
-    pub store: Arc<ElementStore>,
-    pub input_pcollection_id: Option<String>,
+    pub store: Arc<FlareElementStore>,
+    pub input_pcollection_id: String,
     pub output_pcollection_id: String,
     pub consumer_transfrom_id: String, //pub coder: String,
 }
@@ -87,14 +89,14 @@ pub fn from_urn(
             inputs,
             outputs,
             name,
-        )),
+        )) as FlareRunnerTransform,
 
         beam_urns::GROUP_BY_KEY_TRANSFORM => Arc::new(GroupByKey::with(
             Uuid::new_v4().to_string(),
             inputs,
             outputs,
             name,
-        )),
+        )) as FlareRunnerTransform,
         _ => panic!("Unknown URN {}", urn),
     }
 }

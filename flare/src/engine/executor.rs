@@ -10,7 +10,6 @@ use beam_model_rs::v1::{
     RemoteGrpcPort, elements,
 };
 use bytes::{Buf, BytesMut};
-use dashmap::DashMap;
 use log::{error, info};
 use petgraph::{Direction, graph::NodeIndex};
 use prost::Message;
@@ -18,10 +17,14 @@ use tokio::sync::{Mutex, mpsc::UnboundedReceiver};
 
 use crate::{
     engine::{
-        coders::{BeamCoder, BeamValue, StandardBeamCoders, WindowedValueCoder},
+        coders::{BeamCoder, StandardBeamCoders, WindowedValueCoder},
         harness::{
             control::{ControlChannel, ControlResponse},
             data::{DataChannel, DataKey, ElementStreamPayload},
+        },
+        store::{
+            BeamRecord, FlareElementStore, FlareSchemaRegistry, NewCollectionRequest,
+            ScanCollectionRequest,
         },
     },
     fusion::{
@@ -29,16 +32,15 @@ use crate::{
         stage::ExecutableStage,
     },
     jobservice::urns::beam_urns,
-    transforms::ExecutionContext,
+    transforms::{ExecutionContext, FlareRunnerTransform},
 };
 
 pub struct StageExecutor {
     control: ControlChannel,
     data: DataChannel,
-    store: Arc<ElementStore>,
     pipeline_coders: Arc<HashMap<String, Coder>>,
-    graph: Option<ExecutableGraph>, // ows the Scheduler and asks it to give the next element to execute in
-                                    // execute_pipeline and calls execute_node to execute that node
+    graph: Option<ExecutableGraph>,
+    store: Arc<FlareElementStore>,
 }
 
 impl StageExecutor {
@@ -46,9 +48,9 @@ impl StageExecutor {
         Self {
             control,
             data,
-            store: Arc::new(ElementStore::new()),
             pipeline_coders: Arc::new(HashMap::new()),
             graph: None,
+            store: Arc::new(FlareElementStore::new(FlareSchemaRegistry::new())),
         }
     }
 
@@ -71,7 +73,6 @@ impl StageExecutor {
         self.graph = Some(pipeline_graph.clone());
 
         // Root node = node with no incoming edges
-        // we might alredy have a root node stored somehwere
         let root = graph
             .node_indices()
             .find(|&idx| {
@@ -168,7 +169,7 @@ impl StageExecutor {
                 match bundle_status {
                     Ok(response) => {
                         if matches!(response, ControlResponse::BundleRegistered) {
-                            info!("Bundle registered at worker)",);
+                            info!("Bundle registered at worker");
 
                             let instruction_id = self
                                 .control
@@ -307,19 +308,22 @@ impl StageExecutor {
             ExecutableNode::Runner(runner_transform) => {
                 info!("Executing runner node");
                 if let Some(graph) = &self.graph {
-                    let input_pcollection_id = input_edge_metadata
-                        .as_ref()
-                        .map(|meta| meta.produced_pcol_id.clone());
-                    let output_pcollection_id = output_edge_metadata
-                        .as_ref()
-                        .map(|meta| meta.produced_pcol_id.clone())
-                        .or_else(|| runner_transform.output_pcol_ids().into_iter().next())
-                        .unwrap_or_else(|| graph.get_root_metadata().produced_pcol_id.clone());
-                    let consumer_transfrom_id = output_edge_metadata
-                        .as_ref()
-                        .or(input_edge_metadata.as_ref())
-                        .map(|meta| meta.consumer_transfrom_id.clone())
-                        .unwrap_or_else(|| graph.get_root_metadata().consumer_transfrom_id.clone());
+                    let input_metadata = input_edge_metadata.as_ref();
+                    let output_metadata = output_edge_metadata.as_ref();
+                    let root_metadata = graph.get_root_metadata();
+
+                    let input_pcollection_id =
+                        Self::metadata_pcollection_id(input_metadata, root_metadata);
+                    let output_pcollection_id = Self::runner_output_pcollection_id(
+                        &runner_transform,
+                        output_metadata,
+                        root_metadata,
+                    );
+                    let consumer_transfrom_id = Self::runner_consumer_transform_id(
+                        input_metadata,
+                        output_metadata,
+                        root_metadata,
+                    );
 
                     info!("Runner node input metadata: {:?}", input_edge_metadata);
                     info!("Runner node output metadata: {:?}", output_edge_metadata);
@@ -353,7 +357,7 @@ impl StageExecutor {
                                     consumer_transfrom_id,
                                 };
 
-                                runner_transform.execute(ctx);
+                                runner_transform.execute(ctx).await?;
                             } else {
                             }
                         }
@@ -366,6 +370,38 @@ impl StageExecutor {
                 Ok(ControlResponse::BundleDone)
             }
         }
+    }
+
+    fn metadata_pcollection_id(
+        metadata: Option<&ConsumerMetaData>,
+        fallback_metadata: &ConsumerMetaData,
+    ) -> String {
+        metadata
+            .unwrap_or(fallback_metadata)
+            .produced_pcol_id
+            .clone()
+    }
+
+    fn runner_output_pcollection_id(
+        runner_transform: &FlareRunnerTransform,
+        output_metadata: Option<&ConsumerMetaData>,
+        root_metadata: &ConsumerMetaData,
+    ) -> String {
+        output_metadata
+            .map(|meta| meta.produced_pcol_id.clone())
+            .or_else(|| runner_transform.output_pcol_ids().into_iter().next())
+            .unwrap_or_else(|| root_metadata.produced_pcol_id.clone())
+    }
+
+    fn runner_consumer_transform_id(
+        input_metadata: Option<&ConsumerMetaData>,
+        output_metadata: Option<&ConsumerMetaData>,
+        root_metadata: &ConsumerMetaData,
+    ) -> String {
+        output_metadata
+            .or(input_metadata)
+            .map(|meta| meta.consumer_transfrom_id.clone())
+            .unwrap_or_else(|| root_metadata.consumer_transfrom_id.clone())
     }
 
     fn stage_source_transform_id(stage: &ExecutableStage) -> String {
@@ -544,7 +580,7 @@ impl StageExecutor {
     async fn process_output_elements(
         receiver: Arc<Mutex<UnboundedReceiver<ElementStreamPayload>>>,
         edge_metadata: ConsumerMetaData,
-        store: Arc<ElementStore>,
+        store: Arc<FlareElementStore>,
         pipeline_coders: Arc<HashMap<String, Coder>>,
     ) -> anyhow::Result<()> {
         info!("Spawaned task to process stage's output elements");
@@ -582,20 +618,18 @@ impl StageExecutor {
                         );
                         let windowed_value_coder = WindowedValueCoder::new(element_coder);
 
-                        let mut decoded = Vec::<BeamValue>::new();
+                        let mut decoded = Vec::<BeamRecord>::new();
                         let mut buf = stream_buffer.freeze();
 
                         while buf.has_remaining() {
-                            decoded.push(windowed_value_coder.decode(&mut buf).value);
+                            decoded.push(windowed_value_coder.decode(&mut buf)?.value);
                         }
 
-                        let req = NewCollectionRequest {
+                        let request = NewCollectionRequest {
                             pcollection_id: edge_metadata.produced_pcol_id.clone(),
                             elements: decoded,
                         };
-
-                        store.insert_new_collection(req);
-
+                        store.write_collection(request).await?;
                         return Ok(());
                     }
                 }
@@ -617,11 +651,12 @@ impl StageExecutor {
             "Sending input elements: instruction_id={}, transform_id={}",
             ctx.input_instruction_id, ctx.consumer_transform_id,
         );
-        let request = GetCollectionRequest {
+
+        let request = ScanCollectionRequest {
             pcollection_id: ctx.input_pcollection_id,
         };
 
-        let elements = ctx.store.get_collection(request);
+        let elements = ctx.store.scan_collection(request).await?;
         info!("Input element coder: {}", ctx.input_coder_id);
 
         let element_coder = StandardBeamCoders::from_urn(
@@ -632,7 +667,7 @@ impl StageExecutor {
         let windowed_value_coder = WindowedValueCoder::new(element_coder);
         let mut encoded = BytesMut::new();
 
-        for element in &elements {
+        for element in elements {
             windowed_value_coder.encode_value(element, &mut encoded);
         }
 
@@ -654,7 +689,7 @@ impl StageExecutor {
 
 pub struct ProcessInputContext {
     input_stream: DataChannel,
-    store: Arc<ElementStore>,
+    store: Arc<FlareElementStore>,
     input_instruction_id: String,
     consumer_transform_id: String,
     input_pcollection_id: String,
@@ -667,68 +702,3 @@ pub struct ProcessInputContext {
 // decoder for that pcol and decode and process the elemenets.
 // decoing should be async task so we can spwan parallel task to the job
 // check out how beam does decoding
-pub struct ElementStore {
-    // {pcol_id -> [pcol elements]}
-    data: Arc<DashMap<String, Vec<BeamValue>>>,
-}
-
-impl ElementStore {
-    pub fn new() -> Self {
-        Self {
-            data: Arc::new(DashMap::new()),
-        }
-    }
-
-    pub fn insert_new_collection(&self, request: NewCollectionRequest) {
-        info!("Inserting new collection into store, request {:?}", request);
-        self.data.insert(request.pcollection_id, request.elements);
-    }
-
-    pub fn get_collection(&self, request: GetCollectionRequest) -> Vec<BeamValue> {
-        info!("Get Collection request: {:?}", request);
-        self.data
-            .get(&request.pcollection_id)
-            .map(|elements| elements.clone())
-            .unwrap_or_default()
-    }
-
-    pub fn update_collection(&self, request: UpdateCollectionRequest) {
-        let UpdateCollectionRequest {
-            pcollection_id,
-            key,
-            value,
-        } = request;
-
-        let mut collection = self.data.entry(pcollection_id).or_insert(Vec::new());
-
-        for element in collection.iter_mut() {
-            if let BeamValue::Gbk(existing_key, values) = element {
-                if existing_key.as_ref() == &key {
-                    values.push(value);
-                    return;
-                }
-            }
-        }
-
-        collection.push(BeamValue::Gbk(Box::new(key), vec![value]));
-    }
-}
-
-#[derive(Debug)]
-pub struct NewCollectionRequest {
-    // consumed pcollection id
-    pub(crate) pcollection_id: String,
-    // collection
-    pub(crate) elements: Vec<BeamValue>,
-}
-
-#[derive(Debug)]
-pub struct GetCollectionRequest {
-    pub(crate) pcollection_id: String,
-}
-
-pub struct UpdateCollectionRequest {
-    pub(crate) pcollection_id: String,
-    pub(crate) key: BeamValue,
-    pub(crate) value: BeamValue,
-}

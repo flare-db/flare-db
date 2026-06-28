@@ -1,18 +1,21 @@
+use anyhow::Error;
+use async_trait::async_trait;
 use beam_model_rs::v1::{
     Coder, Components, Environment, FunctionSpec, PCollection, PTransform, WindowingStrategy,
 };
-use log::error;
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    engine::{
-        coders::BeamValue,
-        executor::{GetCollectionRequest, UpdateCollectionRequest},
+    engine::store::{
+        BeamGbk, BeamRecord, IterableValue, NewCollectionRequest, PrimitiveValue,
+        ScanCollectionRequest,
     },
     jobservice::urns::beam_urns,
     transforms::{ExecutionContext, FlareTransform},
 };
+use std::collections::hash_map::Entry::{Occupied, Vacant};
 
+use typed_arrow::List;
 #[derive(Clone)]
 pub struct GroupByKey {
     name: String,
@@ -21,6 +24,7 @@ pub struct GroupByKey {
     outputs: HashMap<String, String>,
 }
 
+#[async_trait]
 impl FlareTransform for GroupByKey {
     fn urn() -> &'static str
     where
@@ -43,34 +47,51 @@ impl FlareTransform for GroupByKey {
         }
     }
 
-    fn execute(&self, ctx: ExecutionContext) {
-        let Some(input_pcollection_id) = ctx.input_pcollection_id.clone() else {
-            error!("GroupByKey requires an input PCollection");
-            return;
+    async fn execute(&self, ctx: ExecutionContext) -> Result<(), Error> {
+        let request = ScanCollectionRequest {
+            pcollection_id: ctx.input_pcollection_id,
         };
 
-        let request = GetCollectionRequest {
-            pcollection_id: input_pcollection_id,
-        };
+        let records = ctx.store.scan_collection(request).await?;
 
-        let elemnets = ctx.store.get_collection(request);
+        let mut per_key_map = HashMap::<PrimitiveValue, IterableValue>::new();
 
-        for element in elemnets.iter() {
-            match element {
-                BeamValue::Kv(key, value) => {
-                    let request = UpdateCollectionRequest {
-                        pcollection_id: ctx.output_pcollection_id.clone(),
-                        key: *key.clone(),
-                        value: *value.clone(),
-                    };
-                    ctx.store.update_collection(request);
-                }
+        for record in records {
+            match record {
+                BeamRecord::KV(kv) => match per_key_map.entry(kv.key) {
+                    Occupied(mut entry) => {
+                        let mut values = entry.get().list.values().clone();
+                        values.push(kv.value);
+                        *entry.get_mut() = IterableValue::new(List::new(values));
+                    }
+                    Vacant(entry) => {
+                        entry.insert(IterableValue::new(List::new(vec![kv.value])));
+                    }
+                },
 
                 _ => {
-                    error!("Invalid type for GroupByKey operation");
+                    anyhow::bail!("other types are not expected");
                 }
             }
         }
+
+        let beam_records: Vec<BeamRecord> = per_key_map
+            .iter()
+            .map(|(key, values)| {
+                BeamRecord::GBK(BeamGbk {
+                    key: key.clone(),
+                    value: values.clone(),
+                })
+            })
+            .collect();
+
+        let new_pcol_req = NewCollectionRequest {
+            pcollection_id: ctx.output_pcollection_id,
+            elements: beam_records,
+        };
+
+        ctx.store.write_collection(new_pcol_req).await?;
+        Ok(())
     }
 
     fn output_pcol_ids(&self) -> HashSet<String> {

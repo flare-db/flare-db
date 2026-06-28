@@ -86,7 +86,7 @@ impl GreedyPipelineFuser {
         let dedup = ensure_single_producer(&self.pipeline, &stages, &unfused_pt)?;
 
         Ok(FusedPipeline::of(
-            dedup.components(),
+            // dedup.components(),
             dedup.get_sdk_stages(&stages),
             dedup.get_runner_stages(&unfused_pt),
         ))
