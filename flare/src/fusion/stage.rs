@@ -177,10 +177,10 @@ impl ExecutableStage {
         pt_map
     }
 
-    pub fn pcolmap(&self) {
+    /*pub fn pcolmap(&self) {
         let pcol_map = HashMap::<String, PCollection>::new();
         //self.
-    }
+    }*/
 }
 
 #[derive(Eq, PartialEq, Clone, Hash)]

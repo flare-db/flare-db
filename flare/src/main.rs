@@ -34,7 +34,6 @@ async fn flare_up() -> Result<(), Box<dyn std::error::Error>> {
 
     let artifact_store =
         Arc::new(ArtifactStore::from("/home/ganesh/Dev/flaredir/new", "kafka-to-pinecone").await?);
-    let artifact_service = FlareArtifactStagingService::new(artifact_store.clone());
 
     let (control_channel, control_server) = start_control_server().await?;
     let (data_channel, data_server) = start_data_server().await?;
@@ -49,7 +48,10 @@ async fn flare_up() -> Result<(), Box<dyn std::error::Error>> {
         pipeline_options: "{}".to_string(),
         connect_timeout_secs: 20,
     };
-    let job_service = FlareJobService::with(executor, artifact_store, harness_cfg);
+    let job_service = FlareJobService::with(executor, artifact_store.clone(), harness_cfg);
+
+    let artifact_service =
+        FlareArtifactStagingService::new(artifact_store, job_service.get_staging_tokens());
 
     println!("Flared up 🔥 at {}", addr);
 

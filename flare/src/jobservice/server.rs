@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::{process::Stdio, sync::Arc, time::Duration};
 
 use beam_model_rs::v1::{
@@ -8,10 +9,12 @@ use beam_model_rs::v1::{
     PrepareJobRequest, PrepareJobResponse, RunJobRequest, RunJobResponse,
     job_service_server::JobService,
 };
+use dashmap::DashSet;
 use tokio::{process::Command, sync::Mutex, time::timeout};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Response;
 use tonic::Status;
+use uuid::Uuid;
 
 use crate::engine::executor::StageExecutor;
 use crate::jobservice::artifact::ArtifactStore;
@@ -33,6 +36,7 @@ pub struct FlareJobService {
     executor: Arc<Mutex<StageExecutor>>,
     artifact_store: Arc<ArtifactStore>,
     harness_cfg: HarnessLaunchConfig,
+    staging_tokens: Arc<DashSet<String>>,
 }
 
 impl FlareJobService {
@@ -46,7 +50,12 @@ impl FlareJobService {
             executor: Arc::new(Mutex::new(executor)),
             artifact_store,
             harness_cfg,
+            staging_tokens: Arc::new(DashSet::new()),
         }
+    }
+
+    pub fn get_staging_tokens(&self) -> Arc<DashSet<String>> {
+        self.staging_tokens.clone()
     }
 
     async fn spawn_harness(&self, job_id: &str) -> Result<(), Status> {
@@ -169,14 +178,18 @@ impl JobService for FlareJobService {
             let job_id = job.job_id;
             self.job_store.add_job(&job_id, job.graph);
 
+            let new_token = Uuid::new_v4().to_string();
+
             let response = PrepareJobResponse {
                 preparation_id: job_id.clone(),
                 artifact_staging_endpoint: Some(ApiServiceDescriptor {
                     url: String::from("127.0.0.1:8099"),
                     authentication: None,
                 }),
-                staging_session_token: "token".to_string(),
+                staging_session_token: new_token.clone(),
             };
+
+            self.staging_tokens.insert(new_token);
 
             log::info!("prepare request succeeded: preparation_id={}", job_id);
             Ok(Response::new(response))
@@ -255,44 +268,6 @@ impl JobService for FlareJobService {
                         preparation_id, e
                     ))
                 })?;
-
-            /*
-            let sdk_stages = job_graph.sdk_stages();
-            log::info!(
-                "starting job execution: preparation_id={}, total_stages={}",
-                preparation_id,
-                sdk_stages.len()
-            );
-
-            for (stage_idx, stage) in sdk_stages.iter().enumerate() {
-                let stage_id = format!("{}-stage-{}", preparation_id, stage_idx);
-                log::info!(
-                    "executing stage: preparation_id={}, stage_idx={}, stage_id={}",
-                    preparation_id,
-                    stage_idx,
-                    stage_id
-                );
-                executor.execute(stage, &stage_id).await.map_err(|err| {
-                    log::error!(
-                        "stage execution failed: preparation_id={}, stage_idx={}, stage_id={}, error={}",
-                        preparation_id,
-                        stage_idx,
-                        stage_id,
-                        err
-                    );
-                    Status::internal(format!(
-                        "failed to execute stage {} for job {}: {}",
-                        stage_idx, preparation_id, err
-                    ))
-                })?;
-                log::info!(
-                    "stage execution completed: preparation_id={}, stage_idx={}, stage_id={}",
-                    preparation_id,
-                    stage_idx,
-                    stage_id
-                );
-            }
-            */
 
             log::info!("job execution completed: preparation_id={}", preparation_id);
             Ok(Response::new(RunJobResponse {

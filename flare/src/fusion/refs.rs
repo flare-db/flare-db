@@ -150,7 +150,7 @@ impl UserStateRef {
         ))
     }
 
-    /// The PTransform that uses this user state.
+    /*/// The PTransform that uses this user state.
     fn transform(&self) -> &PTransformNode {
         &self.pt
     }
@@ -163,7 +163,7 @@ impl UserStateRef {
     /// The PCollection that represents the main input to the PTransform.
     fn collection(&self) -> &PCollectionNode {
         &self.pcol
-    }
+    }*/
 }
 
 fn get_main_input_name(transform: &PTransform) -> Result<String, BeamTranslationError> {
