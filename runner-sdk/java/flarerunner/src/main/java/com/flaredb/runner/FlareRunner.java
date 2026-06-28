@@ -111,7 +111,8 @@ public class FlareRunner extends PipelineRunner<FlarePipelineJob> {
             // jobs never return a response.
             RunJobResponse runJobResponse = jobService.run(runJobRequest);
 
-            LOG.info("RunJobResponse received for jobName={}", options.getJobName());
+            LOG.info("RunJobResponse received jobName={}", options.getJobName());
+            LOG.info("Job Eexecution Completed");
             ByteString jobId = runJobResponse.getJobIdBytes();
 
             return new FlarePipelineJob(jobId);
