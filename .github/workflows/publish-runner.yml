@@ -1,11 +1,6 @@
 name: Publish Flare Runner SDK
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - runnersdk
-    paths:
-      - "runner-sdk/java/flarerunner/**"
 permissions:
   contents: read
   packages: write
