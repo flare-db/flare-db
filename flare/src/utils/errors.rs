@@ -36,6 +36,15 @@ pub enum HarnessError {
 }
 
 #[derive(Debug, thiserror::Error)]
+pub enum CodersError {
+    #[error("Error while decoding: {0}")]
+    WhileDecoding(String),
+
+    #[error("Error while encoding: {0}")]
+    WhileEncoding(String),
+}
+
+#[derive(Debug, thiserror::Error)]
 pub enum ElementStoreError {
     #[error("Failed to open database: {0}")]
     Open(String),

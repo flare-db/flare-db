@@ -2,9 +2,9 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use anyhow::{Result, anyhow};
 use beam_model_rs::v1::{
-    ApiServiceDescriptor, GetProcessBundleDescriptorRequest, InstructionRequest,
-    InstructionResponse, ProcessBundleDescriptor, ProcessBundleRequest, ProcessBundleResponse,
-    RegisterRequest, beam_fn_control_server::BeamFnControl, instruction_request,
+    GetProcessBundleDescriptorRequest, InstructionRequest, InstructionResponse,
+    ProcessBundleDescriptor, ProcessBundleRequest, ProcessBundleResponse, RegisterRequest,
+    beam_fn_control_server::BeamFnControl, instruction_request,
 };
 use log::info;
 use tokio::sync::{Mutex, mpsc};
@@ -239,10 +239,10 @@ impl ControlChannel {
     pub async fn send_process_bundle_request(&mut self, descriptor_id: &String) -> Result<String> {
         let id = self.next_id();
 
-        let endpoint = ApiServiceDescriptor {
+        /* s let _endpoint = ApiServiceDescriptor {
             url: "127.0.0.1:8099".to_string(),
             ..Default::default()
-        };
+        };*/
 
         self.outgoing
             .send(Ok(InstructionRequest {

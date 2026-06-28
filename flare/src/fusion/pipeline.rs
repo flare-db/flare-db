@@ -372,7 +372,7 @@ pub struct ConsumerMetaData {
 
 #[derive(Debug, Clone)]
 pub struct FusedPipeline {
-    components: Components,
+    //components: Components,
     sdk_stages: IndexSet<ExecutableStage>,
     runner_stages: IndexSet<PTransformNode>,
     //requirements: HashSet<String>,
@@ -380,13 +380,13 @@ pub struct FusedPipeline {
 
 impl FusedPipeline {
     pub fn of(
-        components: Components,
+        // components: Components,
         sdk_stages: IndexSet<ExecutableStage>,
         runner_stages: IndexSet<PTransformNode>,
         //requirements: HashSet<String>,
     ) -> Self {
         Self {
-            components,
+            // components,
             sdk_stages,
             runner_stages,
             // requirements,

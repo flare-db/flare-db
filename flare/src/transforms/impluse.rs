@@ -1,3 +1,5 @@
+use anyhow::Error;
+use async_trait::async_trait;
 use beam_model_rs::v1::{
     ApiServiceDescriptor, Coder, Components, Environment, FunctionSpec, PCollection, PTransform,
     RemoteGrpcPort, WindowingStrategy,
@@ -5,8 +7,7 @@ use beam_model_rs::v1::{
 use log::info;
 use prost::Message;
 
-use crate::engine::executor::NewCollectionRequest;
-use crate::engine::store::BeamValue;
+use crate::engine::store::{BeamRecord, NewCollectionRequest, PrimitiveValue};
 use crate::jobservice::urns::beam_urns;
 use crate::transforms::{ExecutionContext, FlareTransform};
 use std::collections::{HashMap, HashSet};
@@ -22,6 +23,7 @@ pub struct Impulse {
     outputs: HashMap<String, String>,
 }
 
+#[async_trait]
 impl FlareTransform for Impulse {
     // type Context = ImpluseContext;
 
@@ -46,15 +48,17 @@ impl FlareTransform for Impulse {
         }
     }
 
-    fn execute(&self, ctx: ExecutionContext) {
+    async fn execute(&self, ctx: ExecutionContext) -> Result<(), Error> {
         info!("Executing impluse transfrom");
-        let elements = vec![BeamValue::Bytes(Vec::new())];
+        let elements = vec![BeamRecord::PRIMITIVE(PrimitiveValue::Bytes(Vec::new()))];
         let request = NewCollectionRequest {
             pcollection_id: ctx.output_pcollection_id.clone(),
-            elements,
+            elements: elements,
         };
 
-        ctx.store.insert_new_collection(request);
+        info!("New Collection request {:?}", request);
+        ctx.store.write_collection(request).await?;
+        Ok(())
     }
 
     fn output_pcol_ids(&self) -> HashSet<String> {
