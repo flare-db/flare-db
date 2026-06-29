@@ -41,17 +41,33 @@ pub struct StageExecutor {
     pipeline_coders: Arc<HashMap<String, Coder>>,
     graph: Option<ExecutableGraph>,
     store: Arc<FlareElementStore>,
+    instance_id: String,
 }
 
 impl StageExecutor {
-    pub fn new(control: ControlChannel, data: DataChannel) -> Self {
+    pub fn new(control: ControlChannel, data: DataChannel, instance_id: &str) -> Self {
+        let base_store_path = crate::utils::path::instance_dir(instance_id).join("store");
+        let base_store_path_str = base_store_path.to_str().unwrap_or(".").to_string();
         Self {
             control,
             data,
             pipeline_coders: Arc::new(HashMap::new()),
             graph: None,
-            store: Arc::new(FlareElementStore::new(FlareSchemaRegistry::new())),
+            store: Arc::new(FlareElementStore::with_base_path(
+                FlareSchemaRegistry::new(),
+                base_store_path_str,
+            )),
+            instance_id: instance_id.to_string(),
         }
+    }
+
+    pub fn set_job_store(&mut self, job_id: &str) {
+        let job_store_path = crate::utils::path::store_dir(&self.instance_id, job_id);
+        let job_store_base = job_store_path.to_str().unwrap_or(".").to_string();
+        self.store = Arc::new(FlareElementStore::with_base_path(
+            FlareSchemaRegistry::new(),
+            job_store_base,
+        ));
     }
 
     pub async fn wait_connected(&self) -> anyhow::Result<()> {

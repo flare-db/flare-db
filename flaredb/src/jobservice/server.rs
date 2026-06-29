@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::{process::Stdio, sync::Arc, time::Duration};
 
 use beam_model_rs::v1::{
@@ -37,6 +36,7 @@ pub struct FlareJobService {
     artifact_store: Arc<ArtifactStore>,
     harness_cfg: HarnessLaunchConfig,
     staging_tokens: Arc<DashSet<String>>,
+    instance_id: String,
 }
 
 impl FlareJobService {
@@ -44,6 +44,7 @@ impl FlareJobService {
         executor: StageExecutor,
         artifact_store: Arc<ArtifactStore>,
         harness_cfg: HarnessLaunchConfig,
+        instance_id: String,
     ) -> Self {
         Self {
             job_store: JobStore::new(),
@@ -51,6 +52,7 @@ impl FlareJobService {
             artifact_store,
             harness_cfg,
             staging_tokens: Arc::new(DashSet::new()),
+            instance_id,
         }
     }
 
@@ -82,14 +84,12 @@ impl FlareJobService {
             )));
         }
 
-        tokio::fs::create_dir_all(&self.harness_cfg.logs_dir)
+        let logs_dir = crate::utils::path::logs_dir(&self.instance_id, job_id);
+        tokio::fs::create_dir_all(&logs_dir)
             .await
             .map_err(|e| Status::internal(format!("failed to create logs dir: {}", e)))?;
 
-        let log_path = format!(
-            "{}/worker-harness-{}.log",
-            self.harness_cfg.logs_dir, job_id
-        );
+        let log_path = format!("{}/flare-worker.log", logs_dir.display());
         let stdout_file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -174,7 +174,7 @@ impl JobService for FlareJobService {
                 Status::invalid_argument("Pipeline is missing")
             })?;
 
-            let job = Job::new(pipeline);
+            let job = Job::new(&self.instance_id, pipeline);
             let job_id = job.job_id;
             self.job_store.add_job(&job_id, job.graph);
 
@@ -236,6 +236,7 @@ impl JobService for FlareJobService {
             self.spawn_harness(&preparation_id).await?;
 
             let executor = self.executor.clone();
+            executor.lock().await.set_job_store(&preparation_id);
             timeout(
                 Duration::from_secs(self.harness_cfg.connect_timeout_secs),
                 async {

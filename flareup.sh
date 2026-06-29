@@ -28,8 +28,26 @@ trap cleanup EXIT INT TERM
 
 cd "${REPO_DIR}"
 
-echo "Starting Flare server on localhost:8099..."
-RUST_LOG=info cargo run -p flare >"${FLARE_LOG}" 2>&1 &
+echo "Starting FlareDB server on localhost:8099..."
+# ensure default base directory exists and pass it to flaredb as first arg
+BASE_DIR="${HOME}/.flaredb"
+mkdir -p "${BASE_DIR}"
+
+# generate a new instance id every time the script runs
+if command -v uuidgen >/dev/null 2>&1; then
+    INSTANCE_ID="$(uuidgen)"
+else
+    INSTANCE_ID="$(date +%s)-$$"
+fi
+
+# create per-instance directory and logs dir
+INSTANCE_DIR="${BASE_DIR}/${INSTANCE_ID}"
+INSTANCE_LOG_DIR="${INSTANCE_DIR}/logs"
+mkdir -p "${INSTANCE_LOG_DIR}"
+FLARE_LOG="${INSTANCE_LOG_DIR}/flare-server.log"
+
+# launch flaredb with the base dir arg and set FLAREDB_INSTANCE_ID for the server process
+RUST_LOG=info FLAREDB_INSTANCE_ID="${INSTANCE_ID}" cargo run -p flaredb -- "${BASE_DIR}" >"${FLARE_LOG}" 2>&1 &
 SERVER_PID=$!
 
 port_ready() {
@@ -40,7 +58,7 @@ port_ready() {
     fi
 }
 
-echo "Waiting for Flare server to be ready..."
+echo "Waiting for Flare server to be start..."
 for _ in {1..60}; do
     if port_ready; then
         break
@@ -54,9 +72,11 @@ if ! port_ready; then
     exit 1
 fi
 
-echo "FlareDB server ready."
+echo "Flared up! 🔥🔥"
 echo ""
-echo "  FlareDB log : tail -f \"${FLARE_LOG}\""
-echo "  Worker logs : ${LOG_DIR}"
+echo "  FlareDB server logs : ${FLARE_LOG}"
+echo "  Worker logs        : ${INSTANCE_LOG_DIR}"
 echo ""
+echo "FlareDB is ready."
+echo "SDK workers will be started automatically when jobs are submitted from the Runner SDK."
 wait "${SERVER_PID}"

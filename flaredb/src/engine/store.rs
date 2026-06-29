@@ -829,10 +829,8 @@ pub struct FlareElementStore {
 
 impl FlareElementStore {
     pub fn new(registry: FlareSchemaRegistry) -> Self {
-        Self::with_base_path(
-            registry,
-            "/home/ganesh/flare-db/tonbo/pipeline6".to_string(),
-        )
+        let default_base = crate::utils::path::base_dir().join("store");
+        Self::with_base_path(registry, default_base.to_str().unwrap_or(".").to_string())
     }
 
     pub fn with_base_path(registry: FlareSchemaRegistry, base_path: String) -> Self {
