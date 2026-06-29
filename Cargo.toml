@@ -1,3 +1,0 @@
-[workspace]
-members = ["beam-model-rs", "flaredb"]
-resolver = "2"

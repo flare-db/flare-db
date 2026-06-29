@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-beam-model-rs = { path = "../beam-model-rs" }
+beam-model-rs = "2.70.0"
 tokio-stream = "0.1.18"
 tonic = "0.14.2"
 tokio = { version = "1.38", features = [
