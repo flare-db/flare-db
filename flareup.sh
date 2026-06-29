@@ -58,7 +58,7 @@ port_ready() {
     fi
 }
 
-echo "Waiting for Flare server to be start..."
+echo "Waiting for Flare server to start..."
 for _ in {1..60}; do
     if port_ready; then
         break
@@ -67,7 +67,7 @@ for _ in {1..60}; do
 done
 
 if ! port_ready; then
-    echo "Flare server did not become ready on localhost:8099."
+    echo "Flare server failed to start on localhost:8099."
     echo "Check logs: ${FLARE_LOG}"
     exit 1
 fi
@@ -75,7 +75,8 @@ fi
 echo "Flared up! 🔥🔥"
 echo ""
 echo "  FlareDB server logs : ${FLARE_LOG}"
-echo "  Worker logs        : ${INSTANCE_LOG_DIR}"
+echo "  Instance Dir        : ${INSTANCE_DIR}"
+echo "  Worker logs         : will be availabe during execution at ${INSTANCE_DIR} under unique jobid"
 echo ""
 echo "FlareDB is ready."
 echo "SDK workers will be started automatically when jobs are submitted from the Runner SDK."

@@ -183,7 +183,7 @@ impl JobService for FlareJobService {
             let response = PrepareJobResponse {
                 preparation_id: job_id.clone(),
                 artifact_staging_endpoint: Some(ApiServiceDescriptor {
-                    url: String::from("127.0.0.1:8099"),
+                    url: crate::DEFAULT_API_SERVICE_URL.to_string(),
                     authentication: None,
                 }),
                 staging_session_token: new_token.clone(),
