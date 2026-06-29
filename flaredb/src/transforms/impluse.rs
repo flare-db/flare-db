@@ -114,7 +114,7 @@ impl FlareTransform for Impulse {
         // harness which coder to use for the inbound elements.
         let payload = RemoteGrpcPort {
             api_service_descriptor: Some(ApiServiceDescriptor {
-                url: "127.0.0.1:8099".to_string(),
+                url: crate::DEFAULT_API_SERVICE_URL.to_string(),
                 authentication: None,
             }),
             coder_id: "windowed_value_coder_id".to_string(),

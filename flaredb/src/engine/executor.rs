@@ -151,18 +151,6 @@ impl StageExecutor {
             current_level = next_level.into_iter().collect();
         }
         Ok(())
-        // stream_elements write elements to the mpmc channel that StageExecutor ownes
-        // later on we read the elements in execute_node by polling element of that instruction id
-        // and deserilized or writeten to tonbo as a input to next stage or
-        // to perform whatever the operation is like gbk or cgbk etc..
-
-        // Code Pocl metdata into Consumer edge so that we could emit the right pocl to the next stage
-        // as input
-
-        // decide here on how to send eleemnts to next stage to the worker
-        // use the edge pocl metadata
-
-        // call the scheduler to decide on which node to execute next based on edge connection
     }
 
     pub async fn execute_node(
@@ -345,7 +333,7 @@ impl StageExecutor {
                     info!("Runner node output metadata: {:?}", output_edge_metadata);
 
                     let endpoint = ApiServiceDescriptor {
-                        url: "127.0.0.1:8099".to_string(),
+                        url: crate::DEFAULT_API_SERVICE_URL.to_string(),
                         ..Default::default()
                     };
 
@@ -565,7 +553,7 @@ impl StageExecutor {
         stage: &ExecutableStage,
     ) -> Result<ControlResponse, anyhow::Error> {
         let endpoint = ApiServiceDescriptor {
-            url: "127.0.0.1:8099".to_string(),
+            url: crate::DEFAULT_API_SERVICE_URL.to_string(),
             ..Default::default()
         };
 
@@ -713,8 +701,3 @@ pub struct ProcessInputContext {
     input_component_coder_ids: Option<Vec<String>>,
     pipeline_coders: Arc<HashMap<String, Coder>>,
 }
-// transform_id in the data payload is the the id of the transfrom that produced the pcollection
-// so we could use transform_id to get the pcol id that it producted and then get the
-// decoder for that pcol and decode and process the elemenets.
-// decoing should be async task so we can spwan parallel task to the job
-// check out how beam does decoding

@@ -19,7 +19,7 @@ pub struct Job {
 
 impl Job {
     pub fn new(instance_id: &str, pipeline: &Pipeline) -> Self {
-        let job_id = Uuid::new_v4().to_string();
+        let job_id = format!("jobid{}", Uuid::new_v4());
         let graph = Self::create_job(instance_id, &job_id, pipeline);
         Self { job_id, graph }
     }
