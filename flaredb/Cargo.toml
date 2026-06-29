@@ -1,7 +1,11 @@
 [package]
 name = "flaredb"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
+description = "Apache Beam native streaming database"
+license = "Apache-2.0"
+repository = "https://github.com/flare-db/flare-db/tree/main/beam-model-rs"
+authors = ["Ganesh Sivakumar"]
 
 [dependencies]
 beam-model-rs = "2.70.0"

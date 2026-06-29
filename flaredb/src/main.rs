@@ -52,9 +52,17 @@ async fn flare_up() -> Result<(), Box<dyn std::error::Error>> {
     let (_state_channel, state_server) = start_state_server().await?;
 
     let executor = StageExecutor::new(control_channel, data_channel, &instance_id);
+
+    let worker_jar = std::env::var("WORKER_JAR_PATH").unwrap_or_else(|_| {
+        format!(
+            "{}/bin/beam-sdks-java-harness-2.72.0-flare-bundled.jar",
+            std::env::args().nth(1).unwrap_or_else(|| ".".to_string())
+        )
+    });
+
     let harness_cfg = HarnessLaunchConfig {
-        worker_jar: "/home/ganesh/flare-db/tonboint/flare-db/harness/beam-sdks-java-harness-2.72.0-SNAPSHOT-flare-bundled.jar".to_string(),
-        logs_dir:  artifact_root_str.to_string(),
+        worker_jar,
+        logs_dir: artifact_root_str.to_string(),
         control_url: flaredb::DEFAULT_API_SERVICE_URL.to_string(),
         pipeline_options: "{}".to_string(),
         connect_timeout_secs: 20,
