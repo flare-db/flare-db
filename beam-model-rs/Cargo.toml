@@ -4,6 +4,8 @@ version = "2.70.0"
 edition = "2024"
 description = "Rust types and Protocol Buffers generated from the Apache Beam model."
 license = "Apache-2.0"
+repository = "https://github.com/flare-db/flare-db/tree/main/beam-model-rs"
+authors = ["Ganesh Sivakumar"]
 
 [dependencies]
 prost = "0.14.1"
