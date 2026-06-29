@@ -1,4 +1,4 @@
-use flare::{
+use flaredb::{
     engine::{
         executor::StageExecutor,
         harness::{

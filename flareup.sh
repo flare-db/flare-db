@@ -29,7 +29,7 @@ trap cleanup EXIT INT TERM
 cd "${REPO_DIR}"
 
 echo "Starting Flare server on localhost:8099..."
-RUST_LOG=info cargo run -p flare >"${FLARE_LOG}" 2>&1 &
+RUST_LOG=info cargo run -p flaredb >"${FLARE_LOG}" 2>&1 &
 SERVER_PID=$!
 
 port_ready() {
