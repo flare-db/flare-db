@@ -2,6 +2,7 @@ use crate::fusion::fuser::GreedyPipelineFuser;
 use crate::fusion::pipeline::{ExecutableGraph, FusedPipeline, PTransformNode, QueryablePipeline};
 use crate::fusion::stage::CollectionConsumers;
 use crate::utils::errors::*;
+use crate::utils::path;
 use crate::utils::visualization::executable_graph_to_dot;
 use beam_model_rs::v1::Pipeline;
 use dashmap::DashMap;
@@ -17,33 +18,32 @@ pub struct Job {
 }
 
 impl Job {
-    pub fn new(pipeline: &Pipeline) -> Self {
-        Self {
-            job_id: Uuid::new_v4().to_string(),
-            graph: Self::create_job(pipeline),
-        }
+    pub fn new(instance_id: &str, pipeline: &Pipeline) -> Self {
+        let job_id = Uuid::new_v4().to_string();
+        let graph = Self::create_job(instance_id, &job_id, pipeline);
+        Self { job_id, graph }
     }
 
-    fn create_job(pipeline: &Pipeline) -> ExecutableGraph {
+    fn create_job(instance_id: &str, job_id: &str, pipeline: &Pipeline) -> ExecutableGraph {
         info!("Creating a new job");
 
-        if let Err(error) = fs::create_dir_all("debug") {
+        // ensure debug dir exists for this job
+        let debug_path = path::debug_executable_graph_path(instance_id, job_id);
+        if let Err(error) = path::ensure_parent_for_file(&debug_path) {
             warn!("Failed to create debug output directory: {error}");
         }
 
         let fused_pipeline = fuse_pipeline(pipeline).unwrap();
-        if let Err(error) = fs::write("debug/fused_pipeline.txt", format!("{fused_pipeline:#?}")) {
+        /*let fused_out = path::instance_dir(instance_id).join(job_id).join("debug").join("fused_pipeline.txt");
+        if let Err(error) = fs::write(&fused_out, format!("{fused_pipeline:#?}")) {
             warn!("Failed to write formatted fused pipeline debug file: {error}");
-        }
+        }*/
         let executable_graph = ExecutableGraph::from(
             fused_pipeline.sdk_stages().clone(),
             fused_pipeline.runner_stages().clone(),
             pipeline.components.clone().unwrap(),
         );
-        if let Err(error) = fs::write(
-            "debug/executable_graph.dot",
-            executable_graph_to_dot(&executable_graph),
-        ) {
+        if let Err(error) = fs::write(&debug_path, executable_graph_to_dot(&executable_graph)) {
             warn!("Failed to write executable graph DOT debug file: {error}");
         }
         info!("Built executable graph");

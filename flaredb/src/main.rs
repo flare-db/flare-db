@@ -32,23 +32,35 @@ async fn main() {
 async fn flare_up() -> Result<(), Box<dyn std::error::Error>> {
     let addr: SocketAddr = "127.0.0.1:8099".parse()?;
 
+    //set base dir
+    if let Some(base_dir) = std::env::args().nth(1) {
+        flaredb::utils::path::set_base_dir(&base_dir);
+    }
+
+    // instance id
+    let instance_id =
+        std::env::var("FLAREDB_INSTANCE_ID").unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
+
+    let artifact_root = flaredb::utils::path::instance_dir(&instance_id);
+    let artifact_root_str = artifact_root.to_str().unwrap_or(".");
     let artifact_store =
-        Arc::new(ArtifactStore::from("/home/ganesh/Dev/flaredir/new", "kafka-to-pinecone").await?);
+        Arc::new(ArtifactStore::from(artifact_root_str, "pipeline-artifact").await?);
 
     let (control_channel, control_server) = start_control_server().await?;
     let (data_channel, data_server) = start_data_server().await?;
     let (_log_channel, log_server) = start_log_server().await?;
     let (_state_channel, state_server) = start_state_server().await?;
 
-    let executor = StageExecutor::new(control_channel, data_channel);
+    let executor = StageExecutor::new(control_channel, data_channel, &instance_id);
     let harness_cfg = HarnessLaunchConfig {
         worker_jar: "/home/ganesh/flare-db/tonboint/flare-db/harness/beam-sdks-java-harness-2.72.0-SNAPSHOT-flare-bundled.jar".to_string(),
-        logs_dir:  "/home/ganesh/flare-db/tonboint/flare-db/logs".to_string(),
+        logs_dir:  artifact_root_str.to_string(),
         control_url: "localhost:8099".to_string(),
         pipeline_options: "{}".to_string(),
         connect_timeout_secs: 20,
     };
-    let job_service = FlareJobService::with(executor, artifact_store.clone(), harness_cfg);
+    let job_service =
+        FlareJobService::with(executor, artifact_store.clone(), harness_cfg, instance_id);
 
     let artifact_service =
         FlareArtifactStagingService::new(artifact_store, job_service.get_staging_tokens());
