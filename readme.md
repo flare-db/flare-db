@@ -53,6 +53,20 @@ mvn exec:java -Dexec.mainClass="com.flaredb.example.WordCount"
 
 The pipeline will be submitted to the local FlareDB instance and executed by the engine. Execution logs and pipeline output can be found in the logging directory created during startup.
 
+### Building from source
+
+If you'd like to build and run FlareDB from source, or if you're using macOS, Windows, or a platform other than Linux (x86_64), you'll need to build FlareDB locally. First, install Rust and Cargo, then run the development startup script.
+
+```bash
+# build the project
+cd flaredb && cargo build
+
+chmod +x flareup-dev.sh
+
+./flareup-dev.sh
+
+```
+
 ## Status
 
 **FlareDB V0.1.0** is the first public release of FlareDB. It lays the foundation for a streaming database and its execution engine.

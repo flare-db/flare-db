@@ -73,8 +73,6 @@ async fn flare_up() -> Result<(), Box<dyn std::error::Error>> {
     let artifact_service =
         FlareArtifactStagingService::new(artifact_store, job_service.get_staging_tokens());
 
-    println!("Flared up 🔥 at {}", addr);
-
     Server::builder()
         .add_service(JobServiceServer::new(job_service))
         .add_service(ArtifactStagingServiceServer::new(artifact_service))
