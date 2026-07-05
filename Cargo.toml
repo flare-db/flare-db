@@ -1,0 +1,9 @@
+[workspace]
+resolver = "2"
+
+members = ["beam-model-rs", "flaredb"]
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
