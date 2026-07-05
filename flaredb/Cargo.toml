@@ -4,7 +4,7 @@ version = "0.1.1"
 edition = "2024"
 description = "Apache Beam native streaming database"
 license = "Apache-2.0"
-repository = "https://github.com/flare-db/flare-db/tree/main/beam-model-rs"
+repository = "https://github.com/flare-db/flare-db"
 authors = ["Ganesh Sivakumar"]
 
 [dependencies]
