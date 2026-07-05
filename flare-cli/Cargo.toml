@@ -4,3 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = "1.0.103"
+clap = { version = "4.6.1", features = ["derive"] }
+indicatif = "0.18.6"
+reqwest = { version = "0.11", features = ["rustls-tls"] }
+tokio = { version = "1.44", features = ["rt-multi-thread", "macros", "fs"] }
+tar = "0.4"
+xz2 = "0.1"
+zip = "0.6"
+dirs = "5"
