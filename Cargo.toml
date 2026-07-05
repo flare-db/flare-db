@@ -1,7 +1,9 @@
 [workspace]
 resolver = "2"
 
-members = ["beam-model-rs", "flaredb"]
+members = ["flaredb"]
+
+#"beam-model-rs"
 
 # The profile that 'dist' will build with
 [profile.dist]
