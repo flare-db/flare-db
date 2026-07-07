@@ -22,11 +22,11 @@ pub fn base_dir() -> PathBuf {
 }
 
 pub fn instance_dir(instance_id: &str) -> PathBuf {
-    base_dir().join(instance_id)
+    base_dir().join("instances").join(instance_id)
 }
 
 pub fn job_dir(instance_id: &str, job_id: &str) -> PathBuf {
-    instance_dir(instance_id).join(job_id)
+    instance_dir(instance_id).join("jobs").join(job_id)
 }
 
 pub fn artifacts_dir(instance_id: &str, job_id: &str) -> PathBuf {

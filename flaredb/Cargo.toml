@@ -1,6 +1,6 @@
 [package]
 name = "flaredb"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 description = "Apache Beam native streaming database"
 license = "Apache-2.0"
@@ -35,6 +35,7 @@ async-trait = "0.1.89"
 bytes = "1.11.1"
 fs = "0.0.5"
 tokio-util = { version = "0.7.18", features = ["rt"] }
+#clap = "4.6.1"
 [dependencies.uuid]
 version = "1.23.1"
 features = ["v4"]
