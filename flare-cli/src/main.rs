@@ -1,6 +1,8 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+const FLAREDB_VERSION: &str = "0.1.8";
+
 #[derive(Parser)]
 #[command(name = "flare")]
 #[command(version)]
@@ -37,6 +39,7 @@ pub mod init {
     use anyhow::bail;
     //#[cfg(not(unix))]
     //use anyhow::bail;
+    use crate::FLAREDB_VERSION;
     use anyhow::{Context, Result};
     use indicatif::{ProgressBar, ProgressStyle};
     use std::fs;
@@ -63,11 +66,10 @@ pub mod init {
         })?;
 
         let (asset_filename, archive_type) = detect_flaredb_asset()?;
-        let flaredb_version = "0.1.7";
         let binary_name = if cfg!(windows) {
-            format!("flaredb-{}.exe", flaredb_version)
+            format!("flaredb-{}.exe", FLAREDB_VERSION)
         } else {
-            format!("flaredb-{}", flaredb_version)
+            format!("flaredb-{}", FLAREDB_VERSION)
         };
         let binary_path = bin_dir.join(&binary_name);
 
@@ -76,8 +78,8 @@ pub mod init {
         } else {
             let archive_path = bin_dir.join(&asset_filename);
             let download_url = format!(
-                "https://github.com/flare-db/flare-db/releases/download/flaredb-v0.1.7/{}",
-                asset_filename
+                "https://github.com/flare-db/flare-db/releases/download/flaredb-v{}/{}",
+                FLAREDB_VERSION, asset_filename
             );
 
             download_with_progress(&download_url, &archive_path).await?;
@@ -302,6 +304,7 @@ pub mod init {
 mod server {
     use super::process_control;
     use super::state;
+    use crate::FLAREDB_VERSION;
     use anyhow::{Context, Result, bail};
     use std::fs::{self, OpenOptions};
     use std::process::Stdio;
@@ -311,7 +314,6 @@ mod server {
     use uuid::Uuid;
 
     const PORT: u16 = 8099;
-    const FLAREDB_VERSION: &str = "0.1.7";
     const WORKER_JAR_NAME: &str = "beam-sdks-java-harness-2.72.0-flare-bundled.jar";
 
     pub async fn up() -> Result<()> {
@@ -584,7 +586,9 @@ mod state {
 }
 
 mod process_control {
-    use anyhow::{Context, Result, bail};
+    #[cfg(not(unix))]
+    use anyhow::bail;
+    use anyhow::{Context, Result};
     #[cfg(unix)]
     use sysinfo::Signal;
     use sysinfo::{Pid, ProcessesToUpdate, System};

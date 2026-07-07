@@ -25,5 +25,5 @@ sysinfo = "0.33"
 
 
 [[bin]]
-name = "flaredb"
+name = "flare"
 path = "src/main.rs"
