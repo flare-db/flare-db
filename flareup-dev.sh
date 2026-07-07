@@ -116,9 +116,10 @@ fi
 
 echo "Flared up! 🔥🔥"
 echo ""
+echo "  Instance ID         : ${INSTANCE_ID}"
 echo "  FlareDB server logs : ${FLARE_LOG}"
-echo "  Instance Dir        : ${INSTANCE_DIR}"
-echo "  Worker logs         : will be availabe during execution at ${INSTANCE_DIR} under unique jobid"
+echo "  Worker logs path    : ${INSTANCE_LOG_DIR}/jobs/<job-id>/logs/flare-worker.log"
+echo "                        Check this location for worker logs after submitting jobs."
 echo ""
 echo "FlareDB is ready."
 echo "SDK workers will be started automatically when jobs are submitted from the Runner SDK."
