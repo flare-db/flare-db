@@ -63,7 +63,7 @@ pub mod init {
         })?;
 
         let (asset_filename, archive_type) = detect_flaredb_asset()?;
-        let flaredb_version = "0.1.6";
+        let flaredb_version = "0.1.7";
         let binary_name = if cfg!(windows) {
             format!("flaredb-{}.exe", flaredb_version)
         } else {
@@ -76,7 +76,7 @@ pub mod init {
         } else {
             let archive_path = bin_dir.join(&asset_filename);
             let download_url = format!(
-                "https://github.com/flare-db/flare-db/releases/download/flaredb-v0.1.6/{}",
+                "https://github.com/flare-db/flare-db/releases/download/flaredb-v0.1.7/{}",
                 asset_filename
             );
 
@@ -311,7 +311,7 @@ mod server {
     use uuid::Uuid;
 
     const PORT: u16 = 8099;
-    const FLAREDB_VERSION: &str = "0.1.6";
+    const FLAREDB_VERSION: &str = "0.1.7";
     const WORKER_JAR_NAME: &str = "beam-sdks-java-harness-2.72.0-flare-bundled.jar";
 
     pub async fn up() -> Result<()> {
