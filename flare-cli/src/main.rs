@@ -34,7 +34,10 @@ async fn main() -> Result<()> {
 }
 
 pub mod init {
-    use anyhow::{Context, Result, bail};
+    use anyhow::bail;
+    #[cfg(not(unix))]
+    use anyhow::bail;
+    use anyhow::{Context, Result};
     use indicatif::{ProgressBar, ProgressStyle};
     use std::fs;
     use std::io;
@@ -60,7 +63,7 @@ pub mod init {
         })?;
 
         let (asset_filename, archive_type) = detect_flaredb_asset()?;
-        let flaredb_version = "0.1.5";
+        let flaredb_version = "0.1.6";
         let binary_name = if cfg!(windows) {
             format!("flaredb-{}.exe", flaredb_version)
         } else {
@@ -73,7 +76,7 @@ pub mod init {
         } else {
             let archive_path = bin_dir.join(&asset_filename);
             let download_url = format!(
-                "https://github.com/flare-db/flare-db/releases/download/flaredb-v0.1.5/{}",
+                "https://github.com/flare-db/flare-db/releases/download/flaredb-v0.1.6/{}",
                 asset_filename
             );
 
@@ -308,7 +311,7 @@ mod server {
     use uuid::Uuid;
 
     const PORT: u16 = 8099;
-    const FLAREDB_VERSION: &str = "0.1.5";
+    const FLAREDB_VERSION: &str = "0.1.6";
     const WORKER_JAR_NAME: &str = "beam-sdks-java-harness-2.72.0-flare-bundled.jar";
 
     pub async fn up() -> Result<()> {
@@ -581,8 +584,10 @@ mod state {
 }
 
 mod process_control {
-    use anyhow::{Context, Result};
-    use sysinfo::{Pid, ProcessesToUpdate, Signal, System};
+    use anyhow::{Context, Result, bail};
+    #[cfg(unix)]
+    use sysinfo::Signal;
+    use sysinfo::{Pid, ProcessesToUpdate, System};
 
     fn refresh_system() -> System {
         let mut system = System::new();
@@ -615,9 +620,10 @@ mod process_control {
 
         #[cfg(not(unix))]
         {
-            process
-                .kill()
-                .with_context(|| format!("failed to terminate pid {}", pid))?;
+            let killed = process.kill();
+            if !killed {
+                bail!("failed to terminate pid {}", pid);
+            }
         }
 
         Ok(())
@@ -639,9 +645,10 @@ mod process_control {
 
         #[cfg(not(unix))]
         {
-            process
-                .kill()
-                .with_context(|| format!("failed to terminate pid {}", pid))?;
+            let killed = process.kill();
+            if !killed {
+                bail!("failed to terminate pid {}", pid);
+            }
         }
 
         Ok(())
