@@ -12,10 +12,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    // Intial setup
     Init,
-
+    // Start FlareDB instance
     Up,
-
+    // Stop FlareDB instance
     Down,
 }
 
@@ -25,8 +26,8 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Init => init::init().await?,
-        Commands::Up => {}
-        Commands::Down => {}
+        Commands::Up => server::up().await?,
+        Commands::Down => server::down().await?,
     }
 
     Ok(())
@@ -59,7 +60,7 @@ pub mod init {
         })?;
 
         let (asset_filename, archive_type) = detect_flaredb_asset()?;
-        let flaredb_version = "0.1.4";
+        let flaredb_version = "0.1.5";
         let binary_name = if cfg!(windows) {
             format!("flaredb-{}.exe", flaredb_version)
         } else {
@@ -72,7 +73,7 @@ pub mod init {
         } else {
             let archive_path = bin_dir.join(&asset_filename);
             let download_url = format!(
-                "https://github.com/flare-db/flare-db/releases/download/flaredb-v0.1.4/{}",
+                "https://github.com/flare-db/flare-db/releases/download/flaredb-v0.1.5/{}",
                 asset_filename
             );
 
@@ -291,6 +292,358 @@ pub mod init {
                 format!("failed to set executable permission on {}", path.display())
             })?;
         }
+        Ok(())
+    }
+}
+
+mod server {
+    use super::process_control;
+    use super::state;
+    use anyhow::{Context, Result, bail};
+    use std::fs::{self, OpenOptions};
+    use std::process::Stdio;
+    use tokio::net::TcpStream;
+    use tokio::process::Command;
+    use tokio::time::{Duration, sleep};
+    use uuid::Uuid;
+
+    const PORT: u16 = 8099;
+    const FLAREDB_VERSION: &str = "0.1.5";
+    const WORKER_JAR_NAME: &str = "beam-sdks-java-harness-2.72.0-flare-bundled.jar";
+
+    pub async fn up() -> Result<()> {
+        let home_dir = dirs::home_dir().context("failed to determine home directory")?;
+        let base_dir = home_dir.join(".flaredb");
+        let bin_dir = base_dir.join("bin");
+        let instances_dir = base_dir.join("instances");
+        let state_path = state::state_path(&base_dir);
+
+        if state_path.exists() {
+            let existing_state = state::load_state(&state_path)?;
+            if process_control::is_alive(existing_state.pid) {
+                bail!(
+                    "FlareDB already running (pid {}, instance {}). Run 'flare down' first.",
+                    existing_state.pid,
+                    existing_state.instance_id
+                );
+            }
+
+            println!(
+                "Found stale state for pid {} from instance {}. Removing stale state.",
+                existing_state.pid, existing_state.instance_id
+            );
+            fs::remove_file(&state_path).with_context(|| {
+                format!("failed to remove stale state {}", state_path.display())
+            })?;
+        }
+
+        let binary_name = if cfg!(windows) {
+            format!("flaredb-{}.exe", FLAREDB_VERSION)
+        } else {
+            format!("flaredb-{}", FLAREDB_VERSION)
+        };
+        let binary_path = bin_dir.join(&binary_name);
+        let worker_jar_path = bin_dir.join(WORKER_JAR_NAME);
+
+        if !binary_path.exists() {
+            bail!(
+                "Missing FlareDB binary {}. Run 'flare init' first.",
+                binary_path.display()
+            );
+        }
+        if !worker_jar_path.exists() {
+            bail!(
+                "Missing worker jar {}. Run 'flare init' first.",
+                worker_jar_path.display()
+            );
+        }
+
+        fs::create_dir_all(&instances_dir).with_context(|| {
+            format!(
+                "failed to create instances directory {}",
+                instances_dir.display()
+            )
+        })?;
+
+        let instance_id = Uuid::new_v4().to_string();
+        let instance_log_dir = instances_dir.join(&instance_id).join("logs");
+        fs::create_dir_all(&instance_log_dir).with_context(|| {
+            format!(
+                "failed to create instance log dir {}",
+                instance_log_dir.display()
+            )
+        })?;
+
+        let log_file_path = instance_log_dir.join("flare-server.log");
+        let log_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_file_path)
+            .with_context(|| {
+                format!(
+                    "failed to create server log file {}",
+                    log_file_path.display()
+                )
+            })?;
+        let log_file_err = log_file.try_clone().with_context(|| {
+            format!(
+                "failed to clone log file handle for {}",
+                log_file_path.display()
+            )
+        })?;
+
+        let mut command = Command::new(&binary_path);
+        command
+            .arg(&base_dir)
+            .env("RUST_LOG", "info")
+            .env("FLAREDB_INSTANCE_ID", &instance_id)
+            .env("WORKER_JAR_PATH", &worker_jar_path)
+            .stdout(Stdio::from(log_file))
+            .stderr(Stdio::from(log_file_err))
+            .kill_on_drop(false);
+
+        let child = command.spawn().with_context(|| {
+            format!(
+                "failed to spawn flaredb server from {}",
+                binary_path.display()
+            )
+        })?;
+        let pid = child
+            .id()
+            .context("failed to obtain PID of spawned flaredb process")?;
+        drop(child);
+
+        let ready = wait_for_port_ready(PORT, Duration::from_millis(500), 60).await;
+        if !ready {
+            let _ = process_control::terminate_forceful(pid);
+            bail!(
+                "FlareDB did start. Check log at {}",
+                log_file_path.display()
+            );
+        }
+
+        let state = state::State {
+            pid,
+            instance_id: instance_id.clone(),
+            port: PORT,
+            log_dir: instance_log_dir.display().to_string(),
+            jobs: Vec::new(),
+        };
+        state::write_state(&state_path, &state)
+            .with_context(|| format!("failed to write state file {}", state_path.display()))?;
+
+        println!("Flared up! 🔥🔥");
+        println!("");
+        println!("  Instance ID         : {}", instance_id);
+        println!("  PID                 : {}", pid);
+        println!("  FlareDB server log  : {}", log_file_path.display());
+        println!("  State file          : {}", state_path.display());
+
+        Ok(())
+    }
+
+    pub async fn down() -> Result<()> {
+        let home_dir = dirs::home_dir().context("failed to determine home directory")?;
+        let base_dir = home_dir.join(".flaredb");
+        let state_path = state::state_path(&base_dir);
+
+        if !state_path.exists() {
+            println!("FlareDB is not running.");
+            return Ok(());
+        }
+
+        let state = state::load_state(&state_path)
+            .with_context(|| format!("failed to read state file {}", state_path.display()))?;
+
+        if !process_control::is_alive(state.pid) {
+            println!(
+                "Found stale state for pid {}. Removing state file.",
+                state.pid
+            );
+            fs::remove_file(&state_path)
+                .with_context(|| format!("failed to remove state file {}", state_path.display()))?;
+            return Ok(());
+        }
+
+        process_control::terminate_graceful(state.pid).with_context(|| {
+            format!("failed to request graceful shutdown for pid {}", state.pid)
+        })?;
+
+        let mut attempts = 0;
+        while attempts < 20 && process_control::is_alive(state.pid) {
+            sleep(Duration::from_millis(250)).await;
+            attempts += 1;
+        }
+
+        if process_control::is_alive(state.pid) {
+            process_control::terminate_forceful(state.pid)
+                .with_context(|| format!("failed to forcefully terminate pid {}", state.pid))?;
+
+            let mut attempts = 0;
+            while attempts < 20 && process_control::is_alive(state.pid) {
+                sleep(Duration::from_millis(250)).await;
+                attempts += 1;
+            }
+        }
+
+        if process_control::is_alive(state.pid) {
+            bail!("FlareDB process {} did not stop", state.pid);
+        }
+
+        let port_closed = wait_for_port_closed(state.port, Duration::from_millis(250), 60).await;
+        if !port_closed {
+            bail!("FlareDB port {} did not release after shutdown", state.port);
+        }
+
+        fs::remove_file(&state_path)
+            .with_context(|| format!("failed to remove state file {}", state_path.display()))?;
+
+        println!("FlareDB stopped and state file removed.");
+        Ok(())
+    }
+
+    async fn wait_for_port_ready(port: u16, interval: Duration, attempts: usize) -> bool {
+        for _ in 0..attempts {
+            if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+                return true;
+            }
+            sleep(interval).await;
+        }
+        false
+    }
+
+    async fn wait_for_port_closed(port: u16, interval: Duration, attempts: usize) -> bool {
+        for _ in 0..attempts {
+            if TcpStream::connect(("127.0.0.1", port)).await.is_err() {
+                return true;
+            }
+            sleep(interval).await;
+        }
+        false
+    }
+}
+
+mod state {
+    use anyhow::{Context, Result};
+    use serde::{Deserialize, Serialize};
+    use std::fs;
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
+
+    #[derive(Serialize, Deserialize)]
+    pub struct JobState {
+        pub id: String,
+        pub worker_log: String,
+        pub flaredb_log: String,
+        pub graph: String,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    pub struct State {
+        pub pid: u32,
+        pub instance_id: String,
+        pub port: u16,
+        pub log_dir: String,
+        pub jobs: Vec<JobState>,
+    }
+
+    pub fn state_path(base_dir: &Path) -> PathBuf {
+        base_dir.join("state.json")
+    }
+
+    pub fn load_state(path: &Path) -> Result<State> {
+        let file = fs::File::open(path)
+            .with_context(|| format!("failed to open state file {}", path.display()))?;
+        let state = serde_json::from_reader(file)
+            .with_context(|| format!("failed to parse state file {}", path.display()))?;
+        Ok(state)
+    }
+
+    pub fn write_state(path: &Path, state: &State) -> Result<()> {
+        let temp_path = path.with_extension("json.tmp");
+        let mut file = fs::File::create(&temp_path)
+            .with_context(|| format!("failed to create temp state file {}", temp_path.display()))?;
+        serde_json::to_writer_pretty(&mut file, state)
+            .with_context(|| format!("failed to serialize state to {}", temp_path.display()))?;
+        file.flush()
+            .with_context(|| format!("failed to flush temp state file {}", temp_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to sync temp state file {}", temp_path.display()))?;
+        fs::rename(&temp_path, path).with_context(|| {
+            format!(
+                "failed to rename {} to {}",
+                temp_path.display(),
+                path.display()
+            )
+        })?;
+        Ok(())
+    }
+}
+
+mod process_control {
+    use anyhow::{Context, Result};
+    use sysinfo::{Pid, ProcessesToUpdate, Signal, System};
+
+    fn refresh_system() -> System {
+        let mut system = System::new();
+        system.refresh_processes(ProcessesToUpdate::All, true);
+        system
+    }
+
+    fn pid_from_u32(pid: u32) -> Pid {
+        Pid::from(pid as usize)
+    }
+
+    pub fn is_alive(pid: u32) -> bool {
+        let system = refresh_system();
+        system.process(pid_from_u32(pid)).is_some()
+    }
+
+    pub fn terminate_graceful(pid: u32) -> Result<()> {
+        let mut system = System::new();
+        system.refresh_processes(ProcessesToUpdate::All, true);
+        let process = system
+            .process(pid_from_u32(pid))
+            .with_context(|| format!("process {} not found", pid))?;
+
+        #[cfg(unix)]
+        {
+            process
+                .kill_with(Signal::Term)
+                .with_context(|| format!("failed to send SIGTERM to pid {}", pid))?;
+        }
+
+        #[cfg(not(unix))]
+        {
+            process
+                .kill()
+                .with_context(|| format!("failed to terminate pid {}", pid))?;
+        }
+
+        Ok(())
+    }
+
+    pub fn terminate_forceful(pid: u32) -> Result<()> {
+        let mut system = System::new();
+        system.refresh_processes(ProcessesToUpdate::All, true);
+        let process = system
+            .process(pid_from_u32(pid))
+            .with_context(|| format!("process {} not found", pid))?;
+
+        #[cfg(unix)]
+        {
+            process
+                .kill_with(Signal::Kill)
+                .with_context(|| format!("failed to send SIGKILL to pid {}", pid))?;
+        }
+
+        #[cfg(not(unix))]
+        {
+            process
+                .kill()
+                .with_context(|| format!("failed to terminate pid {}", pid))?;
+        }
+
         Ok(())
     }
 }
