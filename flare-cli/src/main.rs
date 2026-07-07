@@ -438,12 +438,14 @@ mod server {
             .with_context(|| format!("failed to write state file {}", state_path.display()))?;
 
         println!("Flared up! 🔥🔥");
-        println!("");
-        println!("  Instance ID         : {}", instance_id);
-        println!("  PID                 : {}", pid);
-        println!("  FlareDB server log  : {}", log_file_path.display());
-        println!("  State file          : {}", state_path.display());
+        println!();
 
+        println!("  Instance ID      : {}", instance_id);
+
+        println!("  Worker Logs      :");
+        println!("    {}/jobs/<job-id>/logs/flare-worker.log", instance_id);
+        println!("    Check this location for worker logs after submitting jobs.");
+        println!("    Note: <job-id> is generated automatically when a job is submitted.");
         Ok(())
     }
 
@@ -461,10 +463,6 @@ mod server {
             .with_context(|| format!("failed to read state file {}", state_path.display()))?;
 
         if !process_control::is_alive(state.pid) {
-            println!(
-                "Found stale state for pid {}. Removing state file.",
-                state.pid
-            );
             fs::remove_file(&state_path)
                 .with_context(|| format!("failed to remove state file {}", state_path.display()))?;
             return Ok(());
@@ -503,7 +501,7 @@ mod server {
         fs::remove_file(&state_path)
             .with_context(|| format!("failed to remove state file {}", state_path.display()))?;
 
-        println!("FlareDB stopped and state file removed.");
+        println!("FlareDB instance stopped");
         Ok(())
     }
 

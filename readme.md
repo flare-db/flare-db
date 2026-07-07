@@ -8,38 +8,68 @@
   ![Apache Beam](https://img.shields.io/badge/Apache%20Beam-Runner-yellow?logo=apache)
 </div>
 
-**FlareDB** is a streaming database for building and running batch and streaming data pipelines. It uses the Apache Beam as its programming interface. Beam provides a rich programming model for expressing batch and streaming data pipelines in Java, Python, Go and SQL, while FlareDB provides a Rust based runtime to execute pipelines written with Beam SDKs.
+**FlareDB** is a streaming database for building and running batch and streaming data pipelines. It uses Apache Beam as its programming interface. Beam provides a rich programming model for writing batch and streaming data pipelines in Java, Python, Go and SQL, while FlareDB provides a Rust based runtime to execute pipelines written with Beam SDKs.
 
 Its based on a unified streams-and-tables architecture. Streams represent data in motion, while tables represent that same data as materialized state. FlareDB brings these concepts together in a single engine. As pipelines execute, PCollections transition naturally between streams and materialized table state, allowing FlareDB to unify data processing and storage within a single system.
 
-<br><br>
 
-<div align="center">
-  <img src="./assets/flaredb-arch.png" alt="FlareDB Architecture" width="900"/>
-</div>
+#### Learn more about the architecture
+
+For a deeper dive into FlareDB's design and execution model, check out this post: https://ganeshsivakumar.substack.com/p/flaredb.
+
+⭐ New streaming systems don't come along that often. If you're curious to see where this project goes, consider starring the repository, it helps you keep track of updates and helps others discover it too.
 
 ## Getting Started
 
-### 1. Start FlareDB
+### 1. Install the FlareDB CLI
 
-Clone the repository and start a local FlareDB instance.
+The FlareDB CLI provides commands to initialize, start, and manage FlareDB instances, as well as run Apache Beam pipelines on FlareDB.
+
+If you are on **Linux or macOS** , please run the following command to install the CLI:
 
 ```bash
-git clone https://github.com/flare-db/flare-db.git
-cd flare-db
-
-# run script
-./flareup.sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/flare-db/flare-db/releases/download/flare-cli-v0.1.3/flare-cli-installer.sh | sh
 ```
-The startup script creates the required directories, downloads the FlareDB and Beam SDK worker binaries, and starts the local FlareDB instance. Once the server is running, it is ready to accept Beam pipeline jobs.
 
-### 2. Configure Your Beam Pipeline
+For **Windows** run the following command in PowerShell:
 
-To run a Beam pipeline on FlareDB, add the FlareDB Runner SDK as a dependency to your Apache Beam project. The Runner SDK submits the pipeline to the running FlareDB instance for execution.
+```bash
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/flare-db/flare-db/releases/download/flare-cli-v0.1.3/flare-cli-installer.ps1 | iex"
+```
 
-See the WordCount example under `examples/` for a complete reference.
+Alternatively, you can download the CLI binary directly from the GitHub Releases page by selecting the appropriate binary for your platform.
 
-### 3. Run the Example
+### 2. Initialize FlareDB
+
+After installing the CLI, run:
+
+```bash
+flare init
+```
+
+This command performs the initial setup by creating the required local directories and downloading the FlareDB binary and Apache Beam worker JAR.
+
+The initialization only needs to be **completed once**. After that, you can use the `flare up` and `flare down` commands to manage the instance.
+
+### 3. Start a FlareDB Instance
+
+Start a local FlareDB instance with:
+
+```bash
+flare up
+```
+
+Once the instance is running, FlareDB is ready to accept pipeline jobs.
+
+
+### 4. Configure Your Beam Pipeline
+
+To run an Apache Beam pipeline on FlareDB, add the FlareDB Runner SDK as a dependency to your Beam project. The runner sdk submits the pipeline to the FlareDB instance as a Job.
+
+
+Check out the WordCount example under `examples/` for a complete reference.
+
+### 5. Run the Example
 
 With FlareDB running, execute the WordCount example:
 
@@ -47,27 +77,22 @@ With FlareDB running, execute the WordCount example:
 # compile wordcount pipeline
 mvn clean install
 
-# run
+# run the example
 mvn exec:java -Dexec.mainClass="com.flaredb.example.WordCount"
 ```
 
 The pipeline will be submitted to the local FlareDB instance and executed by the engine. Execution logs and pipeline output can be found in the logging directory created during startup.
 
-### Building from source
 
-If you'd like to build and run FlareDB from source, or if you're using macOS, Windows, or a platform other than Linux (x86_64), you'll need to build FlareDB locally. First, install Rust and Cargo, then run the development startup script.
+### 6. Stop FlareDB instance
+
+After executing pipelines, run this command to stop FlareDB instance
 
 ```bash
-# build the project
-cd flaredb && cargo build
-
-chmod +x flareup-dev.sh
-
-./flareup-dev.sh
-
+flare down
 ```
 
-## Status
+## Current Status
 
 **FlareDB V0.1.0** is the first public release of FlareDB. It lays the foundation for a streaming database and its execution engine.
 
@@ -81,7 +106,7 @@ The initial release supports:
 
 ### Roadmap
 
-The next releases will focus on implementing the streaming execution.
+Upcoming releases will focus on expanding FlareDB's streaming execution capabilities:
 
 * **Unbounded Sources** - Support for watermarks, event-time processing, windowing, and triggers.
 * **Splittable DoFns** - Parallel work execution for I/Os.

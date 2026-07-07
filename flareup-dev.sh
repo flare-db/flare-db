@@ -6,6 +6,9 @@ REPO_DIR="${SCRIPT_DIR}"
 LOG_DIR="${REPO_DIR}/logs"
 FLARE_LOG="${LOG_DIR}/flare-server.log"
 
+# Version should match the CLI constant FLAREDB_VERSION in src/main.rs
+FLAREDB_VERSION="0.1.8"
+
 if ! command -v java >/dev/null 2>&1; then
     echo "java is required but was not found on PATH."
     exit 1
@@ -27,16 +30,18 @@ trap cleanup EXIT INT TERM
 
 cd "${REPO_DIR}"
 
-echo "Starting FlareDB server on localhost:8099 using local build..."
 # ensure default base directory exists and pass it to flaredb as first arg
 BASE_DIR="${HOME}/.flaredb"
 mkdir -p "${BASE_DIR}"
 
-# Setup worker jar in bin directory
+# Setup bin/instances and worker jar
 BIN_DIR="${BASE_DIR}/bin"
-mkdir -p "${BIN_DIR}"
-WORKER_JAR="${BIN_DIR}/beam-sdks-java-harness-2.72.0-flare-bundled.jar"
-WORKER_JAR_URL="https://github.com/flare-db/flare-db/releases/download/beam-worker-java-2.72.0/beam-sdks-java-harness-2.72.0-flare-bundled.jar"
+INSTANCES_DIR="${BASE_DIR}/instances"
+mkdir -p "${BIN_DIR}" "${INSTANCES_DIR}"
+
+WORKER_JAR_NAME="beam-sdks-java-harness-2.72.0-flare-bundled.jar"
+WORKER_JAR="${BIN_DIR}/${WORKER_JAR_NAME}"
+WORKER_JAR_URL="https://github.com/flare-db/flare-db/releases/download/beam-worker-java-2.72.0/${WORKER_JAR_NAME}"
 
 # Download worker jar if it doesn't exist (show progress bar)
 if [[ ! -f "${WORKER_JAR}" ]]; then
@@ -50,7 +55,7 @@ else
     echo "Worker jar already exists at ${WORKER_JAR}"
 fi
 
-# Use locally built flaredb binary instead of downloading an external binary
+# Prefer local build binary for development; fall back to bin/flaredb-<version> if present
 LOCAL_FLAREDB_BINARY_DEBUG="${REPO_DIR}/flaredb/target/debug/flaredb"
 LOCAL_FLAREDB_BINARY_RELEASE="${REPO_DIR}/flaredb/target/release/flaredb"
 FLAREDB_BINARY=""
@@ -59,6 +64,8 @@ if [[ -x "${LOCAL_FLAREDB_BINARY_DEBUG}" ]]; then
     FLAREDB_BINARY="${LOCAL_FLAREDB_BINARY_DEBUG}"
 elif [[ -x "${LOCAL_FLAREDB_BINARY_RELEASE}" ]]; then
     FLAREDB_BINARY="${LOCAL_FLAREDB_BINARY_RELEASE}"
+elif [[ -x "${BIN_DIR}/flaredb-${FLAREDB_VERSION}" ]]; then
+    FLAREDB_BINARY="${BIN_DIR}/flaredb-${FLAREDB_VERSION}"
 else
     echo "Local flaredb binary not found."
     echo "Please build it first with:"
@@ -66,7 +73,7 @@ else
     exit 1
 fi
 
-echo "Using local FlareDB binary: ${FLAREDB_BINARY}"
+echo "Using FlareDB binary: ${FLAREDB_BINARY}"
 
 # generate a new instance id every time the script runs
 if command -v uuidgen >/dev/null 2>&1; then
@@ -76,7 +83,7 @@ else
 fi
 
 # create per-instance directory and logs dir
-INSTANCE_DIR="${BASE_DIR}/${INSTANCE_ID}"
+INSTANCE_DIR="${INSTANCES_DIR}/${INSTANCE_ID}"
 INSTANCE_LOG_DIR="${INSTANCE_DIR}/logs"
 mkdir -p "${INSTANCE_LOG_DIR}"
 FLARE_LOG="${INSTANCE_LOG_DIR}/flare-server.log"
@@ -109,9 +116,10 @@ fi
 
 echo "Flared up! 🔥🔥"
 echo ""
+echo "  Instance ID         : ${INSTANCE_ID}"
 echo "  FlareDB server logs : ${FLARE_LOG}"
-echo "  Instance Dir        : ${INSTANCE_DIR}"
-echo "  Worker logs         : will be availabe during execution at ${INSTANCE_DIR} under unique jobid"
+echo "  Worker logs path    : ${INSTANCE_LOG_DIR}/jobs/<job-id>/logs/flare-worker.log"
+echo "                        Check this location for worker logs after submitting jobs."
 echo ""
 echo "FlareDB is ready."
 echo "SDK workers will be started automatically when jobs are submitted from the Runner SDK."
