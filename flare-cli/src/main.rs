@@ -35,8 +35,8 @@ async fn main() -> Result<()> {
 
 pub mod init {
     use anyhow::bail;
-    #[cfg(not(unix))]
-    use anyhow::bail;
+    //#[cfg(not(unix))]
+    //use anyhow::bail;
     use anyhow::{Context, Result};
     use indicatif::{ProgressBar, ProgressStyle};
     use std::fs;
