@@ -1260,7 +1260,7 @@ mod tests {
         let schema = derive_schema_from_records("p1", &records).unwrap();
         let batch = beamrecords_to_record_batch("p1", &records, schema.clone()).unwrap();
         let result = record_batch_to_beamrecords(&batch, &schema).unwrap();
-        let BeamRecord::GBK(g) = &result[0] else {
+        let Some(BeamRecord::GBK(g)) = result.first() else {
             panic!("expected GBK")
         };
         assert_eq!(g.value.list.values().len(), 0);

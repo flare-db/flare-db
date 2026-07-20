@@ -17,7 +17,7 @@ tokio = { version = "1.38", features = [
     "fs",
     "process",
 ] }
-arrow-array = "57.3.1"
+arrow-array = "57.3.1" #tonbo's arrow version
 arrow-buffer = "57.3.1"
 arrow-schema = "57.3.1"
 tonbo = "=0.4.0-a1"

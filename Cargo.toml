@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 
-members = ["flaredb", "flare-cli"]
+members = ["flaredb", "flare-cli", "flare-datafusion"]
 
 #"beam-model-rs"
 
