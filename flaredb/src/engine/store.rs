@@ -31,7 +31,8 @@ pub enum BeamRecord {
     //COMPOSITE(BeamKV),
     ITERABLE(IterableValue),
     KV(BeamKV),
-    GBK(BeamGbk), //VOID,
+    GBK(BeamGbk),
+    //VOID,
 }
 pub enum BeamRecordType {
     Primitive,
@@ -821,7 +822,7 @@ impl FlareSchemaRegistry {
 
 #[derive(Clone)]
 pub struct FlareElementStore {
-    registry: FlareSchemaRegistry,
+    pub(crate) registry: FlareSchemaRegistry,
     open_dbs: Arc<DashMap<String, Arc<DB<TokioFs, TokioExecutor>>>>,
     local_pool: LocalPoolHandle,
     base_path: String,

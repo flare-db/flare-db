@@ -26,6 +26,11 @@ pub struct TonboTable {
     db: Arc<DB<TokioFs, TokioExecutor>>,
     schema: SchemaRef,
 }
+impl TonboTable {
+    pub fn from(db: Arc<DB<TokioFs, TokioExecutor>>, schema: SchemaRef) -> Self {
+        Self { db, schema }
+    }
+}
 impl Debug for TonboTable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TonboTableProvider")

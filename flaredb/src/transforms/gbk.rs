@@ -3,11 +3,21 @@ use async_trait::async_trait;
 use beam_model_rs::v1::{
     Coder, Components, Environment, FunctionSpec, PCollection, PTransform, WindowingStrategy,
 };
-use std::collections::{HashMap, HashSet};
+use datafusion::functions_aggregate::expr_fn::array_agg;
+use datafusion::prelude::*;
+use datafusion::{common::TableReference, execution::context::SessionContext};
+use flare_datafusion::tonbo_table::TonboTable;
+use log::info;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
+
+use crate::engine::store::record_batch_to_beamrecords;
 
 use crate::{
     engine::store::{
-        BeamGbk, BeamRecord, IterableValue, NewCollectionRequest, PrimitiveValue,
+        self, BeamGbk, BeamRecord, IterableValue, NewCollectionRequest, PrimitiveValue,
         ScanCollectionRequest,
     },
     jobservice::urns::beam_urns,
@@ -48,7 +58,40 @@ impl FlareTransform for GroupByKey {
     }
 
     async fn execute(&self, ctx: ExecutionContext) -> Result<(), Error> {
-        let request = ScanCollectionRequest {
+        let df_ctx = SessionContext::new();
+
+        let schema = ctx.store.registry.get(&ctx.input_pcollection_id).unwrap();
+        let db = ctx
+            .store
+            .resolve_db(&ctx.consumer_transfrom_id, Some(schema.clone()))
+            .await?;
+        let table = TonboTable::from(db.clone(), schema.clone());
+
+        info!("created tonbo table");
+
+        df_ctx.register_table(TableReference::bare("gbk"), Arc::new(table))?;
+
+        let query = df_ctx.table("gbk").await?.aggregate(
+            vec![col("key")],
+            vec![array_agg(col("value")).alias("value")],
+        )?;
+
+        let batches = query.collect().await?;
+
+        info!("fetched recod batch");
+
+        let mut beam_records = Vec::new();
+        for batch in batches {
+            beam_records.extend(record_batch_to_beamrecords(&batch, &schema)?);
+        }
+
+        let new_pcol_req = NewCollectionRequest {
+            pcollection_id: ctx.output_pcollection_id,
+            elements: beam_records,
+        };
+
+        ctx.store.write_collection(new_pcol_req).await?;
+        /*  let request = ScanCollectionRequest {
             pcollection_id: ctx.input_pcollection_id,
         };
 
@@ -90,7 +133,7 @@ impl FlareTransform for GroupByKey {
             elements: beam_records,
         };
 
-        ctx.store.write_collection(new_pcol_req).await?;
+        ctx.store.write_collection(new_pcol_req).await?;*/
         Ok(())
     }
 

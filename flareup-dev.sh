@@ -56,8 +56,8 @@ else
 fi
 
 # Prefer local build binary for development; fall back to bin/flaredb-<version> if present
-LOCAL_FLAREDB_BINARY_DEBUG="${REPO_DIR}/flaredb/target/debug/flaredb"
-LOCAL_FLAREDB_BINARY_RELEASE="${REPO_DIR}/flaredb/target/release/flaredb"
+LOCAL_FLAREDB_BINARY_DEBUG="${REPO_DIR}/target/debug/flaredb"
+LOCAL_FLAREDB_BINARY_RELEASE="${REPO_DIR}/target/release/flaredb"
 FLAREDB_BINARY=""
 
 if [[ -x "${LOCAL_FLAREDB_BINARY_DEBUG}" ]]; then
@@ -69,7 +69,7 @@ elif [[ -x "${BIN_DIR}/flaredb-${FLAREDB_VERSION}" ]]; then
 else
     echo "Local flaredb binary not found."
     echo "Please build it first with:"
-    echo "  cd ${REPO_DIR}/flaredb && cargo build"
+    echo "  cd ${REPO_DIR} && cargo build -p flaredb"
     exit 1
 fi
 

@@ -30,7 +30,7 @@ public class WordCount {
         options.setJobEndpoint("127.0.0.1:8099"); // default
         // path of your pipeline jar (set your jar path )
         options.setUberJar(
-                "/home/ganesh/flare-db/example/flare-db/example/wordcount/target/wordcount-1.0-SNAPSHOT.jar");
+                "/home/ganesh/flare-db/gbk-df/flare-db/example/wordcount/target/wordcount-1.0-SNAPSHOT.jar");
 
         Pipeline p = Pipeline.create(options);
 
