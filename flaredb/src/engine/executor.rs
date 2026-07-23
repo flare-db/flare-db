@@ -633,7 +633,7 @@ impl StageExecutor {
                             pcollection_id: edge_metadata.produced_pcol_id.clone(),
                             elements: decoded,
                         };
-                        store.write_collection(request).await?;
+                        store.write_beamrecord_batch(request).await?;
                         return Ok(());
                     }
                 }

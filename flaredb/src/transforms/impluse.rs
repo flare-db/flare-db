@@ -58,7 +58,7 @@ impl FlareTransform for Impulse {
         };
 
         info!("New Collection request {:?}", request);
-        ctx.store.write_collection(request).await?;
+        ctx.store.write_beamrecord_batch(request).await?;
         Ok(())
     }
 

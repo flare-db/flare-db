@@ -3,19 +3,22 @@ use async_trait::async_trait;
 use beam_model_rs::v1::{
     Coder, Components, Environment, FunctionSpec, PCollection, PTransform, WindowingStrategy,
 };
-use std::collections::{HashMap, HashSet};
+use datafusion::functions_aggregate::expr_fn::array_agg;
+use datafusion::prelude::*;
+use datafusion::{common::TableReference, execution::context::SessionContext};
+use flare_datafusion::tonbo_table::TonboTable;
+use log::info;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
+
+use crate::engine::store::create_schema_with_record_type;
 
 use crate::{
-    engine::store::{
-        BeamGbk, BeamRecord, IterableValue, NewCollectionRequest, PrimitiveValue,
-        ScanCollectionRequest,
-    },
     jobservice::urns::beam_urns,
     transforms::{ExecutionContext, FlareTransform},
 };
-use std::collections::hash_map::Entry::{Occupied, Vacant};
-
-use typed_arrow::List;
 #[derive(Clone)]
 pub struct GroupByKey {
     name: String,
@@ -48,49 +51,43 @@ impl FlareTransform for GroupByKey {
     }
 
     async fn execute(&self, ctx: ExecutionContext) -> Result<(), Error> {
-        let request = ScanCollectionRequest {
-            pcollection_id: ctx.input_pcollection_id,
-        };
+        let df_ctx = SessionContext::new();
 
-        let records = ctx.store.scan_collection(request).await?;
+        let input_schema = ctx.store.registry.get(&ctx.input_pcollection_id).unwrap();
+        let db = ctx
+            .store
+            .resolve_db(&ctx.input_pcollection_id, Some(input_schema.clone()))
+            .await?;
+        let table = TonboTable::from(db.clone(), input_schema.clone());
 
-        let mut per_key_map = HashMap::<PrimitiveValue, IterableValue>::new();
+        info!("created tonbo table");
 
-        for record in records {
-            match record {
-                BeamRecord::KV(kv) => match per_key_map.entry(kv.key) {
-                    Occupied(mut entry) => {
-                        let mut values = entry.get().list.values().clone();
-                        values.push(kv.value);
-                        *entry.get_mut() = IterableValue::new(List::new(values));
-                    }
-                    Vacant(entry) => {
-                        entry.insert(IterableValue::new(List::new(vec![kv.value])));
-                    }
-                },
+        df_ctx.register_table(TableReference::bare("gbk"), Arc::new(table))?;
 
-                _ => {
-                    anyhow::bail!("other types are not expected");
-                }
-            }
+        let query = df_ctx.table("gbk").await?.aggregate(
+            vec![col("key")],
+            vec![array_agg(col("value")).alias("value")],
+        )?;
+
+        let batches = query.collect().await?;
+        info!("Executed GroupByKey");
+
+        for batch in batches {
+            let output_schema = create_schema_with_record_type(
+                batch
+                    .schema_ref()
+                    .fields()
+                    .iter()
+                    .map(|field| field.as_ref().clone())
+                    .collect::<Vec<_>>(),
+                "gbk",
+                &ctx.output_pcollection_id,
+            )?;
+
+            ctx.store
+                .write_record_batch(&ctx.output_pcollection_id, batch, output_schema)
+                .await?;
         }
-
-        let beam_records: Vec<BeamRecord> = per_key_map
-            .iter()
-            .map(|(key, values)| {
-                BeamRecord::GBK(BeamGbk {
-                    key: key.clone(),
-                    value: values.clone(),
-                })
-            })
-            .collect();
-
-        let new_pcol_req = NewCollectionRequest {
-            pcollection_id: ctx.output_pcollection_id,
-            elements: beam_records,
-        };
-
-        ctx.store.write_collection(new_pcol_req).await?;
         Ok(())
     }
 
