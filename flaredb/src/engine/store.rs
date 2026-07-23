@@ -19,11 +19,12 @@ use typed_arrow::{List, Null};
 use uuid::Uuid;
 
 const ELEMENT_ID_COLUMN: &str = "element_id";
-const PCOLLECTION_ID_COLUMN: &str = "pcollection_id";
+//const PCOLLECTION_ID_COLUMN: &str = "pcollection_id";
 const COLLECTION_COLUMN: &str = "collection";
 const KEY_COLUMN: &str = "key";
 const VALUE_COLUMN: &str = "value";
 const RECORD_TYPE_METADATA_KEY: &str = "flare.record_type";
+const TABLE_NAME: &str = "table_name";
 
 #[derive(Debug, Clone)]
 pub enum BeamRecord {
@@ -193,14 +194,22 @@ fn storage_record_type(record: &BeamRecord) -> StorageRecordType {
     }
 }
 
-fn schema_with_record_type(fields: Vec<Field>, record_type: StorageRecordType) -> Arc<Schema> {
+pub fn create_schema_with_record_type(
+    fields: Vec<Field>,
+    record_type: &str,
+    pcollection_id: &str,
+) -> Result<Arc<Schema>> {
+    StorageRecordType::from_str(record_type)?;
+
+    // add metada for the schema
     let mut metadata = HashMap::new();
     metadata.insert(
         RECORD_TYPE_METADATA_KEY.to_string(),
-        record_type.as_str().to_string(),
+        record_type.to_string(),
     );
+    metadata.insert(TABLE_NAME.to_string(), pcollection_id.to_string());
 
-    Arc::new(Schema::new(fields).with_metadata(metadata))
+    Ok(Arc::new(Schema::new(fields).with_metadata(metadata)))
 }
 
 fn primitive_data_type(value: &PrimitiveValue) -> DataType {
@@ -435,6 +444,7 @@ fn field_data_type<'a>(schema: &'a Schema, name: &str) -> Result<&'a DataType> {
         .with_context(|| format!("missing schema field {name}"))
 }
 
+/// Generates arrow schema for Beam types
 pub fn derive_schema_from_records(
     pcollection_id: &str,
     records: &[BeamRecord],
@@ -467,14 +477,15 @@ pub fn derive_schema_from_records(
                 }
             }
 
-            Ok(schema_with_record_type(
+            create_schema_with_record_type(
                 vec![
                     Field::new(ELEMENT_ID_COLUMN, DataType::Utf8, false),
-                    Field::new(PCOLLECTION_ID_COLUMN, DataType::Utf8, false),
+                    //Field::new(PCOLLECTION_ID_COLUMN, DataType::Utf8, false),
                     Field::new(COLLECTION_COLUMN, data_type, false),
                 ],
-                record_type,
-            ))
+                record_type.as_str(),
+                pcollection_id,
+            )
         }
         StorageRecordType::Iterable => {
             let mut iterables = Vec::with_capacity(records.len());
@@ -492,10 +503,10 @@ pub fn derive_schema_from_records(
 
             let nullable = matches!(item_data_type, DataType::Null);
 
-            Ok(schema_with_record_type(
+            create_schema_with_record_type(
                 vec![
                     Field::new(ELEMENT_ID_COLUMN, DataType::Utf8, false),
-                    Field::new(PCOLLECTION_ID_COLUMN, DataType::Utf8, false),
+                    //Field::new(PCOLLECTION_ID_COLUMN, DataType::Utf8, false),
                     Field::new(
                         COLLECTION_COLUMN,
                         // DataType::List(Arc::new(Field::new("item", item_data_type, true))),
@@ -503,8 +514,9 @@ pub fn derive_schema_from_records(
                         true,
                     ),
                 ],
-                record_type,
-            ))
+                record_type.as_str(),
+                pcollection_id,
+            )
         }
         StorageRecordType::Kv => {
             let BeamRecord::KV(first_kv) = first else {
@@ -537,15 +549,16 @@ pub fn derive_schema_from_records(
                 }
             }
 
-            Ok(schema_with_record_type(
+            create_schema_with_record_type(
                 vec![
                     Field::new(ELEMENT_ID_COLUMN, DataType::Utf8, false),
-                    Field::new(PCOLLECTION_ID_COLUMN, DataType::Utf8, false),
+                    // Field::new(PCOLLECTION_ID_COLUMN, DataType::Utf8, false),
                     Field::new(KEY_COLUMN, key_data_type, false),
                     Field::new(VALUE_COLUMN, value_data_type, false),
                 ],
-                record_type,
-            ))
+                record_type.as_str(),
+                pcollection_id,
+            )
         }
         StorageRecordType::Gbk => {
             let BeamRecord::GBK(first_gbk) = first else {
@@ -577,10 +590,10 @@ pub fn derive_schema_from_records(
 
             let nullable = matches!(item_data_type, DataType::Null);
 
-            Ok(schema_with_record_type(
+            create_schema_with_record_type(
                 vec![
                     Field::new(ELEMENT_ID_COLUMN, DataType::Utf8, false),
-                    Field::new(PCOLLECTION_ID_COLUMN, DataType::Utf8, false),
+                    // Field::new(PCOLLECTION_ID_COLUMN, DataType::Utf8, false),
                     Field::new(KEY_COLUMN, key_data_type, false),
                     Field::new(
                         VALUE_COLUMN,
@@ -589,8 +602,9 @@ pub fn derive_schema_from_records(
                         true,
                     ),
                 ],
-                record_type,
-            ))
+                record_type.as_str(),
+                pcollection_id,
+            )
         }
     }
 }
@@ -614,9 +628,9 @@ fn validate_iterable_item_types(
 
     Ok(())
 }
-
+/// conters beam records to arrow record batch
 pub fn beamrecords_to_record_batch(
-    pcollection_id: &str,
+    _pcollection_id: &str,
     records: &[BeamRecord],
     schema: Arc<Schema>,
 ) -> Result<RecordBatch> {
@@ -625,15 +639,17 @@ pub fn beamrecords_to_record_batch(
     }
 
     let record_type = record_type_from_schema(&schema)?;
+    info!("record type: {:?}", record_type);
     let row_count = records.len();
     let element_ids: Vec<String> = (0..row_count).map(|_| Uuid::new_v4().to_string()).collect();
 
+    // TODO: fix this we removed pcollection_id column, so its not needed during conversion
     let mut columns: Vec<ArrayRef> = vec![
         Arc::new(StringArray::from(element_ids)),
-        Arc::new(StringArray::from(vec![
+        /*Arc::new(StringArray::from(vec![
             pcollection_id.to_string();
             row_count
-        ])),
+        ])),*/
     ];
 
     match record_type {
@@ -708,6 +724,7 @@ pub fn beamrecords_to_record_batch(
     RecordBatch::try_new(schema, columns).context("failed to build store record batch")
 }
 
+/// convert arrow record batch to beam records
 pub fn record_batch_to_beamrecords(
     batch: &RecordBatch,
     schema: &Schema,
@@ -791,6 +808,7 @@ pub fn record_batch_to_beamrecords(
     Ok(records)
 }
 
+// Registry for maintaing each Pcollection's schema
 #[derive(Clone, Default)]
 pub struct FlareSchemaRegistry {
     schemas: Arc<DashMap<String, Arc<Schema>>>,
@@ -829,6 +847,68 @@ pub struct FlareElementStore {
 }
 
 impl FlareElementStore {
+    async fn ingest_batch(
+        &self,
+        pcollection_id: &str,
+        schema: Arc<Schema>,
+        batch: RecordBatch,
+    ) -> Result<()> {
+        self.registry
+            .register_schema_if_absent(pcollection_id, schema.clone());
+
+        let db = self.resolve_db(pcollection_id, Some(schema)).await?;
+
+        db.ingest(batch)
+            .await
+            .with_context(|| format!("failed to ingest pcollection {pcollection_id}"))?;
+
+        Ok(())
+    }
+
+    fn prepare_record_batch(
+        &self,
+        pcollection_id: &str,
+        batch: RecordBatch,
+        schema: Arc<Schema>,
+    ) -> Result<(Arc<Schema>, RecordBatch)> {
+        // if ELEMENT_ID_COLUMN is present, return the schema.
+        let full_schema = if schema.field_with_name(ELEMENT_ID_COLUMN).is_ok() {
+            schema.clone()
+        } else {
+            // create fields with ELEMENT_ID_COLUMN, cause sometimes transfroms(like gbk)
+            // can only prouce record batches with projected schema i.e, filtered output
+            // that only return the required columns, but ELEMENT_ID_COLUMN is required primary key
+            // column for tonbo So, we add that to output schema.
+            let mut fields = Vec::with_capacity(schema.fields().len() + 1);
+            fields.push(Field::new(ELEMENT_ID_COLUMN, DataType::Utf8, false));
+            fields.extend(schema.fields().iter().map(|field| field.as_ref().clone()));
+            // create schema using fields.
+            create_schema_with_record_type(
+                fields,
+                record_type_from_schema(&schema)?.as_str(),
+                pcollection_id,
+            )?
+        };
+
+        if batch
+            .schema_ref()
+            .field_with_name(ELEMENT_ID_COLUMN)
+            .is_ok()
+        {
+            return Ok((full_schema, batch));
+        }
+
+        let row_count = batch.num_rows();
+        let element_ids: Vec<String> = (0..row_count).map(|_| Uuid::new_v4().to_string()).collect();
+        let mut columns: Vec<ArrayRef> = vec![Arc::new(StringArray::from(element_ids))];
+        columns.extend(batch.columns().iter().cloned());
+
+        let batch = RecordBatch::try_new(full_schema.clone(), columns)
+            .context("failed to build store record batch")?;
+
+        Ok((full_schema, batch))
+    }
+
     pub fn new(registry: FlareSchemaRegistry) -> Self {
         let default_base = crate::utils::path::base_dir().join("store");
         Self::with_base_path(registry, default_base.to_str().unwrap_or(".").to_string())
@@ -843,6 +923,8 @@ impl FlareElementStore {
         }
     }
 
+    // each db is per pcollection_id, So, each db has its own schema and the data stored
+    // in each db belongs to that pcollection_id only.
     pub async fn resolve_db(
         &self,
         pcollection_id: &str,
@@ -876,7 +958,9 @@ impl FlareElementStore {
         Ok(db)
     }
 
-    pub async fn write_collection(&self, req: NewCollectionRequest) -> Result<()> {
+    // used when a transfrom/stage produces beam records and that needs to be converted
+    // to arrow record batch before ingesting into db.
+    pub async fn write_beamrecord_batch(&self, req: NewCollectionRequest) -> Result<()> {
         info!("store: starting to write collection");
 
         let schema = match self.registry.get(&req.pcollection_id) {
@@ -884,21 +968,24 @@ impl FlareElementStore {
             None => derive_schema_from_records(&req.pcollection_id, &req.elements)?,
         };
 
-        self.registry
-            .register_schema_if_absent(&req.pcollection_id, schema.clone());
-
-        info!("store: pcollection schema: {:?}", schema);
-
         let batch =
             beamrecords_to_record_batch(&req.pcollection_id, &req.elements, schema.clone())?;
-        let db = self.resolve_db(&req.pcollection_id, Some(schema)).await?;
 
-        info!("store: ingesting into db");
-        db.ingest(batch)
-            .await
-            .with_context(|| format!("failed to ingest pcollection {}", req.pcollection_id))?;
+        self.ingest_batch(&req.pcollection_id, schema, batch).await
+    }
 
-        Ok(())
+    // used when a transfrom can directly produce arrow record batch
+    pub async fn write_record_batch(
+        &self,
+        pcollection_id: &str,
+        batch: RecordBatch,
+        schema: Arc<Schema>,
+    ) -> Result<()> {
+        let schema = self.registry.get(pcollection_id).unwrap_or(schema);
+
+        let (schema, batch) = self.prepare_record_batch(pcollection_id, batch, schema)?;
+
+        self.ingest_batch(pcollection_id, schema, batch).await
     }
 
     pub async fn scan_collection(&self, req: ScanCollectionRequest) -> Result<Vec<BeamRecord>> {
@@ -908,15 +995,16 @@ impl FlareElementStore {
             .get(&req.pcollection_id)
             .ok_or_else(|| anyhow!("schema not found for pcollection {}", req.pcollection_id))?;
 
-        let filter = Expr::eq(
+        /*let filter = Expr::eq(
             PCOLLECTION_ID_COLUMN,
             ScalarValue::from(req.pcollection_id.clone()),
-        );
+        );*/
 
         //Tonbo's scan is a !Send so we isolate that in a separate thread.
         let batches = self
             .local_pool
-            .spawn_pinned(move || async move { db.scan().filter(filter).collect().await })
+            //.spawn_pinned(move || async move { db.scan().filter(filter).collect().await })
+            .spawn_pinned(move || async move { db.scan().collect().await })
             .await
             .map_err(|error| anyhow!("scan task panicked: {error}"))??;
 
@@ -943,13 +1031,17 @@ pub struct ScanCollectionRequest {
 #[cfg(test)]
 mod tests {
 
-    use arrow_schema::DataType;
+    use std::sync::Arc;
+
+    use arrow_array::RecordBatch;
+    use arrow_schema::{DataType, Field};
     use typed_arrow::{List, Null};
 
+    use super::{KEY_COLUMN, VALUE_COLUMN, iterable_values_to_array, primitive_values_to_array};
     use crate::engine::store::{
         BeamGbk, BeamKV, BeamRecord, FlareElementStore, FlareSchemaRegistry, IterableValue,
         NewCollectionRequest, PrimitiveValue, ScanCollectionRequest, beamrecords_to_record_batch,
-        derive_schema_from_records, record_batch_to_beamrecords,
+        create_schema_with_record_type, derive_schema_from_records, record_batch_to_beamrecords,
     };
 
     // helpers
@@ -1321,7 +1413,7 @@ mod tests {
 
         let records = vec![primitive(bytes(b"hello")), primitive(bytes(b"world"))];
         store
-            .write_collection(NewCollectionRequest {
+            .write_beamrecord_batch(NewCollectionRequest {
                 pcollection_id: "pcol1".to_string(),
                 elements: records.clone(),
             })
@@ -1354,7 +1446,7 @@ mod tests {
 
         let records = vec![kv(str("apple"), void()), kv(str("banana"), void())];
         store
-            .write_collection(NewCollectionRequest {
+            .write_beamrecord_batch(NewCollectionRequest {
                 pcollection_id: "kv_pcol".to_string(),
                 elements: records,
             })
@@ -1393,7 +1485,7 @@ mod tests {
             gbk(str("be"), iterable(vec![void(), void(), void(), void()])),
         ];
         store
-            .write_collection(NewCollectionRequest {
+            .write_beamrecord_batch(NewCollectionRequest {
                 pcollection_id: "gbk_pcol".to_string(),
                 elements: records,
             })
@@ -1423,12 +1515,73 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn store_write_projected_batch_and_scan_gbk() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_base(dir.path().to_str().unwrap());
+
+        let keys = vec![str("to"), str("be")];
+        let values = vec![
+            iterable(vec![void(), void()]),
+            iterable(vec![void(), void(), void(), void()]),
+        ];
+
+        let batch_schema = create_schema_with_record_type(
+            vec![
+                Field::new(KEY_COLUMN, DataType::Utf8, false),
+                Field::new(
+                    VALUE_COLUMN,
+                    DataType::List(Arc::new(Field::new("item", DataType::Null, true))),
+                    true,
+                ),
+            ],
+            "gbk",
+            "gbk_projected_pcol",
+        )
+        .unwrap();
+
+        let batch = RecordBatch::try_new(
+            batch_schema.clone(),
+            vec![
+                primitive_values_to_array(&keys, &DataType::Utf8).unwrap(),
+                iterable_values_to_array(&values, &DataType::Null).unwrap(),
+            ],
+        )
+        .unwrap();
+
+        store
+            .write_record_batch("gbk_projected_pcol", batch, batch_schema)
+            .await
+            .unwrap();
+
+        let result = store
+            .scan_collection(ScanCollectionRequest {
+                pcollection_id: "gbk_projected_pcol".to_string(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 2);
+        let mut entries: Vec<(String, usize)> = result
+            .into_iter()
+            .map(|r| match r {
+                BeamRecord::GBK(BeamGbk {
+                    key: PrimitiveValue::String(k),
+                    value: v,
+                }) => (k, v.list.values().len()),
+                _ => panic!("unexpected record type"),
+            })
+            .collect();
+        entries.sort_by_key(|(k, _)| k.clone());
+        assert_eq!(entries, vec![("be".to_string(), 4), ("to".to_string(), 2)]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn store_separate_pcollections_dont_interfere() {
         let dir = tempfile::tempdir().unwrap();
         let store = store_with_base(dir.path().to_str().unwrap());
 
         store
-            .write_collection(NewCollectionRequest {
+            .write_beamrecord_batch(NewCollectionRequest {
                 pcollection_id: "pcol_a".to_string(),
                 elements: vec![primitive(str("from_a"))],
             })
@@ -1436,7 +1589,7 @@ mod tests {
             .unwrap();
 
         store
-            .write_collection(NewCollectionRequest {
+            .write_beamrecord_batch(NewCollectionRequest {
                 pcollection_id: "pcol_b".to_string(),
                 elements: vec![primitive(str("from_b"))],
             })

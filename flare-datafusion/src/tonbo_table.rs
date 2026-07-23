@@ -83,6 +83,7 @@ pub struct TonboExec {
     db: Arc<DB<TokioFs, TokioExecutor>>,
     schema: Arc<Schema>,
     projection: Option<Vec<usize>>,
+    projected_schema: SchemaRef,
     filters: Vec<DfExpr>,
     limit: Option<usize>,
     properties: Arc<PlanProperties>,
@@ -97,14 +98,21 @@ impl TonboExec {
         filters: Vec<DfExpr>,
         limit: Option<usize>,
     ) -> DataFusionResult<Self> {
+        // Excluding the columns that we don't want to read
+        let projected_schema: SchemaRef = match &projection {
+            Some(indices) => Arc::new(schema.project(indices)?),
+            None => schema.clone(),
+        };
+        let output_schema = projected_schema.clone();
         let instance = Self {
             db,
             schema: schema.clone(),
             projection,
+            projected_schema,
             filters,
             limit,
             properties: Arc::new(PlanProperties::new(
-                EquivalenceProperties::new(schema.into()),
+                EquivalenceProperties::new(output_schema.into()),
                 Partitioning::UnknownPartitioning(1),
                 EmissionType::Final,
                 Boundedness::Bounded,
@@ -188,10 +196,21 @@ impl ExecutionPlan for TonboExec {
         let db = self.db.clone();
         let schema = Arc::clone(&self.schema);
         let local_pool = self.local_pool.clone();
+        let projected_schema = Arc::clone(&self.projected_schema);
+        let output_schema = Arc::clone(&self.projected_schema);
+        let has_projection = self.projection.is_some();
 
         let future = async move {
             local_pool
-                .spawn_pinned(move || async move { db.scan().filter(filter).collect().await })
+                .spawn_pinned(move || async move {
+                    let scan = db.scan().filter(filter);
+                    let scan = if has_projection {
+                        scan.projection(projected_schema)
+                    } else {
+                        scan
+                    };
+                    scan.collect().await
+                })
                 .await
                 .map_err(|e| DataFusionError::Execution(format!("scan task panicked: {e}")))?
                 .map_err(|e| DataFusionError::Execution(e.to_string()))
@@ -199,7 +218,11 @@ impl ExecutionPlan for TonboExec {
                     futures::stream::iter(batches.into_iter().map(Ok::<_, DataFusionError>))
                 })
         };
+
         let stream = futures::stream::once(future).try_flatten();
-        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            output_schema,
+            stream,
+        )))
     }
 }
