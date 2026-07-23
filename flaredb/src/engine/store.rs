@@ -480,7 +480,6 @@ pub fn derive_schema_from_records(
             create_schema_with_record_type(
                 vec![
                     Field::new(ELEMENT_ID_COLUMN, DataType::Utf8, false),
-                    //Field::new(PCOLLECTION_ID_COLUMN, DataType::Utf8, false),
                     Field::new(COLLECTION_COLUMN, data_type, false),
                 ],
                 record_type.as_str(),
@@ -506,7 +505,6 @@ pub fn derive_schema_from_records(
             create_schema_with_record_type(
                 vec![
                     Field::new(ELEMENT_ID_COLUMN, DataType::Utf8, false),
-                    //Field::new(PCOLLECTION_ID_COLUMN, DataType::Utf8, false),
                     Field::new(
                         COLLECTION_COLUMN,
                         // DataType::List(Arc::new(Field::new("item", item_data_type, true))),
@@ -552,7 +550,6 @@ pub fn derive_schema_from_records(
             create_schema_with_record_type(
                 vec![
                     Field::new(ELEMENT_ID_COLUMN, DataType::Utf8, false),
-                    // Field::new(PCOLLECTION_ID_COLUMN, DataType::Utf8, false),
                     Field::new(KEY_COLUMN, key_data_type, false),
                     Field::new(VALUE_COLUMN, value_data_type, false),
                 ],
@@ -593,7 +590,6 @@ pub fn derive_schema_from_records(
             create_schema_with_record_type(
                 vec![
                     Field::new(ELEMENT_ID_COLUMN, DataType::Utf8, false),
-                    // Field::new(PCOLLECTION_ID_COLUMN, DataType::Utf8, false),
                     Field::new(KEY_COLUMN, key_data_type, false),
                     Field::new(
                         VALUE_COLUMN,
@@ -643,14 +639,7 @@ pub fn beamrecords_to_record_batch(
     let row_count = records.len();
     let element_ids: Vec<String> = (0..row_count).map(|_| Uuid::new_v4().to_string()).collect();
 
-    // TODO: fix this we removed pcollection_id column, so its not needed during conversion
-    let mut columns: Vec<ArrayRef> = vec![
-        Arc::new(StringArray::from(element_ids)),
-        /*Arc::new(StringArray::from(vec![
-            pcollection_id.to_string();
-            row_count
-        ])),*/
-    ];
+    let mut columns: Vec<ArrayRef> = vec![Arc::new(StringArray::from(element_ids))];
 
     match record_type {
         StorageRecordType::Primitive => {
@@ -995,15 +984,9 @@ impl FlareElementStore {
             .get(&req.pcollection_id)
             .ok_or_else(|| anyhow!("schema not found for pcollection {}", req.pcollection_id))?;
 
-        /*let filter = Expr::eq(
-            PCOLLECTION_ID_COLUMN,
-            ScalarValue::from(req.pcollection_id.clone()),
-        );*/
-
         //Tonbo's scan is a !Send so we isolate that in a separate thread.
         let batches = self
             .local_pool
-            //.spawn_pinned(move || async move { db.scan().filter(filter).collect().await })
             .spawn_pinned(move || async move { db.scan().collect().await })
             .await
             .map_err(|error| anyhow!("scan task panicked: {error}"))??;
