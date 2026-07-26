@@ -7,7 +7,7 @@ const MAX_GROWTH_FACTOR: usize = 2;
 const WARMUP_BATCH_COUNT: usize = 1;
 
 /// Dynamic batch-size estimation for amortizing a fixed cost over a variable
-/// number of elements, Inspired by Apache Beam BatchElements utility.
+/// number of elements. Inspired by Apache Beam BatchElements utility.
 ///
 /// Tracks `(batch_size, elapsed)` observations and estimates batch size dynamically
 /// that will drive the measured cost model

@@ -3,7 +3,7 @@ use std::{
     io::Cursor,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Error, anyhow};
@@ -35,6 +35,7 @@ use crate::{
     },
     jobservice::urns::beam_urns,
     transforms::{ExecutionContext, FlareRunnerTransform},
+    utils::batch_size_estimator::{BatchConfig, BatchSizeEstimator},
 };
 
 pub struct StageExecutor {
@@ -230,7 +231,7 @@ impl StageExecutor {
                                         &output_meta_data.produced_pcol_id,
                                     ),
                                 };
-                                // pass data_key to get resiciver
+                                // pass data_key to get receiver
                                 info!("Data Key: {:?}", data_key);
                                 let receiver = self.data.get_receiver(data_key);
 
@@ -589,7 +590,11 @@ impl StageExecutor {
         store: Arc<FlareElementStore>,
         pipeline_coders: Arc<HashMap<String, Coder>>,
     ) -> anyhow::Result<()> {
-        const MIN_BATCH_SIZE: usize = 2;
+        let mut batch_size_estimator = BatchSizeEstimator::new(BatchConfig {
+            min_batch_size: 2,
+            ..BatchConfig::default()
+        });
+        let mut target_batch_size = batch_size_estimator.next_batch_size();
 
         info!("Spawned task to process stage's output elements");
         info!(
@@ -605,7 +610,7 @@ impl StageExecutor {
         let windowed_value_coder = WindowedValueCoder::new(element_coder);
 
         let mut stream_buffer = BytesMut::new();
-        let mut batch: Vec<BeamRecord> = Vec::with_capacity(MIN_BATCH_SIZE);
+        let mut batch: Vec<BeamRecord> = Vec::with_capacity(target_batch_size);
         let pcollection_id = edge_metadata.produced_pcol_id.clone();
         let mut stream_ended = false;
 
@@ -646,12 +651,16 @@ impl StageExecutor {
 
                                 batch.push(windowed_value.value);
 
-                                if batch.len() >= MIN_BATCH_SIZE {
+                                if batch.len() >= target_batch_size {
+                                    let batch_size = batch.len();
                                     let request = NewCollectionRequest {
                                         pcollection_id: pcollection_id.clone(),
                                         elements: std::mem::take(&mut batch),
                                     };
+                                    let start = Instant::now();
                                     store.write_beamrecord_batch(request).await?;
+                                    batch_size_estimator.record(batch_size, start.elapsed());
+                                    target_batch_size = batch_size_estimator.next_batch_size();
                                 }
                             }
                             Ok(Err(coder_err)) => {
@@ -679,11 +688,14 @@ impl StageExecutor {
 
         // Flush any remaining elements in the batch.
         if !batch.is_empty() {
+            let batch_size = batch.len();
             let request = NewCollectionRequest {
                 pcollection_id,
                 elements: batch,
             };
+            let start = Instant::now();
             store.write_beamrecord_batch(request).await?;
+            batch_size_estimator.record(batch_size, start.elapsed());
         }
 
         Ok(())
