@@ -37,6 +37,7 @@ async-trait = "0.1.89"
 bytes = "1.11.1"
 fs = "0.0.5"
 tokio-util = { version = "0.7.18", features = ["rt"] }
+rand = "0.10.2"
 #clap = "4.6.1"
 [dependencies.uuid]
 version = "1.23.1"
