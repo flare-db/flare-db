@@ -1,5 +1,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    io::Cursor,
+    panic::{AssertUnwindSafe, catch_unwind},
     sync::Arc,
     time::Duration,
 };
@@ -587,62 +589,101 @@ impl StageExecutor {
         store: Arc<FlareElementStore>,
         pipeline_coders: Arc<HashMap<String, Coder>>,
     ) -> anyhow::Result<()> {
-        info!("Spawaned task to process stage's output elements");
-        let mut stream_buffer = BytesMut::new();
+        const MIN_BATCH_SIZE: usize = 2;
 
+        info!("Spawned task to process stage's output elements");
         info!(
             "Decoding with coder_id={}, component_coders={:?}",
             edge_metadata.coder_id, edge_metadata.component_coder
         );
 
-        loop {
-            info!("Inside the process_output_elements loop ");
+        let element_coder = StandardBeamCoders::from_urn(
+            &edge_metadata.coder_id,
+            edge_metadata.component_coder,
+            Some(pipeline_coders.as_ref()),
+        );
+        let windowed_value_coder = WindowedValueCoder::new(element_coder);
+
+        let mut stream_buffer = BytesMut::new();
+        let mut batch: Vec<BeamRecord> = Vec::with_capacity(MIN_BATCH_SIZE);
+        let pcollection_id = edge_metadata.produced_pcol_id.clone();
+        let mut stream_ended = false;
+
+        while !stream_ended {
             let payload = {
                 let mut receiver_lock = receiver.lock().await;
                 receiver_lock.recv().await
             };
-            info!("Got payload");
-
-            let Some(payload) = payload else {
-                info!("payload is empty");
-                break;
-            };
 
             match payload {
-                ElementStreamPayload::Data(data_chunk) => {
-                    info!("processing data chunk");
+                Some(ElementStreamPayload::Data(data_chunk)) => {
                     stream_buffer.extend_from_slice(&data_chunk.data.data);
 
                     if data_chunk.data.is_last {
-                        info!("Last data chunk");
-                        let element_coder = StandardBeamCoders::from_urn(
-                            &edge_metadata.coder_id,
-                            edge_metadata.component_coder,
-                            Some(pipeline_coders.as_ref()),
-                        );
-                        let windowed_value_coder = WindowedValueCoder::new(element_coder);
+                        stream_ended = true;
+                    }
 
-                        let mut decoded = Vec::<BeamRecord>::new();
-                        let mut buf = stream_buffer.freeze();
-
-                        while buf.has_remaining() {
-                            decoded.push(windowed_value_coder.decode(&mut buf)?.value);
+                    // Decode as many complete elements as possible from the buffer.
+                    // Elements may span Data message boundaries, when a decode underflows
+                    // (panics due to incomplete data), we catch it and wait for more data.
+                    loop {
+                        if stream_buffer.is_empty() {
+                            break;
                         }
 
-                        let request = NewCollectionRequest {
-                            pcollection_id: edge_metadata.produced_pcol_id.clone(),
-                            elements: decoded,
-                        };
-                        store.write_beamrecord_batch(request).await?;
-                        return Ok(());
+                        // Read through a Cursor so stream_buffer is never mutated on panic.
+                        let mut cursor = Cursor::new(&stream_buffer[..]);
+
+                        let decode_result = catch_unwind(AssertUnwindSafe(|| {
+                            windowed_value_coder.decode(&mut cursor)
+                        }));
+
+                        match decode_result {
+                            Ok(Ok(windowed_value)) => {
+                                let consumed = cursor.position() as usize;
+                                drop(cursor);
+                                stream_buffer.advance(consumed);
+
+                                batch.push(windowed_value.value);
+
+                                if batch.len() >= MIN_BATCH_SIZE {
+                                    let request = NewCollectionRequest {
+                                        pcollection_id: pcollection_id.clone(),
+                                        elements: std::mem::take(&mut batch),
+                                    };
+                                    store.write_beamrecord_batch(request).await?;
+                                }
+                            }
+                            Ok(Err(coder_err)) => {
+                                return Err(anyhow!("Coder decode error: {:?}", coder_err));
+                            }
+                            Err(_panic) => {
+                                // Cursor is dropped; stream_buffer was never advanced.
+                                break;
+                            }
+                        }
                     }
                 }
 
-                ElementStreamPayload::Timers(_timer_chunk) => {
+                Some(ElementStreamPayload::Timers(_timer_chunk)) => {
                     //todo!()
                     info!("Timers chunk");
                 }
+
+                None => {
+                    info!("Receiver channel closed");
+                    stream_ended = true;
+                }
             }
+        }
+
+        // Flush any remaining elements in the batch.
+        if !batch.is_empty() {
+            let request = NewCollectionRequest {
+                pcollection_id,
+                elements: batch,
+            };
+            store.write_beamrecord_batch(request).await?;
         }
 
         Ok(())
