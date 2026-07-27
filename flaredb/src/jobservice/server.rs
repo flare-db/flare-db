@@ -1,4 +1,4 @@
-use std::{process::Stdio, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use beam_model_rs::v1::{
     ApiServiceDescriptor, CancelJobRequest, CancelJobResponse, DescribePipelineOptionsRequest,
@@ -9,7 +9,7 @@ use beam_model_rs::v1::{
     job_service_server::JobService,
 };
 use dashmap::DashSet;
-use tokio::{process::Command, sync::Mutex, time::timeout};
+use tokio::{sync::Mutex, time::timeout};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Response;
 use tonic::Status;
@@ -20,21 +20,11 @@ use crate::jobservice::artifact::ArtifactStore;
 use crate::jobservice::job::Job;
 use crate::jobservice::job::JobStore;
 
-#[derive(Clone, Debug)]
-pub struct HarnessLaunchConfig {
-    pub worker_jar: String,
-    pub logs_dir: String,
-    pub control_url: String,
-    pub pipeline_options: String,
-    pub connect_timeout_secs: u64,
-}
-
-#[derive(Clone)]
 pub struct FlareJobService {
     job_store: JobStore,
     executor: Arc<Mutex<StageExecutor>>,
     artifact_store: Arc<ArtifactStore>,
-    harness_cfg: HarnessLaunchConfig,
+    worker_manager: crate::worker::manager::WorkerManager,
     staging_tokens: Arc<DashSet<String>>,
     instance_id: String,
 }
@@ -43,14 +33,14 @@ impl FlareJobService {
     pub fn with(
         executor: StageExecutor,
         artifact_store: Arc<ArtifactStore>,
-        harness_cfg: HarnessLaunchConfig,
+        worker_manager: crate::worker::manager::WorkerManager,
         instance_id: String,
     ) -> Self {
         Self {
             job_store: JobStore::new(),
             executor: Arc::new(Mutex::new(executor)),
             artifact_store,
-            harness_cfg,
+            worker_manager,
             staging_tokens: Arc::new(DashSet::new()),
             instance_id,
         }
@@ -58,85 +48,6 @@ impl FlareJobService {
 
     pub fn get_staging_tokens(&self) -> Arc<DashSet<String>> {
         self.staging_tokens.clone()
-    }
-
-    async fn spawn_harness(&self, job_id: &str) -> Result<(), Status> {
-        let staged_jar = self.artifact_store.staged_path();
-        let worker_jar = &self.harness_cfg.worker_jar;
-
-        let worker_exists = tokio::fs::try_exists(worker_jar)
-            .await
-            .map_err(|e| Status::internal(format!("failed to stat worker jar: {}", e)))?;
-        if !worker_exists {
-            return Err(Status::internal(format!(
-                "worker jar not found at {}",
-                worker_jar
-            )));
-        }
-
-        let staged_exists = tokio::fs::try_exists(&staged_jar)
-            .await
-            .map_err(|e| Status::internal(format!("failed to stat staged artifact: {}", e)))?;
-        if !staged_exists {
-            return Err(Status::internal(format!(
-                "staged artifact not found at {}",
-                staged_jar
-            )));
-        }
-
-        let logs_dir = crate::utils::path::logs_dir(&self.instance_id, job_id);
-        tokio::fs::create_dir_all(&logs_dir)
-            .await
-            .map_err(|e| Status::internal(format!("failed to create logs dir: {}", e)))?;
-
-        let log_path = format!("{}/flare-worker.log", logs_dir.display());
-        let stdout_file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-            .map_err(|e| Status::internal(format!("failed to open harness log file: {}", e)))?;
-        let stderr_file = stdout_file
-            .try_clone()
-            .map_err(|e| Status::internal(format!("failed to clone harness log handle: {}", e)))?;
-
-        let classpath = format!("{}:{}", worker_jar, staged_jar);
-        let mut cmd = Command::new("java");
-        cmd.arg("-cp")
-            .arg(&classpath)
-            .arg("org.apache.beam.fn.harness.FnHarness")
-            .env("HARNESS_ID", job_id)
-            .env(
-                "CONTROL_API_SERVICE_DESCRIPTOR",
-                format!(r#"url: "{}""#, self.harness_cfg.control_url),
-            )
-            .env(
-                "LOGGING_API_SERVICE_DESCRIPTOR",
-                format!(r#"url: "{}""#, self.harness_cfg.control_url),
-            )
-            .env(
-                "DATA_API_SERVICE_DESCRIPTOR",
-                format!(r#"url: "{}""#, self.harness_cfg.control_url),
-            )
-            .env(
-                "STATE_API_SERVICE_DESCRIPTOR",
-                format!(r#"url: "{}""#, self.harness_cfg.control_url),
-            )
-            .env("PIPELINE_OPTIONS", &self.harness_cfg.pipeline_options)
-            .stdout(Stdio::from(stdout_file))
-            .stderr(Stdio::from(stderr_file));
-
-        let child = cmd
-            .spawn()
-            .map_err(|e| Status::internal(format!("failed to spawn harness: {}", e)))?;
-        log::info!(
-            "spawned harness: job_id={}, pid={:?}, classpath={}, log={}",
-            job_id,
-            child.id(),
-            classpath,
-            log_path
-        );
-
-        Ok(())
     }
 }
 
@@ -233,12 +144,16 @@ impl JobService for FlareJobService {
                 Status::not_found(format!("unknown preparation_id: {}", preparation_id))
             })?;
 
-            self.spawn_harness(&preparation_id).await?;
+            let staged_jar = self.artifact_store.staged_path();
+            self.worker_manager
+                .spawn_worker(&preparation_id, &staged_jar, &self.instance_id)
+                .await?;
 
             let executor = self.executor.clone();
             executor.lock().await.set_job_store(&preparation_id);
+            let connect_timeout_secs = self.worker_manager.config().connect_timeout_secs;
             timeout(
-                Duration::from_secs(self.harness_cfg.connect_timeout_secs),
+                Duration::from_secs(connect_timeout_secs),
                 async {
                     let executor = executor.lock().await;
                     executor.wait_connected().await
@@ -248,7 +163,7 @@ impl JobService for FlareJobService {
             .map_err(|_| {
                 Status::internal(format!(
                     "harness did not connect within {}s for job {}",
-                    self.harness_cfg.connect_timeout_secs, preparation_id
+                    connect_timeout_secs, preparation_id
                 ))
             })?
             .map_err(|e| {
@@ -373,7 +288,14 @@ impl JobService for FlareJobService {
         'life0: 'async_trait,
         Self: 'async_trait,
     {
-        todo!()
+        Box::pin(async move {
+            let job_id = request.into_inner().job_id;
+            log::info!("cancel request received for job_id={}", job_id);
+            self.worker_manager.stop_worker(&job_id).await?;
+            Ok(Response::new(CancelJobResponse {
+                state: beam_model_rs::v1::job_state::Enum::Cancelled as i32,
+            }))
+        })
     }
 
     #[doc = " Drain the job"]
