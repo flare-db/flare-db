@@ -635,7 +635,6 @@ pub fn beamrecords_to_record_batch(
     }
 
     let record_type = record_type_from_schema(&schema)?;
-    info!("record type: {:?}", record_type);
     let row_count = records.len();
     let element_ids: Vec<String> = (0..row_count).map(|_| Uuid::new_v4().to_string()).collect();
 
@@ -950,8 +949,6 @@ impl FlareElementStore {
     // used when a transfrom/stage produces beam records and that needs to be converted
     // to arrow record batch before ingesting into db.
     pub async fn write_beamrecord_batch(&self, req: NewCollectionRequest) -> Result<()> {
-        info!("store: starting to write collection");
-
         let schema = match self.registry.get(&req.pcollection_id) {
             Some(schema) => schema,
             None => derive_schema_from_records(&req.pcollection_id, &req.elements)?,
