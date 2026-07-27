@@ -80,3 +80,15 @@ pub enum ElementStoreError {
 pub enum TransformError {
     Error(String),
 }
+
+#[derive(Debug, thiserror::Error)]
+pub enum BatchConfigError {
+    #[error("min_batch_size ({0}) must not be greater than max_batch_size ({1})")]
+    MinExceedsMax(usize, usize),
+    #[error("target_batch_overhead ({0}) must be in (0, 1]")]
+    InvalidOverhead(f64),
+    #[error("target_batch_duration_secs ({0}) must be positive")]
+    InvalidDuration(f64),
+    #[error("target_batch_duration_secs_with_fixed_cost ({0}) must be positive")]
+    InvalidFixedCostDuration(f64),
+}
