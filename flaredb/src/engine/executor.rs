@@ -650,7 +650,6 @@ impl StageExecutor {
                                 stream_buffer.advance(consumed);
 
                                 batch.push(windowed_value.value);
-
                                 if batch.len() >= target_batch_size {
                                     let batch_size = batch.len();
                                     let request = NewCollectionRequest {
@@ -667,6 +666,12 @@ impl StageExecutor {
                                 return Err(anyhow!("Coder decode error: {:?}", coder_err));
                             }
                             Err(_panic) => {
+                                if stream_ended {
+                                    return Err(anyhow!(
+                                        "decode panic with {} leftover bytes after end of stream",
+                                        stream_buffer.len()
+                                    ));
+                                }
                                 // Cursor is dropped; stream_buffer was never advanced.
                                 break;
                             }
@@ -686,17 +691,28 @@ impl StageExecutor {
             }
         }
 
+        if !stream_buffer.is_empty() {
+            return Err(anyhow!(
+                "{} leftover bytes remain after end of stream — decoded {} elements, {} undecoded bytes discarded",
+                stream_buffer.len(),
+                batch.len(),
+                stream_buffer.len(),
+            ));
+        }
+
         // Flush any remaining elements in the batch.
         if !batch.is_empty() {
             let batch_size = batch.len();
             let request = NewCollectionRequest {
-                pcollection_id,
+                pcollection_id: pcollection_id.clone(),
                 elements: batch,
             };
             let start = Instant::now();
             store.write_beamrecord_batch(request).await?;
             batch_size_estimator.record(batch_size, start.elapsed());
         }
+
+        info!("Finished decoding output elements");
 
         Ok(())
     }

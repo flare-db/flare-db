@@ -10,10 +10,9 @@ use arrow_schema::{DataType, Field, Schema};
 use dashmap::DashMap;
 use fusio::disk::TokioFs;
 use fusio::executor::tokio::TokioExecutor;
-use log::info;
 use std::hash::{Hash, Hasher};
 use tokio_util::task::LocalPoolHandle;
-use tonbo::db::{DB, DbBuilder};
+use tonbo::db::{BatchesThreshold, DB, DbBuilder};
 use tonbo::prelude::*;
 use typed_arrow::{List, Null};
 use uuid::Uuid;
@@ -937,6 +936,8 @@ impl FlareElementStore {
 
         let db = DbBuilder::from_schema_key_name(schema, ELEMENT_ID_COLUMN)?
             .on_disk(format!("{}/{safe_id}", self.base_path))?
+            .with_seal_policy(Arc::new(BatchesThreshold { batches: 4 }))
+            .with_minor_compaction(2, 0)
             .open()
             .await?;
 
