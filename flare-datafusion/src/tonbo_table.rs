@@ -194,7 +194,7 @@ impl ExecutionPlan for TonboExec {
     ) -> datafusion::error::Result<SendableRecordBatchStream> {
         let filter = self.df_to_aisle(&self.filters);
         let db = self.db.clone();
-        let schema = Arc::clone(&self.schema);
+        //let schema = Arc::clone(&self.schema);
         let local_pool = self.local_pool.clone();
         let projected_schema = Arc::clone(&self.projected_schema);
         let output_schema = Arc::clone(&self.projected_schema);

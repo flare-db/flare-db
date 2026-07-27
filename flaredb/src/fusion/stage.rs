@@ -1,5 +1,5 @@
 use beam_model_rs::v1::executable_stage_payload::WireCoderSetting;
-use beam_model_rs::v1::{Components, Environment, PCollection, PTransform};
+use beam_model_rs::v1::{Components, Environment, PTransform};
 use indexmap::IndexSet;
 use uuid::Uuid;
 

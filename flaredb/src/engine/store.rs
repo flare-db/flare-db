@@ -10,15 +10,9 @@ use arrow_schema::{DataType, Field, Schema};
 use dashmap::DashMap;
 use fusio::disk::TokioFs;
 use fusio::executor::tokio::TokioExecutor;
-use log::info;
 use std::hash::{Hash, Hasher};
 use tokio_util::task::LocalPoolHandle;
-//use tonbo::db::{DB, DbBuilder};
-use std::time::Duration;
-use tonbo::db::{
-    BatchesThreshold, CompactionOptions, CompactionStrategy, DB, DbBuilder, L0BackpressureConfig,
-    LeveledPlannerConfig,
-};
+use tonbo::db::{BatchesThreshold, DB, DbBuilder};
 use tonbo::prelude::*;
 use typed_arrow::{List, Null};
 use uuid::Uuid;
