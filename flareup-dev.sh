@@ -9,6 +9,17 @@ FLARE_LOG="${LOG_DIR}/flare-server.log"
 # Version should match the CLI constant FLAREDB_VERSION in src/main.rs
 FLAREDB_VERSION="0.1.8"
 
+# Build type (default: debug)
+BUILD_TYPE="debug"
+
+if [[ "${1:-}" == "--release" ]]; then
+    BUILD_TYPE="release"
+    shift
+elif [[ "${1:-}" == "--debug" ]]; then
+    BUILD_TYPE="debug"
+    shift
+fi
+
 if ! command -v java >/dev/null 2>&1; then
     echo "java is required but was not found on PATH."
     exit 1
@@ -58,22 +69,37 @@ fi
 # Prefer local build binary for development; fall back to bin/flaredb-<version> if present
 LOCAL_FLAREDB_BINARY_DEBUG="${REPO_DIR}/target/debug/flaredb"
 LOCAL_FLAREDB_BINARY_RELEASE="${REPO_DIR}/target/release/flaredb"
-FLAREDB_BINARY=""
 
-if [[ -x "${LOCAL_FLAREDB_BINARY_DEBUG}" ]]; then
-    FLAREDB_BINARY="${LOCAL_FLAREDB_BINARY_DEBUG}"
-elif [[ -x "${LOCAL_FLAREDB_BINARY_RELEASE}" ]]; then
-    FLAREDB_BINARY="${LOCAL_FLAREDB_BINARY_RELEASE}"
-elif [[ -x "${BIN_DIR}/flaredb-${FLAREDB_VERSION}" ]]; then
-    FLAREDB_BINARY="${BIN_DIR}/flaredb-${FLAREDB_VERSION}"
-else
-    echo "Local flaredb binary not found."
-    echo "Please build it first with:"
-    echo "  cd ${REPO_DIR} && cargo build -p flaredb"
-    exit 1
-fi
+case "${BUILD_TYPE}" in
+    release)
+        if [[ -x "${LOCAL_FLAREDB_BINARY_RELEASE}" ]]; then
+            FLAREDB_BINARY="${LOCAL_FLAREDB_BINARY_RELEASE}"
+        elif [[ -x "${LOCAL_FLAREDB_BINARY_DEBUG}" ]]; then
+            FLAREDB_BINARY="${LOCAL_FLAREDB_BINARY_DEBUG}"
+        elif [[ -x "${BIN_DIR}/flaredb-${FLAREDB_VERSION}" ]]; then
+            FLAREDB_BINARY="${BIN_DIR}/flaredb-${FLAREDB_VERSION}"
+        else
+            echo "Release binary not found. Build it with:"
+            echo "  cargo build --release -p flaredb"
+            exit 1
+        fi
+        ;;
+    debug)
+        if [[ -x "${LOCAL_FLAREDB_BINARY_DEBUG}" ]]; then
+            FLAREDB_BINARY="${LOCAL_FLAREDB_BINARY_DEBUG}"
+        elif [[ -x "${LOCAL_FLAREDB_BINARY_RELEASE}" ]]; then
+            FLAREDB_BINARY="${LOCAL_FLAREDB_BINARY_RELEASE}"
+        elif [[ -x "${BIN_DIR}/flaredb-${FLAREDB_VERSION}" ]]; then
+            FLAREDB_BINARY="${BIN_DIR}/flaredb-${FLAREDB_VERSION}"
+        else
+            echo "Debug binary not found. Build it with:"
+            echo "  cargo build -p flaredb"
+            exit 1
+        fi
+        ;;
+esac
 
-echo "Using FlareDB binary: ${FLAREDB_BINARY}"
+echo "Using ${BUILD_TYPE} build: ${FLAREDB_BINARY}"
 
 # generate a new instance id every time the script runs
 if command -v uuidgen >/dev/null 2>&1; then
