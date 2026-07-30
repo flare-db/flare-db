@@ -61,6 +61,7 @@
 pub mod engine;
 pub mod fusion;
 pub mod jobservice;
+pub mod store;
 pub mod transforms;
 pub mod utils;
 pub mod worker;

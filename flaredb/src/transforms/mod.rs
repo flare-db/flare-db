@@ -10,8 +10,8 @@ use beam_model_rs::v1::{
 use uuid::Uuid;
 
 use crate::{
-    engine::store::FlareElementStore,
     jobservice::urns::beam_urns,
+    store::element_store::FlareElementStore,
     transforms::{gbk::GroupByKey, impluse::Impulse},
 };
 

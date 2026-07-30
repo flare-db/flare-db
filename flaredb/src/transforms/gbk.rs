@@ -13,7 +13,7 @@ use std::{
     sync::Arc,
 };
 
-use crate::engine::store::create_schema_with_record_type;
+use crate::store::record::create_schema_with_record_type;
 
 use crate::{
     jobservice::urns::beam_urns,

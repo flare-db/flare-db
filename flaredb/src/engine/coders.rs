@@ -1,5 +1,5 @@
 use crate::{
-    engine::store::{BeamGbk, BeamKV, BeamRecord, IterableValue, PrimitiveValue},
+    store::record::{BeamGbk, BeamKV, BeamRecord, IterableValue, PrimitiveValue},
     utils::errors::CodersError,
 };
 use beam_model_rs::v1::Coder;
@@ -605,7 +605,7 @@ mod tests {
     use bytes::BytesMut;
     use typed_arrow::{List, Null};
 
-    use crate::engine::store::{BeamGbk, BeamKV, BeamRecord, IterableValue, PrimitiveValue};
+    use crate::store::record::{BeamGbk, BeamKV, BeamRecord, IterableValue, PrimitiveValue};
 
     fn roundtrip(coder: &StandardBeamCoders, value: BeamRecord) -> BeamRecord {
         let mut buf = BytesMut::new();
@@ -882,7 +882,7 @@ mod beam_wire_tests {
     use bytes::{Bytes, BytesMut};
     use typed_arrow::List;
 
-    use crate::engine::store::{BeamKV, BeamRecord, PrimitiveValue};
+    use crate::store::record::{BeamKV, BeamRecord, PrimitiveValue};
 
     fn str_value(s: &str) -> PrimitiveValue {
         PrimitiveValue::String(s.to_string())

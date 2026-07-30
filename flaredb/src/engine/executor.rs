@@ -26,16 +26,16 @@ use crate::{
             log::LogChannel,
             state::StateChannel,
         },
-        store::{
-            BeamRecord, FlareElementStore, FlareSchemaRegistry, NewCollectionRequest,
-            ScanCollectionRequest,
-        },
     },
     fusion::{
         pipeline::{ConsumerMetaData, ExecutableGraph, ExecutableNode},
         stage::ExecutableStage,
     },
     jobservice::urns::beam_urns,
+    store::element_store::{
+        FlareElementStore, FlareSchemaRegistry, NewCollectionRequest, ScanCollectionRequest,
+    },
+    store::record::BeamRecord,
     transforms::{ExecutionContext, FlareRunnerTransform},
     utils::batch_size_estimator::{BatchConfig, BatchSizeEstimator},
 };
