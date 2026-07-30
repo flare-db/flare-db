@@ -7,24 +7,36 @@ use beam_model_rs::v1::{
     elements::{Data, Timers},
 };
 use dashmap::DashMap;
-use log::info;
+use log::{info, warn};
 use tokio::sync::{
     Mutex,
-    mpsc::{self, Sender, UnboundedReceiver, UnboundedSender},
+    mpsc::{self, UnboundedReceiver, UnboundedSender},
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Response, Status};
 
 pub struct DataInner {
-    outgoing: Mutex<Option<mpsc::Receiver<Result<Elements, Status>>>>,
+    outgoing_tx: Mutex<Option<mpsc::Sender<Result<Elements, Status>>>>,
+    outgoing_rx: Mutex<Option<mpsc::Receiver<Result<Elements, Status>>>>,
     incoming: Mutex<Option<tonic::Streaming<Elements>>>,
+}
+
+impl DataInner {
+    async fn sender(&self) -> anyhow::Result<mpsc::Sender<Result<Elements, Status>>> {
+        self.outgoing_tx
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| anyhow!("data outgoing channel not initialized"))
+    }
 }
 
 pub async fn start_data_server() -> Result<(DataChannel, FlareDataService), anyhow::Error> {
     let (tx, rx) = mpsc::channel::<Result<Elements, Status>>(32);
 
     let stream = Arc::new(DataInner {
-        outgoing: Mutex::new(Some(rx)),
+        outgoing_tx: Mutex::new(Some(tx)),
+        outgoing_rx: Mutex::new(Some(rx)),
         incoming: Mutex::new(None),
     });
 
@@ -33,9 +45,9 @@ pub async fn start_data_server() -> Result<(DataChannel, FlareDataService), anyh
     };
 
     let channel = DataChannel {
-        outgoing: Arc::new(tx),
         worker_stream: stream,
         runner_stream: Arc::new(ElementStreamMultiplexer::new()),
+        stream_task: Arc::new(std::sync::Mutex::new(None)),
     };
     Ok((channel, service))
 }
@@ -75,13 +87,20 @@ impl BeamFnData for FlareDataService {
             info!("BeamFnData stream connected from harness");
             *self.inner.incoming.lock().await = Some(request.into_inner());
 
-            let rx = self
-                .inner
-                .outgoing
-                .lock()
-                .await
-                .take()
-                .ok_or_else(|| Status::internal("Error"))?;
+            let rx = {
+                let mut rx_guard = self.inner.outgoing_rx.lock().await;
+                if rx_guard.is_none() {
+                    warn!(
+                        "Data stream connected while a previous harness stream was still active; replacing stale stream"
+                    );
+                    let (tx, rx) = mpsc::channel::<Result<Elements, Status>>(32);
+                    *self.inner.outgoing_tx.lock().await = Some(tx);
+                    *rx_guard = Some(rx);
+                }
+                rx_guard
+                    .take()
+                    .expect("data outgoing receiver must be initialized")
+            };
 
             std::result::Result::Ok(Response::new(ReceiverStream::new(rx)))
         })
@@ -90,25 +109,55 @@ impl BeamFnData for FlareDataService {
 
 #[derive(Clone)]
 pub struct DataChannel {
-    outgoing: Arc<Sender<Result<Elements, Status>>>,
     worker_stream: Arc<DataInner>,
     runner_stream: Arc<ElementStreamMultiplexer>,
+    // Handle to the background streaming task.  Aborted and awaited on
+    // reset so a stale task from a previous job does not consume the
+    // new harness's data stream.
+    stream_task: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl DataChannel {
     pub async fn send_elements(&self, elements: Elements) -> anyhow::Result<()> {
-        self.outgoing
+        let sender = self.worker_stream.sender().await?;
+        sender
             .send(Ok(elements))
             .await
             .map_err(|e| anyhow!("failed to send data-plane elements to harness: {}", e))
     }
 
+    // Reset the data channel so a new harness can connect.
+    pub async fn reset(&self) {
+        // Abort the streaming task from the previous job so it does not
+        // race with the new task to consume the incoming harness stream.
+        let handle = self.stream_task.lock().unwrap().take();
+        if let Some(handle) = handle {
+            handle.abort();
+            // Wait for the task to finish before replacing channels.
+            let _ = handle.await;
+        }
+
+        let (tx, rx) = mpsc::channel::<Result<Elements, Status>>(32);
+
+        *self.worker_stream.outgoing_tx.lock().await = Some(tx);
+        *self.worker_stream.outgoing_rx.lock().await = Some(rx);
+        *self.worker_stream.incoming.lock().await = None;
+
+        // Clear the element multiplexer — old entries from the previous
+        // harness are stale.
+        self.runner_stream.senders().clear();
+        self.runner_stream.receivers().clear();
+
+        log::info!("data channel reset for next harness");
+    }
+
     pub fn stream_elements(&self) {
         let worker_data_stream = self.worker_stream.clone();
         let runner_stream = self.runner_stream.clone();
+        let task_slot = self.stream_task.clone();
         info!("Streaming elements from harness");
 
-        tokio::spawn(async move {
+        let join_handle = tokio::spawn(async move {
             loop {
                 let mut guard = worker_data_stream.incoming.lock().await;
 
@@ -117,54 +166,61 @@ impl DataChannel {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                     continue;
                 };
+                // timers and data related?
+                loop {
+                    match stream.message().await {
+                        Ok(Some(elements)) => {
+                            info!(
+                                "Received Elements from harness: data={}, timers={}",
+                                elements.data.len(),
+                                elements.timers.len()
+                            );
+                            for data in elements.data {
+                                info!(
+                                    "Routing data from harness: instruction_id={}, transform_id={}, is_last={}, bytes={}",
+                                    data.instruction_id,
+                                    data.transform_id,
+                                    data.is_last,
+                                    data.data.len()
+                                );
+                                let data_key = DataKey {
+                                    instruction_id: data.instruction_id.clone(),
+                                    transform_id: data.transform_id.clone(),
+                                };
 
-                // I am not sure if Data and Timers in elements are realted or not
-                // So, for now i am senning it as individual playload, if realted
-                // we could modify the code later.
-                while let Some(elements) = stream.message().await.unwrap() {
-                    info!(
-                        "Received Elements from harness: data={}, timers={}",
-                        elements.data.len(),
-                        elements.timers.len()
-                    );
-                    for data in elements.data {
-                        info!(
-                            "Routing data from harness: instruction_id={}, transform_id={}, is_last={}, bytes={}",
-                            data.instruction_id,
-                            data.transform_id,
-                            data.is_last,
-                            data.data.len()
-                        );
-                        let data_key = DataKey {
-                            instruction_id: data.instruction_id.clone(),
-                            transform_id: data.transform_id.clone(),
-                        };
+                                let element_key = ElementKey::Data(data_key.clone());
 
-                        let element_key = ElementKey::Data(data_key.clone());
+                                let sender = Self::get_sender(element_key, &runner_stream);
 
-                        let sender = Self::get_sender(element_key, &runner_stream);
+                                let _ = sender.send(ElementStreamPayload::Data(DataChunk {
+                                    key: data_key,
+                                    data,
+                                }));
+                            }
 
-                        let _ = sender.send(ElementStreamPayload::Data(DataChunk {
-                            key: data_key,
-                            data,
-                        }));
-                    }
+                            for timers in elements.timers {
+                                let timers_key = TimersKey {
+                                    instruction_id: timers.instruction_id.clone(),
+                                };
 
-                    for timers in elements.timers {
-                        let timers_key = TimersKey {
-                            instruction_id: timers.instruction_id.clone(),
-                            // transform_id: timers.transform_id.clone(),
-                            // timer_family_id: timers.timer_family_id.clone(),
-                        };
+                                let element_key = ElementKey::Timers(timers_key.clone());
 
-                        let element_key = ElementKey::Timers(timers_key.clone());
+                                let sender = Self::get_sender(element_key, &runner_stream);
 
-                        let sender = Self::get_sender(element_key, &runner_stream);
-
-                        let _ = sender.send(ElementStreamPayload::Timers(TimerChunk {
-                            key: timers_key,
-                            timers,
-                        }));
+                                let _ = sender.send(ElementStreamPayload::Timers(TimerChunk {
+                                    key: timers_key,
+                                    timers,
+                                }));
+                            }
+                        }
+                        Ok(None) => {
+                            info!("BeamFnData stream from harness closed cleanly");
+                            break;
+                        }
+                        Err(e) => {
+                            warn!("BeamFnData stream error (harness gone?): {}", e);
+                            break;
+                        }
                     }
                 }
 
@@ -172,6 +228,9 @@ impl DataChannel {
                 break;
             }
         });
+
+        // Store the join handle so we can cancel and await this task on reset.
+        *task_slot.lock().unwrap() = Some(join_handle);
     }
     fn get_sender(
         key: ElementKey,

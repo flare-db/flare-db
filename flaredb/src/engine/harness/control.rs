@@ -6,27 +6,42 @@ use beam_model_rs::v1::{
     ProcessBundleDescriptor, ProcessBundleRequest, ProcessBundleResponse, RegisterRequest,
     beam_fn_control_server::BeamFnControl, instruction_request,
 };
-use log::info;
+use log::{info, warn};
 use tokio::sync::{Mutex, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Response, Status};
 
-//type Result<T> = std::result::Result<T, HarnessError>;
-
-// shared inner state
-// Arc so both FlareControlService (owned by tonic)
-// and ControlChannel (owned by stage_executor) see the same state
-
+// Shared inner state held in an Arc so both FlareControlService and
+// ControlChannel (owned by StageExecutor) see the same state.
+//
+// The outgoing channel is split into tx (sender, used by ControlChannel to
+// push InstructionRequests to the harness) and rx (receiver, handed to the
+// harness gRPC stream via ReceiverStream).  Both are Option-wrapped so they
+// can be replaced when a job finishes and a fresh harness connects.
 pub struct ControlInner {
-    // rx end — handed to harness as ReceiverStream
-    // Flare writes InstructionRequests to the tx end
-    pub outgoing: Mutex<Option<mpsc::Receiver<Result<InstructionRequest, Status>>>>,
+    // Sender — ControlChannel writes InstructionRequests here.
+    pub outgoing_tx: Mutex<Option<mpsc::Sender<Result<InstructionRequest, Status>>>>,
 
-    // the live gRPC stream from harness
-    // harness writes InstructionResponses into this
-    // ControlChannel reads from it directly
+    // Receiver — taken by FlareControlService::control() and handed to the
+    // harness as a ReceiverStream.
+    pub outgoing_rx: Mutex<Option<mpsc::Receiver<Result<InstructionRequest, Status>>>>,
+
+    // Incoming gRPC stream from the harness (InstructionResponses).
     pub incoming: Mutex<Option<tonic::Streaming<InstructionResponse>>>,
+
+    // ProcessBundleDescriptors registered with the harness.
     pub descriptors: Mutex<HashMap<String, ProcessBundleDescriptor>>,
+}
+
+impl ControlInner {
+    // Clone the sender so callers can send without holding the lock.
+    async fn sender(&self) -> Result<mpsc::Sender<Result<InstructionRequest, Status>>> {
+        self.outgoing_tx
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| anyhow!("control outgoing channel not initialized"))
+    }
 }
 
 // entry point
@@ -35,8 +50,8 @@ pub async fn start_control_server() -> Result<(ControlChannel, FlareControlServi
     let (tx, rx) = mpsc::channel::<Result<InstructionRequest, Status>>(32);
 
     let stream = Arc::new(ControlInner {
-        //reciver
-        outgoing: Mutex::new(Some(rx)),
+        outgoing_tx: Mutex::new(Some(tx)),
+        outgoing_rx: Mutex::new(Some(rx)),
         incoming: Mutex::new(None),
         descriptors: Mutex::new(HashMap::new()),
     });
@@ -45,12 +60,7 @@ pub async fn start_control_server() -> Result<(ControlChannel, FlareControlServi
         inner: stream.clone(),
     };
 
-    let channel = ControlChannel {
-        // sender
-        outgoing: tx,
-        stream,
-        next_id: 0,
-    };
+    let channel = ControlChannel { stream, next_id: 0 };
 
     Ok((channel, service))
 }
@@ -95,17 +105,29 @@ impl BeamFnControl for FlareControlService {
             // persisted in Arc<ControlServiceInner> so it outlives control()
             *self.inner.incoming.lock().await = Some(request.into_inner());
 
-            // take the rx end of the request channel
-            // wrap in ReceiverStream and return to harness
-            // harness will read InstructionRequests from this stream
-            // Flare writes to the tx end via ControlChannel
-            let rx = self
-                .inner
-                .outgoing
-                .lock()
-                .await
-                .take()
-                .ok_or_else(|| Status::internal("harness connected twice"))?;
+            // Take the rx end of the request channel — this is the stream
+            // of InstructionRequests the harness will read.
+            let rx = {
+                let mut rx_guard = self.inner.outgoing_rx.lock().await;
+                // If outgoing_rx is None, a previous harness already took it
+                // and disconnected without a clean reset. Create a fresh
+                // channel pair so the new harness gets a working stream
+                // instead of crashing with "harness connected twice".
+                if rx_guard.is_none() {
+                    warn!(
+                        "Control stream connected while a previous harness stream was still active; replacing stale stream"
+                    );
+                    let (tx, rx) = mpsc::channel::<Result<InstructionRequest, Status>>(32);
+                    *self.inner.outgoing_tx.lock().await = Some(tx);
+                    *rx_guard = Some(rx);
+                }
+                // Take ownership of the receiver and return it as a streaming
+                // gRPC response. After this, outgoing_rx is None again until
+                // the harness is reset for the next job.
+                rx_guard
+                    .take()
+                    .expect("control outgoing receiver must be initialized")
+            };
 
             Ok(Response::new(ReceiverStream::new(rx)))
         })
@@ -157,15 +179,15 @@ pub enum ControlResponse {
     ProcessBundleError(String),
     BundleDone,
 }
-// ControlChannel
-// Flare → harness:  request_tx  (InstructionRequests)
-// harness → Flare:  inner.incoming (InstructionResponses, read directly)
+
+/// ControlChannel: Flare → harness  (InstructionRequests)
+///                harness → Flare  (InstructionResponses, via inner.incoming)
+///
+/// The sender lives inside the shared `ControlInner` so it can be replaced
+/// when a harness disconnects and a new one connects.
 #[derive(Clone)]
 pub struct ControlChannel {
-    // write end — Flare sends InstructionRequests to harness
-    pub outgoing: mpsc::Sender<Result<InstructionRequest, Status>>,
-    // shared with FlareControlService
-    // incoming stream stored here when harness connects
+    /// Shared state with FlareControlService (the gRPC handler).
     pub stream: Arc<ControlInner>,
     pub next_id: u64,
 }
@@ -173,6 +195,7 @@ pub struct ControlChannel {
 impl ControlChannel {
     // wait for harness to connect
     // poll until control() fires and stores the incoming stream
+    /// Wait for the harness to connect its control stream.
     pub async fn wait_connected(&self) -> Result<()> {
         loop {
             if self.stream.incoming.lock().await.is_some() {
@@ -180,6 +203,22 @@ impl ControlChannel {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    // Reset the control channel so a new harness can connect.
+    //
+    // Creates a fresh mpsc pair, clears the incoming stream, and drops all
+    // previously registered descriptors.  Call this between jobs (after
+    // killing the old harness, before spawning the new one).
+    pub async fn reset(&self) {
+        let (tx, rx) = mpsc::channel::<Result<InstructionRequest, Status>>(32);
+
+        *self.stream.outgoing_tx.lock().await = Some(tx);
+        *self.stream.outgoing_rx.lock().await = Some(rx);
+        *self.stream.incoming.lock().await = None;
+        self.stream.descriptors.lock().await.clear();
+
+        log::info!("control channel reset for next harness");
     }
 
     // register stage descriptor with harness
@@ -198,7 +237,8 @@ impl ControlChannel {
             .await
             .insert(descriptor.id.clone(), descriptor.clone());
 
-        self.outgoing
+        let sender = self.stream.sender().await?;
+        sender
             .send(Ok(InstructionRequest {
                 instruction_id: id.clone(),
                 request: Some(instruction_request::Request::Register(RegisterRequest {
@@ -244,7 +284,8 @@ impl ControlChannel {
             ..Default::default()
         };*/
 
-        self.outgoing
+        let sender = self.stream.sender().await?;
+        sender
             .send(Ok(InstructionRequest {
                 instruction_id: id.clone(),
                 request: Some(instruction_request::Request::ProcessBundle(

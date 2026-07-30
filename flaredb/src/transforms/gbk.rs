@@ -70,7 +70,8 @@ impl FlareTransform for GroupByKey {
         )?;
 
         let batches = query.collect().await?;
-        info!("Executed GroupByKey");
+        let output_groups: usize = batches.iter().map(|b| b.num_rows()).sum();
+        info!("Executed GroupByKey: {} output groups", output_groups);
 
         for batch in batches {
             let output_schema = create_schema_with_record_type(

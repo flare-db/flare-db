@@ -8,8 +8,9 @@ use flaredb::{
     },
     jobservice::{
         artifact::{ArtifactStore, FlareArtifactStagingService},
-        server::{FlareJobService, HarnessLaunchConfig},
+        server::FlareJobService,
     },
+    worker::manager::{WorkerLaunchConfig, WorkerManager},
 };
 use std::{net::SocketAddr, sync::Arc};
 use tonic::transport::Server;
@@ -48,10 +49,16 @@ async fn flare_up() -> Result<(), Box<dyn std::error::Error>> {
 
     let (control_channel, control_server) = start_control_server().await?;
     let (data_channel, data_server) = start_data_server().await?;
-    let (_log_channel, log_server) = start_log_server().await?;
-    let (_state_channel, state_server) = start_state_server().await?;
+    let (log_channel, log_server) = start_log_server().await?;
+    let (state_channel, state_server) = start_state_server().await?;
 
-    let executor = StageExecutor::new(control_channel, data_channel, &instance_id);
+    let executor = StageExecutor::new(
+        control_channel,
+        data_channel,
+        log_channel,
+        state_channel,
+        &instance_id,
+    );
 
     let worker_jar = std::env::var("WORKER_JAR_PATH").unwrap_or_else(|_| {
         format!(
@@ -60,15 +67,20 @@ async fn flare_up() -> Result<(), Box<dyn std::error::Error>> {
         )
     });
 
-    let harness_cfg = HarnessLaunchConfig {
+    let worker_cfg = WorkerLaunchConfig {
         worker_jar,
         logs_dir: artifact_root_str.to_string(),
         control_url: flaredb::DEFAULT_API_SERVICE_URL.to_string(),
         pipeline_options: "{}".to_string(),
         connect_timeout_secs: 20,
     };
-    let job_service =
-        FlareJobService::with(executor, artifact_store.clone(), harness_cfg, instance_id);
+    let worker_manager = WorkerManager::new(worker_cfg);
+    let job_service = FlareJobService::with(
+        executor,
+        artifact_store.clone(),
+        worker_manager,
+        instance_id,
+    );
 
     let artifact_service =
         FlareArtifactStagingService::new(artifact_store, job_service.get_staging_tokens());
