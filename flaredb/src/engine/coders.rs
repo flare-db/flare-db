@@ -3,11 +3,9 @@ use crate::{
     utils::errors::CodersError,
 };
 use beam_model_rs::v1::Coder;
-use std::collections::HashMap;
-use typed_arrow::{List, Null};
-
 use bytes::{Buf, BufMut};
 use log::info;
+use std::collections::HashMap;
 
 use crate::jobservice::urns::beam_urns;
 
@@ -164,7 +162,7 @@ impl StandardBeamCoders {
             (StandardBeamCoders::Bool(coder), PrimitiveValue::Bool(value)) => {
                 coder.encode(value, buf)
             }
-            (StandardBeamCoders::Void(coder), PrimitiveValue::Void(_)) => coder.encode(Null, buf),
+            (StandardBeamCoders::Void(coder), PrimitiveValue::Void) => coder.encode((), buf),
             _ => panic!("Mismatched coder: {:?}", std::any::type_name::<Self>()),
         }
     }
@@ -187,7 +185,7 @@ impl StandardBeamCoders {
             StandardBeamCoders::Bool(coder) => Ok(BeamRecord::PRIMITIVE(PrimitiveValue::Bool(
                 coder.decode(buf)?,
             ))),
-            StandardBeamCoders::Void(_) => Ok(BeamRecord::PRIMITIVE(PrimitiveValue::Void(Null))),
+            StandardBeamCoders::Void(_) => Ok(BeamRecord::PRIMITIVE(PrimitiveValue::Void)),
             StandardBeamCoders::Iterable(coder) => Ok(BeamRecord::ITERABLE(IterableValue {
                 list: coder.decode(buf)?,
             })),
@@ -285,9 +283,9 @@ impl IterableCoder {
 }
 
 // ToDo: add seperate method for encoding list
-impl BeamCoder<List<PrimitiveValue>> for IterableCoder {
-    fn encode(&self, val: List<PrimitiveValue>, buf: &mut impl BufMut) {
-        let values = val.into_inner();
+impl BeamCoder<Vec<PrimitiveValue>> for IterableCoder {
+    fn encode(&self, val: Vec<PrimitiveValue>, buf: &mut impl BufMut) {
+        let values = val;
         let count = i32::try_from(values.len()).expect("IterableCoder length exceeds i32::MAX");
         buf.put_i32(count);
 
@@ -296,7 +294,7 @@ impl BeamCoder<List<PrimitiveValue>> for IterableCoder {
         }
     }
 
-    fn decode(&self, buf: &mut impl Buf) -> Result<List<PrimitiveValue>, CodersError> {
+    fn decode(&self, buf: &mut impl Buf) -> Result<Vec<PrimitiveValue>, CodersError> {
         let count = buf.get_i32();
         let mut values = Vec::new();
 
@@ -304,8 +302,7 @@ impl BeamCoder<List<PrimitiveValue>> for IterableCoder {
             for _ in 0..count {
                 values.push(self.element_coder.decode_primitive(buf)?);
             }
-            let list = List::from(values);
-            return Ok(list);
+            return Ok(values);
         }
 
         assert_eq!(count, -1, "IterableCoder length must be non-negative or -1");
@@ -321,21 +318,21 @@ impl BeamCoder<List<PrimitiveValue>> for IterableCoder {
             }
         }
 
-        Ok(List::from(values))
+        Ok(values)
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct VoidCoder;
 
-impl BeamCoder<Null> for VoidCoder {
-    fn encode(&self, _value: Null, _buf: &mut impl BufMut) {
+impl BeamCoder<()> for VoidCoder {
+    fn encode(&self, _value: (), _buf: &mut impl BufMut) {
         // Void encodes as nothing.
     }
 
-    fn decode(&self, _buf: &mut impl Buf) -> Result<Null, CodersError> {
+    fn decode(&self, _buf: &mut impl Buf) -> Result<(), CodersError> {
         // Void encodes as zero bytes - nothing to read.
-        Ok(Null)
+        Ok(())
     }
 }
 
@@ -603,7 +600,6 @@ fn decode_varint(buf: &mut impl Buf) -> u64 {
 mod tests {
     use super::*;
     use bytes::BytesMut;
-    use typed_arrow::{List, Null};
 
     use crate::store::record::{BeamGbk, BeamKV, BeamRecord, IterableValue, PrimitiveValue};
 
@@ -690,11 +686,11 @@ mod tests {
     fn void_roundtrip() {
         let coder = StandardBeamCoders::Void(VoidCoder);
 
-        let decoded = roundtrip(&coder, BeamRecord::PRIMITIVE(PrimitiveValue::Void(Null)));
+        let decoded = roundtrip(&coder, BeamRecord::PRIMITIVE(PrimitiveValue::Void));
 
         assert!(matches!(
             decoded,
-            BeamRecord::PRIMITIVE(PrimitiveValue::Void(_))
+            BeamRecord::PRIMITIVE(PrimitiveValue::Void)
         ));
     }
 
@@ -705,12 +701,12 @@ mod tests {
         )));
 
         let original = BeamRecord::ITERABLE(IterableValue {
-            list: List::from(vec![
+            list: vec![
                 PrimitiveValue::Int64(1),
                 PrimitiveValue::Int64(2),
                 PrimitiveValue::Int64(3),
                 PrimitiveValue::Int64(100),
-            ]),
+            ],
         });
 
         let decoded = roundtrip(&coder, original);
@@ -718,7 +714,7 @@ mod tests {
         match decoded {
             BeamRecord::ITERABLE(values) => {
                 assert_eq!(
-                    values.list.values(),
+                    values.list.as_slice(),
                     &[
                         PrimitiveValue::Int64(1),
                         PrimitiveValue::Int64(2),
@@ -737,15 +733,13 @@ mod tests {
             StandardBeamCoders::StringUtf8(StringUtf8Coder),
         ));
 
-        let original = BeamRecord::ITERABLE(IterableValue {
-            list: List::new(Vec::new()),
-        });
+        let original = BeamRecord::ITERABLE(IterableValue { list: Vec::new() });
 
         let decoded = roundtrip(&coder, original);
 
         match decoded {
             BeamRecord::ITERABLE(values) => {
-                assert!(values.list.values().is_empty());
+                assert!(values.list.is_empty());
             }
             _ => panic!("expected iterable"),
         }
@@ -784,11 +778,11 @@ mod tests {
         let original = BeamRecord::GBK(BeamGbk {
             key: str_value("group"),
             value: IterableValue {
-                list: List::from(vec![
+                list: vec![
                     PrimitiveValue::Int64(10),
                     PrimitiveValue::Int64(20),
                     PrimitiveValue::Int64(30),
-                ]),
+                ],
             },
         });
 
@@ -799,7 +793,7 @@ mod tests {
                 assert_eq!(gbk.key, str_value("group"));
 
                 assert_eq!(
-                    gbk.value.list.values(),
+                    gbk.value.list.as_slice(),
                     &[
                         PrimitiveValue::Int64(10),
                         PrimitiveValue::Int64(20),
@@ -859,11 +853,11 @@ mod tests {
     fn iterable_unknown_length_encoding() {
         let coder = IterableCoder::new(StandardBeamCoders::VarInt(VarIntCoder));
 
-        let values = List::from(vec![
+        let values = vec![
             PrimitiveValue::Int64(1),
             PrimitiveValue::Int64(2),
             PrimitiveValue::Int64(3),
-        ]);
+        ];
 
         let mut buf = BytesMut::new();
         coder.encode(values.clone(), &mut buf);
@@ -871,7 +865,7 @@ mod tests {
         let mut bytes = buf.freeze();
         let decoded = coder.decode(&mut bytes).unwrap();
 
-        assert_eq!(decoded.values(), values.values());
+        assert_eq!(decoded.as_slice(), values.as_slice());
     }
 }
 
@@ -880,7 +874,6 @@ mod beam_wire_tests {
     use super::*;
 
     use bytes::{Bytes, BytesMut};
-    use typed_arrow::List;
 
     use crate::store::record::{BeamKV, BeamRecord, PrimitiveValue};
 
@@ -1043,12 +1036,12 @@ mod beam_wire_tests {
     fn beam_iterable_wire_encode() {
         let coder = IterableCoder::new(StandardBeamCoders::VarInt(VarIntCoder));
 
-        let values = List::from(vec![
+        let values = vec![
             PrimitiveValue::Int64(1),
             PrimitiveValue::Int64(10),
             PrimitiveValue::Int64(200),
             PrimitiveValue::Int64(1000),
-        ]);
+        ];
 
         let mut buf = BytesMut::new();
         coder.encode(values, &mut buf);
@@ -1069,7 +1062,7 @@ mod beam_wire_tests {
         let decoded = coder.decode(&mut bytes).unwrap();
 
         assert_eq!(
-            decoded.values(),
+            decoded.as_slice(),
             &[
                 PrimitiveValue::Int64(1),
                 PrimitiveValue::Int64(10),

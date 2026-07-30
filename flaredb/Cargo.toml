@@ -17,13 +17,13 @@ tokio = { version = "1.38", features = [
     "fs",
     "process",
 ] }
-arrow-array = "57.3.1" #tonbo's arrow version
-arrow-buffer = "57.3.1"
-arrow-schema = "57.3.1"
-datafusion = { version = "51.0.0", default-features = false }
-flare-datafusion = {path = "../flare-datafusion"}
-tonbo = "=0.4.0-a1"
-typed-arrow = "0.6.1" #tonbo dependens on 0.6.1
+arrow-array = "58.0"
+arrow-buffer = "58.0"
+arrow-schema = "58.0"
+datafusion = { version = "54.1.0", default-features = false }
+#flare-datafusion = {path = "../flare-datafusion"}
+#tonbo = "=0.4.0-a1"
+#typed-arrow = "0.6.1" #tonbo dependens on 0.6.1
 fusio = { version = "0.6.1", features = ["tokio"] }
 dashmap = "6.1.0"
 prost = "0.14.3"

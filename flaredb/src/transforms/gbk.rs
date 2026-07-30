@@ -6,7 +6,7 @@ use beam_model_rs::v1::{
 use datafusion::functions_aggregate::expr_fn::array_agg;
 use datafusion::prelude::*;
 use datafusion::{common::TableReference, execution::context::SessionContext};
-use flare_datafusion::tonbo_table::TonboTable;
+//use flare_datafusion::tonbo_table::TonboTable;
 use log::info;
 use std::{
     collections::{HashMap, HashSet},
@@ -51,7 +51,7 @@ impl FlareTransform for GroupByKey {
     }
 
     async fn execute(&self, ctx: ExecutionContext) -> Result<(), Error> {
-        let df_ctx = SessionContext::new();
+        /*let df_ctx = SessionContext::new();
 
         let input_schema = ctx.store.registry.get(&ctx.input_pcollection_id).unwrap();
         let db = ctx
@@ -88,7 +88,7 @@ impl FlareTransform for GroupByKey {
             ctx.store
                 .write_record_batch(&ctx.output_pcollection_id, batch, output_schema)
                 .await?;
-        }
+        }*/
         Ok(())
     }
 

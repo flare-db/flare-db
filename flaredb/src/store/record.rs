@@ -8,8 +8,6 @@ use arrow_array::{
 use arrow_buffer::{OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field, Schema};
 use std::hash::{Hash, Hasher};
-use tonbo::prelude::*;
-use typed_arrow::{List, Null};
 use uuid::Uuid;
 
 use super::{
@@ -84,11 +82,11 @@ pub struct BeamKV {
 
 #[derive(Debug, Clone)]
 pub struct IterableValue {
-    pub(crate) list: List<PrimitiveValue>,
+    pub(crate) list: Vec<PrimitiveValue>,
 }
 
 impl IterableValue {
-    pub fn new(list: List<PrimitiveValue>) -> Self {
+    pub fn new(list: Vec<PrimitiveValue>) -> Self {
         Self { list }
     }
 }
@@ -99,7 +97,7 @@ pub enum PrimitiveValue {
     Bytes(Vec<u8>),
     Int64(i64),
     Bool(bool),
-    Void(Null),
+    Void,
 }
 
 impl Hash for PrimitiveValue {
@@ -121,7 +119,7 @@ impl Hash for PrimitiveValue {
                 3_u8.hash(state);
                 value.hash(state);
             }
-            Self::Void(_) => {
+            Self::Void => {
                 4_u8.hash(state);
             }
         }
@@ -135,7 +133,7 @@ impl PartialEq for PrimitiveValue {
             (Self::Bytes(left), Self::Bytes(right)) => left == right,
             (Self::Int64(left), Self::Int64(right)) => left == right,
             (Self::Bool(left), Self::Bool(right)) => left == right,
-            (Self::Void(_), Self::Void(_)) => true,
+            (Self::Void, Self::Void) => true,
             _ => false,
         }
     }
@@ -206,7 +204,7 @@ fn primitive_data_type(value: &PrimitiveValue) -> DataType {
         PrimitiveValue::Bytes(_) => DataType::Binary,
         PrimitiveValue::Int64(_) => DataType::Int64,
         PrimitiveValue::Bool(_) => DataType::Boolean,
-        PrimitiveValue::Void(_) => DataType::Null,
+        PrimitiveValue::Void => DataType::Null,
     }
 }
 
@@ -217,7 +215,7 @@ fn primitive_type_matches(value: &PrimitiveValue, data_type: &DataType) -> bool 
 
 /// Extract values in a IterableValue
 fn iterable_values(iterable: &IterableValue) -> &[PrimitiveValue] {
-    iterable.list.values()
+    iterable.list.as_slice()
 }
 
 /// Get Arrow DataType of values in a
@@ -307,7 +305,7 @@ pub fn primitive_values_to_array(
         DataType::Null => {
             if values
                 .iter()
-                .all(|value| matches!(value, PrimitiveValue::Void(_)))
+                .all(|value| matches!(value, PrimitiveValue::Void))
             {
                 Ok(Arc::new(NullArray::new(values.len())))
             } else {
@@ -351,7 +349,7 @@ fn primitive_value_from_array_row(
     row: usize,
 ) -> Result<PrimitiveValue> {
     if array.is_null(row) {
-        return Ok(PrimitiveValue::Void(Null));
+        return Ok(PrimitiveValue::Void);
     }
 
     match data_type {
@@ -383,7 +381,7 @@ fn primitive_value_from_array_row(
                 .ok_or_else(|| anyhow!("expected BooleanArray for Boolean primitive column"))?;
             Ok(PrimitiveValue::Bool(array.value(row)))
         }
-        DataType::Null => Ok(PrimitiveValue::Void(Null)),
+        DataType::Null => Ok(PrimitiveValue::Void),
         other => Err(anyhow!("unsupported primitive storage type: {other:?}")),
     }
 }
@@ -401,7 +399,7 @@ fn iterable_value_from_array_row(
     };
 
     if array.is_null(row) {
-        return Ok(IterableValue::new(List::new(Vec::new())));
+        return Ok(IterableValue::new(Vec::new()));
     }
 
     let list_array = array
@@ -423,7 +421,7 @@ fn iterable_value_from_array_row(
         )?);
     }
 
-    Ok(IterableValue::new(List::new(values)))
+    Ok(IterableValue::new(values))
 }
 
 /// Get Beam StorageRecordType of Arrow Schema
@@ -801,7 +799,6 @@ pub fn record_batch_to_beamrecords(
 mod tests {
 
     use arrow_schema::DataType;
-    use typed_arrow::{List, Null};
 
     use super::{
         BeamGbk, BeamKV, BeamRecord, IterableValue, PrimitiveValue, beamrecords_to_record_batch,
@@ -823,11 +820,11 @@ mod tests {
     }
 
     fn void() -> PrimitiveValue {
-        PrimitiveValue::Void(Null)
+        PrimitiveValue::Void
     }
 
     fn iterable(values: Vec<PrimitiveValue>) -> IterableValue {
-        IterableValue::new(List::new(values))
+        IterableValue::new(values)
     }
 
     fn primitive(v: PrimitiveValue) -> BeamRecord {
@@ -1053,11 +1050,12 @@ mod tests {
         let result = round_trip("p1", records);
         assert!(matches!(
             &result[0],
-            BeamRecord::PRIMITIVE(PrimitiveValue::Void(_))
+            BeamRecord::PRIMITIVE(PrimitiveValue::Void)
         ));
+
         assert!(matches!(
             &result[1],
-            BeamRecord::PRIMITIVE(PrimitiveValue::Void(_))
+            BeamRecord::PRIMITIVE(PrimitiveValue::Void)
         ));
     }
 
@@ -1067,12 +1065,13 @@ mod tests {
         let result = round_trip("p1", records);
         assert!(matches!(
             &result[0],
-            BeamRecord::KV(BeamKV { key: PrimitiveValue::String(k), value: PrimitiveValue::Void(_) })
+            BeamRecord::KV(BeamKV { key: PrimitiveValue::String(k), value: PrimitiveValue::Void })
             if k == "apple"
         ));
+
         assert!(matches!(
             &result[1],
-            BeamRecord::KV(BeamKV { key: PrimitiveValue::String(k), value: PrimitiveValue::Void(_) })
+            BeamRecord::KV(BeamKV { key: PrimitiveValue::String(k), value: PrimitiveValue::Void })
             if k == "banana"
         ));
     }
@@ -1101,13 +1100,13 @@ mod tests {
             panic!("expected GBK")
         };
         assert!(matches!(&gbk0.key, PrimitiveValue::String(s) if s == "word"));
-        assert_eq!(gbk0.value.list.values().len(), 3);
+        assert_eq!(gbk0.value.list.len(), 3);
 
         let BeamRecord::GBK(gbk1) = &result[1] else {
             panic!("expected GBK")
         };
         assert!(matches!(&gbk1.key, PrimitiveValue::String(s) if s == "other"));
-        assert_eq!(gbk1.value.list.values().len(), 1);
+        assert_eq!(gbk1.value.list.len(), 1);
     }
 
     #[test]
@@ -1120,7 +1119,7 @@ mod tests {
         let Some(BeamRecord::GBK(g)) = result.first() else {
             panic!("expected GBK")
         };
-        assert_eq!(g.value.list.values().len(), 0);
+        assert_eq!(g.value.list.len(), 0);
     }
 
     #[test]
@@ -1133,11 +1132,11 @@ mod tests {
         let BeamRecord::ITERABLE(iv0) = &result[0] else {
             panic!()
         };
-        assert_eq!(iv0.list.values().len(), 2);
+        assert_eq!(iv0.list.len(), 2);
         let BeamRecord::ITERABLE(iv1) = &result[1] else {
             panic!()
         };
-        assert_eq!(iv1.list.values().len(), 1);
+        assert_eq!(iv1.list.len(), 1);
     }
 
     #[test]

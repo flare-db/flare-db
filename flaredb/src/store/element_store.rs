@@ -7,8 +7,8 @@ use dashmap::DashMap;
 use fusio::disk::TokioFs;
 use fusio::executor::tokio::TokioExecutor;
 use tokio_util::task::LocalPoolHandle;
-use tonbo::db::{DB, DbBuilder};
-use tonbo::prelude::*;
+//use tonbo::db::{DB, DbBuilder};
+//use tonbo::prelude::*;
 use uuid::Uuid;
 
 use crate::store::record::{
@@ -16,6 +16,7 @@ use crate::store::record::{
     derive_schema_from_records, record_batch_to_beamrecords, record_type_from_schema,
 };
 
+/*
 use super::ELEMENT_ID_COLUMN;
 
 // Registry for maintaing each Pcollection's schema
@@ -256,8 +257,6 @@ mod tests {
         create_schema_with_record_type, iterable_values_to_array, primitive_values_to_array,
     };
     use crate::store::{KEY_COLUMN, VALUE_COLUMN};
-    use typed_arrow::{List, Null};
-
     // helpers
 
     fn str(s: &str) -> PrimitiveValue {
@@ -273,11 +272,11 @@ mod tests {
     }
 
     fn void() -> PrimitiveValue {
-        PrimitiveValue::Void(Null)
+        PrimitiveValue::Void
     }
 
     fn iterable(values: Vec<PrimitiveValue>) -> IterableValue {
-        IterableValue::new(List::new(values))
+        IterableValue::new(values)
     }
 
     fn primitive(v: PrimitiveValue) -> BeamRecord {
@@ -396,7 +395,7 @@ mod tests {
                 BeamRecord::GBK(BeamGbk {
                     key: PrimitiveValue::String(k),
                     value: v,
-                }) => (k, v.list.values().len()),
+                }) => (k, v.list.len()),
                 _ => panic!("unexpected record type"),
             })
             .collect();
@@ -457,7 +456,7 @@ mod tests {
                 BeamRecord::GBK(BeamGbk {
                     key: PrimitiveValue::String(k),
                     value: v,
-                }) => (k, v.list.values().len()),
+                }) => (k, v.list.len()),
                 _ => panic!("unexpected record type"),
             })
             .collect();
@@ -528,4 +527,4 @@ mod tests {
     fn store_with_base(base: &str) -> FlareElementStore {
         FlareElementStore::with_base_path(FlareSchemaRegistry::new(), base.to_string())
     }
-}
+}*/
