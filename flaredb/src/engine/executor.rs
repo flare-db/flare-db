@@ -23,6 +23,8 @@ use crate::{
         harness::{
             control::{ControlChannel, ControlResponse},
             data::{DataChannel, DataKey, ElementStreamPayload},
+            log::LogChannel,
+            state::StateChannel,
         },
         store::{
             BeamRecord, FlareElementStore, FlareSchemaRegistry, NewCollectionRequest,
@@ -41,6 +43,8 @@ use crate::{
 pub struct StageExecutor {
     control: ControlChannel,
     data: DataChannel,
+    log: LogChannel,
+    state: StateChannel,
     pipeline_coders: Arc<HashMap<String, Coder>>,
     graph: Option<ExecutableGraph>,
     store: Arc<FlareElementStore>,
@@ -48,12 +52,20 @@ pub struct StageExecutor {
 }
 
 impl StageExecutor {
-    pub fn new(control: ControlChannel, data: DataChannel, instance_id: &str) -> Self {
+    pub fn new(
+        control: ControlChannel,
+        data: DataChannel,
+        log: LogChannel,
+        state: StateChannel,
+        instance_id: &str,
+    ) -> Self {
         let base_store_path = crate::utils::path::instance_dir(instance_id).join("store");
         let base_store_path_str = base_store_path.to_str().unwrap_or(".").to_string();
         Self {
             control,
             data,
+            log,
+            state,
             pipeline_coders: Arc::new(HashMap::new()),
             graph: None,
             store: Arc::new(FlareElementStore::with_base_path(
@@ -76,6 +88,18 @@ impl StageExecutor {
     pub async fn wait_connected(&self) -> anyhow::Result<()> {
         self.control.wait_connected().await?;
         Ok(())
+    }
+
+    /// Reset all harness channels so a new worker can connect.
+    /// Call this between jobs, after killing the old harness and before
+    /// spawning the new one.
+    pub async fn reset_channels(&self) {
+        self.control.reset().await;
+        self.data.reset().await;
+        self.log.reset().await;
+        self.state.reset().await;
+        self.store.reset();
+        log::info!("stage executor channels reset");
     }
 
     pub async fn execute_pipeline(
@@ -602,9 +626,10 @@ impl StageExecutor {
             edge_metadata.coder_id, edge_metadata.component_coder
         );
 
+        let component_coder = edge_metadata.component_coder.clone();
         let element_coder = StandardBeamCoders::from_urn(
             &edge_metadata.coder_id,
-            edge_metadata.component_coder,
+            component_coder,
             Some(pipeline_coders.as_ref()),
         );
         let windowed_value_coder = WindowedValueCoder::new(element_coder);
@@ -613,6 +638,7 @@ impl StageExecutor {
         let mut batch: Vec<BeamRecord> = Vec::with_capacity(target_batch_size);
         let pcollection_id = edge_metadata.produced_pcol_id.clone();
         let mut stream_ended = false;
+        let mut total_decoded: usize = 0;
 
         while !stream_ended {
             let payload = {
@@ -647,8 +673,18 @@ impl StageExecutor {
                             Ok(Ok(windowed_value)) => {
                                 let consumed = cursor.position() as usize;
                                 drop(cursor);
+                                if consumed > stream_buffer.len() {
+                                    return Err(anyhow!(
+                                        "Coder consumed {} bytes from a {} byte buffer while decoding coder_id={} component_coders={:?}",
+                                        consumed,
+                                        stream_buffer.len(),
+                                        edge_metadata.coder_id,
+                                        edge_metadata.component_coder
+                                    ));
+                                }
                                 stream_buffer.advance(consumed);
 
+                                total_decoded += 1;
                                 batch.push(windowed_value.value);
                                 if batch.len() >= target_batch_size {
                                     let batch_size = batch.len();
@@ -712,7 +748,10 @@ impl StageExecutor {
             batch_size_estimator.record(batch_size, start.elapsed());
         }
 
-        info!("Finished decoding output elements");
+        info!(
+            "Finished decoding output elements: {} total elements",
+            total_decoded
+        );
 
         Ok(())
     }

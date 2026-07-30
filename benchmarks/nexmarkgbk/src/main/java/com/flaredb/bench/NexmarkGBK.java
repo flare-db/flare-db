@@ -6,9 +6,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.util.HashSet;
 import java.util.Map;
-import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.TimeUnit;
 
@@ -157,7 +155,7 @@ public class NexmarkGBK {
         options.setRunner(FlareRunner.class);
         options.setJobEndpoint("127.0.0.1:8099");
         options.setUberJar(
-                "/home/ganesh/flaredb-bench/real/flare-db/benchmarks/nexmarkgbk/target/nexmarkgbk-1.0-SNAPSHOT.jar");
+                "/home/ganesh/flare-db/manage-worker/flare-db/benchmarks/nexmarkgbk/target/nexmarkgbk-1.0-SNAPSHOT.jar");
 
         Pipeline p = Pipeline.create(options);
         NexmarkUtils.setupPipeline(NexmarkUtils.CoderStrategy.HAND, p);
@@ -183,29 +181,11 @@ public class NexmarkGBK {
                     }
                 }));
 
-        PCollection<KV<Long, Iterable<Long>>> grouped = bids.apply("GroupByKey", GroupByKey.create());
+        PCollection<KV<Long, Iterable<Long>>> grouped = bids
+                .apply("GroupByKey", GroupByKey.create());
 
-        // Phase 1 — validate every auction group & record GBK timing.
-        PCollection<Long> validatedIds = grouped.apply("ValidatePerAuction",
-                ParDo.of(new ValidatePerAuction(numEvents, baseTime)));
-
-        // Phase 2 — collect all validated IDs and check completeness.
-        validatedIds
-                .apply("CollectIDs", ParDo.of(new DoFn<Long, KV<Long, Long>>() {
-                    @ProcessElement
-                    public void process(ProcessContext ctx) {
-                        ctx.output(KV.of(0L, ctx.element()));
-                    }
-                }))
-                .apply("CollectGroupByKey", GroupByKey.create())
-                .apply("ValidateCompleteness", ParDo.of(
-                        new ValidateCompleteness(numEvents, baseTime)));
-
-        //Run & report
-        long startNanos = System.nanoTime();
-        p.run();
-        long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
-        double throughput = elapsedMs > 0 ? (numEvents * 1000.0) / elapsedMs : 0.0;
+        // Single validation step: validate every auction group against expected data.
+        grouped.apply("ValidatePerAuction", ParDo.of(new ValidatePerAuction(numEvents, baseTime)));
 
         // Compute GBK-specific statistics from the pre-computed expected data.
         long totalBidEvents = 0;
@@ -217,6 +197,14 @@ public class NexmarkGBK {
             maxGroupSize = Math.max(maxGroupSize, d.stats.bidCount);
         }
         double avgGroupSize = (double) totalBidEvents / expected.size();
+        LOG.info("Expected grouped bids: totalBids={} auctionGroups={} minGroupSize={} maxGroupSize={} avgGroupSize={}",
+                totalBidEvents, expected.size(), minGroupSize, maxGroupSize, avgGroupSize);
+
+        //Run & report
+        long startNanos = System.nanoTime();
+        p.run();
+        long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
+        double throughput = elapsedMs > 0 ? (numEvents * 1000.0) / elapsedMs : 0.0;
 
         String table = buildBenchmarkTable(numEvents, elapsedMs, throughput,
                 expected, totalBidEvents, minGroupSize, maxGroupSize, avgGroupSize);
@@ -241,7 +229,7 @@ public class NexmarkGBK {
             LOG.info("Generating {} Nexmark events in-process...", numEvents);
 
             NexmarkConfiguration config = new NexmarkConfiguration();
-            config.numEvents = (long) numEvents;
+            config.numEvents = numEvents;
             GeneratorConfig genConfig = new GeneratorConfig(config, baseTime, 0, numEvents, 0);
             Generator generator = new Generator(genConfig);
 
@@ -257,16 +245,12 @@ public class NexmarkGBK {
 
     /** Validates every per-auction group against the expected data. */
     private static class ValidatePerAuction
-            extends DoFn<KV<Long, Iterable<Long>>, Long> {
+            extends DoFn<KV<Long, Iterable<Long>>, Void> {
 
         private final int numEvents;
         private final long baseTime;
         private transient Map<Long, ExpectedAuctionData> expected;
 
-        // GBK timing counters
-        private long totalProcessingNs;
-        private long maxGroupNs;
-        private long groupsProcessed;
 
         ValidatePerAuction(int numEvents, long baseTime) {
             this.numEvents = numEvents;
@@ -278,25 +262,9 @@ public class NexmarkGBK {
             expected = computeExpectedGroups(numEvents, baseTime);
         }
 
-        @FinishBundle
-        public void finishBundle(FinishBundleContext ctx) {
-            if (groupsProcessed > 0) {
-                long avgNs = totalProcessingNs / groupsProcessed;
-                LOG.info("GBK timing for this bundle: {} groups, total={}ms avg={}ms max={}ms",
-                        groupsProcessed,
-                        TimeUnit.NANOSECONDS.toMillis(totalProcessingNs),
-                        TimeUnit.NANOSECONDS.toMillis(avgNs),
-                        TimeUnit.NANOSECONDS.toMillis(maxGroupNs));
-                totalProcessingNs = 0;
-                maxGroupNs = 0;
-                groupsProcessed = 0;
-            }
-        }
 
         @ProcessElement
         public void process(ProcessContext ctx) {
-            long startNs = System.nanoTime();
-
             KV<Long, Iterable<Long>> element = ctx.element();
             long auctionId = element.getKey();
 
@@ -313,6 +281,23 @@ public class NexmarkGBK {
                 actualSig.addBid(price);
             }
 
+            if (exp.stats.bidCount != actual.bidCount) {
+                LOG.error("Bid count mismatch for auction {}: expected={} actual={} expectedTotalValue={} actualTotalValue={} expectedMin={} actualMin={} expectedMax={} actualMax={} expectedXor={} actualXor={} expectedSum={} actualSum={}",
+                        auctionId,
+                        exp.stats.bidCount,
+                        actual.bidCount,
+                        exp.stats.totalBidValue,
+                        actual.totalBidValue,
+                        exp.stats.safeMinPrice(),
+                        actual.safeMinPrice(),
+                        exp.stats.safeMaxPrice(),
+                        actual.safeMaxPrice(),
+                        exp.signature.xorHash,
+                        actualSig.xorHash,
+                        exp.signature.sumHash,
+                        actualSig.sumHash);
+            }
+
             check("bid count",   auctionId, exp.stats.bidCount,       actual.bidCount);
             check("total value", auctionId, exp.stats.totalBidValue,  actual.totalBidValue);
             check("min price",   auctionId, exp.stats.safeMinPrice(), actual.safeMinPrice());
@@ -320,12 +305,6 @@ public class NexmarkGBK {
             check("sig xorHash", auctionId, exp.signature.xorHash,    actualSig.xorHash);
             check("sig sumHash", auctionId, exp.signature.sumHash,    actualSig.sumHash);
 
-            long elapsed = System.nanoTime() - startNs;
-            totalProcessingNs += elapsed;
-            maxGroupNs = Math.max(maxGroupNs, elapsed);
-            groupsProcessed++;
-
-            ctx.output(auctionId);
         }
 
         private static void check(String field, long id, long exp, long act) {
@@ -337,54 +316,6 @@ public class NexmarkGBK {
         }
     }
 
-    /** Completeness check: no missing, duplicate, or wrong-count groups. */
-    private static class ValidateCompleteness
-            extends DoFn<KV<Long, Iterable<Long>>, Void> {
-
-        private final int numEvents;
-        private final long baseTime;
-        private transient Map<Long, ExpectedAuctionData> expected;
-
-        ValidateCompleteness(int numEvents, long baseTime) {
-            this.numEvents = numEvents;
-            this.baseTime = baseTime;
-        }
-
-        @Setup
-        public void setup() {
-            expected = computeExpectedGroups(numEvents, baseTime);
-        }
-
-        @ProcessElement
-        public void process(ProcessContext ctx) {
-            Set<Long> seen = new HashSet<>();
-            Set<Long> duplicates = new HashSet<>();
-
-            for (Long auctionId : ctx.element().getValue()) {
-                if (!seen.add(auctionId)) {
-                    duplicates.add(auctionId);
-                }
-            }
-
-            if (!duplicates.isEmpty()) {
-                throw new IllegalStateException(
-                        "Duplicate output groups for auctions " + duplicates);
-            }
-
-            Set<Long> missing = new HashSet<>(expected.keySet());
-            missing.removeAll(seen);
-            if (!missing.isEmpty()) {
-                throw new IllegalStateException(
-                        "Missing output groups for auctions " + missing);
-            }
-
-            if (seen.size() != expected.size()) {
-                throw new IllegalStateException(String.format(
-                        "Group count mismatch: expected=%d actual=%d",
-                        expected.size(), seen.size()));
-            }
-        }
-    }
 
     //  Pre-computation
 

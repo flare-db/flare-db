@@ -49,10 +49,16 @@ async fn flare_up() -> Result<(), Box<dyn std::error::Error>> {
 
     let (control_channel, control_server) = start_control_server().await?;
     let (data_channel, data_server) = start_data_server().await?;
-    let (_log_channel, log_server) = start_log_server().await?;
-    let (_state_channel, state_server) = start_state_server().await?;
+    let (log_channel, log_server) = start_log_server().await?;
+    let (state_channel, state_server) = start_state_server().await?;
 
-    let executor = StageExecutor::new(control_channel, data_channel, &instance_id);
+    let executor = StageExecutor::new(
+        control_channel,
+        data_channel,
+        log_channel,
+        state_channel,
+        &instance_id,
+    );
 
     let worker_jar = std::env::var("WORKER_JAR_PATH").unwrap_or_else(|_| {
         format!(
@@ -69,8 +75,12 @@ async fn flare_up() -> Result<(), Box<dyn std::error::Error>> {
         connect_timeout_secs: 20,
     };
     let worker_manager = WorkerManager::new(worker_cfg);
-    let job_service =
-        FlareJobService::with(executor, artifact_store.clone(), worker_manager, instance_id);
+    let job_service = FlareJobService::with(
+        executor,
+        artifact_store.clone(),
+        worker_manager,
+        instance_id,
+    );
 
     let artifact_service =
         FlareArtifactStagingService::new(artifact_store, job_service.get_staging_tokens());

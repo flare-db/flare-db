@@ -145,20 +145,22 @@ impl JobService for FlareJobService {
             })?;
 
             let staged_jar = self.artifact_store.staged_path();
+
+            let executor = self.executor.clone();
+
+            // Reset channels so the new harness can connect on fresh streams.
+            executor.lock().await.reset_channels().await;
+
             self.worker_manager
                 .spawn_worker(&preparation_id, &staged_jar, &self.instance_id)
                 .await?;
 
-            let executor = self.executor.clone();
             executor.lock().await.set_job_store(&preparation_id);
             let connect_timeout_secs = self.worker_manager.config().connect_timeout_secs;
-            timeout(
-                Duration::from_secs(connect_timeout_secs),
-                async {
-                    let executor = executor.lock().await;
-                    executor.wait_connected().await
-                },
-            )
+            timeout(Duration::from_secs(connect_timeout_secs), async {
+                let executor = executor.lock().await;
+                executor.wait_connected().await
+            })
             .await
             .map_err(|_| {
                 Status::internal(format!(
@@ -184,6 +186,9 @@ impl JobService for FlareJobService {
                         preparation_id, e
                     ))
                 })?;
+
+            // Kill the harness — the next job will get a fresh one.
+            self.worker_manager.stop_worker(&preparation_id).await?;
 
             log::info!("job execution completed: preparation_id={}", preparation_id);
             Ok(Response::new(RunJobResponse {

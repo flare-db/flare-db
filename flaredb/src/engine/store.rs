@@ -12,7 +12,7 @@ use fusio::disk::TokioFs;
 use fusio::executor::tokio::TokioExecutor;
 use std::hash::{Hash, Hasher};
 use tokio_util::task::LocalPoolHandle;
-use tonbo::db::{BatchesThreshold, DB, DbBuilder};
+use tonbo::db::{DB, DbBuilder};
 use tonbo::prelude::*;
 use typed_arrow::{List, Null};
 use uuid::Uuid;
@@ -823,6 +823,10 @@ impl FlareSchemaRegistry {
             .entry(pcollection_id.to_string())
             .or_insert(schema);
     }
+
+    pub fn clear(&self) {
+        self.schemas.clear();
+    }
 }
 
 #[derive(Clone)]
@@ -834,6 +838,12 @@ pub struct FlareElementStore {
 }
 
 impl FlareElementStore {
+    // Clear all open database handles so the next job starts with a fresh cache.
+    pub fn reset(&self) {
+        self.open_dbs.clear();
+        self.registry.clear();
+    }
+
     async fn ingest_batch(
         &self,
         pcollection_id: &str,
@@ -936,8 +946,7 @@ impl FlareElementStore {
 
         let db = DbBuilder::from_schema_key_name(schema, ELEMENT_ID_COLUMN)?
             .on_disk(format!("{}/{safe_id}", self.base_path))?
-            .with_seal_policy(Arc::new(BatchesThreshold { batches: 4 }))
-            .with_minor_compaction(2, 0)
+            //.with_seal_policy(Arc::new(BatchesThreshold { batches: 4 }))
             .open()
             .await?;
 

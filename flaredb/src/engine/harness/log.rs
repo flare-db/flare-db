@@ -4,21 +4,33 @@ use anyhow::{Result, anyhow};
 use beam_model_rs::v1::{LogControl, beam_fn_logging_server::BeamFnLogging, log_entry};
 use tokio::sync::{
     Mutex,
-    mpsc::{self, Sender},
+    mpsc::{self},
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Response, Status};
 
 pub struct LogInner {
-    outgoing: Mutex<Option<mpsc::Receiver<Result<LogControl, Status>>>>,
+    outgoing_tx: Mutex<Option<mpsc::Sender<Result<LogControl, Status>>>>,
+    outgoing_rx: Mutex<Option<mpsc::Receiver<Result<LogControl, Status>>>>,
     incoming: Mutex<Option<tonic::Streaming<log_entry::List>>>,
+}
+
+impl LogInner {
+    async fn sender(&self) -> Result<mpsc::Sender<Result<LogControl, Status>>> {
+        self.outgoing_tx
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| anyhow!("log outgoing channel not initialized"))
+    }
 }
 
 pub async fn start_log_server() -> Result<(LogChannel, FlareLogService)> {
     let (tx, rx) = mpsc::channel::<Result<LogControl, Status>>(32);
 
     let stream = Arc::new(LogInner {
-        outgoing: Mutex::new(Some(rx)),
+        outgoing_tx: Mutex::new(Some(tx)),
+        outgoing_rx: Mutex::new(Some(rx)),
         incoming: Mutex::new(None),
     });
 
@@ -26,10 +38,7 @@ pub async fn start_log_server() -> Result<(LogChannel, FlareLogService)> {
         inner: stream.clone(),
     };
 
-    let channel = LogChannel {
-        outgoing: tx,
-        stream,
-    };
+    let channel = LogChannel { stream };
 
     Ok((channel, service))
 }
@@ -62,13 +71,20 @@ impl BeamFnLogging for FlareLogService {
         Box::pin(async move {
             *self.inner.incoming.lock().await = Some(request.into_inner());
 
-            let rx = self
-                .inner
-                .outgoing
-                .lock()
-                .await
-                .take()
-                .ok_or_else(|| Status::internal("harness connected twice"))?;
+            let rx = {
+                let mut rx_guard = self.inner.outgoing_rx.lock().await;
+                if rx_guard.is_none() {
+                    log::warn!(
+                        "Log stream connected while a previous harness stream was still active; replacing stale stream"
+                    );
+                    let (tx, rx) = mpsc::channel::<Result<LogControl, Status>>(32);
+                    *self.inner.outgoing_tx.lock().await = Some(tx);
+                    *rx_guard = Some(rx);
+                }
+                rx_guard
+                    .take()
+                    .expect("log outgoing receiver must be initialized")
+            };
 
             Ok(Response::new(ReceiverStream::new(rx)))
         })
@@ -76,7 +92,6 @@ impl BeamFnLogging for FlareLogService {
 }
 
 pub struct LogChannel {
-    outgoing: Sender<Result<LogControl, Status>>,
     stream: Arc<LogInner>,
 }
 
@@ -90,8 +105,20 @@ impl LogChannel {
         }
     }
 
+    // Reset the log channel so a new harness can connect.
+    pub async fn reset(&self) {
+        let (tx, rx) = mpsc::channel::<Result<LogControl, Status>>(32);
+
+        *self.stream.outgoing_tx.lock().await = Some(tx);
+        *self.stream.outgoing_rx.lock().await = Some(rx);
+        *self.stream.incoming.lock().await = None;
+
+        log::info!("log channel reset for next harness");
+    }
+
     pub async fn send_control(&self, control: LogControl) -> Result<()> {
-        self.outgoing
+        let sender = self.stream.sender().await?;
+        sender
             .send(Ok(control))
             .await
             .map_err(|e| anyhow!("failed to send log control: {}", e))

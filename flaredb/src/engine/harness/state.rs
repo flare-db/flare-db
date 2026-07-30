@@ -4,21 +4,33 @@ use anyhow::{Result, anyhow};
 use beam_model_rs::v1::{StateRequest, StateResponse, beam_fn_state_server::BeamFnState};
 use tokio::sync::{
     Mutex,
-    mpsc::{self, Sender},
+    mpsc::{self},
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Response, Status};
 
 pub struct StateInner {
-    outgoing: Mutex<Option<mpsc::Receiver<Result<StateResponse, Status>>>>,
+    outgoing_tx: Mutex<Option<mpsc::Sender<Result<StateResponse, Status>>>>,
+    outgoing_rx: Mutex<Option<mpsc::Receiver<Result<StateResponse, Status>>>>,
     incoming: Mutex<Option<tonic::Streaming<StateRequest>>>,
+}
+
+impl StateInner {
+    async fn sender(&self) -> Result<mpsc::Sender<Result<StateResponse, Status>>> {
+        self.outgoing_tx
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| anyhow!("state outgoing channel not initialized"))
+    }
 }
 
 pub async fn start_state_server() -> Result<(StateChannel, FlareStateService)> {
     let (tx, rx) = mpsc::channel::<Result<StateResponse, Status>>(32);
 
     let stream = Arc::new(StateInner {
-        outgoing: Mutex::new(Some(rx)),
+        outgoing_tx: Mutex::new(Some(tx)),
+        outgoing_rx: Mutex::new(Some(rx)),
         incoming: Mutex::new(None),
     });
 
@@ -26,10 +38,7 @@ pub async fn start_state_server() -> Result<(StateChannel, FlareStateService)> {
         inner: stream.clone(),
     };
 
-    let channel = StateChannel {
-        outgoing: tx,
-        stream,
-    };
+    let channel = StateChannel { stream };
 
     Ok((channel, service))
 }
@@ -59,13 +68,20 @@ impl BeamFnState for FlareStateService {
         Box::pin(async move {
             *self.inner.incoming.lock().await = Some(request.into_inner());
 
-            let rx = self
-                .inner
-                .outgoing
-                .lock()
-                .await
-                .take()
-                .ok_or_else(|| Status::internal("harness connected twice"))?;
+            let rx = {
+                let mut rx_guard = self.inner.outgoing_rx.lock().await;
+                if rx_guard.is_none() {
+                    log::warn!(
+                        "State stream connected while a previous harness stream was still active; replacing stale stream"
+                    );
+                    let (tx, rx) = mpsc::channel::<Result<StateResponse, Status>>(32);
+                    *self.inner.outgoing_tx.lock().await = Some(tx);
+                    *rx_guard = Some(rx);
+                }
+                rx_guard
+                    .take()
+                    .expect("state outgoing receiver must be initialized")
+            };
 
             Ok(Response::new(ReceiverStream::new(rx)))
         })
@@ -73,7 +89,6 @@ impl BeamFnState for FlareStateService {
 }
 
 pub struct StateChannel {
-    outgoing: Sender<Result<StateResponse, Status>>,
     stream: Arc<StateInner>,
 }
 
@@ -87,8 +102,20 @@ impl StateChannel {
         }
     }
 
+    // Reset the state channel so a new harness can connect.
+    pub async fn reset(&self) {
+        let (tx, rx) = mpsc::channel::<Result<StateResponse, Status>>(32);
+
+        *self.stream.outgoing_tx.lock().await = Some(tx);
+        *self.stream.outgoing_rx.lock().await = Some(rx);
+        *self.stream.incoming.lock().await = None;
+
+        log::info!("state channel reset for next harness");
+    }
+
     pub async fn send_response(&self, response: StateResponse) -> Result<()> {
-        self.outgoing
+        let sender = self.stream.sender().await?;
+        sender
             .send(Ok(response))
             .await
             .map_err(|e| anyhow!("failed to send state response: {}", e))
