@@ -1,11 +1,16 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{Context, Result, anyhow};
 use arrow_array::{ArrayRef, RecordBatch, StringArray};
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use dashmap::DashMap;
+use datafusion::datasource::table_schema;
 use fusio::disk::TokioFs;
 use fusio::executor::tokio::TokioExecutor;
+use paimon::arrow::arrow_fields_to_paimon;
+use paimon::spec::Schema as PaimonSchema;
+use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options, Table, catalog::Identifier};
+use tokio_stream::StreamExt;
 use tokio_util::task::LocalPoolHandle;
 //use tonbo::db::{DB, DbBuilder};
 //use tonbo::prelude::*;
@@ -15,44 +20,190 @@ use crate::store::record::{
     BeamRecord, beamrecords_to_record_batch, create_schema_with_record_type,
     derive_schema_from_records, record_batch_to_beamrecords, record_type_from_schema,
 };
-
-/*
-use super::ELEMENT_ID_COLUMN;
-
 // Registry for maintaing each Pcollection's schema
+// TODO: handle paimontable schema
+// do we even need to maintian table schemas?
 #[derive(Clone, Default)]
 pub struct FlareSchemaRegistry {
-    schemas: Arc<DashMap<String, Arc<Schema>>>,
+    record_schemas: Arc<DashMap<String, Arc<ArrowSchema>>>,
 }
 
 impl FlareSchemaRegistry {
     pub fn new() -> Self {
         Self {
-            schemas: Arc::new(DashMap::new()),
+            record_schemas: Arc::new(DashMap::new()),
         }
     }
 
-    pub fn get(&self, pcollection_id: &str) -> Option<Arc<Schema>> {
-        self.schemas
+    pub fn get(&self, pcollection_id: &str) -> Option<Arc<ArrowSchema>> {
+        self.record_schemas
             .get(pcollection_id)
             .map(|schema| schema.clone())
     }
 
-    pub fn register_schema(&self, pcollection_id: &str, schema: Arc<Schema>) {
-        self.schemas.insert(pcollection_id.to_string(), schema);
+    pub fn register_schema(&self, pcollection_id: &str, schema: Arc<ArrowSchema>) {
+        self.record_schemas
+            .insert(pcollection_id.to_string(), schema);
     }
 
-    pub fn register_schema_if_absent(&self, pcollection_id: &str, schema: Arc<Schema>) {
-        self.schemas
+    pub fn register_schema_if_absent(&self, pcollection_id: &str, schema: Arc<ArrowSchema>) {
+        self.record_schemas
             .entry(pcollection_id.to_string())
             .or_insert(schema);
     }
 
     pub fn clear(&self) {
-        self.schemas.clear();
+        self.record_schemas.clear();
     }
 }
 
+pub struct FlareElementStore {
+    registry: FlareSchemaRegistry,
+    catalog: FileSystemCatalog,
+    db_name: String,
+}
+
+impl FlareElementStore {
+    pub async fn new(warehouse: String, db_name: String) -> Result<Self> {
+        let mut options = Options::new();
+        options.set(CatalogOptions::WAREHOUSE, warehouse.as_str());
+        let catalog = FileSystemCatalog::new(options)?;
+        catalog
+            .create_database(&db_name, true, HashMap::new())
+            .await?;
+        Ok(Self {
+            registry: FlareSchemaRegistry::new(),
+            catalog,
+            db_name,
+        })
+    }
+
+    pub async fn ingest_batch(
+        &self,
+        pcollection_id: &str,
+        schema: Arc<ArrowSchema>,
+        batch: RecordBatch,
+    ) -> Result<()> {
+        let table = self.get_table(pcollection_id, &schema).await?;
+        let builder = table.new_write_builder();
+
+        let mut writer = builder.new_write()?;
+        writer.write_arrow_batch(&batch).await?;
+
+        let messages = writer.prepare_commit().await?;
+        builder.new_commit().commit(messages).await?;
+
+        Ok(())
+    }
+
+    // used when a transfrom/stage produces beam records and that needs to be converted
+    // to arrow record batch before ingesting into db.
+    pub async fn write_beamrecord_batch(&self, req: NewCollectionRequest) -> Result<()> {
+        let schema = match self.registry.get(&req.pcollection_id) {
+            Some(schema) => schema,
+            None => derive_schema_from_records(&req.pcollection_id, &req.elements)?,
+        };
+
+        let batch =
+            beamrecords_to_record_batch(&req.pcollection_id, &req.elements, schema.clone())?;
+
+        self.ingest_batch(&req.pcollection_id, schema, batch).await
+    }
+
+    // used when a transfrom can directly produce arrow record batch
+    pub async fn write_record_batch(
+        &self,
+        pcollection_id: &str,
+        batch: RecordBatch,
+        schema: Arc<ArrowSchema>,
+    ) -> Result<()> {
+        self.ingest_batch(pcollection_id, schema, batch).await;
+
+        Ok(())
+    }
+
+    pub async fn scan_collection(
+        &self,
+        pcollection_id: &str,
+        req: ScanCollectionRequest,
+    ) -> Result<Vec<BeamRecord>> {
+        if req.pcollection_id != pcollection_id {
+            return Err(anyhow!(
+                "scan request pcollection_id mismatch: arg={}, req={}",
+                pcollection_id,
+                req.pcollection_id
+            ));
+        }
+
+        let schema = self
+            .registry
+            .get(pcollection_id)
+            .ok_or_else(|| anyhow!("schema not found for pcollection {}", pcollection_id))?;
+
+        let identifier = Identifier::new(self.db_name.as_str(), pcollection_id);
+        let table = self.catalog.get_table(&identifier).await?;
+
+        let read_builder = table.new_read_builder();
+        let plan = read_builder.new_scan().plan().await?;
+        let read = read_builder.new_read()?;
+        let mut stream = read.to_arrow(plan.splits())?;
+
+        let mut records = Vec::new();
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            records.extend(record_batch_to_beamrecords(&batch, schema.as_ref())?);
+        }
+
+        Ok(records)
+    }
+
+    pub async fn get_table(&self, pcollection_id: &str, schema: &ArrowSchema) -> Result<Table> {
+        let identifier = Identifier::new(self.db_name.as_str(), pcollection_id);
+
+        match self.catalog.get_table(&identifier).await {
+            Ok(table) => Ok(table),
+            Err(paimon::Error::TableNotExist { .. }) => {
+                let table_schema = arrow_schema_to_paimon(schema)?;
+                self.catalog
+                    .create_table(&identifier, table_schema, false)
+                    .await?;
+                let table = self.catalog.get_table(&identifier).await?;
+                Ok(table)
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+}
+
+/// Convert an Arrow [`Schema`](ArrowSchema) into a Paimon [`Schema`](PaimonSchema).
+///
+/// The resulting schema preserves Arrow field names and converted data types,
+/// and is built with no partition keys, no primary keys, no options, and no comment.
+pub fn arrow_schema_to_paimon(schema: &ArrowSchema) -> Result<PaimonSchema> {
+    let arrow_fields: Vec<ArrowField> =
+        schema.fields().iter().map(|f| f.as_ref().clone()).collect();
+    let fields = arrow_fields_to_paimon(&arrow_fields)?;
+    let builder = fields
+        .into_iter()
+        .fold(PaimonSchema::builder(), |builder, field| {
+            builder.column(field.name().to_string(), field.data_type().clone())
+        });
+    let schema = builder.build()?;
+    Ok(schema)
+}
+
+#[derive(Debug)]
+pub struct NewCollectionRequest {
+    pub(crate) pcollection_id: String,
+    pub(crate) elements: Vec<BeamRecord>,
+}
+
+#[derive(Debug)]
+pub struct ScanCollectionRequest {
+    pub(crate) pcollection_id: String,
+}
+
+/*
 #[derive(Clone)]
 pub struct FlareElementStore {
     pub(crate) registry: FlareSchemaRegistry,

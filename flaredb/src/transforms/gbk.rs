@@ -70,6 +70,7 @@ impl FlareTransform for GroupByKey {
         )?;
 
         let batches = query.collect().await?;
+        // ToDo: Create paimon table schema
         let output_groups: usize = batches.iter().map(|b| b.num_rows()).sum();
         info!("Executed GroupByKey: {} output groups", output_groups);
 

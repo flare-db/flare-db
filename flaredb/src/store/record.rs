@@ -637,6 +637,7 @@ pub fn beamrecords_to_record_batch(
     let row_count = records.len();
     let element_ids: Vec<String> = (0..row_count).map(|_| Uuid::new_v4().to_string()).collect();
 
+    // We don't need elementids column
     let mut columns: Vec<ArrayRef> = vec![Arc::new(StringArray::from(element_ids))];
 
     match record_type {

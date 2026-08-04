@@ -645,7 +645,8 @@ impl StageExecutor {
                 let mut receiver_lock = receiver.lock().await;
                 receiver_lock.recv().await
             };
-
+            // ToDo create per bundle schema instred of derivsing schema for eveyry record batch.
+            // create paimon writer and commitor per bundle
             match payload {
                 Some(ElementStreamPayload::Data(data_chunk)) => {
                     stream_buffer.extend_from_slice(&data_chunk.data.data);
