@@ -155,7 +155,12 @@ impl JobService for FlareJobService {
                 .spawn_worker(&preparation_id, &staged_jar, &self.instance_id)
                 .await?;
 
-            executor.lock().await.set_job_store(&preparation_id);
+            executor
+                .lock()
+                .await
+                .set_job_store(&preparation_id)
+                .await
+                .map_err(|e| Status::internal(format!("failed to set job store: {}", e)))?;
             let connect_timeout_secs = self.worker_manager.config().connect_timeout_secs;
             timeout(Duration::from_secs(connect_timeout_secs), async {
                 let executor = executor.lock().await;

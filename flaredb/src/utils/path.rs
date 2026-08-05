@@ -21,6 +21,11 @@ pub fn base_dir() -> PathBuf {
     PathBuf::from(home).join(".flaredb")
 }
 
+/// Root directory where Paimon stores all tables/data.
+pub fn warehouse_dir() -> PathBuf {
+    base_dir().join("warehouse")
+}
+
 pub fn instance_dir(instance_id: &str) -> PathBuf {
     base_dir().join("instances").join(instance_id)
 }
