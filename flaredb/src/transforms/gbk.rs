@@ -3,17 +3,19 @@ use async_trait::async_trait;
 use beam_model_rs::v1::{
     Coder, Components, Environment, FunctionSpec, PCollection, PTransform, WindowingStrategy,
 };
+use datafusion::execution::context::SessionContext;
 use datafusion::functions_aggregate::expr_fn::array_agg;
 use datafusion::prelude::*;
-use datafusion::{common::TableReference, execution::context::SessionContext};
-use flare_datafusion::tonbo_table::TonboTable;
+//use flare_datafusion::tonbo_table::TonboTable;
 use log::info;
+use paimon::Catalog;
+use paimon_datafusion::PaimonTableProvider;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
 };
 
-use crate::engine::store::create_schema_with_record_type;
+use crate::store::record::{RecordTableSchema, TableType};
 
 use crate::{
     jobservice::urns::beam_urns,
@@ -51,18 +53,13 @@ impl FlareTransform for GroupByKey {
     }
 
     async fn execute(&self, ctx: ExecutionContext) -> Result<(), Error> {
+        let identifier = ctx.store.table_identifier(&ctx.input_pcollection_id);
+
+        let table = ctx.store.catalog.get_table(&identifier).await?;
+        let provider = PaimonTableProvider::try_new(table)?;
         let df_ctx = SessionContext::new();
 
-        let input_schema = ctx.store.registry.get(&ctx.input_pcollection_id).unwrap();
-        let db = ctx
-            .store
-            .resolve_db(&ctx.input_pcollection_id, Some(input_schema.clone()))
-            .await?;
-        let table = TonboTable::from(db.clone(), input_schema.clone());
-
-        info!("created tonbo table");
-
-        df_ctx.register_table(TableReference::bare("gbk"), Arc::new(table))?;
+        df_ctx.register_table("gbk", Arc::new(provider))?;
 
         let query = df_ctx.table("gbk").await?.aggregate(
             vec![col("key")],
@@ -70,23 +67,18 @@ impl FlareTransform for GroupByKey {
         )?;
 
         let batches = query.collect().await?;
+
         let output_groups: usize = batches.iter().map(|b| b.num_rows()).sum();
         info!("Executed GroupByKey: {} output groups", output_groups);
 
         for batch in batches {
-            let output_schema = create_schema_with_record_type(
-                batch
-                    .schema_ref()
-                    .fields()
-                    .iter()
-                    .map(|field| field.as_ref().clone())
-                    .collect::<Vec<_>>(),
-                "gbk",
-                &ctx.output_pcollection_id,
-            )?;
+            let table_schema = Arc::new(RecordTableSchema {
+                table_type: TableType::Gbk,
+                arrow_schema: batch.schema(),
+            });
 
             ctx.store
-                .write_record_batch(&ctx.output_pcollection_id, batch, output_schema)
+                .write_record_batch(&ctx.output_pcollection_id, batch, table_schema)
                 .await?;
         }
         Ok(())

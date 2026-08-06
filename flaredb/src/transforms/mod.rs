@@ -10,8 +10,8 @@ use beam_model_rs::v1::{
 use uuid::Uuid;
 
 use crate::{
-    engine::store::FlareElementStore,
     jobservice::urns::beam_urns,
+    store::element_store::FlareElementStore,
     transforms::{gbk::GroupByKey, impluse::Impulse},
 };
 
@@ -83,20 +83,20 @@ pub fn from_urn(
     inputs: HashMap<String, String>,
     outputs: HashMap<String, String>,
 ) -> FlareRunnerTransform {
-    match urn {
+    let transform: FlareRunnerTransform = match urn {
         beam_urns::IMPULSE_TRANSFORM => Arc::new(Impulse::with(
             Uuid::new_v4().to_string(),
             inputs,
             outputs,
             name,
-        )) as FlareRunnerTransform,
-
+        )),
         beam_urns::GROUP_BY_KEY_TRANSFORM => Arc::new(GroupByKey::with(
             Uuid::new_v4().to_string(),
             inputs,
             outputs,
             name,
-        )) as FlareRunnerTransform,
+        )),
         _ => panic!("Unknown URN {}", urn),
-    }
+    };
+    transform
 }

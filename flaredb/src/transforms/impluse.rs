@@ -7,8 +7,9 @@ use beam_model_rs::v1::{
 use log::info;
 use prost::Message;
 
-use crate::engine::store::{BeamRecord, NewCollectionRequest, PrimitiveValue};
 use crate::jobservice::urns::beam_urns;
+use crate::store::element_store::NewCollectionRequest;
+use crate::store::record::{BeamRecord, PrimitiveValue};
 use crate::transforms::{ExecutionContext, FlareTransform};
 use std::collections::{HashMap, HashSet};
 

@@ -26,16 +26,14 @@ use crate::{
             log::LogChannel,
             state::StateChannel,
         },
-        store::{
-            BeamRecord, FlareElementStore, FlareSchemaRegistry, NewCollectionRequest,
-            ScanCollectionRequest,
-        },
     },
     fusion::{
         pipeline::{ConsumerMetaData, ExecutableGraph, ExecutableNode},
         stage::ExecutableStage,
     },
     jobservice::urns::beam_urns,
+    store::element_store::{FlareElementStore, NewCollectionRequest, ScanCollectionRequest},
+    store::record::BeamRecord,
     transforms::{ExecutionContext, FlareRunnerTransform},
     utils::batch_size_estimator::{BatchConfig, BatchSizeEstimator},
 };
@@ -52,37 +50,34 @@ pub struct StageExecutor {
 }
 
 impl StageExecutor {
-    pub fn new(
+    pub async fn new(
         control: ControlChannel,
         data: DataChannel,
         log: LogChannel,
         state: StateChannel,
         instance_id: &str,
-    ) -> Self {
-        let base_store_path = crate::utils::path::instance_dir(instance_id).join("store");
+    ) -> anyhow::Result<Self> {
+        let base_store_path = crate::utils::path::warehouse_dir();
         let base_store_path_str = base_store_path.to_str().unwrap_or(".").to_string();
-        Self {
+        let store =
+            Arc::new(FlareElementStore::new(base_store_path_str, "flare".to_string()).await?);
+        Ok(Self {
             control,
             data,
             log,
             state,
             pipeline_coders: Arc::new(HashMap::new()),
             graph: None,
-            store: Arc::new(FlareElementStore::with_base_path(
-                FlareSchemaRegistry::new(),
-                base_store_path_str,
-            )),
+            store,
             instance_id: instance_id.to_string(),
-        }
+        })
     }
 
-    pub fn set_job_store(&mut self, job_id: &str) {
-        let job_store_path = crate::utils::path::store_dir(&self.instance_id, job_id);
-        let job_store_base = job_store_path.to_str().unwrap_or(".").to_string();
-        self.store = Arc::new(FlareElementStore::with_base_path(
-            FlareSchemaRegistry::new(),
-            job_store_base,
-        ));
+    pub async fn set_job_store(&mut self, job_id: &str) -> anyhow::Result<()> {
+        let store_path = crate::utils::path::warehouse_dir();
+        let store_base = store_path.to_str().unwrap_or(".").to_string();
+        self.store = Arc::new(FlareElementStore::new(store_base, job_id.to_string()).await?);
+        Ok(())
     }
 
     pub async fn wait_connected(&self) -> anyhow::Result<()> {
@@ -98,7 +93,7 @@ impl StageExecutor {
         self.data.reset().await;
         self.log.reset().await;
         self.state.reset().await;
-        self.store.reset();
+        //self.store.reset();
         log::info!("stage executor channels reset");
     }
 
@@ -645,7 +640,8 @@ impl StageExecutor {
                 let mut receiver_lock = receiver.lock().await;
                 receiver_lock.recv().await
             };
-
+            // ToDo create per bundle schema instred of derivsing schema for eveyry record batch.
+            // create paimon writer and commitor per bundle
             match payload {
                 Some(ElementStreamPayload::Data(data_chunk)) => {
                     stream_buffer.extend_from_slice(&data_chunk.data.data);

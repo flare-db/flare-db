@@ -58,7 +58,8 @@ async fn flare_up() -> Result<(), Box<dyn std::error::Error>> {
         log_channel,
         state_channel,
         &instance_id,
-    );
+    )
+    .await?;
 
     let worker_jar = std::env::var("WORKER_JAR_PATH").unwrap_or_else(|_| {
         format!(
