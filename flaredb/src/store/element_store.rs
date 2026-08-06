@@ -50,9 +50,9 @@ impl FlareSchemaRegistry {
 }
 
 pub struct FlareElementStore {
-    registry: FlareSchemaRegistry,
-    catalog: FileSystemCatalog,
-    db_name: String,
+    pub(crate) registry: FlareSchemaRegistry,
+    pub(crate) catalog: FileSystemCatalog,
+    pub(crate) db_name: String,
 }
 
 impl FlareElementStore {
@@ -134,7 +134,7 @@ impl FlareElementStore {
             .get(&req.pcollection_id)
             .ok_or_else(|| anyhow!("table schema not found for pcollection"))?;
 
-        let identifier = Identifier::new(self.db_name.as_str(), req.pcollection_id);
+        let identifier = self.table_identifier(&req.pcollection_id);
         let table = self.catalog.get_table(&identifier).await?;
 
         let read_builder = table.new_read_builder();
@@ -157,7 +157,7 @@ impl FlareElementStore {
         pcollection_id: &str,
         table_schema: &RecordTableSchema,
     ) -> Result<Table> {
-        let identifier = Identifier::new(self.db_name.as_str(), pcollection_id);
+        let identifier = self.table_identifier(pcollection_id);
 
         match self.catalog.get_table(&identifier).await {
             Ok(table) => Ok(table),
@@ -171,6 +171,17 @@ impl FlareElementStore {
             }
             Err(err) => Err(err.into()),
         }
+    }
+
+    pub(crate) fn table_identifier(&self, pcollection_id: &str) -> Identifier {
+        Identifier::new(
+            self.db_name.as_str(),
+            &Self::sanitize_pcollection_id(pcollection_id),
+        )
+    }
+
+    fn sanitize_pcollection_id(id: &str) -> String {
+        id.replace(['/', '.', ' ', '(', ')'], "_")
     }
 }
 

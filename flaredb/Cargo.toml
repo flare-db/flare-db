@@ -21,11 +21,12 @@ arrow-array = "58.0"
 arrow-buffer = "58.0"
 arrow-schema = "58.0"
 paimon = "0.3.0"
+paimon-datafusion = "0.3.0"
 datafusion = { version = "54.1.0", default-features = false }
 #flare-datafusion = {path = "../flare-datafusion"}
 #tonbo = "=0.4.0-a1"
 #typed-arrow = "0.6.1" #tonbo dependens on 0.6.1
-fusio = { version = "0.6.1", features = ["tokio"] }
+#fusio = { version = "0.6.1", features = ["tokio"] }
 dashmap = "6.1.0"
 prost = "0.14.3"
 petgraph = "0.8.3"
