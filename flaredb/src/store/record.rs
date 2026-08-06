@@ -765,3 +765,671 @@ pub fn record_batch_to_beamrecords(
 
     Ok(records)
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::{Array, BinaryArray, BooleanArray, Int64Array, ListArray, StringArray};
+    use arrow_schema::DataType;
+
+    // helpers
+
+    fn s(v: &str) -> PrimitiveValue {
+        PrimitiveValue::String(v.to_string())
+    }
+    fn i(v: i64) -> PrimitiveValue {
+        PrimitiveValue::Int64(v)
+    }
+    fn b(v: bool) -> PrimitiveValue {
+        PrimitiveValue::Bool(v)
+    }
+    fn bytes(v: &[u8]) -> PrimitiveValue {
+        PrimitiveValue::Bytes(v.to_vec())
+    }
+
+    fn assert_primitive(record: &BeamRecord, expected: &PrimitiveValue) {
+        match record {
+            BeamRecord::PRIMITIVE(v) => assert_eq!(v, expected),
+            other => panic!("expected PRIMITIVE, got {other:?}"),
+        }
+    }
+
+    fn assert_kv(record: &BeamRecord, key: &PrimitiveValue, value: &PrimitiveValue) {
+        match record {
+            BeamRecord::KV(kv) => {
+                assert_eq!(&kv.key, key);
+                assert_eq!(&kv.value, value);
+            }
+            other => panic!("expected KV, got {other:?}"),
+        }
+    }
+
+    fn assert_iterable(record: &BeamRecord, expected: &[PrimitiveValue]) {
+        match record {
+            BeamRecord::ITERABLE(it) => assert_eq!(it.list, expected),
+            other => panic!("expected ITERABLE, got {other:?}"),
+        }
+    }
+
+    fn assert_gbk(record: &BeamRecord, key: &PrimitiveValue, values: &[PrimitiveValue]) {
+        match record {
+            BeamRecord::GBK(gbk) => {
+                assert_eq!(&gbk.key, key);
+                assert_eq!(gbk.value.list, values);
+            }
+            other => panic!("expected GBK, got {other:?}"),
+        }
+    }
+
+    // PrimitiveValue equality
+
+    #[test]
+    fn primitive_value_eq_same_variant() {
+        assert_eq!(s("a"), s("a"));
+        assert_ne!(s("a"), s("b"));
+        assert_eq!(i(5), i(5));
+        assert_ne!(i(5), i(6));
+        assert_eq!(b(true), b(true));
+        assert_ne!(b(true), b(false));
+        assert_eq!(bytes(&[1, 2]), bytes(&[1, 2]));
+        assert_ne!(bytes(&[1, 2]), bytes(&[1, 3]));
+        assert_eq!(PrimitiveValue::Void, PrimitiveValue::Void);
+    }
+
+    #[test]
+    fn primitive_value_eq_across_variants_is_false() {
+        // Same "logical" content, different variant -> not equal.
+        assert_ne!(i(1), PrimitiveValue::Bool(true));
+        assert_ne!(s("1"), i(1));
+    }
+
+    // TableType
+
+    #[test]
+    fn table_type_as_str_from_str_roundtrip() {
+        for tt in [
+            TableType::Primitive,
+            TableType::Iterable,
+            TableType::Kv,
+            TableType::Gbk,
+        ] {
+            assert_eq!(TableType::from_str(tt.as_str()).unwrap(), tt);
+        }
+    }
+
+    #[test]
+    fn table_type_from_str_unknown_errors() {
+        assert!(TableType::from_str("bogus").is_err());
+    }
+
+    // BeamRecord accessors
+
+    #[test]
+    /*fn beam_record_record_type_matches_variant() {
+        assert_eq!(
+            BeamRecord::PRIMITIVE(i(1)).record_type(),
+            BeamRecordType::Primitive
+        );
+        assert_eq!(
+            BeamRecord::ITERABLE(IterableValue::new(vec![])).record_type(),
+            BeamRecordType::Iterable
+        );
+        assert_eq!(
+            BeamRecord::KV(BeamKV {
+                key: i(1),
+                value: i(2)
+            })
+            .record_type(),
+            BeamRecordType::Kv
+        );
+        assert_eq!(
+            BeamRecord::GBK(BeamGbk {
+                key: i(1),
+                value: IterableValue::new(vec![])
+            })
+            .record_type(),
+            BeamRecordType::Gbk
+        );
+    }*/
+    #[test]
+    fn beam_record_get_primitive_happy_and_wrong_variant() {
+        assert_eq!(BeamRecord::PRIMITIVE(i(7)).get_primitive().unwrap(), i(7));
+        let kv = BeamRecord::KV(BeamKV {
+            key: i(1),
+            value: i(2),
+        });
+        assert!(kv.get_primitive().is_err());
+    }
+
+    #[test]
+    fn beam_record_get_kv_happy_and_wrong_variant() {
+        let kv = BeamRecord::KV(BeamKV {
+            key: s("k"),
+            value: i(9),
+        });
+        let extracted = kv.clone().get_kv().unwrap();
+        assert_eq!(extracted.key, s("k"));
+        assert_eq!(extracted.value, i(9));
+        assert!(BeamRecord::PRIMITIVE(i(1)).get_kv().is_err());
+    }
+
+    #[test]
+    fn beam_record_get_gbk_happy_and_wrong_variant() {
+        let gbk = BeamRecord::GBK(BeamGbk {
+            key: s("k"),
+            value: IterableValue::new(vec![i(1), i(2)]),
+        });
+        let extracted = gbk.clone().get_gbk().unwrap();
+        assert_eq!(extracted.key, s("k"));
+        assert_eq!(extracted.value.list, vec![i(1), i(2)]);
+        assert!(BeamRecord::PRIMITIVE(i(1)).get_gbk().is_err());
+    }
+
+    #[test]
+    fn beam_record_get_iterable_happy_and_wrong_variant() {
+        let it = BeamRecord::ITERABLE(IterableValue::new(vec![i(1)]));
+        assert_eq!(it.get_iterable().unwrap().list, vec![i(1)]);
+        assert!(BeamRecord::PRIMITIVE(i(1)).get_iterable().is_err());
+    }
+
+    // primitive_values_to_array
+
+    #[test]
+    fn primitive_values_to_array_utf8() {
+        let values = vec![s("a"), s("b"), s("c")];
+        let array = primitive_values_to_array(&values, &DataType::Utf8).unwrap();
+        let arr = array.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr.value(0), "a");
+        assert_eq!(arr.value(2), "c");
+    }
+
+    #[test]
+    fn primitive_values_to_array_binary() {
+        let values = vec![bytes(&[1, 2]), bytes(&[3])];
+        let array = primitive_values_to_array(&values, &DataType::Binary).unwrap();
+        let arr = array.as_any().downcast_ref::<BinaryArray>().unwrap();
+        assert_eq!(arr.value(0), &[1, 2]);
+        assert_eq!(arr.value(1), &[3]);
+    }
+
+    #[test]
+    fn primitive_values_to_array_int64() {
+        let values = vec![i(10), i(-5), i(0)];
+        let array = primitive_values_to_array(&values, &DataType::Int64).unwrap();
+        let arr = array.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(arr.values(), &[10, -5, 0]);
+    }
+
+    #[test]
+    fn primitive_values_to_array_boolean() {
+        let values = vec![b(true), b(false), b(true)];
+        let array = primitive_values_to_array(&values, &DataType::Boolean).unwrap();
+        let arr = array.as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert_eq!(arr.value(0), true);
+        assert_eq!(arr.value(1), false);
+    }
+    /*
+    #[test]
+    fn primitive_values_to_array_null_all_void() {
+        let values = vec![PrimitiveValue::Void, PrimitiveValue::Void];
+        let array = primitive_values_to_array(&values, &DataType::Null).unwrap();
+        assert_eq!(array.len(), 2);
+        assert_eq!(array.null_count(), 2);
+    }*/
+
+    #[test]
+    fn primitive_values_to_array_null_with_non_void_errors() {
+        let values = vec![PrimitiveValue::Void, i(1)];
+        assert!(primitive_values_to_array(&values, &DataType::Null).is_err());
+    }
+
+    #[test]
+    fn primitive_values_to_array_mixed_variant_errors() {
+        let values = vec![s("a"), i(1)];
+        assert!(primitive_values_to_array(&values, &DataType::Utf8).is_err());
+    }
+
+    #[test]
+    fn primitive_values_to_array_unsupported_storage_type_errors() {
+        let values = vec![i(1)];
+        assert!(primitive_values_to_array(&values, &DataType::Float64).is_err());
+    }
+
+    #[test]
+    fn primitive_values_to_array_empty_slice() {
+        let values: Vec<PrimitiveValue> = vec![];
+        let array = primitive_values_to_array(&values, &DataType::Int64).unwrap();
+        assert_eq!(array.len(), 0);
+    }
+
+    // iterable_values_to_array
+
+    #[test]
+    fn iterable_values_to_array_varying_lengths() {
+        let iterables = vec![
+            IterableValue::new(vec![i(1), i(2)]),
+            IterableValue::new(vec![]),
+            IterableValue::new(vec![i(3)]),
+        ];
+        let array = iterable_values_to_array(&iterables, &DataType::Int64).unwrap();
+        let list = array.as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(list.len(), 3);
+        assert_eq!(list.value_length(0), 2);
+        assert_eq!(list.value_length(1), 0);
+        assert_eq!(list.value_length(2), 1);
+
+        let row0 = list.value(0);
+        let row0 = row0.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(row0.values(), &[1, 2]);
+
+        let row2 = list.value(2);
+        let row2 = row2.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(row2.values(), &[3]);
+    }
+
+    #[test]
+    fn iterable_values_to_array_all_empty() {
+        let iterables = vec![IterableValue::new(vec![]), IterableValue::new(vec![])];
+        // infer_iterable_item_data_type would fall back to Null here.
+        let array = iterable_values_to_array(&iterables, &DataType::Null).unwrap();
+        let list = array.as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list.value_length(0), 0);
+        assert_eq!(list.value_length(1), 0);
+    }
+
+    #[test]
+    fn iterable_values_to_array_no_rows() {
+        let iterables: Vec<IterableValue> = vec![];
+        let array = iterable_values_to_array(&iterables, &DataType::Int64).unwrap();
+        assert_eq!(array.len(), 0);
+    }
+
+    // primitive_value_from_array_row
+
+    #[test]
+    fn primitive_value_from_array_row_all_types() {
+        let strings = StringArray::from(vec!["x", "y"]);
+        assert_eq!(
+            primitive_value_from_array_row(&strings, &DataType::Utf8, 1).unwrap(),
+            s("y")
+        );
+
+        let ints = Int64Array::from(vec![10, 20]);
+        assert_eq!(
+            primitive_value_from_array_row(&ints, &DataType::Int64, 0).unwrap(),
+            i(10)
+        );
+
+        let bools = BooleanArray::from(vec![true, false]);
+        assert_eq!(
+            primitive_value_from_array_row(&bools, &DataType::Boolean, 1).unwrap(),
+            b(false)
+        );
+
+        let bin = BinaryArray::from(vec![&b"hi"[..], &b"lo"[..]]);
+        assert_eq!(
+            primitive_value_from_array_row(&bin, &DataType::Binary, 0).unwrap(),
+            bytes(b"hi")
+        );
+    }
+
+    #[test]
+    fn primitive_value_from_array_row_null_becomes_void() {
+        let strings = StringArray::from(vec![Some("x"), None]);
+        assert_eq!(
+            primitive_value_from_array_row(&strings, &DataType::Utf8, 1).unwrap(),
+            PrimitiveValue::Void
+        );
+    }
+
+    #[test]
+    fn primitive_value_from_array_row_wrong_downcast_errors() {
+        let ints = Int64Array::from(vec![1, 2]);
+        // Claiming Utf8 for an Int64Array should fail the downcast.
+        assert!(primitive_value_from_array_row(&ints, &DataType::Utf8, 0).is_err());
+    }
+
+    #[test]
+    fn primitive_value_from_array_row_unsupported_type_errors() {
+        let ints = Int64Array::from(vec![1]);
+        assert!(primitive_value_from_array_row(&ints, &DataType::Float32, 0).is_err());
+    }
+
+    //  iterable_value_from_array_row
+
+    #[test]
+    fn iterable_value_from_array_row_roundtrips_via_builder() {
+        let iterables = vec![
+            IterableValue::new(vec![i(1), i(2), i(3)]),
+            IterableValue::new(vec![]),
+        ];
+        let array = iterable_values_to_array(&iterables, &DataType::Int64).unwrap();
+        let list_type = DataType::List(Arc::new(Field::new("item", DataType::Int64, false)));
+
+        let row0 = iterable_value_from_array_row(array.as_ref(), &list_type, 0).unwrap();
+        assert_eq!(row0.list, vec![i(1), i(2), i(3)]);
+
+        let row1 = iterable_value_from_array_row(array.as_ref(), &list_type, 1).unwrap();
+        assert_eq!(row1.list, Vec::<PrimitiveValue>::new());
+    }
+
+    #[test]
+    fn iterable_value_from_array_row_null_row_yields_empty_list() {
+        let item_field = Arc::new(Field::new("item", DataType::Int64, false));
+        let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 0]));
+        let child = Int64Array::from(Vec::<i64>::new());
+        let validity = arrow_buffer::NullBuffer::from(vec![false]); // row 0 is null
+        let list = ListArray::new(item_field, offsets, Arc::new(child), Some(validity));
+
+        let list_type = DataType::List(Arc::new(Field::new("item", DataType::Int64, false)));
+        let result = iterable_value_from_array_row(&list, &list_type, 0).unwrap();
+        assert_eq!(result.list, Vec::<PrimitiveValue>::new());
+    }
+
+    #[test]
+    fn iterable_value_from_array_row_non_list_type_errors() {
+        let ints = Int64Array::from(vec![1]);
+        assert!(iterable_value_from_array_row(&ints, &DataType::Int64, 0).is_err());
+    }
+
+    //  derive_table_schema
+
+    #[test]
+    fn derive_table_schema_primitive() {
+        let records = vec![BeamRecord::PRIMITIVE(s("a")), BeamRecord::PRIMITIVE(s("b"))];
+        let schema = derive_table_schema("pc1", &records).unwrap();
+        assert_eq!(schema.table_type, TableType::Primitive);
+        assert_eq!(schema.arrow_schema.fields().len(), 1);
+        let field = schema.arrow_schema.field_with_name(VALUE_COLUMN).unwrap();
+        assert_eq!(field.data_type(), &DataType::Utf8);
+        assert!(!field.is_nullable());
+    }
+
+    #[test]
+    fn derive_table_schema_primitive_mixed_types_errors() {
+        let records = vec![BeamRecord::PRIMITIVE(s("a")), BeamRecord::PRIMITIVE(i(1))];
+        assert!(derive_table_schema("pc1", &records).is_err());
+    }
+
+    #[test]
+    fn derive_table_schema_iterable() {
+        let records = vec![
+            BeamRecord::ITERABLE(IterableValue::new(vec![i(1), i(2)])),
+            BeamRecord::ITERABLE(IterableValue::new(vec![])),
+        ];
+        let schema = derive_table_schema("pc2", &records).unwrap();
+        assert_eq!(schema.table_type, TableType::Iterable);
+        let field = schema.arrow_schema.field_with_name(VALUE_COLUMN).unwrap();
+        match field.data_type() {
+            DataType::List(item) => assert_eq!(item.data_type(), &DataType::Int64),
+            other => panic!("expected List, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn derive_table_schema_iterable_mixed_item_types_errors() {
+        let records = vec![BeamRecord::ITERABLE(IterableValue::new(vec![i(1), s("x")]))];
+        assert!(derive_table_schema("pc2", &records).is_err());
+    }
+
+    #[test]
+    fn derive_table_schema_kv() {
+        let records = vec![
+            BeamRecord::KV(BeamKV {
+                key: s("k1"),
+                value: i(1),
+            }),
+            BeamRecord::KV(BeamKV {
+                key: s("k2"),
+                value: i(2),
+            }),
+        ];
+        let schema = derive_table_schema("pc3", &records).unwrap();
+        assert_eq!(schema.table_type, TableType::Kv);
+        assert_eq!(
+            schema
+                .arrow_schema
+                .field_with_name(KEY_COLUMN)
+                .unwrap()
+                .data_type(),
+            &DataType::Utf8
+        );
+        assert_eq!(
+            schema
+                .arrow_schema
+                .field_with_name(VALUE_COLUMN)
+                .unwrap()
+                .data_type(),
+            &DataType::Int64
+        );
+    }
+
+    #[test]
+    fn derive_table_schema_kv_mixed_key_types_errors() {
+        let records = vec![
+            BeamRecord::KV(BeamKV {
+                key: s("k1"),
+                value: i(1),
+            }),
+            BeamRecord::KV(BeamKV {
+                key: i(9),
+                value: i(2),
+            }),
+        ];
+        assert!(derive_table_schema("pc3", &records).is_err());
+    }
+
+    #[test]
+    fn derive_table_schema_kv_mixed_value_types_errors() {
+        let records = vec![
+            BeamRecord::KV(BeamKV {
+                key: s("k1"),
+                value: i(1),
+            }),
+            BeamRecord::KV(BeamKV {
+                key: s("k2"),
+                value: s("oops"),
+            }),
+        ];
+        assert!(derive_table_schema("pc3", &records).is_err());
+    }
+
+    #[test]
+    fn derive_table_schema_gbk() {
+        let records = vec![
+            BeamRecord::GBK(BeamGbk {
+                key: i(1),
+                value: IterableValue::new(vec![s("a"), s("b")]),
+            }),
+            BeamRecord::GBK(BeamGbk {
+                key: i(2),
+                value: IterableValue::new(vec![]),
+            }),
+        ];
+        let schema = derive_table_schema("pc4", &records).unwrap();
+        assert_eq!(schema.table_type, TableType::Gbk);
+        assert_eq!(
+            schema
+                .arrow_schema
+                .field_with_name(KEY_COLUMN)
+                .unwrap()
+                .data_type(),
+            &DataType::Int64
+        );
+        match schema
+            .arrow_schema
+            .field_with_name(VALUE_COLUMN)
+            .unwrap()
+            .data_type()
+        {
+            DataType::List(item) => assert_eq!(item.data_type(), &DataType::Utf8),
+            other => panic!("expected List, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn derive_table_schema_gbk_mixed_key_types_errors() {
+        let records = vec![
+            BeamRecord::GBK(BeamGbk {
+                key: i(1),
+                value: IterableValue::new(vec![]),
+            }),
+            BeamRecord::GBK(BeamGbk {
+                key: s("bad"),
+                value: IterableValue::new(vec![]),
+            }),
+        ];
+        assert!(derive_table_schema("pc4", &records).is_err());
+    }
+
+    #[test]
+    fn derive_table_schema_empty_records_errors() {
+        let records: Vec<BeamRecord> = vec![];
+        assert!(derive_table_schema("pc5", &records).is_err());
+    }
+
+    #[test]
+    fn derive_table_schema_mixed_record_variants_errors() {
+        let records = vec![
+            BeamRecord::PRIMITIVE(i(1)),
+            BeamRecord::KV(BeamKV {
+                key: i(1),
+                value: i(2),
+            }),
+        ];
+        assert!(derive_table_schema("pc6", &records).is_err());
+    }
+
+    //  beamrecords_to_record_batch / record_batch_to_beamrecords roundtrips
+
+    #[test]
+    fn roundtrip_primitive() {
+        let records = vec![
+            BeamRecord::PRIMITIVE(i(1)),
+            BeamRecord::PRIMITIVE(i(2)),
+            BeamRecord::PRIMITIVE(i(3)),
+        ];
+        let schema = derive_table_schema("pc", &records).unwrap();
+        let batch = beamrecords_to_record_batch(&records, &schema).unwrap();
+        assert_eq!(batch.num_rows(), 3);
+
+        let back = record_batch_to_beamrecords(&batch, &schema).unwrap();
+        assert_eq!(back.len(), 3);
+        assert_primitive(&back[0], &i(1));
+        assert_primitive(&back[1], &i(2));
+        assert_primitive(&back[2], &i(3));
+    }
+
+    #[test]
+    fn roundtrip_kv() {
+        let records = vec![
+            BeamRecord::KV(BeamKV {
+                key: s("a"),
+                value: i(1),
+            }),
+            BeamRecord::KV(BeamKV {
+                key: s("b"),
+                value: i(2),
+            }),
+        ];
+        let schema = derive_table_schema("pc", &records).unwrap();
+        let batch = beamrecords_to_record_batch(&records, &schema).unwrap();
+        let back = record_batch_to_beamrecords(&batch, &schema).unwrap();
+        assert_kv(&back[0], &s("a"), &i(1));
+        assert_kv(&back[1], &s("b"), &i(2));
+    }
+
+    #[test]
+    fn roundtrip_iterable() {
+        let records = vec![
+            BeamRecord::ITERABLE(IterableValue::new(vec![i(1), i(2)])),
+            BeamRecord::ITERABLE(IterableValue::new(vec![])),
+            BeamRecord::ITERABLE(IterableValue::new(vec![i(3)])),
+        ];
+        let schema = derive_table_schema("pc", &records).unwrap();
+        let batch = beamrecords_to_record_batch(&records, &schema).unwrap();
+        let back = record_batch_to_beamrecords(&batch, &schema).unwrap();
+        assert_iterable(&back[0], &[i(1), i(2)]);
+        assert_iterable(&back[1], &[]);
+        assert_iterable(&back[2], &[i(3)]);
+    }
+
+    #[test]
+    fn roundtrip_gbk() {
+        let records = vec![
+            BeamRecord::GBK(BeamGbk {
+                key: s("k1"),
+                value: IterableValue::new(vec![i(10), i(20), i(30)]),
+            }),
+            BeamRecord::GBK(BeamGbk {
+                key: s("k2"),
+                value: IterableValue::new(vec![]),
+            }),
+        ];
+        let schema = derive_table_schema("pc", &records).unwrap();
+        let batch = beamrecords_to_record_batch(&records, &schema).unwrap();
+        let back = record_batch_to_beamrecords(&batch, &schema).unwrap();
+        assert_gbk(&back[0], &s("k1"), &[i(10), i(20), i(30)]);
+        assert_gbk(&back[1], &s("k2"), &[]);
+    }
+
+    #[test]
+    fn roundtrip_boolean_and_bytes_primitive() {
+        let records = vec![
+            BeamRecord::PRIMITIVE(b(true)),
+            BeamRecord::PRIMITIVE(b(false)),
+        ];
+        let schema = derive_table_schema("pc", &records).unwrap();
+        let batch = beamrecords_to_record_batch(&records, &schema).unwrap();
+        let back = record_batch_to_beamrecords(&batch, &schema).unwrap();
+        assert_primitive(&back[0], &b(true));
+        assert_primitive(&back[1], &b(false));
+
+        let records = vec![
+            BeamRecord::PRIMITIVE(bytes(&[1, 2, 3])),
+            BeamRecord::PRIMITIVE(bytes(&[])),
+        ];
+        let schema = derive_table_schema("pc", &records).unwrap();
+        let batch = beamrecords_to_record_batch(&records, &schema).unwrap();
+        let back = record_batch_to_beamrecords(&batch, &schema).unwrap();
+        assert_primitive(&back[0], &bytes(&[1, 2, 3]));
+        assert_primitive(&back[1], &bytes(&[]));
+    }
+
+    #[test]
+    fn beamrecords_to_record_batch_empty_records_errors() {
+        let records: Vec<BeamRecord> = vec![];
+        // Schema itself can't be derived from empty input either, so build
+        // a schema from a throwaway non-empty batch and feed empty records in.
+        let seed = vec![BeamRecord::PRIMITIVE(i(1))];
+        let schema = derive_table_schema("pc", &seed).unwrap();
+        assert!(beamrecords_to_record_batch(&records, &schema).is_err());
+    }
+
+    #[test]
+    fn beamrecords_to_record_batch_variant_mismatch_errors() {
+        // Schema derived as Kv, but records passed in are Primitive.
+        let kv_seed = vec![BeamRecord::KV(BeamKV {
+            key: i(1),
+            value: i(2),
+        })];
+        let schema = derive_table_schema("pc", &kv_seed).unwrap();
+        let wrong_records = vec![BeamRecord::PRIMITIVE(i(1))];
+        assert!(beamrecords_to_record_batch(&wrong_records, &schema).is_err());
+    }
+
+    //  large-ish iterable to sanity check offset accumulation
+
+    #[test]
+    fn iterable_values_to_array_many_rows() {
+        let iterables: Vec<IterableValue> = (0..100)
+            .map(|n| IterableValue::new((0..n % 5).map(i).collect()))
+            .collect();
+        let total: usize = iterables.iter().map(|it| it.list.len()).sum();
+        let array = iterable_values_to_array(&iterables, &DataType::Int64).unwrap();
+        let list = array.as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(list.len(), 100);
+        assert_eq!(list.values().len(), total);
+    }
+}
