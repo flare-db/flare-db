@@ -155,7 +155,7 @@ public class NexmarkGBK {
         options.setRunner(FlareRunner.class);
         options.setJobEndpoint("127.0.0.1:8099");
         options.setUberJar(
-                "/home/ganesh/flare-db/manage-worker/flare-db/benchmarks/nexmarkgbk/target/nexmarkgbk-1.0-SNAPSHOT.jar");
+                "/home/ganesh/flare-db/schedule/flare-db/benchmarks/nexmarkgbk/target/nexmarkgbk-1.0-SNAPSHOT.jar");
 
         Pipeline p = Pipeline.create(options);
         NexmarkUtils.setupPipeline(NexmarkUtils.CoderStrategy.HAND, p);

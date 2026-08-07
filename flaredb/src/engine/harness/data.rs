@@ -15,9 +15,14 @@ use tokio::sync::{
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Response, Status};
 
+/// Shared gRPC channel state for data plane communication with the worker.
+/// Holds outgoing (Flare → worker) and incoming (worker → Flare) element streams.
 pub struct DataInner {
+    /// Sender for outgoing Elements stream to the worker.
     outgoing_tx: Mutex<Option<mpsc::Sender<Result<Elements, Status>>>>,
+    /// Receiver side of outgoing channel; handed to worker as gRPC stream.
     outgoing_rx: Mutex<Option<mpsc::Receiver<Result<Elements, Status>>>>,
+    /// Incoming Elements stream from worker; owned by stream_elements() dispatcher.
     incoming: Mutex<Option<tonic::Streaming<Elements>>>,
 }
 
@@ -51,9 +56,9 @@ pub async fn start_data_server() -> Result<(DataChannel, FlareDataService), anyh
     };
     Ok((channel, service))
 }
+/// gRPC server-side handler for BeamFnData service.
+/// Establishes the bidirectional gRPC stream with the worker.
 pub struct FlareDataService {
-    //sender: Arc<Mutex<Option<Sender<Result<Elements, Status>>>>>,
-    //incoming_tx: mpsc::Sender<Elements>,
     inner: Arc<DataInner>,
 }
 
@@ -61,7 +66,7 @@ impl BeamFnData for FlareDataService {
     #[doc = " Server streaming response type for the Data method."]
     type DataStream = ReceiverStream<Result<Elements, Status>>;
 
-    #[doc = " Used to send data between harnesses."]
+    #[doc = " Used to send data between workeres."]
     //#[must_use]
     #[allow(
         //elided_named_lifetimes,
@@ -84,14 +89,14 @@ impl BeamFnData for FlareDataService {
         Self: 'async_trait,
     {
         Box::pin(async move {
-            info!("BeamFnData stream connected from harness");
+            info!("BeamFnData stream connected from worker");
             *self.inner.incoming.lock().await = Some(request.into_inner());
 
             let rx = {
                 let mut rx_guard = self.inner.outgoing_rx.lock().await;
                 if rx_guard.is_none() {
                     warn!(
-                        "Data stream connected while a previous harness stream was still active; replacing stale stream"
+                        "Data stream connected while a previous worker stream was still active; replacing stale stream"
                     );
                     let (tx, rx) = mpsc::channel::<Result<Elements, Status>>(32);
                     *self.inner.outgoing_tx.lock().await = Some(tx);
@@ -107,13 +112,15 @@ impl BeamFnData for FlareDataService {
     }
 }
 
+/// Client-side data channel for executor to send/receive elements.
 #[derive(Clone)]
 pub struct DataChannel {
+    /// Shared gRPC stream state with FlareDataService.
     worker_stream: Arc<DataInner>,
+    /// Multiplexer routing incoming elements by (instruction_id, transform_id).
     runner_stream: Arc<ElementStreamMultiplexer>,
-    // Handle to the background streaming task.  Aborted and awaited on
-    // reset so a stale task from a previous job does not consume the
-    // new harness's data stream.
+    /// Handle to the background dispatcher task.
+    /// Aborted on reset to prevent stale task from consuming new worker stream.
     stream_task: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
@@ -123,13 +130,13 @@ impl DataChannel {
         sender
             .send(Ok(elements))
             .await
-            .map_err(|e| anyhow!("failed to send data-plane elements to harness: {}", e))
+            .map_err(|e| anyhow!("failed to send data-plane elements to worker: {}", e))
     }
 
-    // Reset the data channel so a new harness can connect.
+    // Reset the data channel so a new worker can connect.
     pub async fn reset(&self) {
         // Abort the streaming task from the previous job so it does not
-        // race with the new task to consume the incoming harness stream.
+        // race with the new task to consume the incoming worker stream.
         let handle = self.stream_task.lock().unwrap().take();
         if let Some(handle) = handle {
             handle.abort();
@@ -144,18 +151,20 @@ impl DataChannel {
         *self.worker_stream.incoming.lock().await = None;
 
         // Clear the element multiplexer — old entries from the previous
-        // harness are stale.
+        // worker are stale.
         self.runner_stream.senders().clear();
         self.runner_stream.receivers().clear();
 
-        log::info!("data channel reset for next harness");
+        log::info!("data channel reset for next worker");
     }
 
+    /// Start the background dispatcher task that routes incoming elements.
+    /// reads from incoming_stream and demuxes every message by (instruction_id, transform_id) to separate queues.
     pub fn stream_elements(&self) {
         let worker_data_stream = self.worker_stream.clone();
         let runner_stream = self.runner_stream.clone();
         let task_slot = self.stream_task.clone();
-        info!("Streaming elements from harness");
+        info!("Streaming elements from worker");
 
         let join_handle = tokio::spawn(async move {
             loop {
@@ -170,14 +179,15 @@ impl DataChannel {
                 loop {
                     match stream.message().await {
                         Ok(Some(elements)) => {
+                            // Demux Elements message into per-instruction queues
                             info!(
-                                "Received Elements from harness: data={}, timers={}",
+                                "Received Elements from worker: data={}, timers={}",
                                 elements.data.len(),
                                 elements.timers.len()
                             );
                             for data in elements.data {
                                 info!(
-                                    "Routing data from harness: instruction_id={}, transform_id={}, is_last={}, bytes={}",
+                                    "Routing data from worker: instruction_id={}, transform_id={}, is_last={}, bytes={}",
                                     data.instruction_id,
                                     data.transform_id,
                                     data.is_last,
@@ -188,8 +198,8 @@ impl DataChannel {
                                     transform_id: data.transform_id.clone(),
                                 };
 
+                                // Route to queue keyed by (instruction_id, transform_id)
                                 let element_key = ElementKey::Data(data_key.clone());
-
                                 let sender = Self::get_sender(element_key, &runner_stream);
 
                                 let _ = sender.send(ElementStreamPayload::Data(DataChunk {
@@ -214,17 +224,17 @@ impl DataChannel {
                             }
                         }
                         Ok(None) => {
-                            info!("BeamFnData stream from harness closed cleanly");
+                            info!("BeamFnData stream from worker closed cleanly");
                             break;
                         }
                         Err(e) => {
-                            warn!("BeamFnData stream error (harness gone?): {}", e);
+                            warn!("BeamFnData stream error (worker gone?): {}", e);
                             break;
                         }
                     }
                 }
 
-                info!("BeamFnData stream from harness closed");
+                info!("BeamFnData stream from worker closed");
                 break;
             }
         });
@@ -277,12 +287,14 @@ impl DataChannel {
     }
 }
 
+/// Key for routing data elements: (instruction_id, transform_id) pair.
 #[derive(PartialEq, Eq, Hash, Clone, Debug)]
 pub struct DataKey {
     pub(crate) instruction_id: String,
     pub(crate) transform_id: String,
 }
 
+/// Key for routing timer elements: instruction_id.
 #[derive(PartialEq, Eq, Hash, Clone)]
 pub struct TimersKey {
     pub(crate) instruction_id: String,
@@ -290,13 +302,19 @@ pub struct TimersKey {
     // pub(crate) timer_family_id: String,
 }
 
+/// Union type for routing keys: either data or timers.
 #[derive(PartialEq, Eq, Hash, Clone)]
 pub enum ElementKey {
     Data(DataKey),
     Timers(TimersKey),
 }
+
+/// Multiplexer that routes incoming elements to per-key unbounded channels.
+/// Each caller (executor, transform) registers a key and gets its own receiver queue.
 pub struct ElementStreamMultiplexer {
+    /// Senders for each element key; created on first access.
     senders: DashMap<ElementKey, UnboundedSender<ElementStreamPayload>>,
+    /// Corresponding receivers; one per key.
     receivers: DashMap<ElementKey, Arc<Mutex<UnboundedReceiver<ElementStreamPayload>>>>,
 }
 
@@ -319,32 +337,28 @@ impl ElementStreamMultiplexer {
     }
 }
 
+/// Payload sent through element queues: either data or timers.
 #[derive(Clone)]
 pub enum ElementStreamPayload {
-    // assuming we might need the data and timers in order
     Data(DataChunk),
     Timers(TimerChunk),
 }
 
+/// Data element with routing key.
 #[derive(Eq, Hash, PartialEq, Clone)]
 pub struct DataChunk {
     pub(crate) key: DataKey,
     pub(crate) data: Data,
 }
 
+/// Timer element with routing key.
 #[derive(Eq, Hash, PartialEq, Clone)]
 pub struct TimerChunk {
     pub(crate) key: TimersKey,
     pub(crate) timers: Timers,
 }
 
-// Flare control(process bundle request) -> harness
+// Flare control(process bundle request) -> worker
 //                                            | prcessed elements
 //                                    data channel(processed elements)
-// Flare --> inputs elements to harness ->    |
-
-/*
-one background task drains tonic stream
-routes elements by instruction_id
-bundle sessions receive their own outputs asynchronously
- */
+// Flare --> inputs elements to worker ->    |

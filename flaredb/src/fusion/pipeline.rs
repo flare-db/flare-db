@@ -268,6 +268,24 @@ impl ExecutableGraph {
     pub fn get_executable_graph(&self) -> &Graph<ExecutableNode, ConsumerMetaData> {
         &self.graph
     }
+
+    #[cfg(test)]
+    pub fn from_graph_for_test(
+        graph: Graph<ExecutableNode, ConsumerMetaData>,
+        root_metadata: ConsumerMetaData,
+    ) -> Self {
+        let mut node_indices = HashMap::new();
+        for idx in graph.node_indices() {
+            node_indices.insert(graph[idx].id(), idx);
+        }
+
+        Self {
+            graph,
+            node_indices,
+            components: Components::default(),
+            root_metadata: Some(root_metadata),
+        }
+    }
 }
 
 #[derive(Clone)]

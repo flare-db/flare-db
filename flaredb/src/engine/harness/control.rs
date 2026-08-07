@@ -6,31 +6,29 @@ use beam_model_rs::v1::{
     ProcessBundleDescriptor, ProcessBundleRequest, ProcessBundleResponse, RegisterRequest,
     beam_fn_control_server::BeamFnControl, instruction_request,
 };
+use dashmap::DashMap;
 use log::{info, warn};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Response, Status};
 
-// Shared inner state held in an Arc so both FlareControlService and
-// ControlChannel (owned by StageExecutor) see the same state.
-//
-// The outgoing channel is split into tx (sender, used by ControlChannel to
-// push InstructionRequests to the harness) and rx (receiver, handed to the
-// harness gRPC stream via ReceiverStream).  Both are Option-wrapped so they
-// can be replaced when a job finishes and a fresh harness connects.
+/// Shared gRPC channel for sending instructions to the worker.
 pub struct ControlInner {
     // Sender — ControlChannel writes InstructionRequests here.
     pub outgoing_tx: Mutex<Option<mpsc::Sender<Result<InstructionRequest, Status>>>>,
 
     // Receiver — taken by FlareControlService::control() and handed to the
-    // harness as a ReceiverStream.
+    // worker as a ReceiverStream.
     pub outgoing_rx: Mutex<Option<mpsc::Receiver<Result<InstructionRequest, Status>>>>,
 
-    // Incoming gRPC stream from the harness (InstructionResponses).
+    // Incoming gRPC stream from the worker (InstructionResponses).
     pub incoming: Mutex<Option<tonic::Streaming<InstructionResponse>>>,
 
-    // ProcessBundleDescriptors registered with the harness.
+    // ProcessBundleDescriptors registered with the worker.
     pub descriptors: Mutex<HashMap<String, ProcessBundleDescriptor>>,
+
+    // Pending responses from the worker, keyed by instruction_id.
+    pub pending: DashMap<String, oneshot::Sender<InstructionResponse>>,
 }
 
 impl ControlInner {
@@ -54,13 +52,18 @@ pub async fn start_control_server() -> Result<(ControlChannel, FlareControlServi
         outgoing_rx: Mutex::new(Some(rx)),
         incoming: Mutex::new(None),
         descriptors: Mutex::new(HashMap::new()),
+        pending: DashMap::new(),
     });
 
     let service = FlareControlService {
         inner: stream.clone(),
     };
 
-    let channel = ControlChannel { stream, next_id: 0 };
+    let channel = ControlChannel {
+        stream,
+        next_id: 0,
+        response_task: Arc::new(std::sync::Mutex::new(None)),
+    };
 
     Ok((channel, service))
 }
@@ -106,16 +109,16 @@ impl BeamFnControl for FlareControlService {
             *self.inner.incoming.lock().await = Some(request.into_inner());
 
             // Take the rx end of the request channel — this is the stream
-            // of InstructionRequests the harness will read.
+            // of InstructionRequests the worker will read.
             let rx = {
                 let mut rx_guard = self.inner.outgoing_rx.lock().await;
-                // If outgoing_rx is None, a previous harness already took it
+                // If outgoing_rx is None, a previous worker already took it
                 // and disconnected without a clean reset. Create a fresh
-                // channel pair so the new harness gets a working stream
-                // instead of crashing with "harness connected twice".
+                // channel pair so the new worker gets a working stream
+                // instead of crashing with "worker connected twice".
                 if rx_guard.is_none() {
                     warn!(
-                        "Control stream connected while a previous harness stream was still active; replacing stale stream"
+                        "Control stream connected while a previous worker stream was still active; replacing stale stream"
                     );
                     let (tx, rx) = mpsc::channel::<Result<InstructionRequest, Status>>(32);
                     *self.inner.outgoing_tx.lock().await = Some(tx);
@@ -123,7 +126,7 @@ impl BeamFnControl for FlareControlService {
                 }
                 // Take ownership of the receiver and return it as a streaming
                 // gRPC response. After this, outgoing_rx is None again until
-                // the harness is reset for the next job.
+                // the worker is reset for the next job.
                 rx_guard
                     .take()
                     .expect("control outgoing receiver must be initialized")
@@ -180,22 +183,26 @@ pub enum ControlResponse {
     BundleDone,
 }
 
-/// ControlChannel: Flare → harness  (InstructionRequests)
-///                harness → Flare  (InstructionResponses, via inner.incoming)
+/// ControlChannel: Flare → worker  (InstructionRequests)
+///                worker → Flare  (InstructionResponses, via inner.incoming)
 ///
 /// The sender lives inside the shared `ControlInner` so it can be replaced
-/// when a harness disconnects and a new one connects.
+/// when a worker disconnects and a new one connects.
 #[derive(Clone)]
 pub struct ControlChannel {
     /// Shared state with FlareControlService (the gRPC handler).
     pub stream: Arc<ControlInner>,
     pub next_id: u64,
+    /// Handle to the background response dispatch task. Aborted and awaited on
+    /// during reset so a stale task from the previous job does not race with
+    /// the new worker stream.
+    response_task: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl ControlChannel {
-    // wait for harness to connect
+    // wait for worker to connect
     // poll until control() fires and stores the incoming stream
-    /// Wait for the harness to connect its control stream.
+    /// Wait for the worker to connect its control stream.
     pub async fn wait_connected(&self) -> Result<()> {
         loop {
             if self.stream.incoming.lock().await.is_some() {
@@ -205,23 +212,30 @@ impl ControlChannel {
         }
     }
 
-    // Reset the control channel so a new harness can connect.
+    // Reset the control channel so a new worker can connect.
     //
     // Creates a fresh mpsc pair, clears the incoming stream, and drops all
     // previously registered descriptors.  Call this between jobs (after
-    // killing the old harness, before spawning the new one).
+    // killing the old worker, before spawning the new one).
     pub async fn reset(&self) {
+        let handle = self.response_task.lock().unwrap().take();
+        if let Some(handle) = handle {
+            handle.abort();
+            let _ = handle.await;
+        }
+
         let (tx, rx) = mpsc::channel::<Result<InstructionRequest, Status>>(32);
 
         *self.stream.outgoing_tx.lock().await = Some(tx);
         *self.stream.outgoing_rx.lock().await = Some(rx);
         *self.stream.incoming.lock().await = None;
         self.stream.descriptors.lock().await.clear();
+        self.stream.pending.clear();
 
-        log::info!("control channel reset for next harness");
+        log::info!("control channel reset for next worker");
     }
 
-    // register stage descriptor with harness
+    // register stage descriptor with worker
     // sends InstructionRequest { register: descriptor }
     // waits for InstructionResponse ack
     // called once per stage at startup
@@ -230,6 +244,7 @@ impl ControlChannel {
         descriptor: ProcessBundleDescriptor,
     ) -> Result<ControlResponse> {
         let id = self.next_id();
+        let response_rx = self.insert_pending_response(id.clone());
 
         self.stream
             .descriptors
@@ -238,18 +253,27 @@ impl ControlChannel {
             .insert(descriptor.id.clone(), descriptor.clone());
 
         let sender = self.stream.sender().await?;
-        sender
+        let send_result = sender
             .send(Ok(InstructionRequest {
                 instruction_id: id.clone(),
                 request: Some(instruction_request::Request::Register(RegisterRequest {
                     process_bundle_descriptor: vec![descriptor],
                 })),
             }))
-            .await
-            .map_err(|e| anyhow!("failed to send register request: {}", e))?;
+            .await;
+
+        if let Err(e) = send_result {
+            self.stream.pending.remove(&id);
+            return Err(anyhow!("failed to send register request: {}", e));
+        }
 
         // wait for ack
-        let response = self.recv_response().await?;
+        let response = response_rx.await.map_err(|_| {
+            anyhow!(
+                "control dispatcher reset or worker disconnected while awaiting register ack {}",
+                id
+            )
+        })?;
 
         if response.instruction_id != id {
             return Err(anyhow!(
@@ -265,27 +289,26 @@ impl ControlChannel {
             }
             other => {
                 if !response.error.is_empty() {
-                    return Err(anyhow!("register failed at harness: {}", response.error));
+                    return Err(anyhow!("register failed at worker: {}", response.error));
                 }
                 Err(anyhow!("unexpected register response: {:?}", other))
             }
         }
     }
 
-    // tell harness to start a bundle
+    // tell worker to start a bundle
     // sends InstructionRequest { process_bundle: descriptor_id }
     // returns bundle_id so caller can match the response later
     // called every bundle
-    pub async fn send_process_bundle_request(&mut self, descriptor_id: &String) -> Result<String> {
+    pub async fn send_process_bundle_request(
+        &mut self,
+        descriptor_id: &String,
+    ) -> Result<(String, oneshot::Receiver<InstructionResponse>)> {
         let id = self.next_id();
-
-        /* s let _endpoint = ApiServiceDescriptor {
-            url: "127.0.0.1:8099".to_string(),
-            ..Default::default()
-        };*/
+        let response_rx = self.insert_pending_response(id.clone());
 
         let sender = self.stream.sender().await?;
-        sender
+        let send_result = sender
             .send(Ok(InstructionRequest {
                 instruction_id: id.clone(),
                 request: Some(instruction_request::Request::ProcessBundle(
@@ -295,22 +318,31 @@ impl ControlChannel {
                     },
                 )),
             }))
-            .await
-            .map_err(|e| anyhow!("failed to send process bundle request: {}", e))?;
+            .await;
 
-        // return id — caller correlates with recv_process_bundle_response()
-        Ok(id)
+        if let Err(e) = send_result {
+            self.stream.pending.remove(&id);
+            return Err(anyhow!("failed to send process bundle request: {}", e));
+        }
+
+        Ok((id, response_rx))
     }
 
-    // wait for harness to confirm bundle complete
+    // wait for worker to confirm bundle complete
     // blocks until ProcessBundleResponse arrives on control channel
     // called after sending elements on data channel
     pub async fn recv_process_bundle_response(
-        &mut self,
+        &self,
         bundle_id: &str,
+        response_rx: oneshot::Receiver<InstructionResponse>,
     ) -> Result<ControlResponse> {
         info!("Polling for process bundle response");
-        let response = self.recv_response().await?;
+        let response = response_rx.await.map_err(|_| {
+            anyhow!(
+                "control dispatcher reset or worker disconnected while awaiting instruction {}",
+                bundle_id
+            )
+        })?;
 
         if response.instruction_id != bundle_id {
             return Err(anyhow!(
@@ -327,7 +359,7 @@ impl ControlChannel {
             other => {
                 if !response.error.is_empty() {
                     return Err(anyhow!(
-                        "process bundle failed at harness: {}",
+                        "process bundle failed at worker: {}",
                         response.error
                     ));
                 }
@@ -336,22 +368,63 @@ impl ControlChannel {
         }
     }
 
-    // read next InstructionResponse from harness
-    // reads directly from the persisted gRPC stream
-    // no intermediate mpsc, no spawned tasks
-    // if stream dies → returns Err immediately, no deadlock
-    async fn recv_response(&self) -> Result<InstructionResponse> {
-        let mut guard = self.stream.incoming.lock().await;
+    fn insert_pending_response(&self, id: String) -> oneshot::Receiver<InstructionResponse> {
+        let (sender, receiver) = oneshot::channel();
+        self.stream.pending.insert(id, sender);
+        receiver
+    }
 
-        let stream = guard
-            .as_mut()
-            .ok_or_else(|| anyhow!("harness not connected yet"))?;
+    pub fn stream_responses(&self) {
+        let stream = self.stream.clone();
+        let task_slot = self.response_task.clone();
+        info!("Streaming control responses from worker");
 
-        stream
-            .message()
-            .await
-            .map_err(|e| anyhow!("control stream error: {}", e))?
-            .ok_or_else(|| anyhow!("harness disconnected"))
+        let join_handle = tokio::spawn(async move {
+            loop {
+                let response = {
+                    let mut guard = stream.incoming.lock().await;
+                    let Some(response_stream) = &mut *guard else {
+                        drop(guard);
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        continue;
+                    };
+
+                    response_stream.message().await
+                };
+
+                match response {
+                    Ok(Some(response)) => {
+                        let instruction_id = response.instruction_id.clone();
+                        if let Some((_, sender)) = stream.pending.remove(&instruction_id) {
+                            if sender.send(response).is_err() {
+                                warn!(
+                                    "control response receiver dropped for instruction_id={}",
+                                    instruction_id
+                                );
+                            }
+                        } else {
+                            warn!(
+                                "no pending control receiver for instruction_id={}",
+                                instruction_id
+                            );
+                        }
+                        continue;
+                    }
+                    Ok(None) => {
+                        info!("BeamFnControl stream from worker closed cleanly");
+                        break;
+                    }
+                    Err(e) => {
+                        warn!("BeamFnControl stream error (worker gone?): {}", e);
+                        break;
+                    }
+                }
+            }
+
+            info!("BeamFnControl stream from worker closed");
+        });
+
+        *task_slot.lock().unwrap() = Some(join_handle);
     }
 
     // generate unique instruction ids
