@@ -57,7 +57,7 @@ pub struct StageExecutor {
     pipeline_coders: Arc<HashMap<String, Coder>>,
     /// Pipeline components.
     pipeline_components: Arc<Components>,
-    /// Element storage (input/output sets for bundles).
+    /// Element storage
     store: Arc<FlareElementStore>,
     /// Instance ID
     instance_id: String,
@@ -157,8 +157,8 @@ pub async fn run_pipeline(
 
             in_flight.spawn(async move {
                 let mut executor = executor.lock().await;
-                // TODO: this fix makes ControlChannel safe for concurrent callers
-                // and unblocks switching to Arc<StageExecutor> in a later PR.
+                // TODO:  switch to Arc<StageExecutor>? since its mutex,
+                // each task may not be able to access the executor simultaneously.
                 let result = executor
                     .execute(node, input_metadata, output_metadata)
                     .await;
