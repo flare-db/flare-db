@@ -91,8 +91,11 @@ impl StageExecutor {
     }
 
     pub fn prepare_pipeline(&mut self, pipeline_graph: &ExecutableGraph) {
-        // Start data channel to listening for elements.
+        // Start data channel to listen for elements.
         self.data.stream_elements();
+        // Start control channel response dispatch so concurrent bundle waiters
+        // can receive messages safely.
+        self.control.stream_responses();
         self.pipeline_coders = Arc::new(pipeline_graph.components.coders.clone());
         self.pipeline_components = Arc::new(pipeline_graph.components.clone());
     }
@@ -145,6 +148,8 @@ pub async fn run_pipeline(
 
             in_flight.spawn(async move {
                 let mut executor = executor.lock().await;
+                // TODO: this fix makes ControlChannel safe for concurrent callers
+                // and unblocks switching to Arc<StageExecutor> in a later PR.
                 let result = executor
                     .execute(node, input_metadata, output_metadata)
                     .await;
@@ -194,7 +199,7 @@ impl StageExecutor {
                         if matches!(response, ControlResponse::BundleRegistered) {
                             info!("Bundle registered at worker");
 
-                            let instruction_id = self
+                            let (instruction_id, bundle_response_rx) = self
                                 .control
                                 .send_process_bundle_request(&descriptor_id)
                                 .await?;
@@ -236,8 +241,9 @@ impl StageExecutor {
                                     );
                                 }
                             });
-                            let bundle_response_future =
-                                self.control.recv_process_bundle_response(&instruction_id);
+                            let bundle_response_future = self
+                                .control
+                                .recv_process_bundle_response(&instruction_id, bundle_response_rx);
 
                             if let Some(output_meta_data) = output_meta_data {
                                 let data_key = DataKey {

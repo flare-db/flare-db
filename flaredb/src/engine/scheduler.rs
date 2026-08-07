@@ -1,12 +1,3 @@
-// Scheduler for executing an `ExecutableGraph`.
-//
-// The `Scheduler` iterates over nodes in an `ExecutableGraph` and tracks
-// which nodes have been executed and which are currently in-flight.
-//
-// It exposes methods to fetch next ready nodes, mark nodes complete, and
-// obtain input/output edge metadata. It's used by the engine to schedule
-// execution order while respecting data dependencies.
-
 use std::collections::HashSet;
 
 use petgraph::{Direction, graph::NodeIndex};
@@ -118,7 +109,6 @@ impl Scheduler {
 mod tests {
     use std::collections::{HashMap, HashSet};
 
-    use beam_model_rs::v1::Components;
     use petgraph::Graph;
 
     use crate::engine::scheduler::Scheduler;
@@ -197,7 +187,7 @@ mod tests {
         assert_eq!(ready[0].0, a);
 
         scheduler.mark_complete(a);
-        let mut ready = scheduler.next_nodes();
+        let ready = scheduler.next_nodes();
         assert_eq!(ready.len(), 2);
         let ready_indices: HashSet<_> = ready.into_iter().map(|(idx, _)| idx).collect();
         assert!(ready_indices.contains(&b));
