@@ -1,12 +1,12 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::HashMap,
     io::Cursor,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use anyhow::{Error, anyhow};
+use anyhow::anyhow;
 use async_trait::async_trait;
 use beam_model_rs::v1::{
     ApiServiceDescriptor, Coder, Components, Elements, FunctionSpec, PTransform,
@@ -14,7 +14,6 @@ use beam_model_rs::v1::{
 };
 use bytes::{Buf, BytesMut};
 use log::{error, info};
-use petgraph::{Direction, graph::NodeIndex};
 use prost::Message;
 use tokio::{
     sync::{Mutex, mpsc::UnboundedReceiver},
@@ -43,14 +42,24 @@ use crate::{
     utils::batch_size_estimator::{BatchConfig, BatchSizeEstimator},
 };
 
+/// Executor managing worker communication and bundle processing.
+/// Owns control and data channels, coordinates input/output element flow.
 pub struct StageExecutor {
+    /// Control plane
     control: ControlChannel,
+    /// Data plane
     data: DataChannel,
+    /// Logging channel
     log: LogChannel,
+    /// State API channel.
     state: StateChannel,
+    /// Pipeline coders.
     pipeline_coders: Arc<HashMap<String, Coder>>,
+    /// Pipeline components.
     pipeline_components: Arc<Components>,
+    /// Element storage (input/output sets for bundles).
     store: Arc<FlareElementStore>,
+    /// Instance ID
     instance_id: String,
 }
 
@@ -90,11 +99,11 @@ impl StageExecutor {
         Ok(())
     }
 
+    /// Start dispatcher tasks
     pub fn prepare_pipeline(&mut self, pipeline_graph: &ExecutableGraph) {
-        // Start data channel to listen for elements.
+        // Start data channel dispatcher to listen and demux incoming elements.
         self.data.stream_elements();
-        // Start control channel response dispatch so concurrent bundle waiters
-        // can receive messages safely.
+        // Start control channel dispatcher to route responses to waiting futures.
         self.control.stream_responses();
         self.pipeline_coders = Arc::new(pipeline_graph.components.coders.clone());
         self.pipeline_components = Arc::new(pipeline_graph.components.clone());
@@ -177,6 +186,7 @@ pub async fn run_pipeline(
 }
 
 impl StageExecutor {
+    /// Execute a worker or runner stage node.
     pub async fn execute_node(
         &mut self,
         node: ExecutableNode,
@@ -206,6 +216,7 @@ impl StageExecutor {
 
                             info!("Process instruction id {}", instruction_id);
 
+                            // Spawn background task to send input elements to worker.
                             if let Some(meta_data) = &input_edge_metadata {
                                 info!("Input edge metadata: {:?}", meta_data.clone());
                             }
@@ -630,7 +641,7 @@ impl StageExecutor {
                 let mut receiver_lock = receiver.lock().await;
                 receiver_lock.recv().await
             };
-            // ToDo create per bundle schema instred of derivsing schema for eveyry record batch.
+            // ToDo: create per bundle schema instred of deriving schema for eveyry record batch.
             // create paimon writer and commitor per bundle
             match payload {
                 Some(ElementStreamPayload::Data(data_chunk)) => {
@@ -694,7 +705,7 @@ impl StageExecutor {
                                         stream_buffer.len()
                                     ));
                                 }
-                                // Cursor is dropped; stream_buffer was never advanced.
+                                // Cursor is dropped stream_buffer was never advanced.
                                 break;
                             }
                         }
@@ -742,9 +753,8 @@ impl StageExecutor {
         Ok(())
     }
 
-    // Sends current stage's input elements to worker
-    pub async fn process_input_elements(ctx: ProcessInputContext) -> anyhow::Result<()> {
-        info!("Spawnned task to send stage's input elemenets to worker");
+    async fn process_input_elements(ctx: ProcessInputContext) -> anyhow::Result<()> {
+        info!("Spawned task to send stage's input elements to worker");
         info!(
             "Sending input elements: instruction_id={}, transform_id={}",
             ctx.input_instruction_id, ctx.consumer_transform_id,
@@ -785,6 +795,7 @@ impl StageExecutor {
     }
 }
 
+/// Context for process_input_elements task
 pub struct ProcessInputContext {
     input_stream: DataChannel,
     store: Arc<FlareElementStore>,
