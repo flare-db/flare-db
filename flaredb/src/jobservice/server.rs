@@ -15,7 +15,8 @@ use tonic::Response;
 use tonic::Status;
 use uuid::Uuid;
 
-use crate::engine::executor::StageExecutor;
+use crate::engine::executor::{StageExecutor, run_pipeline};
+use crate::engine::scheduler::Scheduler;
 use crate::jobservice::artifact::ArtifactStore;
 use crate::jobservice::job::Job;
 use crate::jobservice::job::JobStore;
@@ -180,10 +181,13 @@ impl JobService for FlareJobService {
                 ))
             })?;
 
-            executor
-                .lock()
-                .await
-                .execute_pipeline(job_graph.as_ref())
+            {
+                let mut executor_guard = executor.lock().await;
+                executor_guard.prepare_pipeline(job_graph.as_ref());
+            }
+
+            let mut scheduler = Scheduler::new((*job_graph).clone());
+            run_pipeline(&mut scheduler, executor.clone())
                 .await
                 .map_err(|e| {
                     Status::internal(format!(
@@ -192,7 +196,7 @@ impl JobService for FlareJobService {
                     ))
                 })?;
 
-            // Kill the harness — the next job will get a fresh one.
+            // stop worker, next job will get a fresh one.
             self.worker_manager.stop_worker(&preparation_id).await?;
 
             log::info!("job execution completed: preparation_id={}", preparation_id);

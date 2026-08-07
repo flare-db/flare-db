@@ -7,15 +7,19 @@ use std::{
 };
 
 use anyhow::{Error, anyhow};
+use async_trait::async_trait;
 use beam_model_rs::v1::{
-    ApiServiceDescriptor, Coder, Elements, FunctionSpec, PTransform, ProcessBundleDescriptor,
-    RemoteGrpcPort, elements,
+    ApiServiceDescriptor, Coder, Components, Elements, FunctionSpec, PTransform,
+    ProcessBundleDescriptor, RemoteGrpcPort, elements,
 };
 use bytes::{Buf, BytesMut};
 use log::{error, info};
 use petgraph::{Direction, graph::NodeIndex};
 use prost::Message;
-use tokio::sync::{Mutex, mpsc::UnboundedReceiver};
+use tokio::{
+    sync::{Mutex, mpsc::UnboundedReceiver},
+    task::JoinSet,
+};
 
 use crate::{
     engine::{
@@ -26,6 +30,7 @@ use crate::{
             log::LogChannel,
             state::StateChannel,
         },
+        scheduler::Scheduler,
     },
     fusion::{
         pipeline::{ConsumerMetaData, ExecutableGraph, ExecutableNode},
@@ -44,7 +49,7 @@ pub struct StageExecutor {
     log: LogChannel,
     state: StateChannel,
     pipeline_coders: Arc<HashMap<String, Coder>>,
-    graph: Option<ExecutableGraph>,
+    pipeline_components: Arc<Components>,
     store: Arc<FlareElementStore>,
     instance_id: String,
 }
@@ -67,7 +72,7 @@ impl StageExecutor {
             log,
             state,
             pipeline_coders: Arc::new(HashMap::new()),
-            graph: None,
+            pipeline_components: Arc::new(Components::default()),
             store,
             instance_id: instance_id.to_string(),
         })
@@ -85,9 +90,14 @@ impl StageExecutor {
         Ok(())
     }
 
-    /// Reset all harness channels so a new worker can connect.
-    /// Call this between jobs, after killing the old harness and before
-    /// spawning the new one.
+    pub fn prepare_pipeline(&mut self, pipeline_graph: &ExecutableGraph) {
+        // Start data channel to listening for elements.
+        self.data.stream_elements();
+        self.pipeline_coders = Arc::new(pipeline_graph.components.coders.clone());
+        self.pipeline_components = Arc::new(pipeline_graph.components.clone());
+    }
+
+    /// Reset all channels so a new worker can connect.
     pub async fn reset_channels(&self) {
         self.control.reset().await;
         self.data.reset().await;
@@ -96,85 +106,72 @@ impl StageExecutor {
         //self.store.reset();
         log::info!("stage executor channels reset");
     }
+}
 
-    pub async fn execute_pipeline(
+#[async_trait]
+pub trait Executor {
+    async fn execute(
         &mut self,
-        pipeline_graph: &ExecutableGraph,
-    ) -> Result<(), Error> {
-        info!("Starting to execute pipeline");
-        // Spin up channels to start listening for data from worker before node execution
-        self.data.stream_elements();
+        node: ExecutableNode,
+        input_edge_metadata: Option<ConsumerMetaData>,
+        output_edge_metadata: Option<ConsumerMetaData>,
+    ) -> anyhow::Result<ControlResponse>;
+}
 
-        let graph = pipeline_graph.get_executable_graph();
+#[async_trait]
+impl Executor for StageExecutor {
+    async fn execute(
+        &mut self,
+        node: ExecutableNode,
+        input_edge_metadata: Option<ConsumerMetaData>,
+        output_edge_metadata: Option<ConsumerMetaData>,
+    ) -> anyhow::Result<ControlResponse> {
+        self.execute_node(node, input_edge_metadata, output_edge_metadata, None)
+            .await
+    }
+}
 
-        self.pipeline_coders = Arc::new(pipeline_graph.components.coders.clone());
-        self.graph = Some(pipeline_graph.clone());
+pub async fn run_pipeline(
+    scheduler: &mut Scheduler,
+    executor: Arc<Mutex<StageExecutor>>,
+) -> anyhow::Result<()> {
+    let mut in_flight = JoinSet::new();
 
-        // Root node = node with no incoming edges
-        let root = graph
-            .node_indices()
-            .find(|&idx| {
-                graph
-                    .neighbors_directed(idx, Direction::Incoming)
-                    .next()
-                    .is_none()
-            })
-            .ok_or_else(|| anyhow::anyhow!("no root node found"))?;
+    loop {
+        for (idx, node) in scheduler.next_nodes() {
+            let executor = executor.clone();
+            let input_metadata = scheduler.input_edge_metadata(idx);
+            let output_metadata = scheduler.output_edge_metadata(idx);
 
-        let mut current_level = VecDeque::<NodeIndex>::new();
-        current_level.push_front(root);
-        // vec![root];
-
-        // executed nodes
-        let mut executed = HashSet::<NodeIndex>::new();
-
-        while !current_level.is_empty() {
-            let mut next_level = HashSet::<NodeIndex>::new();
-
-            // List of graph nodeindex and nodes in current level
-            let executable_nodes: Vec<(NodeIndex, ExecutableNode)> = current_level
-                .iter()
-                .map(|&idx| (idx, graph[idx].clone()))
-                .collect();
-            info!("Picked up nodes for current level ");
-
-            for (idx, node) in executable_nodes {
-                // Skip already executed nodes
-                // but there is a bug if we add it to the executed list but the node fail to execute
-                // then we'd produce an incorrect list, or we just fail eveything if the node fails
-                if !executed.insert(idx) {
-                    continue;
-                }
-
-                // previous stage -> current stage
-                let incoming_edge = graph
-                    .edges_directed(idx, Direction::Incoming)
-                    .next()
-                    .map(|e| e.weight().clone());
-
-                // current stage -> next stage
-                let outgoing_edge = graph
-                    .edges_directed(idx, Direction::Outgoing)
-                    .next()
-                    .map(|e| e.weight().clone());
-
-                // Execute node
-                self.execute_node(node, incoming_edge, outgoing_edge, None)
-                    .await?;
-
-                // Schedule downstream consumers
-                for downstream in graph.neighbors_directed(idx, Direction::Outgoing) {
-                    if !executed.contains(&downstream) {
-                        next_level.insert(downstream);
-                    }
-                }
-            }
-
-            current_level = next_level.into_iter().collect();
+            in_flight.spawn(async move {
+                let mut executor = executor.lock().await;
+                let result = executor
+                    .execute(node, input_metadata, output_metadata)
+                    .await;
+                (idx, result)
+            });
         }
-        Ok(())
+
+        if in_flight.is_empty() {
+            if scheduler.is_complete() {
+                break;
+            }
+            return Err(anyhow!(
+                "executable graph deadlocked: no ready nodes and no in-flight work"
+            ));
+        }
+
+        if let Some(joined) = in_flight.join_next().await {
+            let (idx, result) = joined?;
+            result?;
+            scheduler.mark_complete(idx);
+        }
     }
 
+    Ok(())
+}
+
+impl StageExecutor {
     pub async fn execute_node(
         &mut self,
         node: ExecutableNode,
@@ -333,77 +330,65 @@ impl StageExecutor {
             }
             ExecutableNode::Runner(runner_transform) => {
                 info!("Executing runner node");
-                if let Some(graph) = &self.graph {
-                    let input_metadata = input_edge_metadata.as_ref();
-                    let output_metadata = output_edge_metadata.as_ref();
-                    let root_metadata = graph.get_root_metadata();
 
-                    let input_pcollection_id =
-                        Self::metadata_pcollection_id(input_metadata, root_metadata);
-                    let output_pcollection_id = Self::runner_output_pcollection_id(
-                        &runner_transform,
-                        output_metadata,
-                        root_metadata,
-                    );
-                    let consumer_transfrom_id = Self::runner_consumer_transform_id(
-                        input_metadata,
-                        output_metadata,
-                        root_metadata,
-                    );
+                let input_metadata = input_edge_metadata.as_ref();
+                let output_metadata = output_edge_metadata.as_ref();
 
-                    info!("Runner node input metadata: {:?}", input_edge_metadata);
-                    info!("Runner node output metadata: {:?}", output_edge_metadata);
+                let input_pcollection_id = Self::metadata_pcollection_id(input_metadata);
+                let output_pcollection_id =
+                    Self::runner_output_pcollection_id(&runner_transform, output_metadata);
+                let consumer_transfrom_id =
+                    Self::runner_consumer_transform_id(input_metadata, output_metadata);
 
-                    let endpoint = ApiServiceDescriptor {
-                        url: crate::DEFAULT_API_SERVICE_URL.to_string(),
-                        ..Default::default()
-                    };
+                info!("Runner node input metadata: {:?}", input_edge_metadata);
+                info!("Runner node output metadata: {:?}", output_edge_metadata);
 
-                    let descriptor = ProcessBundleDescriptor {
-                        id: runner_transform.id(),
-                        transforms: runner_transform.transfrom_spec(),
-                        pcollections: runner_transform.pcollections(&graph.components),
-                        windowing_strategies: runner_transform.windowing_strategies(),
-                        coders: runner_transform.coders(),
-                        environments: runner_transform.environments(),
-                        state_api_service_descriptor: Some(endpoint.clone()),
-                        timer_api_service_descriptor: Some(endpoint),
-                    };
+                let endpoint = ApiServiceDescriptor {
+                    url: crate::DEFAULT_API_SERVICE_URL.to_string(),
+                    ..Default::default()
+                };
 
-                    let bundle_status = self.control.register_bundle(descriptor).await;
+                let descriptor = ProcessBundleDescriptor {
+                    id: runner_transform.id(),
+                    transforms: runner_transform.transfrom_spec(),
+                    pcollections: runner_transform.pcollections(&self.pipeline_components),
+                    windowing_strategies: runner_transform.windowing_strategies(),
+                    coders: runner_transform.coders(),
+                    environments: runner_transform.environments(),
+                    state_api_service_descriptor: Some(endpoint.clone()),
+                    timer_api_service_descriptor: Some(endpoint),
+                };
 
-                    match bundle_status {
-                        Ok(response) => {
-                            if matches!(response, ControlResponse::BundleRegistered) {
-                                info!("Runer bundle registred at worker");
-                                let ctx = ExecutionContext {
-                                    store: self.store.clone(),
-                                    input_pcollection_id,
-                                    output_pcollection_id,
-                                    consumer_transfrom_id,
-                                };
+                let bundle_status = self.control.register_bundle(descriptor).await;
 
-                                runner_transform.execute(ctx).await?;
-                            } else {
-                            }
+                match bundle_status {
+                    Ok(response) => {
+                        if matches!(response, ControlResponse::BundleRegistered) {
+                            info!("Runer bundle registred at worker");
+                            let ctx = ExecutionContext {
+                                store: self.store.clone(),
+                                input_pcollection_id,
+                                output_pcollection_id,
+                                consumer_transfrom_id,
+                            };
+
+                            runner_transform.execute(ctx).await?;
+                        } else {
                         }
-                        Err(err) => {
-                            return Err(anyhow!("Error while processing bundle {}", err));
-                        }
-                    };
-                }
+                    }
+                    Err(err) => {
+                        return Err(anyhow!("Error while processing bundle {}", err));
+                    }
+                };
 
                 Ok(ControlResponse::BundleDone)
             }
         }
     }
 
-    fn metadata_pcollection_id(
-        metadata: Option<&ConsumerMetaData>,
-        fallback_metadata: &ConsumerMetaData,
-    ) -> String {
+    fn metadata_pcollection_id(metadata: Option<&ConsumerMetaData>) -> String {
         metadata
-            .unwrap_or(fallback_metadata)
+            .expect("Runner node must have at least one available metadata source")
             .produced_pcol_id
             .clone()
     }
@@ -411,23 +396,22 @@ impl StageExecutor {
     fn runner_output_pcollection_id(
         runner_transform: &FlareRunnerTransform,
         output_metadata: Option<&ConsumerMetaData>,
-        root_metadata: &ConsumerMetaData,
     ) -> String {
         output_metadata
             .map(|meta| meta.produced_pcol_id.clone())
             .or_else(|| runner_transform.output_pcol_ids().into_iter().next())
-            .unwrap_or_else(|| root_metadata.produced_pcol_id.clone())
+            .expect("Runner transform must have an output pcollection id")
     }
 
     fn runner_consumer_transform_id(
         input_metadata: Option<&ConsumerMetaData>,
         output_metadata: Option<&ConsumerMetaData>,
-        root_metadata: &ConsumerMetaData,
     ) -> String {
         output_metadata
             .or(input_metadata)
-            .map(|meta| meta.consumer_transfrom_id.clone())
-            .unwrap_or_else(|| root_metadata.consumer_transfrom_id.clone())
+            .expect("Runner node must have available transform metadata")
+            .consumer_transfrom_id
+            .clone()
     }
 
     fn stage_source_transform_id(stage: &ExecutableStage) -> String {
