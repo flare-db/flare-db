@@ -1053,3 +1053,1296 @@ fn unique_id(prefix: &str, exists: impl Fn(&str) -> bool) -> String {
     }
     candidate
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fusion::pipeline::{PCollectionNode, PTransformNode, QueryablePipeline};
+    use crate::fusion::stage::{CollectionConsumers, ExecutableStage};
+    use crate::jobservice::urns::beam_urns;
+    use beam_model_rs::v1::{
+        Components, Environment, FunctionSpec, PCollection, PTransform, ParDoPayload, SideInput,
+        StateSpec, TimerFamilySpec, executable_stage_payload::WireCoderSetting,
+    };
+    use indexmap::IndexSet;
+    use prost::Message;
+    use std::collections::{BTreeSet, HashMap, HashSet};
+
+    //
+    // helpers
+    //
+
+    /// Build a minimal Environment recognizable by same_environment.
+    fn make_env(id: &str) -> Environment {
+        Environment {
+            urn: format!("beam:env:test:{id}"),
+            ..Default::default()
+        }
+    }
+
+    /// Build a FunctionSpec with a given URN and no payload.
+    fn make_spec(urn: &str) -> FunctionSpec {
+        FunctionSpec {
+            urn: urn.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// Build a ParDo-aware FunctionSpec whose payload is an encoded ParDoPayload.
+    fn make_pardo_spec(urn: &str, payload: &ParDoPayload) -> FunctionSpec {
+        FunctionSpec {
+            urn: urn.to_string(),
+            payload: payload.encode_to_vec(),
+            ..Default::default()
+        }
+    }
+
+    /// Create a bare PTransformNode with a given URN, no payload.
+    fn make_transform(
+        id: &str,
+        urn: &str,
+        inputs: &[(&str, &str)],
+        outputs: &[(&str, &str)],
+        env_id: &str,
+    ) -> PTransformNode {
+        PTransformNode {
+            id: id.to_string(),
+            transform: PTransform {
+                unique_name: id.to_string(),
+                spec: Some(make_spec(urn)),
+                inputs: inputs
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+                outputs: outputs
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+                environment_id: env_id.to_string(),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Create a PTransformNode whose spec encodes a ParDoPayload.
+    fn make_pardo_transform(
+        id: &str,
+        urn: &str,
+        inputs: &[(&str, &str)],
+        outputs: &[(&str, &str)],
+        env_id: &str,
+        payload: &ParDoPayload,
+    ) -> PTransformNode {
+        PTransformNode {
+            id: id.to_string(),
+            transform: PTransform {
+                unique_name: id.to_string(),
+                spec: Some(make_pardo_spec(urn, payload)),
+                inputs: inputs
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+                outputs: outputs
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+                environment_id: env_id.to_string(),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// A ParDoPayload with no side inputs, state, or timers, but with a non-default
+    /// `do_fn` so it encodes to non-empty bytes — required because
+    /// `can_fuse_pardo` treats an empty encoded payload as "unknown, don't fuse,"
+    /// and `ParDoPayload::default().encode_to_vec()` is empty (protobuf omits
+    /// all-default fields), so `ParDoPayload::default()` alone does not pass
+    /// the `!s.payload.is_empty()` guard.
+    fn clean_pardo_payload() -> ParDoPayload {
+        ParDoPayload {
+            do_fn: Some(FunctionSpec {
+                urn: "test:dofn".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Create a PCollectionNode.
+    fn make_pcol(id: &str) -> PCollectionNode {
+        PCollectionNode {
+            id: id.to_string(),
+            collection: PCollection {
+                unique_name: id.to_string(),
+                coder_id: "test_coder".to_string(),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Assemble a QueryablePipeline from transform nodes, pcollection nodes and environments.
+    fn build_pipeline(
+        transforms: Vec<PTransformNode>,
+        pcollections: Vec<PCollectionNode>,
+        environments: HashMap<String, Environment>,
+    ) -> QueryablePipeline {
+        let mut components = Components::default();
+        for t in &transforms {
+            components
+                .transforms
+                .insert(t.id.clone(), t.transform.clone());
+        }
+        for p in &pcollections {
+            components
+                .pcollections
+                .insert(p.id.clone(), p.collection.clone());
+        }
+        for (id, env) in environments {
+            components.environments.insert(id, env);
+        }
+        QueryablePipeline::new(&components)
+    }
+
+    /// Convenience: build pipeline, extract root transforms, then produce
+    /// (initial_unfused_pt, initial_consumers) suitable for fuse_pipeline.
+    fn extract_initial_sets(
+        pipeline: &QueryablePipeline,
+        fuser: &GreedyPipelineFuser,
+    ) -> (HashSet<PTransformNode>, BTreeSet<CollectionConsumers>) {
+        let roots = pipeline.get_root_transforms();
+        let mut unfused = HashSet::new();
+        let mut consumers = BTreeSet::new();
+        for root in &roots {
+            let desc = fuser.get_root_consumers(root.clone());
+            unfused.extend(desc.get_unfusible().iter().cloned());
+            consumers.extend(desc.get_fusible().iter().cloned());
+        }
+        (unfused, consumers)
+    }
+
+    /// Find an ExecutableStage whose transforms set contains a transform with the given id.
+    fn find_stage_with<'a>(
+        stages: &'a IndexSet<ExecutableStage>,
+        transform_id: &str,
+    ) -> Option<&'a ExecutableStage> {
+        stages.iter().find(|s| {
+            let xforms = s.transforms();
+            xforms.iter().any(|t| t.id.as_str() == transform_id)
+        })
+    }
+
+    //
+    // Group 1: baseline fusion regression
+    //
+
+    /// Impulse -> ParDo(A) -> ParDo(B) -> GroupByKey, same env, no side-inputs/state/timers.
+    /// Expect: exactly one ExecutableStage containing both A and B, GBK in runner_stages.
+    #[test]
+    fn linear_chain_fuses_into_one_stage() {
+        let env = make_env("env1");
+        // ParDoPayload::default() decodes successfully with empty side_inputs/
+        // state_specs/timer_family_specs, which is required for can_fuse_pardo
+        // to return true (it checks !s.payload.is_empty()).
+        let clean = clean_pardo_payload();
+        let impulse = make_transform(
+            "impulse",
+            beam_urns::IMPULSE_TRANSFORM,
+            &[],
+            &[("out", "p0")],
+            "",
+        );
+        let pardo_a = make_pardo_transform(
+            "pardo_a",
+            beam_urns::PAR_DO_TRANSFORM,
+            &[("in", "p0")],
+            &[("out", "p1")],
+            "env1",
+            &clean,
+        );
+        let pardo_b = make_pardo_transform(
+            "pardo_b",
+            beam_urns::PAR_DO_TRANSFORM,
+            &[("in", "p1")],
+            &[("out", "p2")],
+            "env1",
+            &clean,
+        );
+        let gbk = make_transform(
+            "gbk",
+            beam_urns::GROUP_BY_KEY_TRANSFORM,
+            &[("in", "p2")],
+            &[("out", "p3")],
+            "",
+        );
+        let pcols = vec![
+            make_pcol("p0"),
+            make_pcol("p1"),
+            make_pcol("p2"),
+            make_pcol("p3"),
+        ];
+        let transforms = vec![impulse, pardo_a, pardo_b, gbk];
+        let mut envs = HashMap::new();
+        envs.insert("env1".to_string(), env);
+
+        let pipeline = build_pipeline(transforms, pcols, envs);
+        let fuser = GreedyPipelineFuser::with(pipeline);
+        let (initial_unfused, initial_consumers) = extract_initial_sets(&fuser.pipeline, &fuser);
+        let fused = fuser
+            .fuse_pipeline(initial_unfused, initial_consumers)
+            .unwrap();
+
+        let sdk_stages = fused.sdk_stages();
+        let runner_stages = fused.runner_stages();
+
+        // Exactly one SDK stage
+        assert_eq!(
+            sdk_stages.len(),
+            1,
+            "Expected exactly 1 SDK stage, got {}",
+            sdk_stages.len()
+        );
+        let stage = sdk_stages.iter().next().unwrap();
+        let stage_transforms = stage.transforms();
+        let stage_transform_ids: HashSet<&str> =
+            stage_transforms.iter().map(|t| t.id.as_str()).collect();
+        assert!(
+            stage_transform_ids.contains("pardo_a"),
+            "Stage should contain pardo_a"
+        );
+        assert!(
+            stage_transform_ids.contains("pardo_b"),
+            "Stage should contain pardo_b"
+        );
+
+        // GBK appears in runner_stages (unfused)
+        let runner_ids: HashSet<&str> = runner_stages.iter().map(|t| t.id.as_str()).collect();
+        assert!(
+            runner_ids.contains("gbk"),
+            "GBK should be in runner_stages, got: {runner_ids:?}"
+        );
+        assert!(
+            !stage_transform_ids.contains("gbk"),
+            "GBK should NOT be in the SDK stage"
+        );
+    }
+
+    /// Two ParDos with different environment_ids should produce two separate ExecutableStages.
+    #[test]
+    fn different_environments_split_into_separate_stages() {
+        let env_a = make_env("env_a");
+        let env_b = make_env("env_b");
+        let impulse = make_transform(
+            "impulse",
+            beam_urns::IMPULSE_TRANSFORM,
+            &[],
+            &[("out", "p0")],
+            "",
+        );
+        let pardo_a = make_transform(
+            "pardo_a",
+            beam_urns::PAR_DO_TRANSFORM,
+            &[("in", "p0")],
+            &[("out", "p1")],
+            "env_a",
+        );
+        let pardo_b = make_transform(
+            "pardo_b",
+            beam_urns::PAR_DO_TRANSFORM,
+            &[("in", "p1")],
+            &[("out", "p2")],
+            "env_b",
+        );
+        let pcols = vec![make_pcol("p0"), make_pcol("p1"), make_pcol("p2")];
+        let transforms = vec![impulse, pardo_a, pardo_b];
+        let mut envs = HashMap::new();
+        envs.insert("env_a".to_string(), env_a);
+        envs.insert("env_b".to_string(), env_b);
+
+        let pipeline = build_pipeline(transforms, pcols, envs);
+        let fuser = GreedyPipelineFuser::with(pipeline);
+        let (initial_unfused, initial_consumers) = extract_initial_sets(&fuser.pipeline, &fuser);
+        let fused = fuser
+            .fuse_pipeline(initial_unfused, initial_consumers)
+            .unwrap();
+
+        let sdk_stages = fused.sdk_stages();
+        assert_eq!(
+            sdk_stages.len(),
+            2,
+            "Expected 2 separate SDK stages for different environments, got {}",
+            sdk_stages.len()
+        );
+
+        let ids_in_stages: Vec<HashSet<String>> = sdk_stages
+            .iter()
+            .map(|s| {
+                let xforms = s.transforms();
+                xforms.iter().map(|t| t.id.clone()).collect()
+            })
+            .collect();
+        let mut found_a = false;
+        let mut found_b = false;
+        for ids in &ids_in_stages {
+            if ids.contains("pardo_a") {
+                found_a = true;
+            }
+            if ids.contains("pardo_b") {
+                found_b = true;
+            }
+            assert!(
+                !(ids.contains("pardo_a") && ids.contains("pardo_b")),
+                "pardo_a and pardo_b should not be in the same stage"
+            );
+        }
+        assert!(found_a, "pardo_a not found in any stage");
+        assert!(found_b, "pardo_b not found in any stage");
+    }
+
+    /// A PCollection with one PerElement ParDo consumer and one Singleton (side-input)
+    /// consumer should be materialized — the PerElement consumer does NOT inline-fuse.
+    #[test]
+    fn side_input_consumer_materializes_producer() {
+        let env = make_env("env1");
+
+        // ParDoPayload for the side-input consumer: declares "side" as a side input.
+        let mut side_payload = ParDoPayload::default();
+        side_payload
+            .side_inputs
+            .insert("side".to_string(), SideInput::default());
+
+        // impulse -> p0_raw (root, no env)
+        let impulse = make_transform(
+            "impulse",
+            beam_urns::IMPULSE_TRANSFORM,
+            &[],
+            &[("out", "p0_raw")],
+            "",
+        );
+        // SDK-side intermediate: consumes p0_raw -> produces p0.
+        // This ensures p0 enters GreedyStageFuser::fuse's fusion_candidates queue,
+        // where can_fuse will run its get_singleton_consumers(p0) check.
+        let producer_pardo = make_pardo_transform(
+            "producer_pardo",
+            beam_urns::PAR_DO_TRANSFORM,
+            &[("in", "p0_raw")],
+            &[("out", "p0")],
+            "env1",
+            &ParDoPayload::default(),
+        );
+        // Per-element consumer of p0
+        let main_pardo = make_pardo_transform(
+            "main_pardo",
+            beam_urns::PAR_DO_TRANSFORM,
+            &[("in", "p0")],
+            &[("out", "p_main")],
+            "env1",
+            &ParDoPayload::default(),
+        );
+        // Side-input consumer: main input from p0_alt, side input = p0
+        let side_pardo = make_pardo_transform(
+            "side_pardo",
+            beam_urns::PAR_DO_TRANSFORM,
+            &[("in", "p0_alt"), ("side", "p0")],
+            &[("out", "p_side")],
+            "env1",
+            &side_payload,
+        );
+        let impulse2 = make_transform(
+            "impulse2",
+            beam_urns::IMPULSE_TRANSFORM,
+            &[],
+            &[("out", "p0_alt")],
+            "",
+        );
+
+        let pcols = vec![
+            make_pcol("p0_raw"),
+            make_pcol("p0"),
+            make_pcol("p0_alt"),
+            make_pcol("p_main"),
+            make_pcol("p_side"),
+        ];
+        let transforms = vec![impulse, impulse2, producer_pardo, main_pardo, side_pardo];
+        let mut envs = HashMap::new();
+        envs.insert("env1".to_string(), env);
+
+        let pipeline = build_pipeline(transforms, pcols, envs);
+        let fuser = GreedyPipelineFuser::with(pipeline);
+        let (initial_unfused, initial_consumers) = extract_initial_sets(&fuser.pipeline, &fuser);
+        let fused = fuser
+            .fuse_pipeline(initial_unfused, initial_consumers)
+            .unwrap();
+
+        let sdk_stages = fused.sdk_stages();
+
+        // p0 should be materialized (appear as a stage output) when it has a
+        // side-input consumer, because can_fuse sees get_singleton_consumers(p0)
+        // is non-empty and returns MATERIALIZE.
+        let all_outputs: HashSet<String> = sdk_stages
+            .iter()
+            .flat_map(|s| {
+                let outputs = s.output_pcols();
+                outputs.iter().map(|p| p.id.clone()).collect::<Vec<_>>()
+            })
+            .collect();
+        assert!(
+            all_outputs.contains("p0"),
+            "p0 should be materialized (appear as stage output) when it has a side-input consumer.\
+             Outputs: {all_outputs:?}"
+        );
+    }
+
+    /// A ParDo with non-empty state_specs should NOT be inline-fused — its input
+    /// PCollection must be materialized.
+    #[test]
+    fn stateful_pardo_is_not_inline_fused() {
+        let env = make_env("env1");
+        let mut payload = ParDoPayload::default();
+        payload
+            .state_specs
+            .insert("my_state".to_string(), StateSpec::default());
+
+        let impulse = make_transform(
+            "impulse",
+            beam_urns::IMPULSE_TRANSFORM,
+            &[],
+            &[("out", "p0")],
+            "",
+        );
+        let stateful_pardo = make_pardo_transform(
+            "stateful",
+            beam_urns::PAR_DO_TRANSFORM,
+            &[("in", "p0")],
+            &[("out", "p1")],
+            "env1",
+            &payload,
+        );
+        let downstream = make_transform(
+            "downstream",
+            beam_urns::PAR_DO_TRANSFORM,
+            &[("in", "p1")],
+            &[("out", "p2")],
+            "env1",
+        );
+
+        let pcols = vec![make_pcol("p0"), make_pcol("p1"), make_pcol("p2")];
+        let transforms = vec![impulse, stateful_pardo.clone(), downstream];
+        let mut envs = HashMap::new();
+        envs.insert("env1".to_string(), env.clone());
+
+        let pipeline = build_pipeline(transforms, pcols, envs);
+        let fuser = GreedyPipelineFuser::with(pipeline);
+        let (initial_unfused, initial_consumers) = extract_initial_sets(&fuser.pipeline, &fuser);
+        let fused = fuser
+            .fuse_pipeline(initial_unfused, initial_consumers)
+            .unwrap();
+
+        // stateful_pardo should be in its own stage (not fused with downstream).
+        let _stateful_stage = find_stage_with(&fused.sdk_stages(), "stateful")
+            .expect("stateful_pardo not found in any stage");
+        let downstream_stage = find_stage_with(&fused.sdk_stages(), "downstream")
+            .expect("downstream not found in any stage");
+
+        // Verify they are in different stages.
+        let downstream_xforms = downstream_stage.transforms();
+        let stateful_in_downstream = downstream_xforms.iter().any(|t| t.id == "stateful");
+        assert!(
+            !stateful_in_downstream,
+            "stateful_pardo should NOT be fused into the same stage as downstream"
+        );
+
+        // Also verify can_fuse returns false for this transform.
+        assert!(
+            !payload.state_specs.is_empty(),
+            "fixture sanity: state_specs should be non-empty"
+        );
+        let can = GreedyCollectionFuser::can_fuse(
+            &stateful_pardo,
+            &env,
+            &make_pcol("p0"),
+            &fuser.pipeline,
+        );
+        assert!(!can, "can_fuse should be false for stateful ParDo");
+    }
+
+    /// A ParDo with non-empty timer_family_specs should NOT be inline-fused.
+    #[test]
+    fn timer_pardo_is_not_inline_fused() {
+        let env = make_env("env1");
+        let mut payload = ParDoPayload::default();
+        payload
+            .timer_family_specs
+            .insert("my_timer".to_string(), TimerFamilySpec::default());
+
+        let impulse = make_transform(
+            "impulse",
+            beam_urns::IMPULSE_TRANSFORM,
+            &[],
+            &[("out", "p0")],
+            "",
+        );
+        let timer_pardo = make_pardo_transform(
+            "timer_pardo",
+            beam_urns::PAR_DO_TRANSFORM,
+            &[("in", "p0")],
+            &[("out", "p1")],
+            "env1",
+            &payload,
+        );
+        let downstream = make_transform(
+            "downstream",
+            beam_urns::PAR_DO_TRANSFORM,
+            &[("in", "p1")],
+            &[("out", "p2")],
+            "env1",
+        );
+
+        let pcols = vec![make_pcol("p0"), make_pcol("p1"), make_pcol("p2")];
+        let transforms = vec![impulse, timer_pardo.clone(), downstream];
+        let mut envs = HashMap::new();
+        envs.insert("env1".to_string(), env.clone());
+
+        let pipeline = build_pipeline(transforms, pcols, envs);
+        let fuser = GreedyPipelineFuser::with(pipeline);
+        let (initial_unfused, initial_consumers) = extract_initial_sets(&fuser.pipeline, &fuser);
+        let fused = fuser
+            .fuse_pipeline(initial_unfused, initial_consumers)
+            .unwrap();
+
+        let _timer_stage =
+            find_stage_with(&fused.sdk_stages(), "timer_pardo").expect("timer_pardo not found");
+        let downstream_stage =
+            find_stage_with(&fused.sdk_stages(), "downstream").expect("downstream not found");
+
+        let downstream_xforms = downstream_stage.transforms();
+        let timer_in_downstream = downstream_xforms.iter().any(|t| t.id == "timer_pardo");
+        assert!(
+            !timer_in_downstream,
+            "timer_pardo should NOT be fused into the same stage as downstream"
+        );
+
+        // Verify can_fuse returns false.
+        assert!(
+            !payload.timer_family_specs.is_empty(),
+            "fixture sanity: timer_family_specs should be non-empty"
+        );
+        let can =
+            GreedyCollectionFuser::can_fuse(&timer_pardo, &env, &make_pcol("p0"), &fuser.pipeline);
+        assert!(!can, "can_fuse should be false for timer ParDo");
+    }
+
+    /// par_do_compatibility(transform, transform, pipeline) must return true —
+    /// the explicit self-loop exception for state/timer ParDos.
+    #[test]
+    fn stateful_pardo_self_loop_is_compatible() {
+        let env = make_env("env1");
+        let mut payload = ParDoPayload::default();
+        payload
+            .state_specs
+            .insert("s".to_string(), StateSpec::default());
+        payload
+            .timer_family_specs
+            .insert("t".to_string(), TimerFamilySpec::default());
+
+        let pardo = make_pardo_transform(
+            "sdf_pardo",
+            beam_urns::PAR_DO_TRANSFORM,
+            &[("in", "p0")],
+            &[("out", "p1")],
+            "env1",
+            &payload,
+        );
+
+        let pcols = vec![make_pcol("p0"), make_pcol("p1")];
+        let transforms = vec![pardo.clone()];
+        let mut envs = HashMap::new();
+        envs.insert("env1".to_string(), env);
+        let pipeline = build_pipeline(transforms, pcols, envs);
+
+        // Even though this transform has state + timers (which normally block fusion),
+        // par_do_compatibility with itself must return true (self-loop exception).
+        let compatible = GreedyCollectionFuser::par_do_compatibility(&pardo, &pardo, &pipeline);
+        assert!(
+            compatible,
+            "par_do_compatibility must return true for a ParDo compared with itself (self-loop)"
+        );
+
+        // But can_fuse still returns false (it doesn't have the self-loop exception).
+        let can =
+            GreedyCollectionFuser::can_fuse(&pardo, &make_env("env1"), &make_pcol("p0"), &pipeline);
+        assert!(
+            !can,
+            "can_fuse should still return false for stateful ParDo (self-loop is only in par_do_compatibility)"
+        );
+    }
+
+    //
+    // Group 2: fan-out / multi-consumer
+    //
+
+    /// A PCollection with two per-element ParDo consumers (same env, no side-inputs)
+    /// should fuse both into the same ExecutableStage.
+    #[test]
+    fn compatible_siblings_fuse_into_one_stage() {
+        let env = make_env("env1");
+        let impulse = make_transform(
+            "impulse",
+            beam_urns::IMPULSE_TRANSFORM,
+            &[],
+            &[("out", "p0")],
+            "",
+        );
+        let pardo_a = make_transform(
+            "pardo_a",
+            beam_urns::PAR_DO_TRANSFORM,
+            &[("in", "p0")],
+            &[("out", "pa")],
+            "env1",
+        );
+        let pardo_b = make_transform(
+            "pardo_b",
+            beam_urns::PAR_DO_TRANSFORM,
+            &[("in", "p0")],
+            &[("out", "pb")],
+            "env1",
+        );
+
+        let pcols = vec![make_pcol("p0"), make_pcol("pa"), make_pcol("pb")];
+        let transforms = vec![impulse, pardo_a, pardo_b];
+        let mut envs = HashMap::new();
+        envs.insert("env1".to_string(), env);
+
+        let pipeline = build_pipeline(transforms, pcols, envs);
+        let fuser = GreedyPipelineFuser::with(pipeline);
+        let (initial_unfused, initial_consumers) = extract_initial_sets(&fuser.pipeline, &fuser);
+        let fused = fuser
+            .fuse_pipeline(initial_unfused, initial_consumers)
+            .unwrap();
+
+        let sdk_stages = fused.sdk_stages();
+        // Both siblings should be in the same stage.
+        let both_stage = sdk_stages.iter().find(|s| {
+            let xforms = s.transforms();
+            let ids: HashSet<&str> = xforms.iter().map(|t| t.id.as_str()).collect();
+            ids.contains("pardo_a") && ids.contains("pardo_b")
+        });
+        assert!(
+            both_stage.is_some(),
+            "pardo_a and pardo_b should be in the same ExecutableStage"
+        );
+    }
+
+    ///  REVIEW: sibling-grouping only checks the *existing group member's*
+    /// side-inputs/state/timers via par_do_compatibility, never the incoming
+    /// candidate's.  This means a side-input-bearing transform can be grouped
+    /// as a sibling of a side-input-free one, even though it would later be
+    /// correctly excluded if evaluated the other way.  This may be intentionally
+    /// caught later by the separate materialization check (can_fuse's
+    /// any_sideinputs check), or it may be a real gap.
+    #[test]
+    fn sibling_grouping_only_checks_existing_members_side_inputs() {
+        let env = make_env("env1");
+
+        let mut side_payload = ParDoPayload::default();
+        side_payload
+            .side_inputs
+            .insert("side".to_string(), SideInput::default());
+
+        let impulse = make_transform(
+            "impulse",
+            beam_urns::IMPULSE_TRANSFORM,
+            &[],
+            &[("out", "p0")],
+            "",
+        );
+        // Separate source for the side input PCollection.
+        let impulse_side = make_transform(
+            "impulse_side",
+            beam_urns::IMPULSE_TRANSFORM,
+            &[],
+            &[("out", "p_side_src")],
+            "",
+        );
+        // Plain sibling — consumes p0 as main PerElement input, no side inputs.
+        let plain = make_pardo_transform(
+            "plain",
+            beam_urns::PAR_DO_TRANSFORM,
+            &[("in", "p0")],
+            &[("out", "p_plain")],
+            "env1",
+            &ParDoPayload::default(),
+        );
+        // Side-input sibling — consumes p0 as main PerElement input AND
+        // p_side_src as a Singleton (side) input.
+        let side_pardo = make_pardo_transform(
+            "side_pardo",
+            beam_urns::PAR_DO_TRANSFORM,
+            &[("in", "p0"), ("side", "p_side_src")],
+            &[("out", "p_side")],
+            "env1",
+            &side_payload,
+        );
+
+        let pcols = vec![
+            make_pcol("p0"),
+            make_pcol("p_side_src"),
+            make_pcol("p_plain"),
+            make_pcol("p_side"),
+        ];
+        let transforms = vec![impulse, impulse_side, plain.clone(), side_pardo.clone()];
+        let mut envs = HashMap::new();
+        envs.insert("env1".to_string(), env);
+
+        let pipeline = build_pipeline(transforms, pcols, envs);
+
+        // par_do_compatibility only inspects the first argument (the existing group
+        // member).  When plain (no side inputs) is the existing member and side_pardo
+        // (has a side input) is the candidate, only plain's attributes are checked.
+        // Result: is_compatible returns true.
+        let compatible = GreedyCollectionFuser::is_compatible(&plain, &side_pardo, &pipeline);
+        assert!(
+            compatible,
+            "current behavior: is_compatible(plain, side_pardo) returns true — only plain's side-inputs are checked"
+        );
+
+        // Run full fusion: they do end up in the same stage.
+        let fuser = GreedyPipelineFuser::with(pipeline);
+        let (initial_unfused, initial_consumers) = extract_initial_sets(&fuser.pipeline, &fuser);
+        let fused = fuser
+            .fuse_pipeline(initial_unfused, initial_consumers)
+            .unwrap();
+
+        let same_stage = fused.sdk_stages().iter().any(|s| {
+            let xforms = s.transforms();
+            let ids: HashSet<&str> = xforms.iter().map(|t| t.id.as_str()).collect();
+            ids.contains("plain") && ids.contains("side_pardo")
+        });
+        assert!(
+            same_stage,
+            "current behavior: plain and side_pardo end up in the same stage"
+        );
+    }
+
+    //
+    // Group 3: fan-in / multi-producer dedup
+    //
+
+    /// When two stages both claim to produce the same PCollection ID,
+    /// ensure_single_producer must insert a Flatten with one input per original producer.
+    #[test]
+    fn duplicate_producer_gets_flatten_inserted() {
+        let common_pcol_id = "shared_out";
+
+        // Build two minimal ExecutableStages that both output `shared_out`.
+        let env = make_env("env1");
+        let wire_coders = HashSet::<WireCoderSetting>::new();
+
+        let shared_pcol = make_pcol(common_pcol_id);
+
+        let stage_a = ExecutableStage::from(
+            Components::default(),
+            env.clone(),
+            wire_coders.clone(),
+            make_pcol("in_a"),
+            IndexSet::new(),
+            IndexSet::new(),
+            IndexSet::new(),
+            [shared_pcol.clone()].into_iter().collect(),
+            IndexSet::new(),
+        );
+        let stage_b = ExecutableStage::from(
+            Components::default(),
+            env.clone(),
+            wire_coders.clone(),
+            make_pcol("in_b"),
+            IndexSet::new(),
+            IndexSet::new(),
+            IndexSet::new(),
+            [shared_pcol.clone()].into_iter().collect(),
+            IndexSet::new(),
+        );
+
+        // Build a QueryablePipeline where the shared PCollection exists.
+        let pcols = vec![shared_pcol.clone(), make_pcol("in_a"), make_pcol("in_b")];
+        let transforms: Vec<PTransformNode> = vec![];
+        let envs: HashMap<String, Environment> = HashMap::new();
+        let pipeline = build_pipeline(transforms, pcols, envs);
+
+        let stages: IndexSet<ExecutableStage> =
+            [stage_a.clone(), stage_b.clone()].into_iter().collect();
+        let unfused: IndexSet<PTransformNode> = IndexSet::new();
+
+        let result = ensure_single_producer(&pipeline, &stages, &unfused).unwrap();
+
+        // There should be exactly one Flatten introduced.
+        let flattens: Vec<&PTransformNode> = result
+            .introduced_transforms
+            .iter()
+            .filter(|t| {
+                t.transform
+                    .spec
+                    .as_ref()
+                    .map_or(false, |s| s.urn == beam_urns::FLATTEN_TRANSFORM)
+            })
+            .collect();
+        assert_eq!(flattens.len(), 1, "Expected exactly 1 Flatten introduced");
+
+        let flatten = flattens[0];
+        // The Flatten's inputs should have one entry per original producer.
+        assert_eq!(
+            flatten.transform.inputs.len(),
+            2,
+            "Flatten should have 2 inputs (one per original producer)"
+        );
+        // Its single output should equal the original (pre-dedup) PCollection ID.
+        assert_eq!(
+            flatten.transform.outputs.get("output"),
+            Some(&common_pcol_id.to_string()),
+            "Flatten output should be the original PCollection ID"
+        );
+    }
+
+    /// When an ExecutableStage has a transform input referencing a PCollection ID
+    /// that is not the stage input, not an internal output, not a side input, and
+    /// not a timer input, sanitize_dangling_ptransform_inputs must remove it.
+    #[test]
+    fn dangling_input_is_sanitized() {
+        let env = make_env("env1");
+        let wire_coders = HashSet::<WireCoderSetting>::new();
+
+        let stage_input = make_pcol("stage_input");
+        let internal_output = make_pcol("internal_out");
+        let dangling = make_pcol("dangling");
+
+        // A transform that consumes both a valid internal output AND a dangling PCollection.
+        let transform_in_stage = PTransformNode {
+            id: "t1".to_string(),
+            transform: PTransform {
+                unique_name: "t1".to_string(),
+                spec: Some(make_spec(beam_urns::PAR_DO_TRANSFORM)),
+                inputs: [
+                    ("in".to_string(), internal_output.id.clone()),
+                    ("dangling_input".to_string(), dangling.id.clone()),
+                ]
+                .into_iter()
+                .collect(),
+                outputs: [("out".to_string(), "extra".to_string())]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            },
+        };
+
+        // The producer of internal_out.
+        let producer = PTransformNode {
+            id: "producer".to_string(),
+            transform: PTransform {
+                unique_name: "producer".to_string(),
+                spec: Some(make_spec(beam_urns::PAR_DO_TRANSFORM)),
+                inputs: [("in".to_string(), stage_input.id.clone())]
+                    .into_iter()
+                    .collect(),
+                outputs: [("out".to_string(), internal_output.id.clone())]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            },
+        };
+
+        let mut components = Components::default();
+        components
+            .transforms
+            .insert("t1".to_string(), transform_in_stage.transform.clone());
+        components
+            .transforms
+            .insert("producer".to_string(), producer.transform.clone());
+        components
+            .pcollections
+            .insert(stage_input.id.clone(), stage_input.collection.clone());
+        components.pcollections.insert(
+            internal_output.id.clone(),
+            internal_output.collection.clone(),
+        );
+        components
+            .pcollections
+            .insert(dangling.id.clone(), dangling.collection.clone());
+
+        let stage = ExecutableStage::from(
+            components,
+            env,
+            wire_coders,
+            stage_input.clone(),
+            IndexSet::new(),
+            IndexSet::new(),
+            IndexSet::new(),
+            [make_pcol("extra")].into_iter().collect(),
+            [producer, transform_in_stage].into_iter().collect(),
+        );
+
+        let sanitized = sanitize_dangling_ptransform_inputs(stage);
+
+        // The dangling input key should be removed from t1's inputs.
+        let sanitized_transforms = sanitized.transforms();
+        let t1_sanitized = sanitized_transforms
+            .iter()
+            .find(|t| t.id == "t1")
+            .expect("t1 should still be present");
+        assert!(
+            !t1_sanitized.transform.inputs.contains_key("dangling_input"),
+            "dangling_input key should be removed from t1's inputs"
+        );
+        assert!(
+            t1_sanitized.transform.inputs.contains_key("in"),
+            "valid input 'in' should be preserved"
+        );
+
+        // The dangling PCollection should be absent from the sanitized components.
+        assert!(
+            !sanitized.components().pcollections.contains_key("dangling"),
+            "dangling PCollection should be removed from stage components"
+        );
+        // Valid PCollections should remain.
+        assert!(
+            sanitized
+                .components()
+                .pcollections
+                .contains_key("stage_input"),
+            "stage_input should remain"
+        );
+        assert!(
+            sanitized
+                .components()
+                .pcollections
+                .contains_key("internal_out"),
+            "internal_out should remain"
+        );
+    }
+
+    //
+    // Group 4: SDF-specific tests
+
+    /// PROCESS_SIZED_ELEMENTS_AND_RESTRICTIONS is isolated into its own stage
+    /// by can_fuse returning false. We test this directly because the URN is
+    /// not in PRIMITIVES, making full fuse_pipeline unreachable.
+    #[test]
+    fn sdf_process_transform_is_isolated_into_own_stage() {
+        // NOTE: Because SPLITTABLE_PROCESS_SIZED_ELEMENTS_AND_RESTRICTIONS_URN is
+        // not in beam_urns::PRIMITIVES, this transform won't appear in the pipeline
+        // graph.  We test can_fuse directly — the dispatch at line 407-411 returns
+        // false unconditionally for this URN.
+        let env = make_env("env1");
+        let process = make_transform(
+            "process_sized",
+            beam_urns::SPLITTABLE_PROCESS_SIZED_ELEMENTS_AND_RESTRICTIONS_URN,
+            &[("in", "p0")],
+            &[("out", "p1")],
+            "env1",
+        );
+
+        let pcols = vec![make_pcol("p0"), make_pcol("p1")];
+        let transforms = vec![process.clone()];
+        let mut envs = HashMap::new();
+        envs.insert("env1".to_string(), env.clone());
+        let pipeline = build_pipeline(transforms, pcols, envs);
+
+        // can_fuse must return false for PROCESS_SIZED_ELEMENTS_AND_RESTRICTIONS.
+        let can = GreedyCollectionFuser::can_fuse(&process, &env, &make_pcol("p0"), &pipeline);
+        assert!(
+            !can,
+            "can_fuse must return false for SPLITTABLE_PROCESS_SIZED_ELEMENTS_AND_RESTRICTIONS_URN"
+        );
+
+        // Also verify the URN is present in the dispatch match arm (compile-time check).
+        // If can_fuse is extended, this arm must remain false.
+    }
+
+    /// PAIR_WITH_RESTRICTION and SPLIT_AND_SIZE_RESTRICTIONS can fuse together
+    /// (both hit the can_fuse_pardo dispatch arm). We verify this via can_fuse.
+    ///
+    /// This is checking the forward-extension path: can_fuse_pardo is the dispatch
+    /// for both URNs (line 402), so they can fuse inline.  However, SPLIT_AND_SIZE_
+    /// RESTRICTIONS is absent from is_compatible's sibling-grouping match arms, so
+    /// siblings cannot root a stage together — that asymmetry is intentional because
+    /// root/sibling compatibility vs. forward-extension compatibility are different
+    /// code paths.
+    #[test]
+    fn pair_with_restriction_fuses_with_split_and_size() {
+        let env = make_env("env1");
+
+        // Because these URNs are not in PRIMITIVES, we test the can_fuse path directly.
+        // clean_pardo_payload() encodes to non-empty bytes so can_fuse_pardo
+        // passes the !s.payload.is_empty() guard.
+        let clean = clean_pardo_payload();
+        let pair = make_pardo_transform(
+            "pair",
+            beam_urns::SPLITTABLE_PAIR_WITH_RESTRICTION_URN,
+            &[("in", "p0")],
+            &[("out", "p1")],
+            "env1",
+            &clean,
+        );
+        let split = make_pardo_transform(
+            "split",
+            beam_urns::SPLITTABLE_SPLIT_AND_SIZE_RESTRICTIONS_URN,
+            &[("in", "p1")],
+            &[("out", "p2")],
+            "env1",
+            &clean,
+        );
+
+        let pcols = vec![make_pcol("p0"), make_pcol("p1"), make_pcol("p2")];
+        let transforms = vec![pair.clone(), split.clone()];
+        let mut envs = HashMap::new();
+        envs.insert("env1".to_string(), env.clone());
+        let pipeline = build_pipeline(transforms, pcols, envs);
+
+        // Both should be fusible via can_fuse (they hit can_fuse_pardo).
+        let can_pair = GreedyCollectionFuser::can_fuse(&pair, &env, &make_pcol("p0"), &pipeline);
+        assert!(can_pair, "PAIR_WITH_RESTRICTION should be fusible");
+
+        let can_split = GreedyCollectionFuser::can_fuse(&split, &env, &make_pcol("p1"), &pipeline);
+        assert!(can_split, "SPLIT_AND_SIZE_RESTRICTIONS should be fusible");
+    }
+
+    /// A PCollection with two consumers: one plain PAR_DO_TRANSFORM and one
+    /// SPLITTABLE_PAIR_WITH_RESTRICTION_URN (both side-input/state/timer-free,
+    /// same env). Check whether GreedyCollectionFuser::is_compatible returns
+    /// true — they share the par_do_compatibility branch.
+    ///
+    /// ⚠ REVIEW: confirms current behavior — flag if this fusion grouping is not
+    /// intended for FlareDB's SDF model.
+    #[test]
+    fn pair_with_restriction_can_sibling_with_plain_pardo() {
+        let env = make_env("env1");
+
+        let plain = make_transform(
+            "plain",
+            beam_urns::PAR_DO_TRANSFORM,
+            &[("in", "p0")],
+            &[("out", "p_plain")],
+            "env1",
+        );
+        let pair = make_transform(
+            "pair",
+            beam_urns::SPLITTABLE_PAIR_WITH_RESTRICTION_URN,
+            &[("in", "p0")],
+            &[("out", "p_pair")],
+            "env1",
+        );
+
+        let pcols = vec![make_pcol("p0"), make_pcol("p_plain"), make_pcol("p_pair")];
+        let transforms = vec![plain.clone(), pair.clone()];
+        let mut envs = HashMap::new();
+        envs.insert("env1".to_string(), env);
+        let pipeline = build_pipeline(transforms, pcols, envs);
+
+        let result = GreedyCollectionFuser::is_compatible(&pair, &plain, &pipeline);
+        // Both hit the par_do_compatibility branch (line 327-331). Since neither
+        // has side inputs, state, or timers, and they share the same environment,
+        // the current code returns true.
+        //
+        // ⚠ REVIEW: If FlareDB's SDF model intentionally wants PairWithRestriction
+        // to never sibling with plain ParDos, this assertion should be false.
+        assert!(
+            result,
+            "current behavior: PairWithRestriction IS compatible with plain ParDo for sibling fusion.\
+             REVIEW: is this intended for FlareDB's SDF model?"
+        );
+    }
+
+    /// A plain ParDo consuming the output of PROCESS_SIZED_ELEMENTS_AND_RESTRICTIONS
+    /// fuses into the same stage when using PAR_DO_TRANSFORM as a stand-in for the
+    /// SDF process transform (since the real SDF URN is not in PRIMITIVES).
+    ///
+    /// This confirms that nothing in can_fuse's dispatch keys off "am I downstream
+    /// of an SDF transform" — only the candidate's own consumer URN matters. This
+    /// is intentional/current-behavior and matters for SdfStageExecutor: residual
+    /// bundle resubmission carries any fused downstream logic along with it.
+    #[test]
+    fn downstream_pardo_fuses_into_sdf_stage() {
+        let env = make_env("env1");
+
+        // Simulate: upstream ParDo (stand-in for SDF process) -> downstream plain ParDo.
+        // Both use PAR_DO_TRANSFORM so they appear in the graph and can be fused.
+        // clean_pardo_payload() encodes to non-empty bytes so can_fuse_pardo returns true.
+        let clean = clean_pardo_payload();
+        let impulse = make_transform(
+            "impulse",
+            beam_urns::IMPULSE_TRANSFORM,
+            &[],
+            &[("out", "p0")],
+            "",
+        );
+        let upstream = make_pardo_transform(
+            "upstream",
+            beam_urns::PAR_DO_TRANSFORM,
+            &[("in", "p0")],
+            &[("out", "p1")],
+            "env1",
+            &clean,
+        );
+        let downstream = make_pardo_transform(
+            "downstream",
+            beam_urns::PAR_DO_TRANSFORM,
+            &[("in", "p1")],
+            &[("out", "p2")],
+            "env1",
+            &clean,
+        );
+
+        let pcols = vec![make_pcol("p0"), make_pcol("p1"), make_pcol("p2")];
+        let transforms = vec![impulse, upstream, downstream];
+        let mut envs = HashMap::new();
+        envs.insert("env1".to_string(), env);
+
+        let pipeline = build_pipeline(transforms, pcols, envs);
+        let fuser = GreedyPipelineFuser::with(pipeline);
+        let (initial_unfused, initial_consumers) = extract_initial_sets(&fuser.pipeline, &fuser);
+        let fused = fuser
+            .fuse_pipeline(initial_unfused, initial_consumers)
+            .unwrap();
+
+        // Both upstream and downstream should end up in the same ExecutableStage.
+        let stages = fused.sdk_stages();
+        let combined = stages.iter().find(|s| {
+            let xforms = s.transforms();
+            let ids: HashSet<&str> = xforms.iter().map(|t| t.id.as_str()).collect();
+            ids.contains("upstream") && ids.contains("downstream")
+        });
+        assert!(
+            combined.is_some(),
+            "downstream should fuse into same stage as upstream (current behavior for SdfStageExecutor)"
+        );
+    }
+
+    /// TRUNCATE_SIZED_RESTRICTION can be a sibling at root/group formation (it has
+    /// an is_compatible arm at line 329) but can NEVER be extended forward into an
+    /// existing stage via can_fuse — there is no dispatch arm for it:
+    /// can_fuse's match only lists PAR_DO_TRANSFORM, PAIR_WITH_RESTRICTION,
+    /// and SPLIT_AND_SIZE_RESTRICTIONS for can_fuse_pardo.  TRUNCATE_SIZED_
+    /// RESTRICTION falls into the `unknown => false` catch-all.
+    ///
+    /// This may be intentional (drain-only steps might always form a stage
+    /// boundary) or a missing dispatch arm — flag for review before any drain-mode
+    /// work is built on top of it.
+    ///
+    /// This is a placeholder for future drain-mode support and not currently
+    /// exercised by the runner.
+    #[test]
+    fn truncate_sized_restriction_fuses_like_pair_with_restriction() {
+        let env = make_env("env1");
+
+        let trunc = make_transform(
+            "trunc",
+            beam_urns::SPLITTABLE_TRUNCATE_SIZED_RESTRICTION_URN,
+            &[("in", "p0")],
+            &[("out", "p1")],
+            "env1",
+        );
+
+        let pcols = vec![make_pcol("p0"), make_pcol("p1")];
+        let transforms = vec![trunc.clone()];
+        let mut envs = HashMap::new();
+        envs.insert("env1".to_string(), env.clone());
+        let pipeline = build_pipeline(transforms, pcols, envs);
+
+        // can_fuse has no arm for TRUNCATE_SIZED_RESTRICTION_URN — it falls into
+        // the `unknown => false` catch-all.  This is NOT the same dispatch arm as
+        // PAIR_WITH_RESTRICTION/SPLIT_AND_SIZE_RESTRICTIONS, which correctly hit
+        // can_fuse_pardo.
+        let can = GreedyCollectionFuser::can_fuse(&trunc, &env, &make_pcol("p0"), &pipeline);
+        assert!(
+            !can,
+            "TRUNCATE_SIZED_RESTRICTION falls into can_fuse's unknown => false catch-all"
+        );
+    }
+
+    #[test]
+    fn sdf_pipeline_fuses_end_to_end_with_process_transform_isolated() {
+        let env = make_env("env1");
+        let clean = clean_pardo_payload();
+
+        let impulse = make_transform(
+            "impulse",
+            beam_urns::IMPULSE_TRANSFORM,
+            &[],
+            &[("out", "p0")],
+            "",
+        );
+        let pair = make_pardo_transform(
+            "pair",
+            beam_urns::SPLITTABLE_PAIR_WITH_RESTRICTION_URN,
+            &[("in", "p0")],
+            &[("out", "p1")],
+            "env1",
+            &clean,
+        );
+        let split = make_pardo_transform(
+            "split",
+            beam_urns::SPLITTABLE_SPLIT_AND_SIZE_RESTRICTIONS_URN,
+            &[("in", "p1")],
+            &[("out", "p2")],
+            "env1",
+            &clean,
+        );
+        let process = make_pardo_transform(
+            "process",
+            beam_urns::SPLITTABLE_PROCESS_SIZED_ELEMENTS_AND_RESTRICTIONS_URN,
+            &[("in", "p2")],
+            &[("out", "p3")],
+            "env1",
+            &clean,
+        );
+
+        let pcols = vec![
+            make_pcol("p0"),
+            make_pcol("p1"),
+            make_pcol("p2"),
+            make_pcol("p3"),
+        ];
+        let transforms = vec![impulse, pair, split, process];
+        let mut envs = HashMap::new();
+        envs.insert("env1".to_string(), env);
+
+        let pipeline = build_pipeline(transforms, pcols, envs);
+        let fuser = GreedyPipelineFuser::with(pipeline);
+        let (initial_unfused, initial_consumers) = extract_initial_sets(&fuser.pipeline, &fuser);
+        let fused = fuser
+            .fuse_pipeline(initial_unfused, initial_consumers)
+            .unwrap();
+
+        let stages = fused.sdk_stages();
+
+        // pair and split should be fused together in one stage.
+        let pair_split_stage = stages.iter().find(|s| {
+            let xforms = s.transforms();
+            let ids: HashSet<&str> = xforms.iter().map(|t| t.id.as_str()).collect();
+            ids.contains("pair") && ids.contains("split")
+        });
+        assert!(
+            pair_split_stage.is_some(),
+            "pair and split should be fused into one stage"
+        );
+
+        // process must be isolated in its own stage — NOT with pair/split.
+        let process_stage =
+            find_stage_with(&stages, "process").expect("process transform should be in some stage");
+        let process_xforms = process_stage.transforms();
+        let process_stage_ids: HashSet<String> =
+            process_xforms.iter().map(|t| t.id.clone()).collect();
+        assert_eq!(
+            process_stage_ids.len(),
+            1,
+            "process transform must be the sole member of its stage, got: {process_stage_ids:?}"
+        );
+        assert!(process_stage_ids.contains("process"));
+
+        // Confirm pair/split stage and process stage are genuinely different stages.
+        let pair_split_stage = pair_split_stage.unwrap();
+        assert_ne!(
+            pair_split_stage.id(),
+            process_stage.id(),
+            "pair/split stage and process stage must be different ExecutableStages"
+        );
+    }
+}
