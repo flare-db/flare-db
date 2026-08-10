@@ -11,9 +11,7 @@ use prost::Message;
 use crate::{
     check_argument,
     fusion::{
-        pipeline::{
-            FusedPipeline, PCollectionNode, PTransformNode, PipelineEdge, QueryablePipeline,
-        },
+        pipeline::{FusedPipeline, PCollectionNode, PTransformNode, QueryablePipeline},
         refs::{SideInputRef, TimerRef, UserStateRef},
         stage::{CollectionConsumers, DescendantConsumers, ExecutableStage, SiblingKey},
     },
@@ -314,8 +312,26 @@ impl GreedyStageFuser {
 
 struct GreedyCollectionFuser {}
 
+const COMBINE_FUSIBLE: &[&str] = &[
+    urns::beam_urns::COMBINE_PER_KEY_PRECOMBINE_TRANSFORM_URN,
+    urns::beam_urns::COMBINE_PER_KEY_MERGE_ACCUMULATORS_TRANSFORM_URN,
+    urns::beam_urns::COMBINE_PER_KEY_EXTRACT_OUTPUTS_TRANSFORM_URN,
+];
+
 impl GreedyCollectionFuser {
+    /// Bidirectional compatibility check
     fn is_compatible(
+        node: &PTransformNode,
+        other: &PTransformNode,
+        pipeline: &QueryablePipeline,
+    ) -> bool {
+        Self::is_compatible_one_way(node, other, pipeline)
+            && Self::is_compatible_one_way(other, node, pipeline)
+    }
+
+    /// Checks if node is compatible with other
+    /// for sibling fusion.
+    fn is_compatible_one_way(
         node: &PTransformNode,
         other: &PTransformNode,
         pipeline: &QueryablePipeline,
@@ -323,23 +339,23 @@ impl GreedyCollectionFuser {
         let urn = get_urn(node);
 
         match urn {
-            // ParDo family: compatible if no side-inputs/state/timers + same env
+            // ParDo family: compatible if no side-inputs/state/timers + same env.
             urns::beam_urns::PAR_DO_TRANSFORM
             | urns::beam_urns::SPLITTABLE_PAIR_WITH_RESTRICTION_URN
-            | urns::beam_urns::SPLITTABLE_TRUNCATE_SIZED_RESTRICTION_URN => {
+            | urns::beam_urns::SPLITTABLE_SPLIT_AND_SIZE_RESTRICTIONS_URN
+            | urns::beam_urns::SPLITTABLE_PROCESS_SIZED_ELEMENTS_AND_RESTRICTIONS_URN => {
                 Self::par_do_compatibility(node, other, pipeline)
             }
 
-            // Combine sub-components + window assignment: compatible if same env
-            u if urns::beam_urns::COMBINE_COMPONENTS.contains(&u)
-                || u == urns::beam_urns::ASSIGN_WINDOWS_TRANSFORM =>
-            {
+            // Combine sub-components + window assignment: compatible if same env.
+            u if COMBINE_FUSIBLE.contains(&u) || u == urns::beam_urns::ASSIGN_WINDOWS_TRANSFORM => {
                 Self::compatible_environments(node, other, pipeline)
             }
 
-            // Flatten, GBK, Impulse: no sibling fusion
+            // Flatten, GBK, Impulse:
             urns::beam_urns::FLATTEN_TRANSFORM => false,
-            u if urns::beam_urns::FLARE.contains(&u) => false,
+            urns::beam_urns::GROUP_BY_KEY_TRANSFORM => false,
+            urns::beam_urns::IMPULSE_TRANSFORM => false,
 
             unknown => {
                 debug!(
@@ -358,21 +374,20 @@ impl GreedyCollectionFuser {
     ) -> bool {
         // Self-loop: a ParDo is always compatible with itself (timer case).
         par_do == other
-            || (!Self::has_side_inputs(par_do, pipeline)
+            || (!Self::has_side_inputs_in_payload(par_do, pipeline)
                 && !Self::has_state_or_timers(par_do)
                 && Self::compatible_environments(par_do, other, pipeline))
     }
 
-    /// Returns `true` if this transform consumes any side-input (`Singleton`) edges.
-    fn has_side_inputs(transform: &PTransformNode, pipeline: &QueryablePipeline) -> bool {
-        if let Some(&node_idx) = pipeline.transform_ids().get(&transform.id) {
-            pipeline
-                .graph()
-                .edges_directed(node_idx, petgraph::Direction::Incoming)
-                .any(|edge| matches!(edge.weight(), PipelineEdge::Singleton))
-        } else {
-            false
-        }
+    /// Returns true if this transform's ParDoPayload declares side inputs.
+    fn has_side_inputs_in_payload(
+        transform: &PTransformNode,
+        pipeline: &QueryablePipeline,
+    ) -> bool {
+        pipeline
+            .get_side_inputs(transform)
+            .map(|s| !s.is_empty())
+            .unwrap_or(true) // on decode error, treat as having side inputs (safer)
     }
     /// Parses `par_do.transform.spec.payload` as a `ParDoPayload` proto and
     /// checks if `state_specs` or `timer_family_specs` are non-empty.
@@ -410,9 +425,7 @@ impl GreedyCollectionFuser {
             | urns::beam_urns::GROUP_BY_KEY_TRANSFORM
             | urns::beam_urns::CREATE_VIEW_TRANSFORM => false,
 
-            u if urns::beam_urns::COMBINE_COMPONENTS.contains(&u)
-                || u == urns::beam_urns::ASSIGN_WINDOWS_TRANSFORM =>
-            {
+            u if COMBINE_FUSIBLE.contains(&u) || u == urns::beam_urns::ASSIGN_WINDOWS_TRANSFORM => {
                 Self::can_fuse_compatible_env(node, environment, pipeline)
             }
 
@@ -479,8 +492,8 @@ impl GreedyCollectionFuser {
             return false;
         }
 
-        // Can't fuse if it has side inputs
-        if any_sideinputs(&pardo, pipeline) {
+        // Can't fuse if it has side inputs.
+        if Self::has_side_inputs_in_payload(&pardo, pipeline) {
             return false;
         }
 
@@ -1732,15 +1745,9 @@ mod tests {
         );
     }
 
-    ///  REVIEW: sibling-grouping only checks the *existing group member's*
-    /// side-inputs/state/timers via par_do_compatibility, never the incoming
-    /// candidate's.  This means a side-input-bearing transform can be grouped
-    /// as a sibling of a side-input-free one, even though it would later be
-    /// correctly excluded if evaluated the other way.  This may be intentionally
-    /// caught later by the separate materialization check (can_fuse's
-    /// any_sideinputs check), or it may be a real gap.
+    /// With bidirectional compatibility
     #[test]
-    fn sibling_grouping_only_checks_existing_members_side_inputs() {
+    fn side_input_bearing_pardo_is_incompatible_with_plain_sibling() {
         let env = make_env("env1");
 
         let mut side_payload = ParDoPayload::default();
@@ -1770,7 +1777,7 @@ mod tests {
             &[("in", "p0")],
             &[("out", "p_plain")],
             "env1",
-            &ParDoPayload::default(),
+            &clean_pardo_payload(),
         );
         // Side-input sibling — consumes p0 as main PerElement input AND
         // p_side_src as a Singleton (side) input.
@@ -1795,17 +1802,15 @@ mod tests {
 
         let pipeline = build_pipeline(transforms, pcols, envs);
 
-        // par_do_compatibility only inspects the first argument (the existing group
-        // member).  When plain (no side inputs) is the existing member and side_pardo
-        // (has a side input) is the candidate, only plain's attributes are checked.
-        // Result: is_compatible returns true.
+        // Bidirectional is_compatible: side_pardo's payload has side inputs,
+        // so is_compatible_one_way(side_pardo, plain) returns false.
         let compatible = GreedyCollectionFuser::is_compatible(&plain, &side_pardo, &pipeline);
         assert!(
-            compatible,
-            "current behavior: is_compatible(plain, side_pardo) returns true — only plain's side-inputs are checked"
+            !compatible,
+            "side-input-bearing ParDo must be incompatible with plain sibling (bidirectional check)"
         );
 
-        // Run full fusion: they do end up in the same stage.
+        // Run full fusion: they end up in separate stages.
         let fuser = GreedyPipelineFuser::with(pipeline);
         let (initial_unfused, initial_consumers) = extract_initial_sets(&fuser.pipeline, &fuser);
         let fused = fuser
@@ -1818,8 +1823,8 @@ mod tests {
             ids.contains("plain") && ids.contains("side_pardo")
         });
         assert!(
-            same_stage,
-            "current behavior: plain and side_pardo end up in the same stage"
+            !same_stage,
+            "plain and side_pardo should be in separate stages"
         );
     }
 
