@@ -9,7 +9,6 @@ use crate::utils::visualization::executable_graph_to_dot;
 use beam_model_rs::v1::Pipeline;
 use dashmap::DashMap;
 use log::{info, warn};
-use prost::Message;
 use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::sync::Arc;

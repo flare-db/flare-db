@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use arrow_array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Int64Array, ListArray, NullArray, RecordBatch,
-    StringArray,
+    Array, ArrayRef, BinaryArray, BooleanArray, Float64Array, Int64Array, ListArray, NullArray,
+    RecordBatch, StringArray,
 };
 use arrow_buffer::{OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field, Schema};
@@ -94,6 +94,7 @@ pub enum PrimitiveValue {
     String(String),
     Bytes(Vec<u8>),
     Int64(i64),
+    Float64(f64),
     Bool(bool),
     Void,
 }
@@ -113,12 +114,17 @@ impl Hash for PrimitiveValue {
                 2_u8.hash(state);
                 value.hash(state);
             }
-            Self::Bool(value) => {
+            Self::Float64(value) => {
+                // f64 does not implement Hash; hash the bits instead.
                 3_u8.hash(state);
+                value.to_bits().hash(state);
+            }
+            Self::Bool(value) => {
+                4_u8.hash(state);
                 value.hash(state);
             }
             Self::Void => {
-                4_u8.hash(state);
+                5_u8.hash(state);
             }
         }
     }
@@ -130,6 +136,7 @@ impl PartialEq for PrimitiveValue {
             (Self::String(left), Self::String(right)) => left == right,
             (Self::Bytes(left), Self::Bytes(right)) => left == right,
             (Self::Int64(left), Self::Int64(right)) => left == right,
+            (Self::Float64(left), Self::Float64(right)) => left.to_bits() == right.to_bits(),
             (Self::Bool(left), Self::Bool(right)) => left == right,
             (Self::Void, Self::Void) => true,
             _ => false,
@@ -196,6 +203,7 @@ fn primitive_data_type(value: &PrimitiveValue) -> DataType {
         PrimitiveValue::String(_) => DataType::Utf8,
         PrimitiveValue::Bytes(_) => DataType::Binary,
         PrimitiveValue::Int64(_) => DataType::Int64,
+        PrimitiveValue::Float64(_) => DataType::Float64,
         PrimitiveValue::Bool(_) => DataType::Boolean,
         PrimitiveValue::Void => DataType::Null,
     }
@@ -291,6 +299,19 @@ pub fn primitive_values_to_array(
                 .collect::<Result<Vec<_>>>()?;
             Ok(Arc::new(BooleanArray::from(bools)))
         }
+        DataType::Float64 => {
+            let floats = values
+                .iter()
+                .map(|value| match value {
+                    PrimitiveValue::Float64(value) => Ok(*value),
+                    other => Err(anyhow!(
+                        "mixed primitive variants in batch: expected Float64, found {:?}",
+                        other
+                    )),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Arc::new(Float64Array::from(floats)))
+        }
         DataType::Null => {
             if values
                 .iter()
@@ -366,6 +387,13 @@ fn primitive_value_from_array_row(
                 .downcast_ref::<BooleanArray>()
                 .ok_or_else(|| anyhow!("expected BooleanArray for Boolean primitive column"))?;
             Ok(PrimitiveValue::Bool(array.value(row)))
+        }
+        DataType::Float64 => {
+            let array = array
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| anyhow!("expected Float64Array for Float64 primitive column"))?;
+            Ok(PrimitiveValue::Float64(array.value(row)))
         }
         DataType::Null => Ok(PrimitiveValue::Void),
         other => Err(anyhow!("unsupported primitive storage type: {other:?}")),

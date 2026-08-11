@@ -6,9 +6,6 @@ use beam_model_rs::v1::{
 use prost::Message;
 use std::collections::HashMap;
 
-/// The URN for the standard double coder.
-const DOUBLE_CODER_URN: &str = "beam:coder:double:v1";
-
 /// A function that takes a transform id and existing components, returning
 /// the replacement `MessageWithComponents`, or `None` if no replacement
 /// should be performed.
@@ -461,7 +458,7 @@ fn get_or_add_double_coder(
 ) -> String {
     for (id, coder) in existing_components.coders.iter() {
         if let Some(spec) = &coder.spec {
-            if spec.urn == DOUBLE_CODER_URN {
+            if spec.urn == urns::beam_urns::DOUBLE_CODER {
                 return id.clone();
             }
         }
@@ -475,7 +472,7 @@ fn get_or_add_double_coder(
         double_coder_id.clone(),
         Coder {
             spec: Some(FunctionSpec {
-                urn: DOUBLE_CODER_URN.to_string(),
+                urn: urns::beam_urns::DOUBLE_CODER.to_string(),
                 payload: Vec::new(),
             }),
             component_coder_ids: Vec::new(),
@@ -785,7 +782,7 @@ mod tests {
             "existing_double".to_string(),
             Coder {
                 spec: Some(FunctionSpec {
-                    urn: DOUBLE_CODER_URN.to_string(),
+                    urn: beam_urns::DOUBLE_CODER.to_string(),
                     payload: vec![],
                 }),
                 component_coder_ids: vec![],
@@ -808,6 +805,9 @@ mod tests {
 
         assert!(id.starts_with("DoubleCoder"));
         assert!(out.coders.contains_key(&id));
-        assert_eq!(out.coders[&id].spec.as_ref().unwrap().urn, DOUBLE_CODER_URN);
+        assert_eq!(
+            out.coders[&id].spec.as_ref().unwrap().urn,
+            beam_urns::DOUBLE_CODER
+        );
     }
 }

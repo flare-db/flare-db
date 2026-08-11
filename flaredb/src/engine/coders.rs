@@ -18,6 +18,7 @@ pub enum StandardBeamCoders {
     Bytes(BytesCoder),
     VarInt(VarIntCoder),
     Bool(BoolCoder),
+    Double(DoubleCoder),
     Void(VoidCoder),
     Iterable(IterableCoder),
     Kv(Box<StandardBeamCoders>, Box<StandardBeamCoders>),
@@ -48,6 +49,7 @@ impl StandardBeamCoders {
             beam_urns::STRING_UTF8_CODER => StandardBeamCoders::StringUtf8(StringUtf8Coder),
             beam_urns::VARINT_CODER => StandardBeamCoders::VarInt(VarIntCoder),
             beam_urns::BOOL_CODER => StandardBeamCoders::Bool(BoolCoder),
+            beam_urns::DOUBLE_CODER => StandardBeamCoders::Double(DoubleCoder),
             beam_urns::JAVA_SDK_CODER => {
                 if id == "VoidCoder" {
                     StandardBeamCoders::Void(VoidCoder)
@@ -162,6 +164,9 @@ impl StandardBeamCoders {
             (StandardBeamCoders::Bool(coder), PrimitiveValue::Bool(value)) => {
                 coder.encode(value, buf)
             }
+            (StandardBeamCoders::Double(coder), PrimitiveValue::Float64(value)) => {
+                coder.encode(value, buf)
+            }
             (StandardBeamCoders::Void(coder), PrimitiveValue::Void) => coder.encode((), buf),
             _ => panic!("Mismatched coder: {:?}", std::any::type_name::<Self>()),
         }
@@ -185,6 +190,9 @@ impl StandardBeamCoders {
             StandardBeamCoders::Bool(coder) => Ok(BeamRecord::PRIMITIVE(PrimitiveValue::Bool(
                 coder.decode(buf)?,
             ))),
+            StandardBeamCoders::Double(coder) => Ok(BeamRecord::PRIMITIVE(
+                PrimitiveValue::Float64(coder.decode(buf)?),
+            )),
             StandardBeamCoders::Void(_) => Ok(BeamRecord::PRIMITIVE(PrimitiveValue::Void)),
             StandardBeamCoders::Iterable(coder) => Ok(BeamRecord::ITERABLE(IterableValue {
                 list: coder.decode(buf)?,
@@ -266,6 +274,25 @@ impl BeamCoder<bool> for BoolCoder {
 
     fn decode(&self, buf: &mut impl Buf) -> Result<bool, CodersError> {
         Ok(buf.get_u8() != 0)
+    }
+}
+
+/// Encodes `f64` as 8 bytes in big-endian IEEE 754 format.
+#[derive(Debug, Clone)]
+pub struct DoubleCoder;
+
+impl BeamCoder<f64> for DoubleCoder {
+    fn encode(&self, val: f64, buf: &mut impl BufMut) {
+        buf.put_f64(val);
+    }
+
+    fn decode(&self, buf: &mut impl Buf) -> Result<f64, CodersError> {
+        if buf.remaining() < 8 {
+            return Err(CodersError::WhileDecoding(
+                "DoubleCoder: insufficient bytes".to_string(),
+            ));
+        }
+        Ok(buf.get_f64())
     }
 }
 
