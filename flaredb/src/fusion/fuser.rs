@@ -2113,9 +2113,6 @@ mod tests {
     /// SPLITTABLE_PAIR_WITH_RESTRICTION_URN (both side-input/state/timer-free,
     /// same env). Check whether GreedyCollectionFuser::is_compatible returns
     /// true — they share the par_do_compatibility branch.
-    ///
-    /// ⚠ REVIEW: confirms current behavior — flag if this fusion grouping is not
-    /// intended for FlareDB's SDF model.
     #[test]
     fn pair_with_restriction_can_sibling_with_plain_pardo() {
         let env = make_env("env1");
@@ -2145,9 +2142,6 @@ mod tests {
         // Both hit the par_do_compatibility branch (line 327-331). Since neither
         // has side inputs, state, or timers, and they share the same environment,
         // the current code returns true.
-        //
-        // ⚠ REVIEW: If FlareDB's SDF model intentionally wants PairWithRestriction
-        // to never sibling with plain ParDos, this assertion should be false.
         assert!(
             result,
             "current behavior: PairWithRestriction IS compatible with plain ParDo for sibling fusion.\
