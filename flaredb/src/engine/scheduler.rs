@@ -29,7 +29,7 @@ impl Scheduler {
     /// `in_flight` sets and all of its predecessor nodes have been executed.
     /// Nodes returned by this method are marked as in-flight.
     pub fn next_nodes(&mut self) -> Vec<(NodeIndex, ExecutableNode)> {
-        let mut ready = Vec::new();
+        let mut next = Vec::new();
 
         for idx in self.graph.get_executable_graph().node_indices() {
             if self.executed.contains(&idx) || self.in_flight.contains(&idx) {
@@ -44,11 +44,12 @@ impl Scheduler {
 
             if all_predecessors_executed {
                 self.in_flight.insert(idx);
-                ready.push((idx, self.graph.get_executable_graph()[idx].clone()));
+                next.push((idx, self.graph.get_executable_graph()[idx].clone()));
             }
+            // is
         }
 
-        ready
+        next
     }
 
     /// Marks a node as completed.
@@ -103,6 +104,7 @@ impl Scheduler {
     pub fn is_complete(&self) -> bool {
         self.executed.len() == self.graph.get_executable_graph().node_count()
     }
+    // set_job_store
 }
 
 #[cfg(test)]

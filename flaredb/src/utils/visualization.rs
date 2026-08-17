@@ -109,6 +109,26 @@ fn node_label_html(node_index: usize, node: &ExecutableNode) -> String {
 
             table_html("#d97706", "#fffbeb", rows)
         }
+        ExecutableNode::Splittable(stage) => {
+            let mut output_pcols: Vec<_> = stage.output_pcols().iter().cloned().collect();
+            output_pcols.sort();
+
+            let mut rows = vec![
+                header_row(&format!("Splittable Node #{}", node_index), "#c4b5fd"),
+                kv_row("id", stage.id()),
+                kv_row("nested stages", &stage.graph().node_count().to_string()),
+                section_row(&format!("boundary outputs ({})", output_pcols.len())),
+            ];
+            if output_pcols.is_empty() {
+                rows.push(value_row("-"));
+            } else {
+                for output_pcol in output_pcols {
+                    rows.push(value_row(&output_pcol));
+                }
+            }
+
+            table_html("#7c3aed", "#f5f3ff", rows)
+        }
     }
 }
 

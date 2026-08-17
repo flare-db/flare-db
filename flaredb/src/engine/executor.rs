@@ -400,6 +400,9 @@ impl StageExecutor {
 
                 Ok(ControlResponse::BundleDone)
             }
+            ExecutableNode::Splittable(_) => Err(anyhow!(
+                "splittable-stage execution is not implemented; this node must be handled by SplittableStageExecutor"
+            )),
         }
     }
 

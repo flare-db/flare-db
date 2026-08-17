@@ -1,5 +1,5 @@
 use crate::fusion::refs::{SideInputRef, TimerRef, UserStateRef};
-use crate::fusion::stage::ExecutableStage;
+use crate::fusion::stage::{ExecutableStage, SplittableStage};
 use crate::jobservice::urns;
 use crate::transforms::{FlareRunnerTransform, from_urn};
 use crate::utils::errors::*;
@@ -52,7 +52,9 @@ impl ExecutableGraph {
         self.graph = Graph::<ExecutableNode, ConsumerMetaData>::new();
         self.node_indices.clear();
 
-        // Map each PCollection to all of its consumer transform links.
+        // Map each PCollection to all of its consumer transform links. This
+        // map is left uncollapsed; splittable stages are folded into `Splittable`
+        // nodes lazily while walking downstream from the root.
         let mut consumer_map: HashMap<String, Vec<ConsumerLink>> = HashMap::new();
 
         for stage in sdk_stages.iter() {
@@ -98,6 +100,10 @@ impl ExecutableGraph {
             }
         }
 
+        // Memoizes the `Splittable` node built for a splittable run so every
+        // member stage resolves to the same outer node.
+        let mut splittable_cache: HashMap<String, ExecutableNode> = HashMap::new();
+
         let mut work_queue = VecDeque::<ExecutableNode>::new();
         info!("Created work queue");
         // Create Root node and immidate consumer pair
@@ -120,7 +126,15 @@ impl ExecutableGraph {
                 for (_output_key, output_id) in root.node().outputs.iter() {
                     if let Some(consumer_links) = consumer_map.get(output_id).cloned() {
                         for consumer_link in consumer_links {
-                            let consumer_index = self.ensure_node_exists(&consumer_link.node);
+                            let consumer_node = self.resolve_consumer(
+                                &consumer_link.node,
+                                &sdk_stages,
+                                &runner_stages,
+                                &consumer_map,
+                                &mut splittable_cache,
+                            );
+
+                            let consumer_index = self.ensure_node_exists(&consumer_node);
 
                             let edge = self.build_consumer_metadata(
                                 output_id,
@@ -132,7 +146,7 @@ impl ExecutableGraph {
                             self.root_metadata.get_or_insert_with(|| edge.clone());
 
                             self.graph.add_edge(runner_index, consumer_index, edge);
-                            work_queue.push_back(consumer_link.node);
+                            work_queue.push_back(consumer_node);
                         }
                     }
                 }
@@ -154,7 +168,22 @@ impl ExecutableGraph {
                 // get all consumer nodes of that PCollection
                 if let Some(consumer_links) = consumer_map.get(&output_pcol).cloned() {
                     for consumer_link in consumer_links {
-                        let consumer_index = self.ensure_node_exists(&consumer_link.node);
+                        let consumer_node = self.resolve_consumer(
+                            &consumer_link.node,
+                            &sdk_stages,
+                            &runner_stages,
+                            &consumer_map,
+                            &mut splittable_cache,
+                        );
+
+                        // Skip links that were folded into the producer's own
+                        // nested graph (fan-out from a splittable stage to both
+                        // a splittable sibling and an external consumer).
+                        if consumer_node.id() == producer_node.id() {
+                            continue;
+                        }
+
+                        let consumer_index = self.ensure_node_exists(&consumer_node);
 
                         // Create edge metadata for this producer -> consumer edge.
                         let edge = self.build_consumer_metadata(
@@ -167,11 +196,119 @@ impl ExecutableGraph {
                         // Connect the producer and consumer nodes with PCollection metadata
                         self.graph.add_edge(producer_index, consumer_index, edge);
                         // Add consumer node to queue to itterate and do the same for its downstream nodes.
-                        work_queue.push_back(consumer_link.node);
+                        work_queue.push_back(consumer_node);
                     }
                 }
             }
         }
+    }
+
+    /// Return the outer-graph node for a consumer link.
+    ///
+    /// If the consumer is a splittable worker stage, return the `Splittable`
+    /// node for the whole downstream run it belongs to (building it once and
+    /// memoizing it in `cache`). Otherwise return the node unchanged.
+    fn resolve_consumer(
+        &self,
+        node: &ExecutableNode,
+        sdk_stages: &IndexSet<ExecutableStage>,
+        runner_stages: &IndexSet<PTransformNode>,
+        consumer_map: &HashMap<String, Vec<ConsumerLink>>,
+        cache: &mut HashMap<String, ExecutableNode>,
+    ) -> ExecutableNode {
+        let ExecutableNode::Worker(stage) = node else {
+            return node.clone();
+        };
+
+        if !stage.is_splittable() {
+            return node.clone();
+        }
+
+        if let Some(existing) = cache.get(&stage.id()) {
+            return existing.clone();
+        }
+
+        let (splittable, member_ids) =
+            self.build_splittable_node(stage, sdk_stages, runner_stages, consumer_map);
+        for member_id in member_ids {
+            cache.insert(member_id, splittable.clone());
+        }
+        splittable
+    }
+
+    /// Build the nested graph for the run of splittable stages of a source transform after root.
+    ///
+    /// Follows downstream stages while they are splittable, and stops at the
+    /// first regular stage. Any output that goes to a regular stage becomes a
+    /// boundary output of the outer node.
+    ///
+    /// Returns the built node plus the IDs of every stage in the run.
+    fn build_splittable_node(
+        &self,
+        start: &ExecutableStage,
+        sdk_stages: &IndexSet<ExecutableStage>,
+        runner_stages: &IndexSet<PTransformNode>,
+        consumer_map: &HashMap<String, Vec<ConsumerLink>>,
+    ) -> (ExecutableNode, Vec<String>) {
+        let mut nested_graph = Graph::<ExecutableNode, ConsumerMetaData>::new();
+        let mut nested_indices = HashMap::new();
+        let mut boundary_outputs = HashSet::new();
+        let mut pending = VecDeque::from([start.clone()]);
+        let mut visited = HashSet::new();
+        let mut member_ids = Vec::new();
+
+        while let Some(stage) = pending.pop_front() {
+            let stage_id = stage.id();
+            if !visited.insert(stage_id.clone()) {
+                continue;
+            }
+
+            let stage_node = ExecutableNode::Worker(stage.clone());
+            let stage_index = *nested_indices
+                .entry(stage_id.clone())
+                .or_insert_with(|| nested_graph.add_node(stage_node));
+            member_ids.push(stage_id);
+
+            for output_pcol in stage.get_output_pcol_ids() {
+                let mut has_external_consumer = false;
+
+                if let Some(consumers) = consumer_map.get(&output_pcol) {
+                    for consumer in consumers {
+                        match &consumer.node {
+                            ExecutableNode::Worker(next_stage) if next_stage.is_splittable() => {
+                                let next_id = next_stage.id();
+                                let next_node = ExecutableNode::Worker(next_stage.clone());
+                                let next_index = *nested_indices
+                                    .entry(next_id.clone())
+                                    .or_insert_with(|| nested_graph.add_node(next_node));
+                                let edge = self.build_consumer_metadata(
+                                    &output_pcol,
+                                    &consumer.transform_id,
+                                    sdk_stages,
+                                    runner_stages,
+                                );
+                                nested_graph.add_edge(stage_index, next_index, edge);
+                                pending.push_back(next_stage.clone());
+                            }
+                            _ => has_external_consumer = true,
+                        }
+                    }
+                }
+
+                if has_external_consumer {
+                    boundary_outputs.insert(output_pcol);
+                }
+            }
+        }
+
+        member_ids.sort();
+        let splittable = ExecutableNode::Splittable(SplittableStage::new(
+            format!("splittable:{}", member_ids.join(",")),
+            nested_graph,
+            boundary_outputs,
+        ));
+
+        (splittable, member_ids)
     }
 
     fn ensure_node_exists(&mut self, node: &ExecutableNode) -> NodeIndex {
@@ -292,6 +429,7 @@ impl ExecutableGraph {
 pub enum ExecutableNode {
     Worker(ExecutableStage),
     Runner(FlareRunnerTransform),
+    Splittable(SplittableStage),
 }
 
 impl ExecutableNode {
@@ -331,6 +469,16 @@ impl ExecutableNode {
                     output_pcols,
                 )
             }
+            ExecutableNode::Splittable(stage) => {
+                let mut output_pcols: Vec<_> = stage.output_pcols().iter().cloned().collect();
+                output_pcols.sort();
+                format!(
+                    "Splittable id={} stages={} output_pcols={:?}",
+                    stage.id(),
+                    stage.graph().node_count(),
+                    output_pcols,
+                )
+            }
         }
     }
 
@@ -338,6 +486,7 @@ impl ExecutableNode {
         match self {
             ExecutableNode::Worker(s) => s.get_output_pcol_ids(),
             ExecutableNode::Runner(r) => r.output_pcol_ids(),
+            ExecutableNode::Splittable(s) => s.output_pcols().clone(),
         }
     }
 
@@ -345,6 +494,7 @@ impl ExecutableNode {
         match self {
             ExecutableNode::Worker(e) => e.id(),
             ExecutableNode::Runner(r) => r.id(),
+            ExecutableNode::Splittable(s) => s.id().to_string(),
         }
     }
 }
@@ -354,6 +504,7 @@ impl Hash for ExecutableNode {
         match self {
             ExecutableNode::Worker(s) => s.id().hash(state),
             ExecutableNode::Runner(r) => r.id().hash(state),
+            ExecutableNode::Splittable(s) => s.id().hash(state),
         }
     }
 
@@ -372,6 +523,7 @@ impl PartialEq for ExecutableNode {
         match (self, other) {
             (ExecutableNode::Worker(a), ExecutableNode::Worker(b)) => a.id() == b.id(),
             (ExecutableNode::Runner(a), ExecutableNode::Runner(b)) => a.id() == b.id(),
+            (ExecutableNode::Splittable(a), ExecutableNode::Splittable(b)) => a.id() == b.id(),
             _ => false,
         }
     }
