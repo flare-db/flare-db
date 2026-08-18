@@ -6,6 +6,7 @@ use crate::engine::harness::{
     log::{FlareLogService, LogChannel, start_log_server},
     state::{FlareStateService, StateChannel, start_state_server},
 };
+use ::log::info;
 
 pub mod control;
 pub mod data;
@@ -33,8 +34,41 @@ impl Channels {
     pub fn into_parts(self) -> (ControlChannel, DataChannel, LogChannel, StateChannel) {
         (self.control, self.data, self.log, self.state)
     }
-    // Todo: Move reset channels here
-    // wait_connected()
+
+    /// Clone the control channel so the executor can use it.
+    pub fn control(&self) -> ControlChannel {
+        self.control.clone()
+    }
+
+    /// Clone the data channel so the executor can use it.
+    pub fn data(&self) -> DataChannel {
+        self.data.clone()
+    }
+
+    /// Wait for the worker to connect its control stream.
+    pub async fn wait_connected(&self) -> Result<()> {
+        self.control.wait_connected().await
+    }
+
+    /// Start the data channel dispatcher to demux incoming elements.
+    pub fn stream_elements(&self) {
+        self.data.stream_elements();
+    }
+
+    /// Start the control channel dispatcher to route responses.
+    pub fn stream_responses(&self) {
+        self.control.stream_responses();
+    }
+
+    /// Reset all channels so a new worker can connect.
+    pub async fn reset(&self) {
+        self.control.reset().await;
+        self.data.reset().await;
+        self.log.reset().await;
+        self.state.reset().await;
+        //self.store.reset();
+        info!("stage executor channels reset");
+    }
 }
 
 /// The gRPC services that correspond to a [`Channels`] bundle.

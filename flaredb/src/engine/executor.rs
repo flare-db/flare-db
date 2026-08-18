@@ -23,21 +23,22 @@ use tokio::{
 use crate::{
     engine::{
         coders::{BeamCoder, StandardBeamCoders, WindowedValueCoder},
+        dispatcher::{self, ExecutorDispatcher},
         harness::{
             control::{ControlChannel, ControlResponse},
             data::{DataChannel, DataKey, ElementStreamPayload},
-            log::LogChannel,
-            state::StateChannel,
         },
         scheduler::Scheduler,
     },
     fusion::{
-        pipeline::{ConsumerMetaData, ExecutableGraph, ExecutableNode},
+        pipeline::{ConsumerMetaData, ExecutableNode},
         stage::ExecutableStage,
     },
     jobservice::urns::beam_urns,
-    store::element_store::{FlareElementStore, NewCollectionRequest, ScanCollectionRequest},
-    store::record::BeamRecord,
+    store::{
+        element_store::{FlareElementStore, NewCollectionRequest, ScanCollectionRequest},
+        record::BeamRecord,
+    },
     transforms::{ExecutionContext, FlareRunnerTransform},
     utils::batch_size_estimator::{BatchConfig, BatchSizeEstimator},
 };
@@ -49,74 +50,29 @@ pub struct StageExecutor {
     control: ControlChannel,
     /// Data plane
     data: DataChannel,
-    /// Logging channel
-    log: LogChannel,
-    /// State API channel.
-    state: StateChannel,
     /// Pipeline coders.
     pipeline_coders: Arc<HashMap<String, Coder>>,
     /// Pipeline components.
     pipeline_components: Arc<Components>,
     /// Element storage
     store: Arc<FlareElementStore>,
-    /// Instance ID
-    instance_id: String,
 }
 
 impl StageExecutor {
-    pub async fn new(
+    pub fn new(
         control: ControlChannel,
         data: DataChannel,
-        log: LogChannel,
-        state: StateChannel,
-        instance_id: &str,
-    ) -> anyhow::Result<Self> {
-        let base_store_path = crate::utils::path::warehouse_dir();
-        let base_store_path_str = base_store_path.to_str().unwrap_or(".").to_string();
-        let store =
-            Arc::new(FlareElementStore::new(base_store_path_str, "flare".to_string()).await?);
-        Ok(Self {
+        store: Arc<FlareElementStore>,
+        pipeline_coders: Arc<HashMap<String, Coder>>,
+        pipeline_components: Arc<Components>,
+    ) -> Self {
+        Self {
             control,
             data,
-            log,
-            state,
-            pipeline_coders: Arc::new(HashMap::new()),
-            pipeline_components: Arc::new(Components::default()),
+            pipeline_coders,
+            pipeline_components,
             store,
-            instance_id: instance_id.to_string(),
-        })
-    }
-
-    pub async fn set_job_store(&mut self, job_id: &str) -> anyhow::Result<()> {
-        let store_path = crate::utils::path::warehouse_dir();
-        let store_base = store_path.to_str().unwrap_or(".").to_string();
-        self.store = Arc::new(FlareElementStore::new(store_base, job_id.to_string()).await?);
-        Ok(())
-    }
-
-    pub async fn wait_connected(&self) -> anyhow::Result<()> {
-        self.control.wait_connected().await?;
-        Ok(())
-    }
-
-    /// Start dispatcher tasks
-    pub fn prepare_pipeline(&mut self, pipeline_graph: &ExecutableGraph) {
-        // Start data channel dispatcher to listen and demux incoming elements.
-        self.data.stream_elements();
-        // Start control channel dispatcher to route responses to waiting futures.
-        self.control.stream_responses();
-        self.pipeline_coders = Arc::new(pipeline_graph.components.coders.clone());
-        self.pipeline_components = Arc::new(pipeline_graph.components.clone());
-    }
-
-    /// Reset all channels so a new worker can connect.
-    pub async fn reset_channels(&self) {
-        self.control.reset().await;
-        self.data.reset().await;
-        self.log.reset().await;
-        self.state.reset().await;
-        //self.store.reset();
-        log::info!("stage executor channels reset");
+        }
     }
 }
 
@@ -145,25 +101,31 @@ impl Executor for StageExecutor {
 
 pub async fn run_pipeline(
     scheduler: &mut Scheduler,
-    executor: Arc<Mutex<StageExecutor>>,
+    //executor: Arc<Mutex<StageExecutor>>,
+    dispatcher: Arc<ExecutorDispatcher>,
 ) -> anyhow::Result<()> {
     let mut in_flight = JoinSet::new();
 
     loop {
         for (idx, node) in scheduler.next_nodes() {
-            let executor = executor.clone();
+            //let executor = executor.clone();
             let input_metadata = scheduler.input_edge_metadata(idx);
             let output_metadata = scheduler.output_edge_metadata(idx);
 
-            in_flight.spawn(async move {
-                let mut executor = executor.lock().await;
-                // TODO:  switch to Arc<StageExecutor>? since its mutex,
-                // each task may not be able to access the executor simultaneously.
-                let result = executor
-                    .execute(node, input_metadata, output_metadata)
-                    .await;
-                (idx, result)
-            });
+            if matches!(node, ExecutableNode::Splittable(_)) {
+                // ToDo: run splittable stage executor
+            } else {
+                in_flight.spawn(async move {
+                    //let mut executor = executor.lock().await;
+                    // create new stage executor and execute node
+                    // TODO:  switch to Arc<StageExecutor>? since its mutex,
+                    // each task may not be able to access the executor simultaneously.
+                    let result = executor
+                        .execute(node, input_metadata, output_metadata)
+                        .await;
+                    (idx, result)
+                });
+            }
         }
 
         if in_flight.is_empty() {

@@ -15,7 +15,8 @@ use tonic::Response;
 use tonic::Status;
 use uuid::Uuid;
 
-use crate::engine::executor::{StageExecutor, run_pipeline};
+use crate::engine::dispatcher::ExecutorDispatcher;
+use crate::engine::executor::run_pipeline;
 use crate::engine::scheduler::Scheduler;
 use crate::jobservice::artifact::ArtifactStore;
 use crate::jobservice::job::Job;
@@ -23,7 +24,7 @@ use crate::jobservice::job::JobStore;
 
 pub struct FlareJobService {
     job_store: JobStore,
-    executor: Arc<Mutex<StageExecutor>>,
+    dispatcher: Arc<Mutex<ExecutorDispatcher>>,
     artifact_store: Arc<ArtifactStore>,
     worker_manager: crate::worker::manager::WorkerManager,
     staging_tokens: Arc<DashSet<String>>,
@@ -32,18 +33,18 @@ pub struct FlareJobService {
 
 impl FlareJobService {
     pub fn with(
-        executor: StageExecutor,
         artifact_store: Arc<ArtifactStore>,
         worker_manager: crate::worker::manager::WorkerManager,
         instance_id: String,
+        dispatcher: Arc<Mutex<ExecutorDispatcher>>,
     ) -> Self {
         Self {
             job_store: JobStore::new(),
-            executor: Arc::new(Mutex::new(executor)),
             artifact_store,
             worker_manager,
             staging_tokens: Arc::new(DashSet::new()),
             instance_id,
+            dispatcher,
         }
     }
 
@@ -147,25 +148,24 @@ impl JobService for FlareJobService {
 
             let staged_jar = self.artifact_store.staged_path();
 
-            let executor = self.executor.clone();
-
             // Reset channels so the new harness can connect on fresh streams.
-            executor.lock().await.reset_channels().await;
+            self.dispatcher.lock().await.reset_channels().await;
 
             self.worker_manager
                 .spawn_worker(&preparation_id, &staged_jar, &self.instance_id)
                 .await?;
 
-            executor
+            self.dispatcher
                 .lock()
                 .await
                 .set_job_store(&preparation_id)
                 .await
                 .map_err(|e| Status::internal(format!("failed to set job store: {}", e)))?;
+
             let connect_timeout_secs = self.worker_manager.config().connect_timeout_secs;
             timeout(Duration::from_secs(connect_timeout_secs), async {
-                let executor = executor.lock().await;
-                executor.wait_connected().await
+                let dispatcher = self.dispatcher.lock().await;
+                dispatcher.wait_connected().await
             })
             .await
             .map_err(|_| {
@@ -181,13 +181,14 @@ impl JobService for FlareJobService {
                 ))
             })?;
 
-            {
-                let mut executor_guard = executor.lock().await;
-                executor_guard.prepare_pipeline(job_graph.as_ref());
-            }
+            let executor = {
+                let mut dispatcher = self.dispatcher.lock().await;
+                dispatcher.prepare_pipeline(job_graph.as_ref());
+                dispatcher.executor()
+            };
 
             let mut scheduler = Scheduler::new((*job_graph).clone());
-            run_pipeline(&mut scheduler, executor.clone())
+            run_pipeline(&mut scheduler, Arc::new(Mutex::new(executor)))
                 .await
                 .map_err(|e| {
                     Status::internal(format!(

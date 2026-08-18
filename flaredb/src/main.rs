@@ -1,5 +1,5 @@
 use flaredb::{
-    engine::{executor::StageExecutor, harness::Channels},
+    engine::{dispatcher::ExecutorDispatcher, harness::Channels},
     jobservice::{
         artifact::{ArtifactStore, FlareArtifactStagingService},
         server::FlareJobService,
@@ -7,6 +7,7 @@ use flaredb::{
     worker::manager::{WorkerLaunchConfig, WorkerManager},
 };
 use std::{net::SocketAddr, sync::Arc};
+use tokio::sync::Mutex;
 use tonic::transport::Server;
 
 use beam_model_rs::v1::{
@@ -42,15 +43,8 @@ async fn flare_up() -> Result<(), Box<dyn std::error::Error>> {
         Arc::new(ArtifactStore::from(artifact_root_str, "pipeline-artifact").await?);
 
     let (channels, services) = Channels::builder().build().await?;
-    let (control_channel, data_channel, log_channel, state_channel) = channels.into_parts();
-    let executor = StageExecutor::new(
-        control_channel,
-        data_channel,
-        log_channel,
-        state_channel,
-        &instance_id,
-    )
-    .await?;
+
+    let dispatcher = Arc::new(Mutex::new(ExecutorDispatcher::new(channels).await?));
 
     let worker_jar = std::env::var("WORKER_JAR_PATH").unwrap_or_else(|_| {
         format!(
@@ -68,10 +62,10 @@ async fn flare_up() -> Result<(), Box<dyn std::error::Error>> {
     };
     let worker_manager = WorkerManager::new(worker_cfg);
     let job_service = FlareJobService::with(
-        executor,
         artifact_store.clone(),
         worker_manager,
         instance_id,
+        dispatcher,
     );
 
     let artifact_service =
