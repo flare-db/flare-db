@@ -8,13 +8,13 @@ use crate::fusion::pipeline::{ConsumerMetaData, ExecutableGraph, ExecutableNode}
 ///
 /// Tracks executed and in-flight nodes and provides helpers to query ready
 /// nodes and edge metadata.
-pub struct Scheduler {
+pub struct NodeScheduler {
     graph: ExecutableGraph,
     executed: HashSet<NodeIndex>,
     in_flight: HashSet<NodeIndex>,
 }
 
-impl Scheduler {
+impl NodeScheduler {
     pub fn new(graph: ExecutableGraph) -> Self {
         Self {
             graph,
@@ -113,7 +113,7 @@ mod tests {
 
     use petgraph::Graph;
 
-    use crate::engine::scheduler::Scheduler;
+    use crate::engine::scheduler::NodeScheduler;
     use crate::fusion::pipeline::{ConsumerMetaData, ExecutableGraph, ExecutableNode};
     use crate::jobservice::urns::beam_urns;
     use crate::transforms::from_urn;
@@ -155,7 +155,7 @@ mod tests {
         graph.add_edge(b, c, dummy_metadata("bc"));
 
         let executable_graph = graph_for_test(graph, dummy_metadata("root"));
-        let mut scheduler = Scheduler::new(executable_graph);
+        let mut scheduler = NodeScheduler::new(executable_graph);
 
         let ready = scheduler.next_nodes();
         assert_eq!(ready.len(), 1);
@@ -182,7 +182,7 @@ mod tests {
         graph.add_edge(a, c, dummy_metadata("ac"));
 
         let executable_graph = graph_for_test(graph, dummy_metadata("root"));
-        let mut scheduler = Scheduler::new(executable_graph);
+        let mut scheduler = NodeScheduler::new(executable_graph);
 
         let ready = scheduler.next_nodes();
         assert_eq!(ready.len(), 1);
@@ -207,7 +207,7 @@ mod tests {
         graph.add_edge(b, c, dummy_metadata("bc"));
 
         let executable_graph = graph_for_test(graph, dummy_metadata("root"));
-        let mut scheduler = Scheduler::new(executable_graph);
+        let mut scheduler = NodeScheduler::new(executable_graph);
 
         let ready = scheduler.next_nodes();
         assert_eq!(ready.len(), 2);

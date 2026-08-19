@@ -16,8 +16,7 @@ use tonic::Status;
 use uuid::Uuid;
 
 use crate::engine::dispatcher::ExecutorDispatcher;
-use crate::engine::executor::run_pipeline;
-use crate::engine::scheduler::Scheduler;
+use crate::engine::scheduler::NodeScheduler;
 use crate::jobservice::artifact::ArtifactStore;
 use crate::jobservice::job::Job;
 use crate::jobservice::job::JobStore;
@@ -181,21 +180,16 @@ impl JobService for FlareJobService {
                 ))
             })?;
 
-            let executor = {
-                let mut dispatcher = self.dispatcher.lock().await;
-                dispatcher.prepare_pipeline(job_graph.as_ref());
-                dispatcher.executor()
-            };
+            let mut dispatcher = self.dispatcher.lock().await;
+            dispatcher.prepare_pipeline(job_graph.as_ref());
 
-            let mut scheduler = Scheduler::new((*job_graph).clone());
-            run_pipeline(&mut scheduler, Arc::new(Mutex::new(executor)))
-                .await
-                .map_err(|e| {
-                    Status::internal(format!(
-                        "failed to execute pipeline for job {}: {}",
-                        preparation_id, e
-                    ))
-                })?;
+            let mut scheduler = NodeScheduler::new((*job_graph).clone());
+            dispatcher.run_pipeline(&mut scheduler).await.map_err(|e| {
+                Status::internal(format!(
+                    "failed to execute pipeline for job {}: {}",
+                    preparation_id, e
+                ))
+            })?;
 
             // stop worker, next job will get a fresh one.
             self.worker_manager.stop_worker(&preparation_id).await?;

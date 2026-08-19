@@ -1,14 +1,20 @@
-use std::{collections::HashMap, sync::Arc};
-
-use beam_model_rs::v1::{Coder, Components};
-
 use crate::{
-    engine::{executor::StageExecutor, harness::Channels},
+    engine::{
+        executor::{Executor, StageExecutor},
+        harness::Channels,
+        runtime::BundleRuntime,
+        scheduler::NodeScheduler,
+    },
     fusion::pipeline::ExecutableGraph,
     store::element_store::FlareElementStore,
 };
+use anyhow::anyhow;
+use beam_model_rs::v1::{Coder, Components};
+use log::info;
+use std::{collections::HashMap, sync::Arc};
+use tokio::task::JoinSet;
 
-/// Owns the harness channels and per-job state needed to prepare a worker for
+/// Owns the harness channels and per-job state needed to prepare a pipeline for
 /// execution. A [`StageExecutor`] is built from this prepared state so that the
 /// executor itself only concerns itself with executing bundles.
 pub struct ExecutorDispatcher {
@@ -61,8 +67,49 @@ impl ExecutorDispatcher {
     }
 
     /// Build a [`StageExecutor`] from the currently prepared state.
-    pub fn executor(&self) -> StageExecutor {
-        StageExecutor::new(
+    pub fn new_executor(&self) -> StageExecutor {
+        StageExecutor::new(self.new_bundle_runtime())
+    }
+
+    pub async fn run_pipeline(&self, scheduler: &mut NodeScheduler) -> anyhow::Result<()> {
+        let mut in_flight = JoinSet::new();
+
+        loop {
+            for (idx, node) in scheduler.next_nodes() {
+                let mut executor = self.new_executor();
+                let input_metadata = scheduler.input_edge_metadata(idx);
+                let output_metadata = scheduler.output_edge_metadata(idx);
+
+                // ToDo: is a node is splittable, dispatch it into splittablestageexecutor, we need seperate layer cause
+                // execution should be async and sdf may take longer time to complete so sdf executor and other stages should run parally
+                in_flight.spawn(async move {
+                    let result = executor
+                        .execute(node, input_metadata, output_metadata)
+                        .await;
+                    (idx, result)
+                });
+            }
+
+            if in_flight.is_empty() {
+                if scheduler.is_complete() {
+                    break;
+                }
+                return Err(anyhow!(
+                    "executable graph deadlocked: no ready nodes and no in-flight work"
+                ));
+            }
+
+            if let Some(joined) = in_flight.join_next().await {
+                let (idx, result) = joined?;
+                result?;
+                scheduler.mark_complete(idx);
+            }
+        }
+
+        Ok(())
+    }
+    fn new_bundle_runtime(&self) -> BundleRuntime {
+        BundleRuntime::new(
             self.channels.control(),
             self.channels.data(),
             self.store.clone(),
