@@ -4,14 +4,13 @@ use anyhow::{Result, anyhow};
 use arrow_array::RecordBatch;
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 use dashmap::DashMap;
-use paimon::arrow::arrow_fields_to_paimon;
 use paimon::spec::Schema as PaimonSchema;
 use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options, Table, catalog::Identifier};
 use tokio_stream::StreamExt;
 
 use crate::store::record::{
-    BeamRecord, RecordTableSchema, beamrecords_to_record_batch, derive_table_schema,
-    record_batch_to_beamrecords,
+    BeamRecord, RecordTableSchema, arrow_fields_to_paimon, beamrecords_to_record_batch,
+    derive_table_schema, materialize_void_columns, record_batch_to_beamrecords,
 };
 
 /// In-memory cache of [`RecordTableSchema`] per PCollection id.
@@ -79,6 +78,9 @@ impl FlareElementStore {
     ) -> Result<()> {
         let table = self.get_table(pcollection_id, &table_schema).await?;
         let builder = table.new_write_builder();
+
+        // Paimon has no Null type; convert Void columns to null booleans.
+        let batch = materialize_void_columns(batch)?;
 
         let mut writer = builder.new_write()?;
         writer.write_arrow_batch(&batch).await?;

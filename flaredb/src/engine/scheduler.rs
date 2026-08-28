@@ -163,7 +163,8 @@ mod tests {
 
         scheduler.mark_complete(a);
         let ready = scheduler.next_nodes();
-        assert_eq!(ready.len(), 0);
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].0, b);
 
         scheduler.mark_complete(b);
         let ready = scheduler.next_nodes();
@@ -217,8 +218,7 @@ mod tests {
 
         scheduler.mark_complete(a);
         let ready = scheduler.next_nodes();
-        assert_eq!(ready.len(), 1);
-        assert_eq!(ready[0].0, b);
+        assert_eq!(ready.len(), 0);
 
         scheduler.mark_complete(b);
         let ready = scheduler.next_nodes();

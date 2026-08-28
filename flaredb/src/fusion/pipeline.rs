@@ -1,5 +1,7 @@
 use crate::fusion::refs::{SideInputRef, TimerRef, UserStateRef};
-use crate::fusion::stage::{ExecutableStage, SplittableStage};
+use crate::fusion::stage::{
+    ExecutableStage, SplittableExecutionPlan, SplittableProcessKind, SplittableStage,
+};
 use crate::jobservice::urns;
 use crate::transforms::{FlareRunnerTransform, from_urn};
 use crate::utils::errors::*;
@@ -302,13 +304,84 @@ impl ExecutableGraph {
         }
 
         member_ids.sort();
+        let id = format!("splittable:{}", member_ids.join(","));
+        let plan = Self::build_splittable_execution_plan(&id, &nested_graph);
         let splittable = ExecutableNode::Splittable(SplittableStage::new(
-            format!("splittable:{}", member_ids.join(",")),
+            id,
             nested_graph,
             boundary_outputs,
+            plan,
         ));
 
         (splittable, member_ids)
+    }
+
+    fn build_splittable_execution_plan(
+        stage_id: &str,
+        nested_graph: &Graph<ExecutableNode, ConsumerMetaData>,
+    ) -> SplittableExecutionPlan {
+        let sorted = petgraph::algo::toposort(nested_graph, None).unwrap_or_else(|_| {
+            panic!(
+                "splittable stage {} has a cycle in its nested graph",
+                stage_id
+            );
+        });
+
+        let mut initialization_stage = None;
+        let mut process_stage = None;
+        let mut process_kind = None;
+
+        for idx in sorted {
+            let node = &nested_graph[idx];
+            if let ExecutableNode::Worker(stage) = node {
+                let mut kind = None;
+                for t in stage.transforms() {
+                    if let Some(spec) = &t.node().spec {
+                        match spec.urn.as_str() {
+                        urns::beam_urns::SPLITTABLE_PROCESS_ELEMENTS_URN => {
+                            kind = Some(SplittableProcessKind::ProcessElements);
+                        }
+                        urns::beam_urns::SPLITTABLE_PROCESS_KEYED_URN => {
+                            kind = Some(SplittableProcessKind::ProcessKeyedElements);
+                        }
+                        urns::beam_urns::SPLITTABLE_PROCESS_SIZED_ELEMENTS_AND_RESTRICTIONS_URN => {
+                            kind = Some(SplittableProcessKind::ProcessSizedElementsAndRestrictions);
+                        }
+                        _ => {}
+                    }
+                    }
+                }
+
+                if let Some(k) = kind {
+                    process_stage = Some(stage.clone());
+                    process_kind = Some(k);
+                } else {
+                    initialization_stage = Some(stage.clone());
+                }
+            }
+        }
+
+        let initialization_stage = initialization_stage.unwrap_or_else(|| {
+            panic!(
+                "SDF splittable stage {} missing initialization stage",
+                stage_id
+            );
+        });
+        let process_stage = process_stage.unwrap_or_else(|| {
+            panic!("SDF splittable stage {} missing process stage", stage_id);
+        });
+        let process_kind = process_kind.unwrap_or_else(|| {
+            panic!(
+                "SDF splittable stage {} missing process transform URN",
+                stage_id
+            );
+        });
+
+        SplittableExecutionPlan {
+            initialization_stage,
+            process_stage,
+            process_kind,
+        }
     }
 
     fn ensure_node_exists(&mut self, node: &ExecutableNode) -> NodeIndex {

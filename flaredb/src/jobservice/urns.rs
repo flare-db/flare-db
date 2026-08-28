@@ -118,7 +118,7 @@ pub mod beam_urns {
         "beam:transform:sdf_split_and_size_restrictions:v1";
     pub const SPLITTABLE_PROCESS_ELEMENTS_URN: &str = "beam:transform:sdf_process_elements:v1";
     pub const SPLITTABLE_PROCESS_SIZED_ELEMENTS_AND_RESTRICTIONS_URN: &str =
-        "beam:transform:sdf_process_sized_elements_and_restrictions:v1";
+        "beam:transform:sdf_process_sized_element_and_restrictions:v1";
 
     //Deprecated
     pub const SPLITTABLE_PROCESS_KEYED_URN: &str = "beam:transform:sdf_process_keyed_elements:v1";

@@ -5,12 +5,12 @@ use crate::{
         runtime::BundleRuntime,
         scheduler::NodeScheduler,
     },
-    fusion::pipeline::ExecutableGraph,
+    fusion::pipeline::{ExecutableGraph, ExecutableNode},
     store::element_store::FlareElementStore,
 };
+use crate::engine::sdf::SplittableStageExecutor;
 use anyhow::anyhow;
 use beam_model_rs::v1::{Coder, Components};
-use log::info;
 use std::{collections::HashMap, sync::Arc};
 use tokio::task::JoinSet;
 
@@ -76,16 +76,18 @@ impl ExecutorDispatcher {
 
         loop {
             for (idx, node) in scheduler.next_nodes() {
-                let mut executor = self.new_executor();
+                let runtime = self.new_bundle_runtime();
                 let input_metadata = scheduler.input_edge_metadata(idx);
                 let output_metadata = scheduler.output_edge_metadata(idx);
 
-                // ToDo: is a node is splittable, dispatch it into splittablestageexecutor, we need seperate layer cause
-                // execution should be async and sdf may take longer time to complete so sdf executor and other stages should run parally
                 in_flight.spawn(async move {
-                    let result = executor
-                        .execute(node, input_metadata, output_metadata)
-                        .await;
+                    let result = if matches!(node, ExecutableNode::Splittable(_)) {
+                        let mut executor = SplittableStageExecutor::new(runtime);
+                        executor.execute(node, input_metadata, output_metadata).await
+                    } else {
+                        let mut executor = StageExecutor::new(runtime);
+                        executor.execute(node, input_metadata, output_metadata).await
+                    };
                     (idx, result)
                 });
             }

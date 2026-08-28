@@ -240,6 +240,20 @@ impl SiblingKey {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SplittableProcessKind {
+    ProcessElements,
+    ProcessKeyedElements,
+    ProcessSizedElementsAndRestrictions,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SplittableExecutionPlan {
+    pub initialization_stage: ExecutableStage,
+    pub process_stage: ExecutableStage,
+    pub process_kind: SplittableProcessKind,
+}
+
 /// A subgraph of worker nodes that use a splittable ParDo.
 ///
 /// The outer executable graph treats this as one node; `output_pcols` contains
@@ -249,6 +263,7 @@ pub struct SplittableStage {
     id: String,
     stage: Graph<ExecutableNode, ConsumerMetaData>,
     output_pcols: HashSet<String>,
+    plan: SplittableExecutionPlan,
 }
 
 impl SplittableStage {
@@ -256,11 +271,13 @@ impl SplittableStage {
         id: String,
         stage: Graph<ExecutableNode, ConsumerMetaData>,
         output_pcols: HashSet<String>,
+        plan: SplittableExecutionPlan,
     ) -> Self {
         Self {
             id,
             stage,
             output_pcols,
+            plan,
         }
     }
 
@@ -274,5 +291,9 @@ impl SplittableStage {
 
     pub fn output_pcols(&self) -> &HashSet<String> {
         &self.output_pcols
+    }
+
+    pub fn plan(&self) -> &SplittableExecutionPlan {
+        &self.plan
     }
 }
