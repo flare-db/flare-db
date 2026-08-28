@@ -24,6 +24,7 @@ pub mod beam_urns {
     pub const KV_CODER: &str = "beam:coder:kv:v1";
     pub const BOOL_CODER: &str = "beam:coder:bool:v1";
     pub const VARINT_CODER: &str = "beam:coder:varint:v1";
+    pub const DOUBLE_CODER: &str = "beam:coder:double:v1";
     pub const ITERABLE_CODER: &str = "beam:coder:iterable:v1";
     pub const GLOBAL_WINDOW_CODER: &str = "beam:coder:global_window:v1";
     pub const WINDOWED_VALUE_CODER: &str = "beam:coder:windowed_value:v1";
@@ -45,6 +46,11 @@ pub mod beam_urns {
         MERGE_WINDOWS_TRANSFORM,
         TO_STRING_TRANSFORM,
         MANAGED_TRANSFORM,
+        // Splittable DoFn
+        SPLITTABLE_PAIR_WITH_RESTRICTION_URN,
+        SPLITTABLE_SPLIT_AND_SIZE_RESTRICTIONS_URN,
+        SPLITTABLE_TRUNCATE_SIZED_RESTRICTION_URN,
+        SPLITTABLE_PROCESS_SIZED_ELEMENTS_AND_RESTRICTIONS_URN,
     ];
 
     pub const FLARE: &[&str] = &[GROUP_BY_KEY_TRANSFORM, IMPULSE_TRANSFORM];
@@ -104,13 +110,15 @@ pub mod beam_urns {
     pub const SPLITTABLE_PARDO_COMPONENTS: &[&str] = &[
         SPLITTABLE_PAIR_WITH_RESTRICTION_URN,
         SPLITTABLE_TRUNCATE_SIZED_RESTRICTION_URN,
+        SPLITTABLE_SPLIT_AND_SIZE_RESTRICTIONS_URN,
+        SPLITTABLE_PROCESS_SIZED_ELEMENTS_AND_RESTRICTIONS_URN,
     ];
 
     pub const SPLITTABLE_SPLIT_AND_SIZE_RESTRICTIONS_URN: &str =
         "beam:transform:sdf_split_and_size_restrictions:v1";
     pub const SPLITTABLE_PROCESS_ELEMENTS_URN: &str = "beam:transform:sdf_process_elements:v1";
     pub const SPLITTABLE_PROCESS_SIZED_ELEMENTS_AND_RESTRICTIONS_URN: &str =
-        "beam:transform:sdf_process_sized_elements_and_restrictions:v1";
+        "beam:transform:sdf_process_sized_element_and_restrictions:v1";
 
     //Deprecated
     pub const SPLITTABLE_PROCESS_KEYED_URN: &str = "beam:transform:sdf_process_keyed_elements:v1";

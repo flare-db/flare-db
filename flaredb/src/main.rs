@@ -1,11 +1,5 @@
 use flaredb::{
-    engine::{
-        executor::StageExecutor,
-        harness::{
-            control::start_control_server, data::start_data_server, log::start_log_server,
-            state::start_state_server,
-        },
-    },
+    engine::{dispatcher::ExecutorDispatcher, harness::Channels},
     jobservice::{
         artifact::{ArtifactStore, FlareArtifactStagingService},
         server::FlareJobService,
@@ -13,6 +7,7 @@ use flaredb::{
     worker::manager::{WorkerLaunchConfig, WorkerManager},
 };
 use std::{net::SocketAddr, sync::Arc};
+use tokio::sync::Mutex;
 use tonic::transport::Server;
 
 use beam_model_rs::v1::{
@@ -47,19 +42,9 @@ async fn flare_up() -> Result<(), Box<dyn std::error::Error>> {
     let artifact_store =
         Arc::new(ArtifactStore::from(artifact_root_str, "pipeline-artifact").await?);
 
-    let (control_channel, control_server) = start_control_server().await?;
-    let (data_channel, data_server) = start_data_server().await?;
-    let (log_channel, log_server) = start_log_server().await?;
-    let (state_channel, state_server) = start_state_server().await?;
+    let (channels, services) = Channels::builder().build().await?;
 
-    let executor = StageExecutor::new(
-        control_channel,
-        data_channel,
-        log_channel,
-        state_channel,
-        &instance_id,
-    )
-    .await?;
+    let dispatcher = Arc::new(Mutex::new(ExecutorDispatcher::new(channels).await?));
 
     let worker_jar = std::env::var("WORKER_JAR_PATH").unwrap_or_else(|_| {
         format!(
@@ -77,10 +62,10 @@ async fn flare_up() -> Result<(), Box<dyn std::error::Error>> {
     };
     let worker_manager = WorkerManager::new(worker_cfg);
     let job_service = FlareJobService::with(
-        executor,
         artifact_store.clone(),
         worker_manager,
         instance_id,
+        dispatcher,
     );
 
     let artifact_service =
@@ -89,10 +74,10 @@ async fn flare_up() -> Result<(), Box<dyn std::error::Error>> {
     Server::builder()
         .add_service(JobServiceServer::new(job_service))
         .add_service(ArtifactStagingServiceServer::new(artifact_service))
-        .add_service(BeamFnControlServer::new(control_server))
-        .add_service(BeamFnDataServer::new(data_server))
-        .add_service(BeamFnLoggingServer::new(log_server))
-        .add_service(BeamFnStateServer::new(state_server))
+        .add_service(BeamFnControlServer::new(services.control))
+        .add_service(BeamFnDataServer::new(services.data))
+        .add_service(BeamFnLoggingServer::new(services.log))
+        .add_service(BeamFnStateServer::new(services.state))
         .serve(addr)
         .await?;
 

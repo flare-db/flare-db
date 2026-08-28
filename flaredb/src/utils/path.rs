@@ -56,6 +56,24 @@ pub fn debug_executable_graph_path(instance_id: &str, job_id: &str) -> PathBuf {
         .join("executable_graph.dot")
 }
 
+pub fn debug_raw_pipeline_path(instance_id: &str, job_id: &str) -> PathBuf {
+    job_dir(instance_id, job_id)
+        .join("debug")
+        .join("raw_pipeline.pb")
+}
+
+pub fn debug_raw_pipeline_text_path(instance_id: &str, job_id: &str) -> PathBuf {
+    job_dir(instance_id, job_id)
+        .join("debug")
+        .join("raw_pipeline.txt")
+}
+
+pub fn debug_fused_pipeline_path(instance_id: &str, job_id: &str) -> PathBuf {
+    job_dir(instance_id, job_id)
+        .join("debug")
+        .join("fused_pipeline.txt")
+}
+
 pub fn ensure_dir(path: &Path) -> io::Result<()> {
     std::fs::create_dir_all(path)
 }

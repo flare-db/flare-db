@@ -8,13 +8,13 @@ use crate::fusion::pipeline::{ConsumerMetaData, ExecutableGraph, ExecutableNode}
 ///
 /// Tracks executed and in-flight nodes and provides helpers to query ready
 /// nodes and edge metadata.
-pub struct Scheduler {
+pub struct NodeScheduler {
     graph: ExecutableGraph,
     executed: HashSet<NodeIndex>,
     in_flight: HashSet<NodeIndex>,
 }
 
-impl Scheduler {
+impl NodeScheduler {
     pub fn new(graph: ExecutableGraph) -> Self {
         Self {
             graph,
@@ -29,7 +29,7 @@ impl Scheduler {
     /// `in_flight` sets and all of its predecessor nodes have been executed.
     /// Nodes returned by this method are marked as in-flight.
     pub fn next_nodes(&mut self) -> Vec<(NodeIndex, ExecutableNode)> {
-        let mut ready = Vec::new();
+        let mut next = Vec::new();
 
         for idx in self.graph.get_executable_graph().node_indices() {
             if self.executed.contains(&idx) || self.in_flight.contains(&idx) {
@@ -44,11 +44,12 @@ impl Scheduler {
 
             if all_predecessors_executed {
                 self.in_flight.insert(idx);
-                ready.push((idx, self.graph.get_executable_graph()[idx].clone()));
+                next.push((idx, self.graph.get_executable_graph()[idx].clone()));
             }
+            // is
         }
 
-        ready
+        next
     }
 
     /// Marks a node as completed.
@@ -103,6 +104,7 @@ impl Scheduler {
     pub fn is_complete(&self) -> bool {
         self.executed.len() == self.graph.get_executable_graph().node_count()
     }
+    // set_job_store
 }
 
 #[cfg(test)]
@@ -111,7 +113,7 @@ mod tests {
 
     use petgraph::Graph;
 
-    use crate::engine::scheduler::Scheduler;
+    use crate::engine::scheduler::NodeScheduler;
     use crate::fusion::pipeline::{ConsumerMetaData, ExecutableGraph, ExecutableNode};
     use crate::jobservice::urns::beam_urns;
     use crate::transforms::from_urn;
@@ -153,7 +155,7 @@ mod tests {
         graph.add_edge(b, c, dummy_metadata("bc"));
 
         let executable_graph = graph_for_test(graph, dummy_metadata("root"));
-        let mut scheduler = Scheduler::new(executable_graph);
+        let mut scheduler = NodeScheduler::new(executable_graph);
 
         let ready = scheduler.next_nodes();
         assert_eq!(ready.len(), 1);
@@ -161,7 +163,8 @@ mod tests {
 
         scheduler.mark_complete(a);
         let ready = scheduler.next_nodes();
-        assert_eq!(ready.len(), 0);
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].0, b);
 
         scheduler.mark_complete(b);
         let ready = scheduler.next_nodes();
@@ -180,7 +183,7 @@ mod tests {
         graph.add_edge(a, c, dummy_metadata("ac"));
 
         let executable_graph = graph_for_test(graph, dummy_metadata("root"));
-        let mut scheduler = Scheduler::new(executable_graph);
+        let mut scheduler = NodeScheduler::new(executable_graph);
 
         let ready = scheduler.next_nodes();
         assert_eq!(ready.len(), 1);
@@ -205,7 +208,7 @@ mod tests {
         graph.add_edge(b, c, dummy_metadata("bc"));
 
         let executable_graph = graph_for_test(graph, dummy_metadata("root"));
-        let mut scheduler = Scheduler::new(executable_graph);
+        let mut scheduler = NodeScheduler::new(executable_graph);
 
         let ready = scheduler.next_nodes();
         assert_eq!(ready.len(), 2);
@@ -215,8 +218,7 @@ mod tests {
 
         scheduler.mark_complete(a);
         let ready = scheduler.next_nodes();
-        assert_eq!(ready.len(), 1);
-        assert_eq!(ready[0].0, b);
+        assert_eq!(ready.len(), 0);
 
         scheduler.mark_complete(b);
         let ready = scheduler.next_nodes();

@@ -2,12 +2,19 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use arrow_array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Int64Array, ListArray, NullArray, RecordBatch,
-    StringArray,
+    Array, ArrayRef, BinaryArray, BooleanArray, Float64Array, Int64Array, ListArray, NullArray,
+    RecordBatch, StringArray,
 };
-use arrow_buffer::{OffsetBuffer, ScalarBuffer};
-use arrow_schema::{DataType, Field, Schema};
+use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
+use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema, TimeUnit};
 use std::hash::{Hash, Hasher};
+
+use paimon::spec::{
+    ArrayType, BigIntType, BooleanType, DataField, DataType as PaimonDataType, DateType,
+    DecimalType, DoubleType, FloatType, IntType, LocalZonedTimestampType, MapType, RowType,
+    SmallIntType, TimeType, TimestampType, TinyIntType, VarBinaryType, VarCharType, VariantType,
+    VectorType,
+};
 
 use super::{KEY_COLUMN, VALUE_COLUMN};
 
@@ -94,6 +101,7 @@ pub enum PrimitiveValue {
     String(String),
     Bytes(Vec<u8>),
     Int64(i64),
+    Float64(f64),
     Bool(bool),
     Void,
 }
@@ -113,12 +121,17 @@ impl Hash for PrimitiveValue {
                 2_u8.hash(state);
                 value.hash(state);
             }
-            Self::Bool(value) => {
+            Self::Float64(value) => {
+                // f64 does not implement Hash; hash the bits instead.
                 3_u8.hash(state);
+                value.to_bits().hash(state);
+            }
+            Self::Bool(value) => {
+                4_u8.hash(state);
                 value.hash(state);
             }
             Self::Void => {
-                4_u8.hash(state);
+                5_u8.hash(state);
             }
         }
     }
@@ -130,6 +143,7 @@ impl PartialEq for PrimitiveValue {
             (Self::String(left), Self::String(right)) => left == right,
             (Self::Bytes(left), Self::Bytes(right)) => left == right,
             (Self::Int64(left), Self::Int64(right)) => left == right,
+            (Self::Float64(left), Self::Float64(right)) => left.to_bits() == right.to_bits(),
             (Self::Bool(left), Self::Bool(right)) => left == right,
             (Self::Void, Self::Void) => true,
             _ => false,
@@ -191,17 +205,18 @@ pub struct RecordTableSchema {
 
 // Value-type helpers
 
-fn primitive_data_type(value: &PrimitiveValue) -> DataType {
+fn primitive_data_type(value: &PrimitiveValue) -> ArrowDataType {
     match value {
-        PrimitiveValue::String(_) => DataType::Utf8,
-        PrimitiveValue::Bytes(_) => DataType::Binary,
-        PrimitiveValue::Int64(_) => DataType::Int64,
-        PrimitiveValue::Bool(_) => DataType::Boolean,
-        PrimitiveValue::Void => DataType::Null,
+        PrimitiveValue::String(_) => ArrowDataType::Utf8,
+        PrimitiveValue::Bytes(_) => ArrowDataType::Binary,
+        PrimitiveValue::Int64(_) => ArrowDataType::Int64,
+        PrimitiveValue::Float64(_) => ArrowDataType::Float64,
+        PrimitiveValue::Bool(_) => ArrowDataType::Boolean,
+        PrimitiveValue::Void => ArrowDataType::Null,
     }
 }
 
-fn primitive_type_matches(value: &PrimitiveValue, data_type: &DataType) -> bool {
+fn primitive_type_matches(value: &PrimitiveValue, data_type: &ArrowDataType) -> bool {
     &primitive_data_type(value) == data_type
 }
 
@@ -209,13 +224,13 @@ fn iterable_values(iterable: &IterableValue) -> &[PrimitiveValue] {
     iterable.list.as_slice()
 }
 
-fn infer_iterable_item_data_type(iterables: &[IterableValue]) -> DataType {
+fn infer_iterable_item_data_type(iterables: &[IterableValue]) -> ArrowDataType {
     iterables
         .iter()
         .flat_map(iterable_values)
         .next()
         .map(primitive_data_type)
-        .unwrap_or(DataType::Null)
+        .unwrap_or(ArrowDataType::Null)
 }
 
 fn build_offsets(lengths: &[usize]) -> Result<OffsetBuffer<i32>> {
@@ -236,10 +251,10 @@ fn build_offsets(lengths: &[usize]) -> Result<OffsetBuffer<i32>> {
 
 pub fn primitive_values_to_array(
     values: &[PrimitiveValue],
-    data_type: &DataType,
+    data_type: &ArrowDataType,
 ) -> Result<ArrayRef> {
     match data_type {
-        DataType::Utf8 => {
+        ArrowDataType::Utf8 => {
             let strings = values
                 .iter()
                 .map(|value| match value {
@@ -252,7 +267,7 @@ pub fn primitive_values_to_array(
                 .collect::<Result<Vec<_>>>()?;
             Ok(Arc::new(StringArray::from(strings)))
         }
-        DataType::Binary => {
+        ArrowDataType::Binary => {
             let bytes = values
                 .iter()
                 .map(|value| match value {
@@ -265,7 +280,7 @@ pub fn primitive_values_to_array(
                 .collect::<Result<Vec<_>>>()?;
             Ok(Arc::new(BinaryArray::from(bytes)))
         }
-        DataType::Int64 => {
+        ArrowDataType::Int64 => {
             let ints = values
                 .iter()
                 .map(|value| match value {
@@ -278,7 +293,7 @@ pub fn primitive_values_to_array(
                 .collect::<Result<Vec<_>>>()?;
             Ok(Arc::new(Int64Array::from(ints)))
         }
-        DataType::Boolean => {
+        ArrowDataType::Boolean => {
             let bools = values
                 .iter()
                 .map(|value| match value {
@@ -291,7 +306,20 @@ pub fn primitive_values_to_array(
                 .collect::<Result<Vec<_>>>()?;
             Ok(Arc::new(BooleanArray::from(bools)))
         }
-        DataType::Null => {
+        ArrowDataType::Float64 => {
+            let floats = values
+                .iter()
+                .map(|value| match value {
+                    PrimitiveValue::Float64(value) => Ok(*value),
+                    other => Err(anyhow!(
+                        "mixed primitive variants in batch: expected Float64, found {:?}",
+                        other
+                    )),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Arc::new(Float64Array::from(floats)))
+        }
+        ArrowDataType::Null => {
             if values
                 .iter()
                 .all(|value| matches!(value, PrimitiveValue::Void))
@@ -309,7 +337,7 @@ pub fn primitive_values_to_array(
 
 pub fn iterable_values_to_array(
     iterables: &[IterableValue],
-    item_data_type: &DataType,
+    item_data_type: &ArrowDataType,
 ) -> Result<ArrayRef> {
     let mut lengths = Vec::with_capacity(iterables.len());
     let mut flattened = Vec::new();
@@ -323,15 +351,15 @@ pub fn iterable_values_to_array(
     let offsets = build_offsets(&lengths)?;
     let child = primitive_values_to_array(&flattened, item_data_type)?;
 
-    let nullable = matches!(item_data_type, DataType::Null);
-    let item_field = Arc::new(Field::new("item", item_data_type.clone(), nullable));
+    let nullable = matches!(item_data_type, ArrowDataType::Null);
+    let item_field = Arc::new(ArrowField::new("item", item_data_type.clone(), nullable));
 
     Ok(Arc::new(ListArray::new(item_field, offsets, child, None)))
 }
 
 fn primitive_value_from_array_row(
     array: &dyn Array,
-    data_type: &DataType,
+    data_type: &ArrowDataType,
     row: usize,
 ) -> Result<PrimitiveValue> {
     if array.is_null(row) {
@@ -339,45 +367,52 @@ fn primitive_value_from_array_row(
     }
 
     match data_type {
-        DataType::Utf8 => {
+        ArrowDataType::Utf8 => {
             let array = array
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .ok_or_else(|| anyhow!("expected StringArray for Utf8 primitive column"))?;
             Ok(PrimitiveValue::String(array.value(row).to_string()))
         }
-        DataType::Binary => {
+        ArrowDataType::Binary => {
             let array = array
                 .as_any()
                 .downcast_ref::<BinaryArray>()
                 .ok_or_else(|| anyhow!("expected BinaryArray for Binary primitive column"))?;
             Ok(PrimitiveValue::Bytes(array.value(row).to_vec()))
         }
-        DataType::Int64 => {
+        ArrowDataType::Int64 => {
             let array = array
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .ok_or_else(|| anyhow!("expected Int64Array for Int64 primitive column"))?;
             Ok(PrimitiveValue::Int64(array.value(row)))
         }
-        DataType::Boolean => {
+        ArrowDataType::Boolean => {
             let array = array
                 .as_any()
                 .downcast_ref::<BooleanArray>()
                 .ok_or_else(|| anyhow!("expected BooleanArray for Boolean primitive column"))?;
             Ok(PrimitiveValue::Bool(array.value(row)))
         }
-        DataType::Null => Ok(PrimitiveValue::Void),
+        ArrowDataType::Float64 => {
+            let array = array
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| anyhow!("expected Float64Array for Float64 primitive column"))?;
+            Ok(PrimitiveValue::Float64(array.value(row)))
+        }
+        ArrowDataType::Null => Ok(PrimitiveValue::Void),
         other => Err(anyhow!("unsupported primitive storage type: {other:?}")),
     }
 }
 
 fn iterable_value_from_array_row(
     array: &dyn Array,
-    data_type: &DataType,
+    data_type: &ArrowDataType,
     row: usize,
 ) -> Result<IterableValue> {
-    let DataType::List(item_field) = data_type else {
+    let ArrowDataType::List(item_field) = data_type else {
         return Err(anyhow!(
             "expected List column for iterable, found {data_type:?}"
         ));
@@ -414,7 +449,7 @@ fn iterable_value_from_array_row(
 fn validate_iterable_item_types(
     pcollection_id: &str,
     iterables: &[IterableValue],
-    item_data_type: &DataType,
+    item_data_type: &ArrowDataType,
 ) -> Result<()> {
     for iterable in iterables {
         for value in iterable_values(iterable) {
@@ -462,11 +497,11 @@ pub fn derive_table_schema(
                     ));
                 }
             }
-
-            Arc::new(Schema::new(vec![Field::new(
+            let nullable = matches!(data_type, ArrowDataType::Null);
+            Arc::new(Schema::new(vec![ArrowField::new(
                 VALUE_COLUMN,
                 data_type,
-                false,
+                nullable,
             )]))
         }
 
@@ -484,11 +519,11 @@ pub fn derive_table_schema(
 
             let item_data_type = infer_iterable_item_data_type(&iterables);
             validate_iterable_item_types(pcollection_id, &iterables, &item_data_type)?;
-            let nullable = matches!(item_data_type, DataType::Null);
+            let nullable = matches!(item_data_type, ArrowDataType::Null);
 
-            Arc::new(Schema::new(vec![Field::new(
+            Arc::new(Schema::new(vec![ArrowField::new(
                 VALUE_COLUMN,
-                DataType::List(Arc::new(Field::new("item", item_data_type, nullable))),
+                ArrowDataType::List(Arc::new(ArrowField::new("item", item_data_type, nullable))),
                 true,
             )]))
         }
@@ -523,9 +558,12 @@ pub fn derive_table_schema(
                 }
             }
 
+            let key_nullable = matches!(key_data_type, ArrowDataType::Null);
+            let value_nullable = matches!(value_data_type, ArrowDataType::Null);
+
             Arc::new(Schema::new(vec![
-                Field::new(KEY_COLUMN, key_data_type, false),
-                Field::new(VALUE_COLUMN, value_data_type, false),
+                ArrowField::new(KEY_COLUMN, key_data_type, key_nullable),
+                ArrowField::new(VALUE_COLUMN, value_data_type, value_nullable),
             ]))
         }
 
@@ -555,13 +593,17 @@ pub fn derive_table_schema(
 
             let item_data_type = infer_iterable_item_data_type(&values);
             validate_iterable_item_types(pcollection_id, &values, &item_data_type)?;
-            let nullable = matches!(item_data_type, DataType::Null);
+            let nullable = matches!(item_data_type, ArrowDataType::Null);
 
             Arc::new(Schema::new(vec![
-                Field::new(KEY_COLUMN, key_data_type, false),
-                Field::new(
+                ArrowField::new(KEY_COLUMN, key_data_type, false),
+                ArrowField::new(
                     VALUE_COLUMN,
-                    DataType::List(Arc::new(Field::new("item", item_data_type, nullable))),
+                    ArrowDataType::List(Arc::new(ArrowField::new(
+                        "item",
+                        item_data_type,
+                        nullable,
+                    ))),
                     true,
                 ),
             ]))
@@ -608,7 +650,7 @@ pub fn beamrecords_to_record_batch(
                 .field_with_name(VALUE_COLUMN)
                 .with_context(|| format!("missing {VALUE_COLUMN} column"))?
                 .data_type();
-            let DataType::List(item_field) = data_type else {
+            let ArrowDataType::List(item_field) = data_type else {
                 return Err(anyhow!("iterable value field must be a List"));
             };
             let iterables = records
@@ -659,7 +701,7 @@ pub fn beamrecords_to_record_batch(
                 .field_with_name(VALUE_COLUMN)
                 .with_context(|| format!("missing {VALUE_COLUMN} column"))?
                 .data_type();
-            let DataType::List(item_field) = value_data_type else {
+            let ArrowDataType::List(item_field) = value_data_type else {
                 return Err(anyhow!("gbk value field must be a List"));
             };
 
@@ -764,6 +806,180 @@ pub fn record_batch_to_beamrecords(
     }
 
     Ok(records)
+}
+
+/// Paimon cannot store Arrow `Null`. Rewrite top-level `Null` columns as
+/// nullable `Boolean` columns where every value is null. This is a lossless
+/// surrogate for `PrimitiveValue::Void`.
+pub fn materialize_void_columns(batch: RecordBatch) -> Result<RecordBatch> {
+    let schema = batch.schema();
+    let mut new_fields = Vec::new();
+    let mut new_columns: Vec<ArrayRef> = Vec::new();
+    let mut modified = false;
+
+    for (i, field) in schema.fields().iter().enumerate() {
+        if field.data_type() == &ArrowDataType::Null {
+            modified = true;
+            new_fields.push(Arc::new(ArrowField::new(
+                field.name(),
+                ArrowDataType::Boolean,
+                true,
+            )));
+            let nulls = Some(NullBuffer::new_null(batch.num_rows()));
+            let values = BooleanBuffer::new_unset(batch.num_rows());
+            new_columns.push(Arc::new(BooleanArray::new(values, nulls)));
+        } else {
+            new_fields.push(field.clone());
+            new_columns.push(batch.column(i).clone());
+        }
+    }
+
+    if !modified {
+        return Ok(batch);
+    }
+
+    let new_schema = Arc::new(Schema::new(new_fields));
+    RecordBatch::try_new(new_schema, new_columns)
+        .context("failed to materialize Null columns for Paimon storage")
+}
+
+/// Convert Arrow fields to Paimon [`DataField`]s with auto-assigned IDs starting from 0.
+pub fn arrow_fields_to_paimon(fields: &[ArrowField]) -> Result<Vec<DataField>> {
+    fields
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            let paimon_type = arrow_to_paimon_type(f.data_type(), f.is_nullable())?;
+            Ok(DataField::new(i as i32, f.name().clone(), paimon_type))
+        })
+        .collect()
+}
+/// Convert an Arrow [`DataType`](ArrowDataType) to a Paimon [`DataType`](PaimonDataType).
+pub fn arrow_to_paimon_type(arrow_type: &ArrowDataType, nullable: bool) -> Result<PaimonDataType> {
+    match arrow_type {
+        ArrowDataType::Boolean => Ok(PaimonDataType::Boolean(BooleanType::with_nullable(
+            nullable,
+        ))),
+        ArrowDataType::Int8 => Ok(PaimonDataType::TinyInt(TinyIntType::with_nullable(
+            nullable,
+        ))),
+        ArrowDataType::Int16 => Ok(PaimonDataType::SmallInt(SmallIntType::with_nullable(
+            nullable,
+        ))),
+        ArrowDataType::Int32 => Ok(PaimonDataType::Int(IntType::with_nullable(nullable))),
+        ArrowDataType::Int64 => Ok(PaimonDataType::BigInt(BigIntType::with_nullable(nullable))),
+        ArrowDataType::Float32 => Ok(PaimonDataType::Float(FloatType::with_nullable(nullable))),
+        ArrowDataType::Float64 => Ok(PaimonDataType::Double(DoubleType::with_nullable(nullable))),
+        ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 | ArrowDataType::Utf8View => {
+            Ok(PaimonDataType::VarChar(VarCharType::with_nullable(
+                nullable,
+                VarCharType::MAX_LENGTH,
+            )?))
+        }
+        ArrowDataType::Binary | ArrowDataType::LargeBinary | ArrowDataType::BinaryView => Ok(
+            PaimonDataType::VarBinary(VarBinaryType::try_new(nullable, VarBinaryType::MAX_LENGTH)?),
+        ),
+        ArrowDataType::Date32 => Ok(PaimonDataType::Date(DateType::with_nullable(nullable))),
+        ArrowDataType::Timestamp(unit, tz) => {
+            let precision = match unit {
+                TimeUnit::Second => 0,
+                TimeUnit::Millisecond => 3,
+                TimeUnit::Microsecond => 6,
+                TimeUnit::Nanosecond => 9,
+            };
+            if tz.is_some() {
+                Ok(PaimonDataType::LocalZonedTimestamp(
+                    LocalZonedTimestampType::with_nullable(nullable, precision)?,
+                ))
+            } else {
+                Ok(PaimonDataType::Timestamp(TimestampType::with_nullable(
+                    nullable, precision,
+                )?))
+            }
+        }
+        ArrowDataType::Time32(_) | ArrowDataType::Time64(_) => {
+            let precision = match arrow_type {
+                ArrowDataType::Time32(TimeUnit::Second) => 0,
+                ArrowDataType::Time32(TimeUnit::Millisecond) => 3,
+                ArrowDataType::Time64(TimeUnit::Microsecond) => 6,
+                ArrowDataType::Time64(TimeUnit::Nanosecond) => 9,
+                _ => 0,
+            };
+            Ok(PaimonDataType::Time(TimeType::with_nullable(
+                nullable, precision,
+            )?))
+        }
+        ArrowDataType::Decimal128(p, s) => Ok(PaimonDataType::Decimal(DecimalType::with_nullable(
+            nullable, *p as u32, *s as u32,
+        )?)),
+        ArrowDataType::List(field) | ArrowDataType::LargeList(field) => {
+            let element = arrow_to_paimon_type(field.data_type(), field.is_nullable())?;
+            Ok(PaimonDataType::Array(ArrayType::with_nullable(
+                nullable, element,
+            )))
+        }
+        ArrowDataType::Map(entries_field, _) => {
+            if let ArrowDataType::Struct(fields) = entries_field.data_type() {
+                if fields.len() == 2 {
+                    let key = arrow_to_paimon_type(fields[0].data_type(), fields[0].is_nullable())?;
+                    let value =
+                        arrow_to_paimon_type(fields[1].data_type(), fields[1].is_nullable())?;
+                    return Ok(PaimonDataType::Map(MapType::with_nullable(
+                        nullable, key, value,
+                    )));
+                }
+            }
+            Err(anyhow!("Unsupported Map structure"))
+        }
+        ArrowDataType::Struct(fields) => {
+            if is_variant_arrow_fields(fields) && has_variant_arrow_field_ids(fields) {
+                return Ok(PaimonDataType::Variant(VariantType::with_nullable(
+                    nullable,
+                )));
+            }
+            let field_slice: Vec<ArrowField> = fields.iter().map(|f| f.as_ref().clone()).collect();
+            let paimon_fields = arrow_fields_to_paimon(&field_slice)?;
+            Ok(PaimonDataType::Row(RowType::with_nullable(
+                nullable,
+                paimon_fields,
+            )))
+        }
+        ArrowDataType::FixedSizeList(field, size) => {
+            let element = arrow_to_paimon_type(field.data_type(), field.is_nullable())?;
+            // FixedSizeList size is i32; reject non-positive sizes with a clear error
+            // rather than casting a negative into a huge u32.
+            let length = u32::try_from(*size)
+                .map_err(|_| anyhow!("Invalid vector (FixedSizeList) length: {size}"))?;
+            Ok(PaimonDataType::Vector(VectorType::try_new(
+                nullable, length, element,
+            )?))
+        }
+
+        ArrowDataType::Null => Ok(PaimonDataType::Boolean(BooleanType::with_nullable(true))),
+        _ => Err(anyhow!(
+            "Unsupported Arrow type for Paimon conversion: {arrow_type:?}"
+        )),
+    }
+}
+
+pub(crate) fn is_variant_arrow_fields(fields: &arrow_schema::Fields) -> bool {
+    fields.len() == 2
+        && fields[0].name() == "value"
+        && fields[0].data_type() == &ArrowDataType::Binary
+        && !fields[0].is_nullable()
+        && fields[1].name() == "metadata"
+        && fields[1].data_type() == &ArrowDataType::Binary
+        && !fields[1].is_nullable()
+}
+
+fn has_variant_arrow_field_ids(fields: &arrow_schema::Fields) -> bool {
+    fields.len() == 2
+        && arrow_field_id(&fields[0]) == Some(0)
+        && arrow_field_id(&fields[1]) == Some(1)
+}
+
+fn arrow_field_id(field: &ArrowField) -> Option<i32> {
+    field.metadata().get("PARQUET:field_id")?.parse().ok()
 }
 #[cfg(test)]
 mod tests {
@@ -1105,7 +1321,7 @@ mod tests {
             IterableValue::new(vec![]),
         ];
         let array = iterable_values_to_array(&iterables, &DataType::Int64).unwrap();
-        let list_type = DataType::List(Arc::new(Field::new("item", DataType::Int64, false)));
+        let list_type = DataType::List(Arc::new(ArrowField::new("item", DataType::Int64, false)));
 
         let row0 = iterable_value_from_array_row(array.as_ref(), &list_type, 0).unwrap();
         assert_eq!(row0.list, vec![i(1), i(2), i(3)]);
@@ -1116,13 +1332,13 @@ mod tests {
 
     #[test]
     fn iterable_value_from_array_row_null_row_yields_empty_list() {
-        let item_field = Arc::new(Field::new("item", DataType::Int64, false));
+        let item_field = Arc::new(ArrowField::new("item", DataType::Int64, false));
         let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 0]));
         let child = Int64Array::from(Vec::<i64>::new());
         let validity = arrow_buffer::NullBuffer::from(vec![false]); // row 0 is null
         let list = ListArray::new(item_field, offsets, Arc::new(child), Some(validity));
 
-        let list_type = DataType::List(Arc::new(Field::new("item", DataType::Int64, false)));
+        let list_type = DataType::List(Arc::new(ArrowField::new("item", DataType::Int64, false)));
         let result = iterable_value_from_array_row(&list, &list_type, 0).unwrap();
         assert_eq!(result.list, Vec::<PrimitiveValue>::new());
     }

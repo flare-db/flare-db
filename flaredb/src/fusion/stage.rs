@@ -1,10 +1,12 @@
 use beam_model_rs::v1::executable_stage_payload::WireCoderSetting;
 use beam_model_rs::v1::{Components, Environment, PTransform};
 use indexmap::IndexSet;
+use petgraph::Graph;
 use uuid::Uuid;
 
-use crate::fusion::pipeline::{PCollectionNode, PTransformNode};
+use crate::fusion::pipeline::{ConsumerMetaData, ExecutableNode, PCollectionNode, PTransformNode};
 use crate::fusion::refs::{SideInputRef, TimerRef, UserStateRef};
+use crate::jobservice::urns;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -49,59 +51,6 @@ impl Hash for ExecutableStage {
         self.id.hash(state);
     }
 }
-/*
-impl PartialEq for ExecutableStage {
-    fn eq(&self, other: &Self) -> bool {
-        self.components.encode_to_vec() == other.components.encode_to_vec()
-            && self.environment.encode_to_vec() == other.environment.encode_to_vec()
-            && self.wire_coder == other.wire_coder
-            && self.input_pcol == other.input_pcol
-            && self.side_inputs == other.side_inputs
-            && self.user_states == other.user_states
-            && self.timers == other.timers
-            && self.output_pcols == other.output_pcols
-            && self.transforms == other.transforms
-    }
-}
-
-impl Eq for ExecutableStage {}
-
-impl Hash for ExecutableStage {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.components.encode_to_vec().hash(state);
-        self.environment.encode_to_vec().hash(state);
-
-        let mut wire_hashes: Vec<u64> = self
-            .wire_coder
-            .iter()
-            .map(|item| {
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                item.hash(&mut hasher);
-                hasher.finish()
-            })
-            .collect();
-        wire_hashes.sort_unstable();
-        wire_hashes.hash(state);
-
-        self.input_pcol.hash(state);
-        for item in &self.side_inputs {
-            item.hash(state);
-        }
-        for item in &self.user_states {
-            item.hash(state);
-        }
-        for item in &self.timers {
-            item.hash(state);
-        }
-        for item in &self.output_pcols {
-            item.hash(state);
-        }
-        for item in &self.transforms {
-            item.hash(state);
-        }
-    }
-}
-*/
 impl ExecutableStage {
     pub fn from(
         components: Components,
@@ -181,6 +130,15 @@ impl ExecutableStage {
         let pcol_map = HashMap::<String, PCollection>::new();
         //self.
     }*/
+    pub fn is_splittable(&self) -> bool {
+        self.transforms().iter().any(|t| {
+            t.node()
+                .spec
+                .as_ref()
+                .map(|s| urns::beam_urns::SPLITTABLE_PARDO_COMPONENTS.contains(&s.urn.as_str()))
+                .unwrap_or(false)
+        })
+    }
 }
 
 #[derive(Eq, PartialEq, Clone, Hash)]
@@ -279,5 +237,63 @@ impl SiblingKey {
 
     pub fn get_env(&self) -> &Option<Environment> {
         &self.env
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SplittableProcessKind {
+    ProcessElements,
+    ProcessKeyedElements,
+    ProcessSizedElementsAndRestrictions,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SplittableExecutionPlan {
+    pub initialization_stage: ExecutableStage,
+    pub process_stage: ExecutableStage,
+    pub process_kind: SplittableProcessKind,
+}
+
+/// A subgraph of worker nodes that use a splittable ParDo.
+///
+/// The outer executable graph treats this as one node; `output_pcols` contains
+/// only the PCollections that leave the subgraph.
+#[derive(Clone)]
+pub struct SplittableStage {
+    id: String,
+    stage: Graph<ExecutableNode, ConsumerMetaData>,
+    output_pcols: HashSet<String>,
+    plan: SplittableExecutionPlan,
+}
+
+impl SplittableStage {
+    pub fn new(
+        id: String,
+        stage: Graph<ExecutableNode, ConsumerMetaData>,
+        output_pcols: HashSet<String>,
+        plan: SplittableExecutionPlan,
+    ) -> Self {
+        Self {
+            id,
+            stage,
+            output_pcols,
+            plan,
+        }
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn graph(&self) -> &Graph<ExecutableNode, ConsumerMetaData> {
+        &self.stage
+    }
+
+    pub fn output_pcols(&self) -> &HashSet<String> {
+        &self.output_pcols
+    }
+
+    pub fn plan(&self) -> &SplittableExecutionPlan {
+        &self.plan
     }
 }

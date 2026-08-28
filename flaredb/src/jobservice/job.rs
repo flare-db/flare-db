@@ -1,6 +1,8 @@
+use crate::fusion::expander::{ProtoOverrides, SplittableParDoExpander};
 use crate::fusion::fuser::GreedyPipelineFuser;
 use crate::fusion::pipeline::{ExecutableGraph, FusedPipeline, PTransformNode, QueryablePipeline};
 use crate::fusion::stage::CollectionConsumers;
+use crate::jobservice::urns;
 use crate::utils::errors::*;
 use crate::utils::path;
 use crate::utils::visualization::executable_graph_to_dot;
@@ -33,15 +35,29 @@ impl Job {
             warn!("Failed to create debug output directory: {error}");
         }
 
-        let fused_pipeline = fuse_pipeline(pipeline).unwrap();
-        /*let fused_out = path::instance_dir(instance_id).join(job_id).join("debug").join("fused_pipeline.txt");
+        let raw_pipeline_text_out = path::debug_raw_pipeline_text_path(instance_id, job_id);
+        if let Err(error) = fs::write(&raw_pipeline_text_out, format!("{pipeline:#?}")) {
+            warn!("Failed to write formatted raw pipeline debug file: {error}");
+        }
+        // Expand any splittable ParDos within the graph to enable sizing and
+        // splitting of bundles.
+        let pipeline_with_sdf_expanded = ProtoOverrides::update_transform(
+            urns::beam_urns::PAR_DO_TRANSFORM,
+            pipeline,
+            &SplittableParDoExpander::create_sized_replacement(),
+        );
+
+        let fused_pipeline = fuse_pipeline(&pipeline_with_sdf_expanded).unwrap();
+
+        let fused_out = path::debug_fused_pipeline_path(instance_id, job_id);
         if let Err(error) = fs::write(&fused_out, format!("{fused_pipeline:#?}")) {
             warn!("Failed to write formatted fused pipeline debug file: {error}");
-        }*/
+        }
+
         let executable_graph = ExecutableGraph::from(
             fused_pipeline.sdk_stages().clone(),
             fused_pipeline.runner_stages().clone(),
-            pipeline.components.clone().unwrap(),
+            pipeline_with_sdf_expanded.components.clone().unwrap(),
         );
         if let Err(error) = fs::write(&debug_path, executable_graph_to_dot(&executable_graph)) {
             warn!("Failed to write executable graph DOT debug file: {error}");
@@ -55,7 +71,7 @@ impl Job {
 
 #[derive(Clone)]
 pub struct JobStore {
-    jobs: Arc<DashMap<String, Arc<ExecutableGraph>>>, // store Arc so reads don't require a guard
+    jobs: Arc<DashMap<String, Arc<ExecutableGraph>>>,
 }
 
 impl JobStore {

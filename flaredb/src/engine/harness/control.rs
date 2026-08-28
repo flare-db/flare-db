@@ -215,7 +215,7 @@ impl ControlChannel {
     // Reset the control channel so a new worker can connect.
     //
     // Creates a fresh mpsc pair, clears the incoming stream, and drops all
-    // previously registered descriptors.  Call this between jobs (after
+    // previously registered descriptors.  Called between jobs (after
     // killing the old worker, before spawning the new one).
     pub async fn reset(&self) {
         let handle = self.response_task.lock().unwrap().take();
