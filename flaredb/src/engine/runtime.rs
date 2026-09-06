@@ -17,12 +17,10 @@ use prost::Message;
 use tokio::sync::{Mutex, mpsc::UnboundedReceiver};
 
 use crate::{
-    engine::{
-        coders::{BeamCoder, StandardBeamCoders, WindowedValueCoder},
-        harness::{
-            control::{ControlChannel, ControlResponse},
-            data::{DataChannel, DataKey, ElementStreamPayload},
-        },
+    coders::{BeamCoder, StandardBeamCoders, primitives::WindowedValueCoder},
+    engine::harness::{
+        control::{ControlChannel, ControlResponse},
+        data::{DataChannel, DataKey, ElementStreamPayload},
     },
     fusion::{pipeline::ConsumerMetaData, stage::ExecutableStage},
     jobservice::urns::beam_urns,
