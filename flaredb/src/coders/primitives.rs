@@ -372,15 +372,15 @@ fn decode_pane_info(buf: &mut impl Buf) -> PaneInfo {
     }
 }
 
-fn encode_signed_varint(value: i64, buf: &mut impl BufMut) {
+pub(crate) fn encode_signed_varint(value: i64, buf: &mut impl BufMut) {
     encode_varint(value as u64, buf);
 }
 
-fn decode_signed_varint(buf: &mut impl Buf) -> i64 {
+pub(crate) fn decode_signed_varint(buf: &mut impl Buf) -> i64 {
     decode_varint(buf) as i64
 }
 
-fn encode_varint(mut value: u64, buf: &mut impl BufMut) {
+pub(crate) fn encode_varint(mut value: u64, buf: &mut impl BufMut) {
     loop {
         let mut byte = (value & 0x7F) as u8;
         value >>= 7;
@@ -397,7 +397,7 @@ fn encode_varint(mut value: u64, buf: &mut impl BufMut) {
     }
 }
 
-fn decode_varint(buf: &mut impl Buf) -> u64 {
+pub(crate) fn decode_varint(buf: &mut impl Buf) -> u64 {
     let mut result = 0u64;
     let mut shift = 0;
 

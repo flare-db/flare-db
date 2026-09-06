@@ -1,4 +1,6 @@
 pub mod primitives;
+pub mod row;
+pub mod schema;
 
 use crate::store::record::{BeamGbk, BeamKV, BeamRecord, IterableValue};
 use crate::{
