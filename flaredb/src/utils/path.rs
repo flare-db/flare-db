@@ -26,6 +26,10 @@ pub fn warehouse_dir() -> PathBuf {
     base_dir().join("warehouse")
 }
 
+pub fn flare_warehouse_dir() -> PathBuf {
+    base_dir().join("flare_warehouse")
+}
+
 pub fn instance_dir(instance_id: &str) -> PathBuf {
     base_dir().join("instances").join(instance_id)
 }

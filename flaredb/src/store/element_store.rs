@@ -56,12 +56,7 @@ pub struct FlareElementStore {
 
 impl FlareElementStore {
     pub async fn new(warehouse: String, db_name: String) -> Result<Self> {
-        let mut options = Options::new();
-        options.set(CatalogOptions::WAREHOUSE, warehouse.as_str());
-        let catalog = FileSystemCatalog::new(options)?;
-        catalog
-            .create_database(&db_name, true, HashMap::new())
-            .await?;
+        let catalog = create_catalog(warehouse, db_name.clone()).await?;
         Ok(Self {
             registry: FlareSchemaRegistry::new(),
             catalog,
@@ -187,6 +182,15 @@ impl FlareElementStore {
     }
 }
 
+pub async fn create_catalog(warehouse: String, db_name: String) -> Result<FileSystemCatalog> {
+    let mut options = Options::new();
+    options.set(CatalogOptions::WAREHOUSE, warehouse.as_str());
+    let catalog = FileSystemCatalog::new(options)?;
+    catalog
+        .create_database(&db_name, true, HashMap::new())
+        .await?;
+    Ok(catalog)
+}
 /// Convert an Arrow [`Schema`](ArrowSchema) into a Paimon [`Schema`](PaimonSchema).
 ///
 /// The resulting schema preserves Arrow field names and converted data types,
