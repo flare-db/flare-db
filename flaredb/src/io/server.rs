@@ -5,7 +5,10 @@ use arrow_flight::{
     SchemaAsIpc, Ticket,
     encode::FlightDataEncoderBuilder,
     flight_service_server::FlightServiceServer,
-    sql::{CommandStatementQuery, SqlInfo, TicketStatementQuery, server::FlightSqlService},
+    sql::{
+        CommandStatementQuery, CommandStatementUpdate, SqlInfo, TicketStatementQuery,
+        server::{FlightSqlService, PeekableFlightDataStream},
+    },
 };
 
 use arrow_ipc::writer::IpcWriteOptions;
@@ -175,5 +178,13 @@ impl FlightSqlService for FlareIO {
             .map(|result| result.map_err(|err| Status::internal(format!("Flight error: {}", err))));
 
         Ok(Response::new(Box::pin(flight_stream)))
+    }
+
+    async fn do_put_statement_update(
+        &self,
+        ticket: CommandStatementUpdate,
+        _request: Request<PeekableFlightDataStream>,
+    ) -> Result<i64, Status> {
+        Ok(0)
     }
 }
