@@ -82,7 +82,7 @@ impl FlareElementStore {
         let table = self.get_table(pcollection_id, &table_schema).await?;
         let builder = table.new_write_builder();
 
-        // Paimon has no Null type; convert Void columns to null booleans.
+        // Paimon has no Null type so convert Void columns to null booleans.
         let batch = materialize_void_columns(batch)?;
 
         let mut writer = builder.new_write()?;

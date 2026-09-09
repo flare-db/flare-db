@@ -2,13 +2,13 @@ use std::{pin::Pin, sync::Arc};
 
 use arrow_flight::{
     FlightDescriptor, FlightEndpoint, FlightInfo, HandshakeRequest, HandshakeResponse, IpcMessage,
-    SchemaAsIpc, Ticket,
+    PutResult, SchemaAsIpc, Ticket,
     decode::FlightRecordBatchStream,
     encode::FlightDataEncoderBuilder,
     error::FlightError,
     flight_service_server::FlightServiceServer,
     sql::{
-        CommandStatementQuery, CommandStatementUpdate, SqlInfo, TicketStatementQuery,
+        Any, CommandStatementQuery, DoPutUpdateResult, SqlInfo, TicketStatementQuery,
         server::{FlightSqlService, PeekableFlightDataStream},
     },
 };
@@ -66,6 +66,38 @@ impl FlareIO {
 
     pub fn into_server(self) -> FlightServiceServer<Self> {
         FlightServiceServer::new(self)
+    }
+
+    /// Decode an Arrow Flight `DoPut` stream and write each record batch to the
+    /// Paimon table backing `pcollection_id`.
+    async fn write_flight_batches(
+        &self,
+        pcollection_id: &str,
+        stream: PeekableFlightDataStream,
+    ) -> Result<i64, Status> {
+        let stream = stream
+            .into_inner()
+            .map(|item| item.map_err(|status| FlightError::from_external_error(Box::new(status))));
+        let mut batches = FlightRecordBatchStream::new_from_flight_data(stream);
+
+        let mut record_count = 0_i64;
+        while let Some(batch) = batches.next().await {
+            let batch = batch
+                .map_err(|err| Status::internal(format!("Failed to decode Flight data: {err}")))?;
+            record_count += batch.num_rows() as i64;
+
+            self.store
+                .write_row_batch(pcollection_id, batch)
+                .await
+                .map_err(|err| {
+                    Status::internal(format!(
+                        "Failed to write batch to Paimon table '{pcollection_id}': {err}"
+                    ))
+                })?;
+        }
+
+        debug!("Wrote {record_count} rows to pcollection '{pcollection_id}'");
+        Ok(record_count)
     }
 }
 
@@ -191,37 +223,48 @@ impl FlightSqlService for FlareIO {
         Ok(Response::new(Box::pin(flight_stream)))
     }
 
-    async fn do_put_statement_update(
+    /*async fn do_put_statement_update(
         &self,
         ticket: CommandStatementUpdate,
         request: Request<PeekableFlightDataStream>,
     ) -> Result<i64, Status> {
         let pcollection_id = parse_table_name(&ticket.query)?;
+        self.write_flight_batches(&pcollection_id, request.into_inner())
+            .await
+    }*/
 
-        // Convert the tonic `Status` error stream into `FlightError`
-        let stream = request
-            .into_inner()
-            .map(|item| item.map_err(|status| FlightError::from_external_error(Box::new(status))));
-        let mut batches = FlightRecordBatchStream::new_from_flight_data(stream);
+    async fn do_put_fallback(
+        &self,
+        request: Request<PeekableFlightDataStream>,
+        _message: Any,
+    ) -> Result<
+        Response<Pin<Box<dyn Stream<Item = Result<PutResult, Status>> + Send + 'static>>>,
+        Status,
+    > {
+        let mut stream = request.into_inner();
 
-        let mut record_count = 0_i64;
-        while let Some(batch) = batches.next().await {
-            let batch = batch
-                .map_err(|err| Status::internal(format!("Failed to decode Flight data: {err}")))?;
-            record_count += batch.num_rows() as i64;
+        let reference = match stream.peek().await {
+            Some(Ok(data)) => data
+                .flight_descriptor
+                .as_ref()
+                .map(|descriptor| descriptor.path.join("."))
+                .unwrap_or_default(),
+            Some(Err(status)) => return Err(status.clone()),
+            None => {
+                return Err(Status::invalid_argument(
+                    "DoPut stream is missing its FlightData descriptor",
+                ));
+            }
+        };
 
-            self.store
-                .write_row_batch(&pcollection_id, batch)
-                .await
-                .map_err(|err| {
-                    Status::internal(format!(
-                        "Failed to write batch to Paimon table '{pcollection_id}': {err}"
-                    ))
-                })?;
-        }
+        let pcollection_id = parse_table_name(&reference)?;
+        let record_count = self.write_flight_batches(&pcollection_id, stream).await?;
 
-        debug!("Wrote {record_count} rows to pcollection '{pcollection_id}'");
-        Ok(record_count)
+        let result = DoPutUpdateResult { record_count };
+        let output = futures::stream::iter(vec![Ok(PutResult {
+            app_metadata: prost::Message::encode_to_vec(&result).into(),
+        })]);
+        Ok(Response::new(Box::pin(output)))
     }
 }
 
