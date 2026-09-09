@@ -12,11 +12,16 @@ use std::hash::{Hash, Hasher};
 use paimon::spec::{
     ArrayType, BigIntType, BooleanType, DataField, DataType as PaimonDataType, DateType,
     DecimalType, DoubleType, FloatType, IntType, LocalZonedTimestampType, MapType, RowType,
-    SmallIntType, TimeType, TimestampType, TinyIntType, VarBinaryType, VarCharType, VariantType,
-    VectorType,
+    Schema as PaimonSchema, SmallIntType, TimeType, TimestampType, TinyIntType, VarBinaryType,
+    VarCharType, VariantType, VectorType,
 };
 
 use super::{KEY_COLUMN, VALUE_COLUMN};
+
+use crate::{
+    coders::schema::{BeamField, BeamFieldType, BeamSchema, BeamTypeKind},
+    jobservice::urns,
+};
 
 #[derive(Debug, Clone)]
 pub enum BeamRecord {
@@ -164,6 +169,8 @@ pub enum TableType {
     Kv,
     /// Two columns: `key` (primitive), `value` (List<Primitive>).
     Gbk,
+    /// A full Beam row schema stored as its named Arrow columns.
+    Row,
 }
 
 impl TableType {
@@ -173,6 +180,7 @@ impl TableType {
             TableType::Iterable => "iterable",
             TableType::Kv => "kv",
             TableType::Gbk => "gbk",
+            TableType::Row => "row",
         }
     }
 
@@ -182,6 +190,7 @@ impl TableType {
             "iterable" => Ok(TableType::Iterable),
             "kv" => Ok(TableType::Kv),
             "gbk" => Ok(TableType::Gbk),
+            "row" => Ok(TableType::Row),
             other => Err(anyhow!("unknown table type: {other}")),
         }
     }
@@ -201,6 +210,16 @@ fn table_type_of(record: &BeamRecord) -> TableType {
 pub struct RecordTableSchema {
     pub table_type: TableType,
     pub arrow_schema: Arc<Schema>,
+}
+
+impl RecordTableSchema {
+    /// Build a row-shaped table schema from an arbitrary Arrow schema.
+    pub fn row(arrow_schema: Arc<Schema>) -> Self {
+        Self {
+            table_type: TableType::Row,
+            arrow_schema,
+        }
+    }
 }
 
 // Value-type helpers
@@ -608,6 +627,8 @@ pub fn derive_table_schema(
                 ),
             ]))
         }
+
+        TableType::Row => unreachable!("BeamRecord cannot derive a row table"),
     };
 
     Ok(RecordTableSchema {
@@ -719,6 +740,11 @@ pub fn beamrecords_to_record_batch(
             columns.push(primitive_values_to_array(&keys, key_data_type)?);
             columns.push(iterable_values_to_array(&values, item_field.data_type())?);
         }
+        TableType::Row => {
+            return Err(anyhow!(
+                "row tables store full Beam row schemas and do not convert to BeamRecord"
+            ));
+        }
     }
 
     RecordBatch::try_new(table_schema.arrow_schema.clone(), columns)
@@ -802,6 +828,11 @@ pub fn record_batch_to_beamrecords(
                     )?,
                 }));
             }
+        }
+        TableType::Row => {
+            return Err(anyhow!(
+                "row tables store full Beam row schemas and do not convert to BeamRecord"
+            ));
         }
     }
 
@@ -960,6 +991,103 @@ pub fn arrow_to_paimon_type(arrow_type: &ArrowDataType, nullable: bool) -> Resul
             "Unsupported Arrow type for Paimon conversion: {arrow_type:?}"
         )),
     }
+}
+
+/// Convert a Beam field type into its Arrow [`DataType`](ArrowDataType) form.
+///
+/// This mirrors the Beam-to-Arrow mapping used by the Beam Arrow extension
+/// (`ArrowConversion.toArrowField`), extended to the composite row types that
+/// the portable `beam:coder:row:v1` schema supports.
+fn beam_field_type_to_arrow(ft: &BeamFieldType) -> Result<ArrowDataType> {
+    match &ft.kind {
+        BeamTypeKind::Byte => Ok(ArrowDataType::Int8),
+        BeamTypeKind::Int16 => Ok(ArrowDataType::Int16),
+        BeamTypeKind::Int32 => Ok(ArrowDataType::Int32),
+        BeamTypeKind::Int64 => Ok(ArrowDataType::Int64),
+        BeamTypeKind::Float => Ok(ArrowDataType::Float32),
+        BeamTypeKind::Double => Ok(ArrowDataType::Float64),
+        BeamTypeKind::String => Ok(ArrowDataType::Utf8),
+        BeamTypeKind::Boolean => Ok(ArrowDataType::Boolean),
+        BeamTypeKind::Bytes => Ok(ArrowDataType::Binary),
+        BeamTypeKind::Array(elem) => Ok(ArrowDataType::List(Arc::new(
+            beam_field_type_to_arrow_field("item", elem)?,
+        ))),
+        BeamTypeKind::Iterable(elem) => Ok(ArrowDataType::List(Arc::new(
+            beam_field_type_to_arrow_field("item", elem)?,
+        ))),
+        BeamTypeKind::Map(key_ft, value_ft) => {
+            let key = beam_field_type_to_arrow_field("key", key_ft)?;
+            let value = beam_field_type_to_arrow_field("value", value_ft)?;
+            let entries = ArrowField::new(
+                "entries",
+                ArrowDataType::Struct(vec![Arc::new(key), Arc::new(value)].into()),
+                false,
+            );
+            Ok(ArrowDataType::Map(Arc::new(entries), false))
+        }
+        BeamTypeKind::Row(sub_schema) => {
+            let fields = sub_schema
+                .fields
+                .iter()
+                .map(|field| Ok(Arc::new(beam_field_to_arrow_field(field)?)))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(ArrowDataType::Struct(fields.into()))
+        }
+        BeamTypeKind::Logical { urn, repr } => match urn.as_str() {
+            urns::beam_urns::LOGICAL_TYPE_MICROS_INSTANT => Ok(ArrowDataType::Timestamp(
+                TimeUnit::Microsecond,
+                Some("UTC".into()),
+            )),
+            urns::beam_urns::LOGICAL_TYPE_MILLIS_INSTANT => Ok(ArrowDataType::Timestamp(
+                TimeUnit::Millisecond,
+                Some("UTC".into()),
+            )),
+            urns::beam_urns::LOGICAL_TYPE_NANOS_INSTANT => Ok(ArrowDataType::Timestamp(
+                TimeUnit::Nanosecond,
+                Some("UTC".into()),
+            )),
+            _ => beam_field_type_to_arrow(repr),
+        },
+    }
+}
+
+fn beam_field_type_to_arrow_field(name: &str, ft: &BeamFieldType) -> Result<ArrowField> {
+    Ok(ArrowField::new(
+        name,
+        beam_field_type_to_arrow(ft)?,
+        ft.nullable,
+    ))
+}
+
+fn beam_field_to_arrow_field(field: &BeamField) -> Result<ArrowField> {
+    beam_field_type_to_arrow_field(field.name.as_str(), &field.field_type)
+}
+
+/// Convert a portable Beam row schema into an Arrow [`Schema`](Schema).
+pub fn beam_schema_to_arrow(schema: &BeamSchema) -> Result<Arc<Schema>> {
+    let fields = schema
+        .fields
+        .iter()
+        .map(beam_field_to_arrow_field)
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Arc::new(Schema::new(fields)))
+}
+
+/// Convert a portable Beam row schema into a Paimon [`Schema`](PaimonSchema).
+pub fn beam_schema_to_paimon(schema: &BeamSchema) -> Result<PaimonSchema> {
+    let arrow_schema = beam_schema_to_arrow(schema)?;
+    let arrow_fields: Vec<ArrowField> = arrow_schema
+        .fields()
+        .iter()
+        .map(|field| field.as_ref().clone())
+        .collect();
+    let fields = arrow_fields_to_paimon(&arrow_fields)?;
+    let builder = fields
+        .into_iter()
+        .fold(PaimonSchema::builder(), |builder, field| {
+            builder.column(field.name().to_string(), field.data_type().clone())
+        });
+    Ok(builder.build()?)
 }
 
 pub(crate) fn is_variant_arrow_fields(fields: &arrow_schema::Fields) -> bool {
@@ -1647,5 +1775,41 @@ mod tests {
         let list = array.as_any().downcast_ref::<ListArray>().unwrap();
         assert_eq!(list.len(), 100);
         assert_eq!(list.values().len(), total);
+    }
+
+    //  Beam row schema -> Paimon schema
+
+    #[test]
+    fn beam_schema_to_paimon_maps_named_fields() {
+        use crate::coders::schema::{BeamField, BeamFieldType, BeamSchema, BeamTypeKind};
+
+        let schema = BeamSchema {
+            id: "row-schema".to_string(),
+            fields: vec![
+                BeamField {
+                    name: "id".to_string(),
+                    field_type: BeamFieldType {
+                        nullable: false,
+                        kind: BeamTypeKind::Int64,
+                    },
+                    encoding_position: 0,
+                },
+                BeamField {
+                    name: "name".to_string(),
+                    field_type: BeamFieldType {
+                        nullable: true,
+                        kind: BeamTypeKind::String,
+                    },
+                    encoding_position: 1,
+                },
+            ],
+            encode_order: vec![0, 1],
+        };
+
+        let paimon = beam_schema_to_paimon(&schema).unwrap();
+        let fields = paimon.fields();
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].name(), "id");
+        assert_eq!(fields[1].name(), "name");
     }
 }

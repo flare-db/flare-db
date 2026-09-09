@@ -4,6 +4,7 @@ use anyhow::{Result, anyhow};
 use arrow_array::RecordBatch;
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 use dashmap::DashMap;
+use datafusion::catalog;
 use paimon::spec::Schema as PaimonSchema;
 use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options, Table, catalog::Identifier};
 use tokio_stream::StreamExt;
@@ -50,13 +51,20 @@ impl FlareSchemaRegistry {
 
 pub struct FlareElementStore {
     pub(crate) registry: FlareSchemaRegistry,
-    pub(crate) catalog: FileSystemCatalog,
+    pub(crate) catalog: Arc<FileSystemCatalog>,
     pub(crate) db_name: String,
 }
 
 impl FlareElementStore {
-    pub async fn new(warehouse: String, db_name: String) -> Result<Self> {
-        let catalog = create_catalog(warehouse, db_name.clone()).await?;
+    pub async fn new(
+        warehouse: String,
+        db_name: String,
+        catalog: Option<Arc<FileSystemCatalog>>,
+    ) -> Result<Self> {
+        let catalog = match catalog {
+            Some(catalog) => catalog,
+            None => Arc::new(create_catalog(warehouse, db_name.clone()).await?),
+        };
         Ok(Self {
             registry: FlareSchemaRegistry::new(),
             catalog,
@@ -121,6 +129,14 @@ impl FlareElementStore {
             .await?;
 
         Ok(())
+    }
+
+    /// Ingest a row-shaped [`RecordBatch`] whose Arrow schema describes a full
+    /// Beam Row.
+    pub async fn write_row_batch(&self, pcollection_id: &str, batch: RecordBatch) -> Result<()> {
+        let table_schema = Arc::new(RecordTableSchema::row(batch.schema()));
+        self.write_record_batch(pcollection_id, batch, table_schema)
+            .await
     }
 
     /// Full scan of a PCollection, reads all rows from Paimon and converts
@@ -236,7 +252,7 @@ mod element_store_tests {
             .to_str()
             .expect("tempdir path is not valid utf8")
             .to_string();
-        let store = FlareElementStore::new(warehouse, "testdb".to_string())
+        let store = FlareElementStore::new(warehouse, "testdb".to_string(), None)
             .await
             .expect("failed to construct FlareElementStore");
         (dir, store)
@@ -312,10 +328,10 @@ mod element_store_tests {
         let warehouse = dir.path().to_str().unwrap().to_string();
         // create_database is called with exist_ok=true, so constructing
         // twice against the same warehouse/db name must not error.
-        FlareElementStore::new(warehouse.clone(), "testdb".to_string())
+        FlareElementStore::new(warehouse.clone(), "testdb".to_string(), None)
             .await
             .unwrap();
-        FlareElementStore::new(warehouse, "testdb".to_string())
+        FlareElementStore::new(warehouse, "testdb".to_string(), None)
             .await
             .unwrap();
     }

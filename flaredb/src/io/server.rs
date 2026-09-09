@@ -3,7 +3,9 @@ use std::{pin::Pin, sync::Arc};
 use arrow_flight::{
     FlightDescriptor, FlightEndpoint, FlightInfo, HandshakeRequest, HandshakeResponse, IpcMessage,
     SchemaAsIpc, Ticket,
+    decode::FlightRecordBatchStream,
     encode::FlightDataEncoderBuilder,
+    error::FlightError,
     flight_service_server::FlightServiceServer,
     sql::{
         CommandStatementQuery, CommandStatementUpdate, SqlInfo, TicketStatementQuery,
@@ -21,13 +23,14 @@ use paimon::{Catalog, FileSystemCatalog};
 use paimon_datafusion::SQLContext;
 use tonic::{Request, Response, Status, Streaming};
 
-use crate::store::element_store::create_catalog;
+use crate::store::element_store::{FlareElementStore, create_catalog};
 
 pub struct FlareIO {
     catalog: Arc<FileSystemCatalog>,
     sql_info: DashMap<i32, SqlInfo>,
     sql_ctx: SQLContext,
     statements: DashMap<Vec<u8>, String>,
+    store: FlareElementStore,
 }
 
 impl FlareIO {
@@ -35,9 +38,16 @@ impl FlareIO {
         let store_path = crate::utils::path::flare_warehouse_dir();
         let store_base = store_path.to_str().unwrap_or(".").to_string();
 
-        let catalog = create_catalog(store_base, "default".to_string()).await?;
+        let catalog = create_catalog(store_base.clone(), "default".to_string()).await?;
 
         let catalog = Arc::new(catalog);
+
+        let store = FlareElementStore::new(
+            store_base,
+            "default".to_string(),
+            Some(Arc::clone(&catalog)),
+        )
+        .await?;
 
         let mut sql_ctx = SQLContext::new();
 
@@ -50,6 +60,7 @@ impl FlareIO {
             sql_ctx,
             sql_info: DashMap::new(),
             statements: DashMap::new(),
+            store,
         })
     }
 
@@ -183,8 +194,50 @@ impl FlightSqlService for FlareIO {
     async fn do_put_statement_update(
         &self,
         ticket: CommandStatementUpdate,
-        _request: Request<PeekableFlightDataStream>,
+        request: Request<PeekableFlightDataStream>,
     ) -> Result<i64, Status> {
-        Ok(0)
+        let pcollection_id = parse_table_name(&ticket.query)?;
+
+        // Convert the tonic `Status` error stream into `FlightError`
+        let stream = request
+            .into_inner()
+            .map(|item| item.map_err(|status| FlightError::from_external_error(Box::new(status))));
+        let mut batches = FlightRecordBatchStream::new_from_flight_data(stream);
+
+        let mut record_count = 0_i64;
+        while let Some(batch) = batches.next().await {
+            let batch = batch
+                .map_err(|err| Status::internal(format!("Failed to decode Flight data: {err}")))?;
+            record_count += batch.num_rows() as i64;
+
+            self.store
+                .write_row_batch(&pcollection_id, batch)
+                .await
+                .map_err(|err| {
+                    Status::internal(format!(
+                        "Failed to write batch to Paimon table '{pcollection_id}': {err}"
+                    ))
+                })?;
+        }
+
+        debug!("Wrote {record_count} rows to pcollection '{pcollection_id}'");
+        Ok(record_count)
     }
+}
+
+fn parse_table_name(reference: &str) -> Result<String, Status> {
+    let table = reference
+        .trim()
+        .rsplit('.')
+        .next()
+        .map(str::trim)
+        .unwrap_or_default();
+
+    if table.is_empty() {
+        return Err(Status::invalid_argument(
+            "Cannot derive a destination table name from the update statement",
+        ));
+    }
+
+    Ok(table.to_string())
 }
