@@ -10,6 +10,7 @@ out/
 !gradle/wrapper/gradle-wrapper.jar
 dependency-reduced-pom.xml
 .flattened-pom.xml
+bin/
 
 # IDE
 .idea/

@@ -1,5 +1,6 @@
 use flaredb::{
     engine::{dispatcher::ExecutorDispatcher, harness::Channels},
+    io::server::FlareIO,
     jobservice::{
         artifact::{ArtifactStore, FlareArtifactStagingService},
         server::FlareJobService,
@@ -71,6 +72,8 @@ async fn flare_up() -> Result<(), Box<dyn std::error::Error>> {
     let artifact_service =
         FlareArtifactStagingService::new(artifact_store, job_service.get_staging_tokens());
 
+    let flare_io = FlareIO::new().await?;
+
     Server::builder()
         .add_service(JobServiceServer::new(job_service))
         .add_service(ArtifactStagingServiceServer::new(artifact_service))
@@ -78,6 +81,7 @@ async fn flare_up() -> Result<(), Box<dyn std::error::Error>> {
         .add_service(BeamFnDataServer::new(services.data))
         .add_service(BeamFnLoggingServer::new(services.log))
         .add_service(BeamFnStateServer::new(services.state))
+        .add_service(flare_io.into_server())
         .serve(addr)
         .await?;
 

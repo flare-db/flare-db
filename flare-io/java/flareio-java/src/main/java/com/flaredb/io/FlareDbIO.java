@@ -65,7 +65,7 @@ import com.google.auto.value.AutoValue;
  * PCollection<Row> rows = pipeline.apply(
  *     FlareDbIO.read()
  *         .fromQuery("SELECT * FROM flare.default.my_table"));
- *         .withDbUrl("grpc://localhost:47470")
+ *         .withDbUrl("grpc://localhost:8099")
  * }</pre>
  *
  * <h3>Writing to FlareDB</h3>
@@ -74,14 +74,14 @@ import com.google.auto.value.AutoValue;
  * rows.apply(
  *     FlareDbIO.<Row>write()
  *         .to("flare.default.my_table"));
- *         .withDbUrl("grpc://localhost:47470")
+ *         .withDbUrl("grpc://localhost:8099")
  * }</pre>
  *
  */
 public class FlareDbIO {
 
   private static final Logger LOG = LoggerFactory.getLogger(FlareDbIO.class);
-  public static final String DEFAULT_DB_URL = "grpc://localhost:47470";
+  public static final String DEFAULT_DB_URL = "grpc://localhost:8099";
 
   /** Create a read transform for FlareDB. */
   public static Read read() {
@@ -113,7 +113,7 @@ public class FlareDbIO {
     }
 
     String host = "localhost";
-    int port = 47470;
+    int port = 8099;
     if (raw.contains(":")) {
       String[] parts = raw.split(":");
       host = parts[0];
@@ -196,7 +196,7 @@ public class FlareDbIO {
       abstract Read build();
     }
 
-    /** Sets the FlareDB URL (e.g. {@code "grpc://localhost:47470"}). */
+    /** Sets the FlareDB URL (e.g. {@code "grpc://localhost:8099"}). */
     public Read withDbUrl(String dbUrl) {
       return builder().setDbUrl(dbUrl).build();
     }
@@ -452,7 +452,7 @@ public class FlareDbIO {
       abstract Write<T> build();
     }
 
-    /** Sets the FlareDB URL (e.g. {@code "grpc://localhost:47470"}). */
+    /** Sets the FlareDB URL (e.g. {@code "grpc://localhost:8099"}). */
     public Write<T> withDbUrl(String dbUrl) {
       return builder().setDbUrl(dbUrl).build();
     }
@@ -622,8 +622,8 @@ public class FlareDbIO {
         case BYTES -> ((VarBinaryVector) vector).setSafe(index, (byte[]) value);
         case DATETIME -> {
             long millis;
-            if (value instanceof org.joda.time.ReadableInstant) {
-                millis = ((org.joda.time.ReadableInstant) value).getMillis();
+            if (value instanceof org.joda.time.ReadableInstant readableInstant) {
+                millis = readableInstant.getMillis();
             } else {
                 millis = ((Number) value).longValue();
             }
