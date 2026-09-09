@@ -4,7 +4,6 @@ use anyhow::{Result, anyhow};
 use arrow_array::RecordBatch;
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 use dashmap::DashMap;
-use datafusion::catalog;
 use paimon::spec::Schema as PaimonSchema;
 use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options, Table, catalog::Identifier};
 use tokio_stream::StreamExt;

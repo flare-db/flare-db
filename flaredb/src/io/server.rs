@@ -278,7 +278,7 @@ fn parse_table_name(reference: &str) -> Result<String, Status> {
 
     if table.is_empty() {
         return Err(Status::invalid_argument(
-            "Cannot derive a destination table name from the update statement",
+            "Cannot derive a destination table name",
         ));
     }
 

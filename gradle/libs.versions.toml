@@ -1,0 +1,41 @@
+
+[versions]
+
+beam = "2.76.0"
+
+arrow = "18.0.0"
+auto-value = "1.10.4"
+checker-qual = "3.42.0"
+joda-time = "2.10.14"
+junit = "4.13.2"
+slf4j = "2.0.11"
+
+# Plugins
+shadow = "8.3.8"
+spotless = "8.10.2"
+
+[libraries]
+beam-core = { group = "org.apache.beam", name = "beam-sdks-java-core", version.ref = "beam" }
+beam-arrow = { group = "org.apache.beam", name = "beam-sdks-java-extensions-arrow", version.ref = "beam" }
+beam-runners-portability = { group = "org.apache.beam", name = "beam-runners-portability-java", version.ref = "beam" }
+beam-nexmark = { group = "org.apache.beam", name = "beam-sdks-java-nexmark", version.ref = "beam" }
+
+arrow-flight-core = { group = "org.apache.arrow", name = "flight-core", version.ref = "arrow" }
+arrow-flight-sql = { group = "org.apache.arrow", name = "flight-sql", version.ref = "arrow" }
+arrow-vector = { group = "org.apache.arrow", name = "arrow-vector", version.ref = "arrow" }
+arrow-memory-core = { group = "org.apache.arrow", name = "arrow-memory-core", version.ref = "arrow" }
+arrow-memory-netty = { group = "org.apache.arrow", name = "arrow-memory-netty", version.ref = "arrow" }
+
+auto-value-annotations = { group = "com.google.auto.value", name = "auto-value-annotations", version.ref = "auto-value" }
+auto-value = { group = "com.google.auto.value", name = "auto-value", version.ref = "auto-value" }
+
+slf4j-api = { group = "org.slf4j", name = "slf4j-api", version.ref = "slf4j" }
+slf4j-simple = { group = "org.slf4j", name = "slf4j-simple", version.ref = "slf4j" }
+
+joda-time = { group = "joda-time", name = "joda-time", version.ref = "joda-time" }
+checker-qual = { group = "org.checkerframework", name = "checker-qual", version.ref = "checker-qual" }
+junit = { group = "junit", name = "junit", version.ref = "junit" }
+
+[plugins]
+shadow = { id = "com.gradleup.shadow", version.ref = "shadow" }
+spotless = { id = "com.diffplug.spotless", version.ref = "spotless" }

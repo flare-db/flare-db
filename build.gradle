@@ -1,0 +1,22 @@
+// Shared configuration for every Java module in the repository. Module
+// specific concerns (dependencies, publishing, application entry points)
+// live in each module's own build.gradle.
+
+allprojects {
+    group = 'com.flare-db'
+    version = '0.1.0'
+}
+
+subprojects {
+    apply plugin: 'java'
+
+    java {
+        toolchain {
+            languageVersion = JavaLanguageVersion.of(17)
+        }
+    }
+
+    tasks.withType(JavaCompile).configureEach {
+        options.encoding = 'UTF-8'
+    }
+}

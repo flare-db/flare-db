@@ -13,16 +13,16 @@ Benchmarks Apache Beam [`GroupByKey`](https://beam.apache.org/documentation/prog
 
 ## How to Run
 
-1. build project
+1. build project (from the repository root)
 ```sh
-mvn clean install
+./gradlew :nexmarkgbk:shadowJar
 ```
 
 2. Set your jar path in pipeline options. 
 ```java
 // Eg:
 options.setUberJar(
-        "/home/ganesh/flaredb-bench/flare-db/benchmarks/nexmarkgbk/target/nexmarkgbk-1.0-SNAPSHOT.jar");
+        "/home/ganesh/flare-db/flareio/flare-db/benchmarks/nexmarkgbk/build/libs/nexmarkgbk-0.1.0-all.jar");
 ```
 
 3. Create flaredb release build
@@ -36,20 +36,19 @@ cargo build --release
 ./flareup-dev.sh --release
 ```
 
-5. Run the pipeline
+5. Run the pipeline (from the repository root)
 ```sh
-cd benchmarks/nexmarkgbk
-mvn exec:java -Dexec.mainClass="com.flaredb.bench.NexmarkGBK"
+./gradlew :nexmarkgbk:run
 ```
 
-Benchmark results will be generated at target/nexmark-gbk-benchmark.txt
+Benchmark results will be generated at `build/nexmark-gbk-benchmark.txt` in the `nexmarkgbk` module.
 
 ### Options
 
 | Option | Default | Description |
 |---|---|---|
 | `numEvents` | `1000000` | Number of Nexmark events to generate |
-| `benchmarkOutputPath` | `target/nexmark-gbk-benchmark.txt` | Path for the benchmark summary table |
+| `benchmarkOutputPath` | `build/nexmark-gbk-benchmark.txt` | Path for the benchmark summary table |
 
 ## Output
 
@@ -77,4 +76,4 @@ Impulse → GenerateEvents → Filter(bids) → MapToKV
 - Cargo
 - Java 17
 
-The uber-jar produced by `mvn package` includes all dependencies via the Maven Shade Plugin.
+The uber-jar produced by `./gradlew :nexmarkgbk:shadowJar` includes all dependencies (Gradle Shadow plugin, equivalent to the previous Maven Shade setup).

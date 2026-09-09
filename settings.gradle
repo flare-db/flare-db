@@ -1,1 +1,24 @@
-rootProject.name = "flare-db"
+rootProject.name = 'flare-db'
+
+// Standard Java build for flare-db.
+
+def javaModules = [
+    'flaredb-runner' : 'runner-sdk/java/flarerunner',
+    'flareio-java'   : 'flare-io/java/flareio-java',
+    'wordcount'      : 'example/wordcount',
+    'flareio-example': 'example/flare-io',
+    'nexmarkgbk'     : 'benchmarks/nexmarkgbk',
+]
+
+javaModules.each { moduleName, moduleDir ->
+    include moduleName
+    project(":$moduleName").projectDir = file(moduleDir)
+}
+
+dependencyResolutionManagement {
+    repositoriesMode = RepositoriesMode.PREFER_SETTINGS
+    repositories {
+        mavenCentral()
+        maven { url = 'https://packages.confluent.io/maven/' }
+    }
+}

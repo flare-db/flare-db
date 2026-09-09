@@ -1,0 +1,25 @@
+// FlareDB I/O for Apache Beam (formerly flare-io/java/flareio-java/pom.xml).
+
+plugins {
+    id 'java-library'
+}
+
+dependencies {
+    implementation libs.beam.core
+    implementation libs.beam.arrow
+    implementation libs.arrow.flight.core
+    implementation libs.arrow.flight.sql
+    implementation libs.arrow.vector
+    implementation libs.arrow.memory.core
+    implementation libs.arrow.memory.netty
+
+    // AutoValue generates the AutoValue_FlareDbIO_* implementations.
+    compileOnly libs.auto.value.annotations
+    annotationProcessor libs.auto.value
+
+    implementation libs.slf4j.api
+    implementation libs.joda.time
+    implementation libs.checker.qual
+
+    testImplementation libs.junit
+}

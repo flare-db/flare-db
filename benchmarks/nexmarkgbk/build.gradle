@@ -1,0 +1,29 @@
+// Nexmark GBK benchmark pipeline (formerly benchmarks/nexmarkgbk/pom.xml).
+//
+// Depends on the in-tree flaredb-runner project instead of the published
+// artifact, so benchmarks always exercise the local runner.
+//
+// Run with:   ./gradlew :nexmarkgbk:run
+// Fat jar:    ./gradlew :nexmarkgbk:shadowJar  (build/libs/nexmarkgbk-0.1.0-all.jar)
+
+plugins {
+    id 'java'
+    id 'application'
+    alias(libs.plugins.shadow)
+}
+
+application {
+    mainClass = 'com.flaredb.bench.NexmarkGBK'
+}
+
+dependencies {
+    implementation project(':flaredb-runner')
+    implementation libs.beam.core
+    implementation libs.beam.nexmark
+    runtimeOnly libs.slf4j.simple
+}
+
+shadowJar {
+    mergeServiceFiles()
+    zip64 = true // Nexmark + Beam deps exceed the 65535-entry zip limit.
+}
