@@ -1,7 +1,4 @@
-// FlareDB Apache Beam Runner SDK (formerly runner-sdk/java/flarerunner/pom.xml).
-//
-// This is the only module published to Maven Central, so it carries the
-// publishing/signing configuration.
+// FlareDB Apache Beam Runner SDK.
 
 plugins {
     id 'java-library'

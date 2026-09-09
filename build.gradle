@@ -1,6 +1,4 @@
-// Shared configuration for every Java module in the repository. Module
-// specific concerns (dependencies, publishing, application entry points)
-// live in each module's own build.gradle.
+// Shared configuration for every Java module in the repository.
 
 allprojects {
     group = 'com.flare-db'

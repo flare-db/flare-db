@@ -1,6 +1,6 @@
 # Contributing to FlareDB
 
-Thanks for interest contributing This guide covers the repo layout and the commands you need to build, test, and run.
+Thanks for contributing to FlareDB. This guide covers the repo layout and the commands you need to build, test, and run your changes.
 
 ## Repository structure
 

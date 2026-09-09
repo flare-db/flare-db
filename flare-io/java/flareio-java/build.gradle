@@ -1,4 +1,4 @@
-// FlareDB I/O for Apache Beam (formerly flare-io/java/flareio-java/pom.xml).
+// FlareDB I/O for Apache Beam.
 
 plugins {
     id 'java-library'
