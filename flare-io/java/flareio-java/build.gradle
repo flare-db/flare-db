@@ -14,7 +14,6 @@ java {
 
 dependencies {
     implementation libs.beam.core
-    implementation libs.beam.arrow
     implementation libs.arrow.flight.core
     implementation libs.arrow.flight.sql
     implementation libs.arrow.vector

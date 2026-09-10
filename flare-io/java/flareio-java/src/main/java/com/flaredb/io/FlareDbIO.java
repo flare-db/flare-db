@@ -1,5 +1,9 @@
 package com.flaredb.io;
 
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkArgument;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkNotNull;
+
+import com.google.auto.value.AutoValue;
 import java.io.IOException;
 import java.io.Serializable;
 import java.net.URI;
@@ -8,7 +12,6 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
-
 import org.apache.arrow.flight.AsyncPutListener;
 import org.apache.arrow.flight.FlightClient;
 import org.apache.arrow.flight.FlightDescriptor;
@@ -34,7 +37,6 @@ import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.beam.sdk.coders.Coder;
 import org.apache.beam.sdk.coders.RowCoder;
-import org.apache.beam.sdk.extensions.arrow.ArrowConversion;
 import org.apache.beam.sdk.io.BoundedSource;
 import org.apache.beam.sdk.metrics.Counter;
 import org.apache.beam.sdk.metrics.Metrics;
@@ -48,16 +50,13 @@ import org.apache.beam.sdk.values.PBegin;
 import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.sdk.values.PDone;
 import org.apache.beam.sdk.values.Row;
-import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkArgument;
-import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkNotNull;
 import org.checkerframework.checker.nullness.qual.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.google.auto.value.AutoValue;
-
 /**
- * {@link PTransform}s for reading and writing data to/from <a href="https://www.flare-db.com/">FlareDB</a>
+ * {@link PTransform}s for reading and writing data to/from <a
+ * href="https://www.flare-db.com/">FlareDB</a>
  *
  * <h2>Reading from FlareDB</h2>
  *
@@ -76,7 +75,6 @@ import com.google.auto.value.AutoValue;
  *         .to("flare.default.my_table"));
  *         .withDbUrl("grpc://localhost:8099")
  * }</pre>
- *
  */
 public class FlareDbIO {
 
@@ -201,7 +199,10 @@ public class FlareDbIO {
       return builder().setDbUrl(dbUrl).build();
     }
 
-    /** Sets the SQL query to execute on FlareDB (e.g. {@code "SELECT * FROM flare.default.my_table"}). */
+    /**
+     * Sets the SQL query to execute on FlareDB (e.g. {@code "SELECT * FROM
+     * flare.default.my_table"}).
+     */
     public Read fromQuery(String query) {
       return builder().setQuery(query).build();
     }
@@ -492,8 +493,10 @@ public class FlareDbIO {
   /** DoFn that buffers Beam Rows and streams them as Arrow record batches to FlareDB. */
   @SuppressWarnings("initialization.fields.uninitialized")
   static class FlightWriteFn extends DoFn<Row, Void> {
-    private static final Counter RECORDS_WRITTEN = Metrics.counter(FlareDbIO.class, "recordsWritten");
-    private static final Counter BATCHES_WRITTEN = Metrics.counter(FlareDbIO.class, "batchesWritten");
+    private static final Counter RECORDS_WRITTEN =
+        Metrics.counter(FlareDbIO.class, "recordsWritten");
+    private static final Counter BATCHES_WRITTEN =
+        Metrics.counter(FlareDbIO.class, "batchesWritten");
 
     private final Write<?> spec;
     private final Schema beamSchema;
@@ -570,8 +573,7 @@ public class FlareDbIO {
         VectorSchemaRoot currentRoot = VectorSchemaRoot.create(arrowSchema, currentAllocator);
         root = currentRoot;
 
-        FlightDescriptor descriptor =
-            FlightDescriptor.path(checkNotNull(spec.table(), "table"));
+        FlightDescriptor descriptor = FlightDescriptor.path(checkNotNull(spec.table(), "table"));
         listener = currentClient.startPut(descriptor, currentRoot, new AsyncPutListener());
       }
     }
@@ -617,20 +619,22 @@ public class FlareDbIO {
         case FLOAT -> ((Float4Vector) vector).setSafe(index, ((Number) value).floatValue());
         case DOUBLE -> ((Float8Vector) vector).setSafe(index, ((Number) value).doubleValue());
         case BOOLEAN -> ((BitVector) vector).setSafe(index, ((Boolean) value) ? 1 : 0);
-        case STRING -> ((VarCharVector) vector)
-              .setSafe(index, value.toString().getBytes(StandardCharsets.UTF_8));
+        case STRING ->
+            ((VarCharVector) vector)
+                .setSafe(index, value.toString().getBytes(StandardCharsets.UTF_8));
         case BYTES -> ((VarBinaryVector) vector).setSafe(index, (byte[]) value);
         case DATETIME -> {
-            long millis;
-            if (value instanceof org.joda.time.ReadableInstant readableInstant) {
-                millis = readableInstant.getMillis();
-            } else {
-                millis = ((Number) value).longValue();
-            }
-            ((TimeStampMilliTZVector) vector).setSafe(index, millis);
-            }
-        default -> throw new IllegalArgumentException(
-              "Unsupported Beam type for FlareDbIO.write(): " + type.getTypeName());
+          long millis;
+          if (value instanceof org.joda.time.ReadableInstant readableInstant) {
+            millis = readableInstant.getMillis();
+          } else {
+            millis = ((Number) value).longValue();
+          }
+          ((TimeStampMilliTZVector) vector).setSafe(index, millis);
+        }
+        default ->
+            throw new IllegalArgumentException(
+                "Unsupported Beam type for FlareDbIO.write(): " + type.getTypeName());
       }
     }
 

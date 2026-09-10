@@ -7,6 +7,7 @@ def javaModules = [
     'flareio-java'   : 'flare-io/java/flareio-java',
     'wordcount'      : 'example/wordcount',
     'flareio-write' : 'example/flare-io-write',
+    'flareio-read'   : 'example/flare-io-read',
     'nexmarkgbk'     : 'benchmarks/nexmarkgbk',
 ]
 

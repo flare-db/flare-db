@@ -17,6 +17,7 @@ flare-db/
 ├── flare-io/java/        # :flareio-java — FlareDB I/O for Beam (Arrow/Flight SQL)
 ├── example/wordcount/    # :wordcount — WordCount pipeline example
 ├── example/flare-io-write/  # :flareio-write — FlareDB I/O write example pipeline
+├── example/flare-io-read/   # :flareio-read — FlareDB I/O read example pipeline
 └── benchmarks/nexmarkgbk # :nexmarkgbk — Nexmark benchmarks
 ```
 
@@ -28,7 +29,7 @@ Java modules are declared in `settings.gradle` and `gradle/libs.versions.toml` p
 # Java: compile all modules
 ./gradlew build -x test
 
-# Java: compile a single module (one of: flaredb-runner, flareio-java, wordcount, flareio-write, nexmarkgbk)
+# Java: compile a single module (one of: flaredb-runner, flareio-java, wordcount, flareio-write, flareio-read, nexmarkgbk)
 ./gradlew :wordcount:compileJava
 ./gradlew :flaredb-runner:jar
 

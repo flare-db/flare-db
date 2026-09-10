@@ -2,9 +2,8 @@ package com.flaredb.io;
 
 import static org.junit.Assert.assertEquals;
 
-import org.apache.beam.sdk.extensions.arrow.ArrowConversion;
-import org.apache.beam.sdk.schemas.Schema;
 import org.apache.arrow.vector.types.pojo.ArrowType;
+import org.apache.beam.sdk.schemas.Schema;
 import org.junit.Test;
 
 public class FlareDbIOTest {
@@ -44,10 +43,34 @@ public class FlareDbIOTest {
     assertEquals(ArrowType.ArrowTypeID.Int, arrowSchema.getFields().get(1).getType().getTypeID());
 
     assertEquals("score", arrowSchema.getFields().get(2).getName());
-    assertEquals(ArrowType.ArrowTypeID.FloatingPoint, arrowSchema.getFields().get(2).getType().getTypeID());
+    assertEquals(
+        ArrowType.ArrowTypeID.FloatingPoint, arrowSchema.getFields().get(2).getType().getTypeID());
 
     assertEquals("active", arrowSchema.getFields().get(3).getName());
     assertEquals(ArrowType.ArrowTypeID.Bool, arrowSchema.getFields().get(3).getType().getTypeID());
+  }
+
+  @Test
+  public void testArrowViewTypesToBeamSchema() {
+    org.apache.arrow.vector.types.pojo.Schema arrowSchema =
+        new org.apache.arrow.vector.types.pojo.Schema(
+            java.util.Arrays.asList(
+                new org.apache.arrow.vector.types.pojo.Field(
+                    "name",
+                    org.apache.arrow.vector.types.pojo.FieldType.nullable(
+                        ArrowType.Utf8View.INSTANCE),
+                    java.util.Collections.emptyList()),
+                new org.apache.arrow.vector.types.pojo.Field(
+                    "payload",
+                    org.apache.arrow.vector.types.pojo.FieldType.nullable(
+                        ArrowType.BinaryView.INSTANCE),
+                    java.util.Collections.emptyList())));
+
+    Schema beamSchema = ArrowConversion.ArrowSchemaTranslator.toBeamSchema(arrowSchema);
+
+    assertEquals(2, beamSchema.getFieldCount());
+    assertEquals(Schema.TypeName.STRING, beamSchema.getField("name").getType().getTypeName());
+    assertEquals(Schema.TypeName.BYTES, beamSchema.getField("payload").getType().getTypeName());
   }
 
   @Test
