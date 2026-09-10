@@ -76,7 +76,7 @@ impl FlareIO {
         stream: PeekableFlightDataStream,
     ) -> Result<i64, Status> {
         let stream = stream
-            .into_inner()
+            .into_peekable()
             .map(|item| item.map_err(|status| FlightError::from_external_error(Box::new(status))));
         let mut batches = FlightRecordBatchStream::new_from_flight_data(stream);
 

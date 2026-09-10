@@ -59,7 +59,7 @@ import com.google.auto.value.AutoValue;
 /**
  * {@link PTransform}s for reading and writing data to/from <a href="https://www.flare-db.com/">FlareDB</a>
  *
- * <h3>Reading from FlareDB</h3>
+ * <h2>Reading from FlareDB</h2>
  *
  * <pre>{@code
  * PCollection<Row> rows = pipeline.apply(
@@ -68,7 +68,7 @@ import com.google.auto.value.AutoValue;
  *         .withDbUrl("grpc://localhost:8099")
  * }</pre>
  *
- * <h3>Writing to FlareDB</h3>
+ * <h2>Writing to FlareDB</h2>
  *
  * <pre>{@code
  * rows.apply(

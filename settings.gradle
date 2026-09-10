@@ -6,7 +6,7 @@ def javaModules = [
     'flaredb-runner' : 'runner-sdk/java/flarerunner',
     'flareio-java'   : 'flare-io/java/flareio-java',
     'wordcount'      : 'example/wordcount',
-    'flareio-example': 'example/flare-io',
+    'flareio-write' : 'example/flare-io-write',
     'nexmarkgbk'     : 'benchmarks/nexmarkgbk',
 ]
 

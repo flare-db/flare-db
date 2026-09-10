@@ -50,7 +50,7 @@ BIN_DIR="${BASE_DIR}/bin"
 INSTANCES_DIR="${BASE_DIR}/instances"
 mkdir -p "${BIN_DIR}" "${INSTANCES_DIR}"
 
-WORKER_JAR_NAME="beam-sdks-java-harness-2.72.0-flare-bundled.jar"
+WORKER_JAR_NAME="beam-sdks-java-harness-2.76.0-flare-bundled.jar"
 WORKER_JAR="${BIN_DIR}/${WORKER_JAR_NAME}"
 WORKER_JAR_URL="https://github.com/flare-db/flare-db/releases/download/beam-worker-java-2.72.0/${WORKER_JAR_NAME}"
 
