@@ -1,3 +1,4 @@
+use crate::engine::sdf::SplittableStageExecutor;
 use crate::{
     engine::{
         executor::{Executor, StageExecutor},
@@ -8,7 +9,6 @@ use crate::{
     fusion::pipeline::{ExecutableGraph, ExecutableNode},
     store::element_store::FlareElementStore,
 };
-use crate::engine::sdf::SplittableStageExecutor;
 use anyhow::anyhow;
 use beam_model_rs::v1::{Coder, Components};
 use std::{collections::HashMap, sync::Arc};
@@ -28,7 +28,8 @@ impl ExecutorDispatcher {
     pub async fn new(channels: Channels) -> anyhow::Result<Self> {
         let store_path = crate::utils::path::warehouse_dir();
         let store_base = store_path.to_str().unwrap_or(".").to_string();
-        let store = Arc::new(FlareElementStore::new(store_base, "flare".to_string()).await?);
+        let store =
+            Arc::new(FlareElementStore::new(store_base, "pcollection".to_string(), None).await?);
         Ok(Self {
             channels,
             store,
@@ -46,7 +47,7 @@ impl ExecutorDispatcher {
     pub async fn set_job_store(&mut self, job_id: &str) -> anyhow::Result<()> {
         let store_path = crate::utils::path::warehouse_dir();
         let store_base = store_path.to_str().unwrap_or(".").to_string();
-        self.store = Arc::new(FlareElementStore::new(store_base, job_id.to_string()).await?);
+        self.store = Arc::new(FlareElementStore::new(store_base, job_id.to_string(), None).await?);
         Ok(())
     }
 
@@ -83,10 +84,14 @@ impl ExecutorDispatcher {
                 in_flight.spawn(async move {
                     let result = if matches!(node, ExecutableNode::Splittable(_)) {
                         let mut executor = SplittableStageExecutor::new(runtime);
-                        executor.execute(node, input_metadata, output_metadata).await
+                        executor
+                            .execute(node, input_metadata, output_metadata)
+                            .await
                     } else {
                         let mut executor = StageExecutor::new(runtime);
-                        executor.execute(node, input_metadata, output_metadata).await
+                        executor
+                            .execute(node, input_metadata, output_metadata)
+                            .await
                     };
                     (idx, result)
                 });

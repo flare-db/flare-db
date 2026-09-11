@@ -50,18 +50,20 @@ impl FlareSchemaRegistry {
 
 pub struct FlareElementStore {
     pub(crate) registry: FlareSchemaRegistry,
-    pub(crate) catalog: FileSystemCatalog,
+    pub(crate) catalog: Arc<FileSystemCatalog>,
     pub(crate) db_name: String,
 }
 
 impl FlareElementStore {
-    pub async fn new(warehouse: String, db_name: String) -> Result<Self> {
-        let mut options = Options::new();
-        options.set(CatalogOptions::WAREHOUSE, warehouse.as_str());
-        let catalog = FileSystemCatalog::new(options)?;
-        catalog
-            .create_database(&db_name, true, HashMap::new())
-            .await?;
+    pub async fn new(
+        warehouse: String,
+        db_name: String,
+        catalog: Option<Arc<FileSystemCatalog>>,
+    ) -> Result<Self> {
+        let catalog = match catalog {
+            Some(catalog) => catalog,
+            None => Arc::new(create_catalog(warehouse, db_name.clone()).await?),
+        };
         Ok(Self {
             registry: FlareSchemaRegistry::new(),
             catalog,
@@ -79,7 +81,7 @@ impl FlareElementStore {
         let table = self.get_table(pcollection_id, &table_schema).await?;
         let builder = table.new_write_builder();
 
-        // Paimon has no Null type; convert Void columns to null booleans.
+        // Paimon has no Null type so convert Void columns to null booleans.
         let batch = materialize_void_columns(batch)?;
 
         let mut writer = builder.new_write()?;
@@ -126,6 +128,14 @@ impl FlareElementStore {
             .await?;
 
         Ok(())
+    }
+
+    /// Ingest a row-shaped [`RecordBatch`] whose Arrow schema describes a full
+    /// Beam Row.
+    pub async fn write_row_batch(&self, pcollection_id: &str, batch: RecordBatch) -> Result<()> {
+        let table_schema = Arc::new(RecordTableSchema::row(batch.schema()));
+        self.write_record_batch(pcollection_id, batch, table_schema)
+            .await
     }
 
     /// Full scan of a PCollection, reads all rows from Paimon and converts
@@ -187,6 +197,15 @@ impl FlareElementStore {
     }
 }
 
+pub async fn create_catalog(warehouse: String, db_name: String) -> Result<FileSystemCatalog> {
+    let mut options = Options::new();
+    options.set(CatalogOptions::WAREHOUSE, warehouse.as_str());
+    let catalog = FileSystemCatalog::new(options)?;
+    catalog
+        .create_database(&db_name, true, HashMap::new())
+        .await?;
+    Ok(catalog)
+}
 /// Convert an Arrow [`Schema`](ArrowSchema) into a Paimon [`Schema`](PaimonSchema).
 ///
 /// The resulting schema preserves Arrow field names and converted data types,
@@ -232,7 +251,7 @@ mod element_store_tests {
             .to_str()
             .expect("tempdir path is not valid utf8")
             .to_string();
-        let store = FlareElementStore::new(warehouse, "testdb".to_string())
+        let store = FlareElementStore::new(warehouse, "testdb".to_string(), None)
             .await
             .expect("failed to construct FlareElementStore");
         (dir, store)
@@ -308,10 +327,10 @@ mod element_store_tests {
         let warehouse = dir.path().to_str().unwrap().to_string();
         // create_database is called with exist_ok=true, so constructing
         // twice against the same warehouse/db name must not error.
-        FlareElementStore::new(warehouse.clone(), "testdb".to_string())
+        FlareElementStore::new(warehouse.clone(), "testdb".to_string(), None)
             .await
             .unwrap();
-        FlareElementStore::new(warehouse, "testdb".to_string())
+        FlareElementStore::new(warehouse, "testdb".to_string(), None)
             .await
             .unwrap();
     }
@@ -407,6 +426,49 @@ mod element_store_tests {
             .unwrap();
 
         assert_eq!(extract_ints(&scanned), vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn write_and_scan_opaque_bytes_roundtrip_preserves_wire_bytes() {
+        let (_dir, store) = make_store().await;
+
+        // Opaque VoidCoder elements are stored as the exact encoded
+        // WindowedValue bytes (timestamp + windows + pane framing).
+        let frames: Vec<Vec<u8>> = vec![
+            vec![
+                0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x03,
+            ],
+            vec![0xff; 5],
+            Vec::new(),
+        ];
+        let records = frames
+            .iter()
+            .map(|raw| BeamRecord::PRIMITIVE(PrimitiveValue::Bytes(raw.clone())))
+            .collect();
+
+        store
+            .write_beamrecord_batch(NewCollectionRequest {
+                pcollection_id: "pc-opaque-void".to_string(),
+                elements: records,
+            })
+            .await
+            .unwrap();
+
+        let scanned = store
+            .scan_collection(ScanCollectionRequest {
+                pcollection_id: "pc-opaque-void".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let scanned_frames: Vec<Vec<u8>> = scanned
+            .iter()
+            .map(|record| match record {
+                BeamRecord::PRIMITIVE(PrimitiveValue::Bytes(raw)) => raw.clone(),
+                other => panic!("expected opaque bytes, found {other:?}"),
+            })
+            .collect();
+        assert_eq!(scanned_frames, frames);
     }
 
     #[tokio::test]

@@ -28,6 +28,7 @@ pub mod beam_urns {
     pub const ITERABLE_CODER: &str = "beam:coder:iterable:v1";
     pub const GLOBAL_WINDOW_CODER: &str = "beam:coder:global_window:v1";
     pub const WINDOWED_VALUE_CODER: &str = "beam:coder:windowed_value:v1";
+    pub const ROW_CODER: &str = "beam:coder:row:v1";
     pub const JAVA_SDK_CODER: &str = "beam:coders:javasdk:0.1";
 
     //Deprecated
@@ -138,4 +139,8 @@ pub mod beam_urns {
         SPLITTABLE_SPLIT_AND_SIZE_RESTRICTIONS_URN,
         SPLITTABLE_PROCESS_SIZED_ELEMENTS_AND_RESTRICTIONS_URN,
     ];
+
+    pub const LOGICAL_TYPE_MICROS_INSTANT: &str = "beam:logical_type:micros_instant:v1";
+    pub const LOGICAL_TYPE_MILLIS_INSTANT: &str = "beam:logical_type:millis_instant:v1";
+    pub const LOGICAL_TYPE_NANOS_INSTANT: &str = "beam:logical_type:nanos_instant:v1";
 }

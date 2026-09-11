@@ -1,6 +1,22 @@
-target
-.gradle/
+# Build outputs
+target/
 build/
-Cargo.lock
-.idea
-.vscode
+.gradle/
+out/
+*.class
+
+# Java artifacts
+*.jar
+!gradle/wrapper/gradle-wrapper.jar
+dependency-reduced-pom.xml
+.flattened-pom.xml
+bin/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.classpath
+.project
+.settings/
+.factorypath

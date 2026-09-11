@@ -67,21 +67,21 @@ Once the instance is running, FlareDB is ready to accept pipeline jobs.
 To run an Apache Beam pipeline on FlareDB, add the FlareDB Runner SDK as a dependency to your Beam project. The runner sdk submits the pipeline to the FlareDB instance as a Job.
 
 
-Check out the WordCount example under `examples/` for a complete reference.
+Check out the WordCount example under `example/wordcount` for a complete reference. All Java modules (runner, I/O, examples, benchmarks) live in a single Gradle build defined at the repository root.
 
 ### 5. Run the Example
 
 With FlareDB running, execute the WordCount example:
 
 ```bash
-# compile wordcount pipeline
-mvn clean install
+# compile the wordcount pipeline
+./gradlew :wordcount:shadowJar
 
 # run the example
-mvn exec:java -Dexec.mainClass="com.flaredb.example.WordCount"
+./gradlew :wordcount:run
 ```
 
-The pipeline will be submitted to the local FlareDB instance and executed by the engine. Execution logs and pipeline output can be found in the logging directory created during startup.
+The `run` task executes `com.flaredb.example.WordCount`, which submits the pipeline to the local FlareDB instance, where it is executed by the engine. `shadowJar` additionally produces a self-contained `wordcount-0.1.0-all.jar` under `example/wordcount/build/libs/`. Execution logs and pipeline output can be found in the logging directory created during startup.
 
 
 ### 6. Stop FlareDB instance

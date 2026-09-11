@@ -1,0 +1,20 @@
+// Shared configuration for every Java module in the repository.
+
+allprojects {
+    group = 'com.flare-db'
+    version = '0.1.0'
+}
+
+subprojects {
+    plugins.withId('java') {
+        java {
+            toolchain {
+                languageVersion = JavaLanguageVersion.of(17)
+            }
+        }
+
+        tasks.withType(JavaCompile).configureEach {
+            options.encoding = 'UTF-8'
+        }
+    }
+}

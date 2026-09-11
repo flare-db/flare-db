@@ -1,7 +1,7 @@
+use dashmap::DashMap;
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::process::{Child, Command};
-use dashmap::DashMap;
 use tonic::Status;
 
 use crate::utils::path::logs_dir;
@@ -78,7 +78,10 @@ impl WorkerManager {
 
         let classpath = format!("{}:{}", worker_jar, staged_jar);
         let mut cmd = Command::new("java");
-        cmd.arg("-cp")
+
+        cmd.arg("--add-opens=java.base/java.nio=org.apache.arrow.memory.core,ALL-UNNAMED") // arrow vector needs it
+            .arg("-Dio.netty.tryReflectionSetAccessible=true")
+            .arg("-cp")
             .arg(&classpath)
             .arg("org.apache.beam.fn.harness.FnHarness")
             .env("HARNESS_ID", job_id)
@@ -140,14 +143,14 @@ impl WorkerManager {
     }
 
     pub async fn stop_all(&self) {
-        let keys: Vec<String> = self.active_workers.iter().map(|r| r.key().clone()).collect();
+        let keys: Vec<String> = self
+            .active_workers
+            .iter()
+            .map(|r| r.key().clone())
+            .collect();
         for key in keys {
             if let Some((_, mut child)) = self.active_workers.remove(&key) {
-                log::info!(
-                    "stopping worker for job_id={}, pid={:?}",
-                    key,
-                    child.id()
-                );
+                log::info!("stopping worker for job_id={}, pid={:?}", key, child.id());
                 let _ = child.kill().await;
             }
         }

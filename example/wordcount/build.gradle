@@ -1,0 +1,28 @@
+// WordCount example pipeline (formerly example/wordcount/pom.xml).
+//
+// Depends on the in-tree flaredb-runner project instead of the published
+// artifact, so examples always exercise the local runner.
+//
+// Run with:   ./gradlew :wordcount:run
+// Fat jar:    ./gradlew :wordcount:shadowJar  (build/libs/wordcount-0.1.0-all.jar)
+
+plugins {
+    id 'java'
+    id 'application'
+    alias(libs.plugins.shadow)
+}
+
+application {
+    mainClass = 'com.flaredb.example.WordCount'
+}
+
+dependencies {
+    implementation project(':flaredb-runner')
+    implementation libs.beam.core
+    runtimeOnly libs.slf4j.simple
+}
+
+shadowJar {
+    mergeServiceFiles()
+    zip64 = true // Shaded Beam deps can exceed the 65535-entry zip limit.
+}

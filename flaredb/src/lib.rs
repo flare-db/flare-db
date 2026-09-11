@@ -58,8 +58,10 @@
 //! Project repository:
 //!
 //! https://github.com/flare-db/flare-db
+pub mod coders;
 pub mod engine;
 pub mod fusion;
+pub mod io;
 pub mod jobservice;
 pub mod store;
 pub mod transforms;

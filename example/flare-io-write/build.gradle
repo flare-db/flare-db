@@ -1,0 +1,36 @@
+// FlareDB I/O write example pipeline (formerly example/flare-io).
+//
+// Depends on the in-tree flaredb-runner project so the example always
+// exercises the local runner and the local FlareDB I/O.
+//
+// Run with:   ./gradlew :flareio-write:run
+// Fat jar:    ./gradlew :flareio-write:shadowJar
+//             (build/libs/flareio-write-0.1.0-all.jar)
+
+plugins {
+    id 'java'
+    id 'application'
+    alias(libs.plugins.shadow)
+}
+
+application {
+    mainClass = 'com.flaredb.example.flareio.WritePipeline'
+}
+
+dependencies {
+    implementation project(':flaredb-runner')
+    implementation project(':flareio-java')
+    implementation 'com.flare-db:flareio-java:0.1.0'
+    implementation libs.beam.core
+    runtimeOnly libs.slf4j.simple
+}
+
+repositories {
+    mavenLocal()
+    mavenCentral()
+}
+
+shadowJar {
+    mergeServiceFiles()
+    zip64 = true // Shaded Beam deps can exceed the 65535-entry zip limit.
+}

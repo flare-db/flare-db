@@ -15,7 +15,7 @@ public interface NexmarkGBKPipelineOptions extends FlarePipelineOptions{
     void setNumEvents(int value);
 
     @Description("Path of the text file where the benchmark summary table will be written")
-    @Default.String("target/nexmark-gbk-benchmark.txt")
+    @Default.String("build/nexmark-gbk-benchmark.txt")
     String getBenchmarkOutputPath();
 
     void setBenchmarkOutputPath(String value);

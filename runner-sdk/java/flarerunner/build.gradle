@@ -1,0 +1,68 @@
+// FlareDB Apache Beam Runner SDK.
+
+plugins {
+    id 'java-library'
+    id 'maven-publish'
+    id 'signing'
+    alias(libs.plugins.spotless)
+}
+
+java {
+    withSourcesJar()
+    withJavadocJar()
+}
+
+dependencies {
+    implementation libs.beam.core
+    implementation libs.beam.runners.portability
+    implementation libs.slf4j.api
+}
+
+spotless {
+    java {
+        googleJavaFormat('1.27.0')
+    }
+}
+
+publishing {
+    publications {
+        mavenJava(MavenPublication) {
+            from components.java
+            pom {
+                name = 'FlareDB Runner'
+                description = 'Apache Beam Runner for FlareDB'
+                url = 'https://github.com/flare-db/flare-db'
+                licenses {
+                    license {
+                        name = 'Apache License, Version 2.0'
+                        url = 'https://www.apache.org/licenses/LICENSE-2.0.txt'
+                    }
+                }
+                developers {
+                    developer {
+                        name = 'Ganesh Sivakumar'
+                        email = 'ganesh.gsivakumar@gmail.com'
+                    }
+                }
+                scm {
+                    connection = 'scm:git:https://github.com/flare-db/flare-db.git'
+                    developerConnection = 'scm:git:ssh://git@github.com:flare-db/flare-db.git'
+                    url = 'https://github.com/flare-db/flare-db'
+                }
+            }
+        }
+    }
+    repositories {
+        maven {
+            name = 'sonatype'
+            // Sonatype Central Portal. Publish with:
+            //   ./gradlew :flaredb-runner:publish -PossrhUsername=... -PossrhPassword=...
+            url = 'https://central.sonatype.com/api/v1/publisher'
+            credentials(PasswordCredentials)
+        }
+    }
+}
+
+signing {
+    sign publishing.publications.mavenJava
+}
