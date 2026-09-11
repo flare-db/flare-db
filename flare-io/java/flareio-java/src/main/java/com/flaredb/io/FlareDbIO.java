@@ -283,14 +283,25 @@ public class FlareDbIO {
     @Override
     public long getEstimatedSizeBytes(PipelineOptions options) throws Exception {
       if (endpoint != null) {
-        return -1;
+        // Endpoint-scoped sources are produced by split(); the Arrow Flight
+        // protocol does not expose a per-endpoint byte count, so a real
+        // estimate is not available here. Return 0 rather than -1: Beam's
+        // BoundedSourceAsSDFWrapperFn.DefaultGetSize.validateSize() rejects
+        // any negative size and a non-negative placeholder lets the pipeline
+        // proceed.
+        // TODO: thread the query's total byte count from split() through to the
+        // endpoint sources (e.g. divide it by the endpoint count) once
+        // per-endpoint sizing is available.
+        return 0L;
       }
       ConnectionParams params = parseDbUrl(spec.dbUrl());
       try (BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
           FlightClient client = createClient(allocator, params)) {
         FlightSqlClient sqlClient = new FlightSqlClient(client);
         FlightInfo info = sqlClient.execute(checkNotNull(spec.query(), "query"));
-        return info.getBytes();
+        // FlightInfo.getBytes() reports -1 when the server does not know the
+        // total byte count; clamp so validateSize() never sees a negative value.
+        return Math.max(0L, info.getBytes());
       }
     }
 

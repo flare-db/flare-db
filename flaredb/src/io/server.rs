@@ -8,7 +8,8 @@ use arrow_flight::{
     error::FlightError,
     flight_service_server::FlightServiceServer,
     sql::{
-        Any, CommandStatementQuery, DoPutUpdateResult, SqlInfo, TicketStatementQuery,
+        Any, CommandStatementQuery, DoPutUpdateResult, ProstMessageExt, SqlInfo,
+        TicketStatementQuery,
         server::{FlightSqlService, PeekableFlightDataStream},
     },
 };
@@ -142,7 +143,7 @@ impl FlightSqlService for FlareIO {
             statement_handle: statement_handle.into(),
         };
         let ticket = Ticket {
-            ticket: prost::Message::encode_to_vec(&ticket).into(),
+            ticket: prost::Message::encode_to_vec(&ticket.as_any()).into(),
         };
 
         let schema = df.schema().inner();

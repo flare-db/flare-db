@@ -26,7 +26,7 @@ use crate::{
     jobservice::urns::beam_urns,
     store::{
         element_store::{FlareElementStore, NewCollectionRequest, ScanCollectionRequest},
-        record::BeamRecord,
+        record::{BeamRecord, PrimitiveValue},
     },
     transforms::FlareRunnerTransform,
     utils::batch_size_estimator::{BatchConfig, BatchSizeEstimator},
@@ -144,6 +144,10 @@ impl BundleRuntime {
             component_coder,
             Some(pipeline_coders.as_ref()),
         );
+        // VoidCoder elements carry no payload, so round-tripping them through
+        // `BeamRecord`/Arrow/Paimon is both unnecessary and lossy for the
+        // WindowedValue framing. Preserve the original encoded bytes instead.
+        let opaque_void = element_coder.is_void();
         let windowed_value_coder = WindowedValueCoder::new(element_coder);
 
         let mut stream_buffer = BytesMut::new();
@@ -195,10 +199,22 @@ impl BundleRuntime {
                                         edge_metadata.component_coder
                                     ));
                                 }
+                                // For VoidCoder PCollections capture the exact
+                                // encoded WindowedValue bytes before they are
+                                // consumed from the buffer.
+                                let opaque_element = if opaque_void {
+                                    Some(stream_buffer[..consumed].to_vec())
+                                } else {
+                                    None
+                                };
                                 stream_buffer.advance(consumed);
 
                                 total_decoded += 1;
-                                batch.push(windowed_value.value);
+                                match opaque_element {
+                                    Some(raw) => batch
+                                        .push(BeamRecord::PRIMITIVE(PrimitiveValue::Bytes(raw))),
+                                    None => batch.push(windowed_value.value),
+                                }
                                 if batch.len() >= target_batch_size {
                                     let batch_size = batch.len();
                                     let request = NewCollectionRequest {
@@ -284,7 +300,7 @@ impl BundleRuntime {
         );
 
         let request = ScanCollectionRequest {
-            pcollection_id: input_pcollection_id,
+            pcollection_id: input_pcollection_id.clone(),
         };
 
         let elements = self.store.scan_collection(request).await?;
@@ -295,11 +311,35 @@ impl BundleRuntime {
             input_component_coder_ids.clone(),
             Some(self.pipeline_coders.as_ref()),
         );
+
+        let opaque_void = element_coder.is_void();
         let windowed_value_coder = WindowedValueCoder::new(element_coder);
         let mut encoded = BytesMut::new();
 
-        for element in elements {
-            windowed_value_coder.encode_value(element, &mut encoded);
+        if opaque_void {
+            info!(
+                "VoidCoder pcollection {}: forwarding {} opaque element(s) unchanged",
+                input_pcollection_id,
+                elements.len()
+            );
+            for element in elements {
+                match element {
+                    BeamRecord::PRIMITIVE(PrimitiveValue::Bytes(raw)) => {
+                        encoded.extend_from_slice(&raw);
+                    }
+                    other => {
+                        return Err(anyhow!(
+                            "expected opaque bytes for VoidCoder pcollection {}, found {:?}",
+                            input_pcollection_id,
+                            other.record_type()
+                        ));
+                    }
+                }
+            }
+        } else {
+            for element in elements {
+                windowed_value_coder.encode_value(element, &mut encoded);
+            }
         }
 
         let elements = Elements {

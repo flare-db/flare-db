@@ -119,6 +119,17 @@ impl StandardBeamCoders {
         }
     }
 
+    /// Whether this is the Beam `VoidCoder`.
+    ///
+    /// A `VoidCoder` element has a zero-byte payload, but the surrounding
+    /// `WindowedValue` still carries framing (timestamp, windows, pane) whose
+    /// exact wire representation must be preserved. Such PCollections are
+    /// therefore treated opaquely: their encoded `WindowedValue` bytes are
+    /// stored and forwarded without ever materializing a [`BeamRecord`].
+    pub fn is_void(&self) -> bool {
+        matches!(self, StandardBeamCoders::Void(_))
+    }
+
     fn decode_primitive(&self, buf: &mut impl Buf) -> Result<PrimitiveValue, CodersError> {
         self.decode_nested(buf)?
             .get_primitive()

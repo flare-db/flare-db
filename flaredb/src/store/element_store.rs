@@ -429,6 +429,49 @@ mod element_store_tests {
     }
 
     #[tokio::test]
+    async fn write_and_scan_opaque_bytes_roundtrip_preserves_wire_bytes() {
+        let (_dir, store) = make_store().await;
+
+        // Opaque VoidCoder elements are stored as the exact encoded
+        // WindowedValue bytes (timestamp + windows + pane framing).
+        let frames: Vec<Vec<u8>> = vec![
+            vec![
+                0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x03,
+            ],
+            vec![0xff; 5],
+            Vec::new(),
+        ];
+        let records = frames
+            .iter()
+            .map(|raw| BeamRecord::PRIMITIVE(PrimitiveValue::Bytes(raw.clone())))
+            .collect();
+
+        store
+            .write_beamrecord_batch(NewCollectionRequest {
+                pcollection_id: "pc-opaque-void".to_string(),
+                elements: records,
+            })
+            .await
+            .unwrap();
+
+        let scanned = store
+            .scan_collection(ScanCollectionRequest {
+                pcollection_id: "pc-opaque-void".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let scanned_frames: Vec<Vec<u8>> = scanned
+            .iter()
+            .map(|record| match record {
+                BeamRecord::PRIMITIVE(PrimitiveValue::Bytes(raw)) => raw.clone(),
+                other => panic!("expected opaque bytes, found {other:?}"),
+            })
+            .collect();
+        assert_eq!(scanned_frames, frames);
+    }
+
+    #[tokio::test]
     async fn write_and_scan_kv_roundtrip() {
         let (_dir, store) = make_store().await;
 

@@ -515,6 +515,42 @@ mod tests {
     }
 
     #[test]
+    fn is_void_only_for_void_coder() {
+        assert!(StandardBeamCoders::Void(VoidCoder).is_void());
+        assert!(!StandardBeamCoders::Bytes(BytesCoder).is_void());
+        assert!(
+            !StandardBeamCoders::Iterable(IterableCoder::new(StandardBeamCoders::Void(VoidCoder)))
+                .is_void()
+        );
+    }
+
+    #[test]
+    fn opaque_void_frames_slice_back_to_exact_wire_bytes() {
+        // The opaque path locates each VoidCoder element frame by decoding the
+        // WindowedValue framing, then preserves the original bytes untouched.
+        // Reassembling those slices must reproduce the input wire bytes exactly.
+        let coder = WindowedValueCoder::new(StandardBeamCoders::Void(VoidCoder));
+
+        let mut buf = BytesMut::new();
+        coder.encode_value(BeamRecord::PRIMITIVE(PrimitiveValue::Void), &mut buf);
+        coder.encode_value(BeamRecord::PRIMITIVE(PrimitiveValue::Void), &mut buf);
+        coder.encode_value(BeamRecord::PRIMITIVE(PrimitiveValue::Void), &mut buf);
+        let wire = buf.freeze();
+
+        let mut cursor = std::io::Cursor::new(&wire[..]);
+        let mut frames = Vec::new();
+        while (cursor.position() as usize) < wire.len() {
+            let start = cursor.position() as usize;
+            coder.decode(&mut cursor).unwrap();
+            let end = cursor.position() as usize;
+            frames.push(wire[start..end].to_vec());
+        }
+
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames.concat(), wire.to_vec());
+    }
+
+    #[test]
     fn iterable_varint_roundtrip() {
         let coder = StandardBeamCoders::Iterable(IterableCoder::new(StandardBeamCoders::VarInt(
             VarIntCoder,

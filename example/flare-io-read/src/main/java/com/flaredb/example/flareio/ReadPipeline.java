@@ -1,12 +1,11 @@
 package com.flaredb.example.flareio;
 
 import org.apache.beam.sdk.Pipeline;
-import org.apache.beam.sdk.io.TextIO;
 import org.apache.beam.sdk.options.PipelineOptionsFactory;
-import org.apache.beam.sdk.transforms.MapElements;
+import org.apache.beam.sdk.transforms.DoFn;
+import org.apache.beam.sdk.transforms.ParDo;
 import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.sdk.values.Row;
-import org.apache.beam.sdk.values.TypeDescriptors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -47,14 +46,18 @@ public class ReadPipeline {
         pipeline.apply(
             "ReadFromFlareDb",
             FlareDbIO.read()
-            .fromQuery("SELECT id, name, score FROM flare.default.scores WHERE score > 80 ORDER BY id")
+            .fromQuery("SELECT id, name, score FROM flare.default.scores WHERE score > 90 ORDER BY id")
             .withDbUrl(options.getDbUrl()));
 
-    LOG.info("Writing rows to {}", options.getOutputFile());
-
-    // Write each read row as a line to the output text file.
-    rows.apply("FormatRows", MapElements.into(TypeDescriptors.strings()).via(Row::toString))
-        .apply("WriteRows", TextIO.write().to(options.getOutputFile()).withoutSharding());
+    rows.apply(
+        "LogRows",
+        ParDo.of(
+            new DoFn<Row, Void>() {
+              @ProcessElement
+              public void processElement(ProcessContext context) {
+                LOG.info("Row: {}", context.element());
+              }
+            }));
 
     pipeline.run();
   }
