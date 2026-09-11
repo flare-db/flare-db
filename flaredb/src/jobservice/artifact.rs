@@ -55,6 +55,12 @@ impl ArtifactStagingService for FlareArtifactStagingService {
 
                     info!("Received and validated staging token");
 
+                    // Start each staging session from an empty file.
+                    if let Err(e) = store.reset().await {
+                        eprintln!("failed to reset artifact store before staging: {}", e);
+                        return;
+                    }
+
                     let resolve_request = ArtifactRequestWrapper {
                         request: Some(artifact_request_wrapper::Request::ResolveArtifact(
                             ResolveArtifactsRequest {
@@ -189,6 +195,15 @@ impl ArtifactStore {
             file: Mutex::new(file),
         })
     }
+    /// Truncates the staged artifact file, discarding any content staged by a
+    /// previous job, so the file always contains a single valid JAR.
+    pub async fn reset(&self) -> Result<(), std::io::Error> {
+        let staging_path = format!("{}/{}", self.path, self.file_name);
+        let mut guard = self.file.lock().await;
+        *guard = Some(File::create(&staging_path).await?);
+        Ok(())
+    }
+
     pub async fn stage_artifact(&self, chunk: &[u8]) -> Result<(), std::io::Error> {
         let mut guard = self.file.lock().await;
 
