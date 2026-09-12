@@ -27,7 +27,7 @@ serde_json = "1.0"
 uuid = { version = "1.4", features = ["v4"] }
 sysinfo = "0.33"
 lzma-rs = "0.3"
-
+flare-sql = {path = "../flare-sql"}
 
 [[bin]]
 name = "flare"

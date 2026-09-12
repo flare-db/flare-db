@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+use flare_sql;
 const FLAREDB_VERSION: &str = "0.1.8";
 
 #[derive(Parser)]
@@ -20,6 +21,8 @@ enum Commands {
     Up,
     // Stop FlareDB instance
     Down,
+    /// Launch the interactive SQL shell.
+    Sql,
 }
 
 #[tokio::main]
@@ -30,6 +33,7 @@ async fn main() -> Result<()> {
         Commands::Init => init::init().await?,
         Commands::Up => server::up().await?,
         Commands::Down => server::down().await?,
+        Commands::Sql => flare_sql::run().await?,
     }
 
     Ok(())

@@ -2162,6 +2162,7 @@ dependencies = [
  "anyhow",
  "clap",
  "dirs",
+ "flare-sql",
  "indicatif",
  "lzma-rs",
  "reqwest 0.11.27",
