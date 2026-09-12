@@ -8,7 +8,7 @@ def javaModules = [
     'wordcount'      : 'example/wordcount',
     'flareio-write' : 'example/flare-io-write',
     'flareio-read'   : 'example/flare-io-read',
-    'nexmarkgbk'     : 'benchmarks/nexmarkgbk',
+    'nexmark'        : 'benchmarks/nexmark',
 ]
 
 javaModules.each { moduleName, moduleDir ->

@@ -1,0 +1,34 @@
+// Nexmark benchmark suite module for FlareDB.
+//
+// Run with:   ./gradlew :nexmark:run -Pnexmark.args="--query=0 --numEvents=10000 --streaming=false"
+// Fat jar:    ./gradlew :nexmark:shadowJar  (build/libs/nexmark-0.1.0-all.jar)
+
+plugins {
+    id 'java'
+    id 'application'
+    alias(libs.plugins.shadow)
+}
+
+application {
+    mainClass = 'com.flaredb.benchmarks.nexmark.Main'
+}
+
+dependencies {
+    implementation project(':flaredb-runner')
+    implementation libs.beam.core
+    implementation libs.beam.nexmark
+    implementation libs.slf4j.api
+    runtimeOnly libs.slf4j.simple
+    implementation libs.joda.time
+}
+
+shadowJar {
+    mergeServiceFiles()
+    zip64 = true
+}
+
+run {
+    if (project.hasProperty('nexmark.args')) {
+        args = project.property('nexmark.args').toString().split('\\s+').findAll { !it.isEmpty() }
+    }
+}
