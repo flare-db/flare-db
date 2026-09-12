@@ -21,7 +21,7 @@ enum Commands {
     Up,
     // Stop FlareDB instance
     Down,
-    /// Launch the interactive SQL shell.
+    // Launch the interactive SQL shell.
     Sql,
 }
 
