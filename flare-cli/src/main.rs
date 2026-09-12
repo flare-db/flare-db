@@ -201,8 +201,11 @@ pub mod init {
     fn extract_tar_xz(archive_path: &Path, dest: &Path) -> Result<()> {
         let file = fs::File::open(archive_path)
             .with_context(|| format!("failed to open archive {}", archive_path.display()))?;
-        let decoder = xz2::read::XzDecoder::new(file);
-        let mut archive = tar::Archive::new(decoder);
+        let mut reader = std::io::BufReader::new(file);
+        let mut decompressed = Vec::new();
+        lzma_rs::xz_decompress(&mut reader, &mut decompressed)
+            .map_err(|e| anyhow::anyhow!("failed to decompress xz: {:?}", e))?;
+        let mut archive = tar::Archive::new(&decompressed[..]);
         let source_binary_name = if cfg!(windows) {
             "flaredb.exe"
         } else {

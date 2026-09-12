@@ -1,0 +1,9 @@
+[package]
+name = "flare-sql"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+paimon-datafusion = "0.3.0"
+paimon = "0.3.0"
+datafusion = "=54.1.0"
