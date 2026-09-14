@@ -34,6 +34,10 @@ pip install -e runner-sdk/python/flarerunner
 `FlareRunner` does not start a job server for you (unlike `FlinkRunner` or
 `PrismRunner`) — start FlareDB separately, then point `--job_endpoint` at it.
 
+See `examples/python/wordcount` for a project-specific example (the Python
+counterpart to `example/wordcount`) instead of Beam's generic wordcount
+module.
+
 ## Test
 
 ```sh
