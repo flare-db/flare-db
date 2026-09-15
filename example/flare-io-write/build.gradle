@@ -18,9 +18,10 @@ application {
 }
 
 dependencies {
-    implementation project(':flaredb-runner')
+    //implementation project(':flaredb-runner')
     //implementation project(':flareio-java')
     implementation 'com.flare-db:flareio-java:0.2.0'
+    implementation 'com.flare-db:flaredb-runner:0.2.0'
     implementation libs.beam.core
     runtimeOnly libs.slf4j.simple
 }
