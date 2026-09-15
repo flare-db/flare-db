@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 
 use flare_sql;
 const FLAREDB_VERSION: &str = "0.2.0";
+const BEAM_WORKER_VERSION: &str = "2.76.0";
 
 #[derive(Parser)]
 #[command(name = "flare")]
@@ -43,6 +44,7 @@ pub mod init {
     use anyhow::bail;
     //#[cfg(not(unix))]
     //use anyhow::bail;
+    use crate::BEAM_WORKER_VERSION;
     use crate::FLAREDB_VERSION;
     use anyhow::{Context, Result};
     use indicatif::{ProgressBar, ProgressStyle};
@@ -94,14 +96,17 @@ pub mod init {
                 .with_context(|| format!("failed to remove archive {}", archive_path.display()))?;
         }
 
-        let worker_jar_name = "beam-sdks-java-harness-2.72.0-flare-bundled.jar";
-        let worker_jar_path = bin_dir.join(worker_jar_name);
-        let worker_url = "https://github.com/flare-db/flare-db/releases/download/beam-worker-java-2.72.0/beam-sdks-java-harness-2.72.0-flare-bundled.jar";
+        let worker_jar_name =
+            format!("beam-sdks-java-harness-{BEAM_WORKER_VERSION}-flare-bundled.jar");
+        let worker_jar_path = bin_dir.join(&worker_jar_name);
+        let worker_url = format!(
+            "https://github.com/flare-db/flare-db/releases/download/beam-worker-java-{BEAM_WORKER_VERSION}/{worker_jar_name}"
+        );
 
         if worker_jar_path.exists() {
             println!("Worker jar already exists at {}", worker_jar_path.display());
         } else {
-            download_with_progress(worker_url, &worker_jar_path).await?;
+            download_with_progress(worker_url.as_str(), &worker_jar_path).await?;
         }
 
         Ok(())
@@ -311,6 +316,7 @@ pub mod init {
 mod server {
     use super::process_control;
     use super::state;
+    use crate::BEAM_WORKER_VERSION;
     use crate::FLAREDB_VERSION;
     use anyhow::{Context, Result, bail};
     use std::fs::{self, OpenOptions};
@@ -321,7 +327,6 @@ mod server {
     use uuid::Uuid;
 
     const PORT: u16 = 8099;
-    const WORKER_JAR_NAME: &str = "beam-sdks-java-harness-2.72.0-flare-bundled.jar";
 
     pub async fn up() -> Result<()> {
         let home_dir = dirs::home_dir().context("failed to determine home directory")?;
@@ -355,7 +360,9 @@ mod server {
             format!("flaredb-{}", FLAREDB_VERSION)
         };
         let binary_path = bin_dir.join(&binary_name);
-        let worker_jar_path = bin_dir.join(WORKER_JAR_NAME);
+        let worker_jar_path = bin_dir.join(format!(
+            "beam-sdks-java-harness-{BEAM_WORKER_VERSION}-flare-bundled.jar"
+        ));
 
         if !binary_path.exists() {
             bail!(
