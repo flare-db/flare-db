@@ -24,6 +24,16 @@ enum Commands {
     Down,
     // Launch the interactive SQL shell.
     Sql,
+    /// View or stream job logs
+    Logs {
+        /// Job ID to view logs for
+        #[arg(short = 'j', long)]
+        job_id: Option<String>,
+
+        /// Follow log output (stream continuously)
+        #[arg(short, long, default_value_t = true)]
+        follow: bool,
+    },
 }
 
 #[tokio::main]
@@ -35,6 +45,7 @@ async fn main() -> Result<()> {
         Commands::Up => server::up().await?,
         Commands::Down => server::down().await?,
         Commands::Sql => flare_sql::run().await?,
+        Commands::Logs { job_id, follow } => logs::stream_logs(job_id, follow).await?,
     }
 
     Ok(())
@@ -670,3 +681,117 @@ mod process_control {
         Ok(())
     }
 }
+
+pub mod logs {
+    use anyhow::{Context, Result, bail};
+    use std::io::Write;
+    use std::path::PathBuf;
+    use std::time::Duration;
+    use tokio::io::AsyncBufReadExt;
+    use tokio::time::sleep;
+
+    use crate::state;
+
+    pub async fn stream_logs(target_job_id: Option<String>, follow: bool) -> Result<()> {
+        let home_dir = dirs::home_dir().context("failed to determine home directory")?;
+        let base_dir = home_dir.join(".flaredb");
+        let state_path = state::state_path(&base_dir);
+
+        let state_opt = if state_path.exists() {
+            state::load_state(&state_path).ok()
+        } else {
+            None
+        };
+
+        let (resolved_job_id, log_path) = match target_job_id {
+            Some(ref req_id) => {
+                let mut found_path = None;
+                if let Some(ref st) = state_opt {
+                    if let Some(j) = st.jobs.iter().find(|j| j.id == *req_id || j.id.starts_with(req_id)) {
+                        found_path = Some((j.id.clone(), PathBuf::from(&j.worker_log)));
+                    }
+                }
+                if found_path.is_none() {
+                    let instances_dir = base_dir.join("instances");
+                    if instances_dir.exists() {
+                        if let Ok(entries) = std::fs::read_dir(&instances_dir) {
+                            for entry in entries.flatten() {
+                                let candidate = entry.path().join("jobs").join(req_id).join("logs").join("flare-worker.log");
+                                if candidate.exists() {
+                                    found_path = Some((req_id.clone(), candidate));
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                match found_path {
+                    Some(res) => res,
+                    None => {
+                        if let Some(ref st) = state_opt {
+                            if !st.jobs.is_empty() {
+                                let available: Vec<String> = st.jobs.iter().map(|j| j.id.clone()).collect();
+                                bail!("Job ID '{}' not found. Available jobs: {}", req_id, available.join(", "));
+                            }
+                        }
+                        bail!("Job ID '{}' not found.", req_id);
+                    }
+                }
+            }
+            None => {
+                if let Some(ref st) = state_opt {
+                    if let Some(last_job) = st.jobs.last() {
+                        println!("Targeting most recent job: {}", last_job.id);
+                        (last_job.id.clone(), PathBuf::from(&last_job.worker_log))
+                    } else {
+                        bail!("No jobs found in state. Please specify --job-id <job-id>.");
+                    }
+                } else {
+                    bail!("No state file found at {}. Start flaredb and submit a job first.", state_path.display());
+                }
+            }
+        };
+
+        println!("Streaming logs for job {} from {}...", resolved_job_id, log_path.display());
+
+        let mut attempts = 0;
+        while !log_path.exists() && attempts < 20 {
+            sleep(Duration::from_millis(250)).await;
+            attempts += 1;
+        }
+
+        if !log_path.exists() {
+            bail!("Log file not found at {}", log_path.display());
+        }
+
+        let file = tokio::fs::File::open(&log_path)
+            .await
+            .with_context(|| format!("failed to open log file {}", log_path.display()))?;
+
+        let mut reader = tokio::io::BufReader::new(file);
+        let mut line = String::new();
+        let mut stdout = std::io::stdout();
+
+        loop {
+            line.clear();
+            let bytes_read = reader
+                .read_line(&mut line)
+                .await
+                .with_context(|| format!("failed to read line from {}", log_path.display()))?;
+
+            if bytes_read > 0 {
+                print!("{}", line);
+                let _ = stdout.flush();
+            } else {
+                if !follow {
+                    break;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        }
+
+        Ok(())
+    }
+}
+

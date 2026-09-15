@@ -39,6 +39,8 @@ fs = "0.0.5"
 tokio-util = { version = "0.7.18", features = ["rt"] }
 rand = "0.10.2"
 futures = "0.3.34"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 [dependencies.uuid]
 version = "1.23.1"
 features = ["v4"]

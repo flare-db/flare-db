@@ -63,6 +63,7 @@ pub mod engine;
 pub mod fusion;
 pub mod io;
 pub mod jobservice;
+pub mod state;
 pub mod store;
 pub mod transforms;
 pub mod utils;
