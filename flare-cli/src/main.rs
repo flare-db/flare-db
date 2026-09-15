@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use flare_sql;
-const FLAREDB_VERSION: &str = "0.2.0";
+const FLAREDB_VERSION: &str = "0.2.1";
 const BEAM_WORKER_VERSION: &str = "2.76.0";
 
 #[derive(Parser)]
