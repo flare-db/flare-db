@@ -12,6 +12,11 @@ dependency-reduced-pom.xml
 .flattened-pom.xml
 bin/
 
+# Python artifacts
+__pycache__/
+*.pyc
+*.egg-info/
+
 # IDE
 .idea/
 *.iml
