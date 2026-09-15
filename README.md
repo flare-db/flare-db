@@ -15,7 +15,7 @@ Its based on a unified streams-and-tables architecture. Streams represent data i
 
 #### Learn more about the architecture
 
-For a deeper dive into FlareDB's design and execution model, check out this post: https://ganeshsivakumar.substack.com/p/flaredb.
+For a deeper dive into FlareDB's design and execution model, check out this post: https://www.flare-db.com/blog/flaredb-initial-version.
 
 ⭐ New streaming systems don't come along that often. If you're curious to see where this project goes, consider starring the repository, it helps you keep track of updates and helps others discover it too.
 
@@ -28,13 +28,13 @@ The FlareDB CLI provides commands to initialize, start, and manage FlareDB insta
 If you are on **Linux or macOS** , please run the following command to install the CLI:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/flare-db/flare-db/releases/download/flare-cli-v0.1.3/flare-cli-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/flare-db/flare-db/releases/download/flare-cli-v0.2.1/flare-cli-installer.sh | sh
 ```
 
 For **Windows** run the following command in PowerShell:
 
 ```bash
-powershell -ExecutionPolicy Bypass -c "irm https://github.com/flare-db/flare-db/releases/download/flare-cli-v0.1.3/flare-cli-installer.ps1 | iex"
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/flare-db/flare-db/releases/download/flare-cli-v0.2.1/flare-cli-installer.ps1 | iex"
 ```
 
 Alternatively, you can download the CLI binary directly from the GitHub Releases page by selecting the appropriate binary for your platform.
