@@ -2,6 +2,10 @@
 name = "flare-sql"
 version = "0.1.0"
 edition = "2024"
+description = "FlareDB SQL shell"
+license = "Apache-2.0"
+repository = "https://github.com/flare-db/flare-db"
+authors = ["Ganesh Sivakumar"]
 
 [dependencies]
 paimon-datafusion = "0.3.0"

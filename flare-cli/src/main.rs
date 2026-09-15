@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use flare_sql;
-const FLAREDB_VERSION: &str = "0.1.8";
+const FLAREDB_VERSION: &str = "0.2.0";
 
 #[derive(Parser)]
 #[command(name = "flare")]
