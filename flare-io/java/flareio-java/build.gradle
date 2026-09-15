@@ -68,16 +68,16 @@ publishing {
     repositories {
         maven {
             name = 'sonatype'
-            url = 'https://central.sonatype.com/api/v1/publisher'
+            url = 'https://ossrh-staging-api.central.sonatype.com/service/local/staging/deploy/maven2/'
             credentials(PasswordCredentials)
         }
     }
 }
 
 signing {
-    // Only require a signatory when publishing to a remote repository
-    // (Sonatype Central). Local publishes via publishToMavenLocal skip
-    // signing so no GPG key setup is needed for development/testing.
+
+    useGpgCmd()
+
     setRequired {
         gradle.taskGraph.allTasks.any { it.name.contains('SonatypeRepository') }
     }
