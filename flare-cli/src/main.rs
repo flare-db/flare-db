@@ -477,15 +477,16 @@ mod server {
         state::write_state(&state_path, &state)
             .with_context(|| format!("failed to write state file {}", state_path.display()))?;
 
-        println!("Flared up! 🔥🔥");
         println!();
-
-        println!("  Instance ID      : {}", instance_id);
-
-        println!("  Worker Logs      :");
-        println!("    {}/jobs/<job-id>/logs/flare-worker.log", instance_id);
-        println!("    Check this location for worker logs after submitting jobs.");
-        println!("    Note: <job-id> is generated automatically when a job is submitted.");
+        println!("\x1b[1mFlared up! 🔥\x1b[0m");
+        println!();
+        println!();
+        println!("A <JOB_ID> is generated automatically for each submitted job.");
+        println!("Use the <JOB_ID> to view logs for a specific job.");
+        println!();
+        println!("Usage:");
+        println!("  flare logs                  # Stream logs for the most recent job");
+        println!("  flare logs <JOB_ID>         # Stream logs for a specific job");
         Ok(())
     }
 

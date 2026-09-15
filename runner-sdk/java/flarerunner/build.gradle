@@ -57,8 +57,6 @@ publishing {
     repositories {
         maven {
             name = 'sonatype'
-            // Sonatype Central Portal. Publish with:
-            //   ./gradlew :flaredb-runner:publish -PossrhUsername=... -PossrhPassword=...
             url = 'https://central.sonatype.com/api/v1/publisher'
             credentials(PasswordCredentials)
         }
@@ -66,5 +64,11 @@ publishing {
 }
 
 signing {
+
+    useGpgCmd()
+
+    setRequired {
+        gradle.taskGraph.allTasks.any { it.name.contains('SonatypeRepository') }
+    }
     sign publishing.publications.mavenJava
 }

@@ -34,8 +34,8 @@ public class ReadPipeline {
     options.setJobName("flareio-read-scores");
     options.setJobEndpoint("127.0.0.1:8099");
     options.setUberJar(
-        "/home/ganesh/flare-db/flareio/flare-db/example/flare-io-read/build/libs/"
-            + "flareio-read-0.1.0-all.jar");
+        "/home/ganesh/flare-db/clilogs/flare-db/example/flare-io-read/build/libs/"
+            + "flareio-read-0.2.0-all.jar"); // set your jar path
 
     Pipeline pipeline = Pipeline.create(options);
 

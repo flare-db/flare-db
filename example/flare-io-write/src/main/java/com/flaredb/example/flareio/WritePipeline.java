@@ -83,7 +83,7 @@ public class WritePipeline {
     options.setJobEndpoint("127.0.0.1:8099");
     options.setUberJar(
         "/home/ganesh/flare-db/flareio/flare-db/example/flare-io-write/build/libs/"
-            + "flareio-write-0.1.0-all.jar");
+            + "flareio-write-0.1.0-all.jar"); // set your jar path
 
     Pipeline pipeline = Pipeline.create(options);
 

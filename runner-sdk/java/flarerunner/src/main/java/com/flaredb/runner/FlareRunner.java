@@ -145,7 +145,7 @@ public class FlareRunner extends PipelineRunner<FlarePipelineJob> {
               .setPreparationId(prepareJobResponse.getPreparationId())
               .build();
 
-      LOG.info("Created run job request: {}", runJobRequest);
+      LOG.info("Created run job request: JOB-ID {}", prepareJobResponse.getPreparationId());
       // Run the job and wait for a result, we don't set a timeout here because
       // it may take a long time for a job to complete and streaming
       // jobs never return a response.
