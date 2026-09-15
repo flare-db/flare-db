@@ -79,19 +79,34 @@ import org.slf4j.LoggerFactory;
 public class FlareDbIO {
 
   private static final Logger LOG = LoggerFactory.getLogger(FlareDbIO.class);
+
+  /** Default FlareDB connection URL. */
   public static final String DEFAULT_DB_URL = "grpc://localhost:8099";
 
-  /** Create a read transform for FlareDB. */
+  /**
+   * Create a read transform for FlareDB.
+   *
+   * @return a new {@link Read} transform
+   */
   public static Read read() {
     return new AutoValue_FlareDbIO_Read.Builder().setDbUrl(DEFAULT_DB_URL).build();
   }
 
-  /** Like {@link #read()} but returns Beam Rows formatted for schema-aware row processing. */
+  /**
+   * Like {@link #read()} but returns Beam Rows formatted for schema-aware row processing.
+   *
+   * @return a new {@link Read} transform
+   */
   public static Read readTableRows() {
     return read();
   }
 
-  /** Create a write transform for FlareDB. */
+  /**
+   * Create a write transform for FlareDB.
+   *
+   * @param <T> the type of elements written to FlareDB
+   * @return a new {@link Write} transform
+   */
   public static <T> Write<T> write() {
     return new AutoValue_FlareDbIO_Write.Builder<T>()
         .setDbUrl(DEFAULT_DB_URL)
@@ -176,6 +191,9 @@ public class FlareDbIO {
 
   // READ
 
+  /**
+   * A {@link PTransform} that reads rows from FlareDB into a {@link PCollection} of {@link Row}s.
+   */
   @AutoValue
   public abstract static class Read extends PTransform<PBegin, PCollection<Row>> {
 
@@ -194,7 +212,12 @@ public class FlareDbIO {
       abstract Read build();
     }
 
-    /** Sets the FlareDB URL (e.g. {@code "grpc://localhost:8099"}). */
+    /**
+     * Sets the FlareDB URL (e.g. {@code "grpc://localhost:8099"}).
+     *
+     * @param dbUrl the FlareDB connection URL
+     * @return a new {@link Read} transform with the given URL
+     */
     public Read withDbUrl(String dbUrl) {
       return builder().setDbUrl(dbUrl).build();
     }
@@ -202,6 +225,9 @@ public class FlareDbIO {
     /**
      * Sets the SQL query to execute on FlareDB (e.g. {@code "SELECT * FROM
      * flare.default.my_table"}).
+     *
+     * @param query the SQL query to execute
+     * @return a new {@link Read} transform with the given query
      */
     public Read fromQuery(String query) {
       return builder().setQuery(query).build();
@@ -442,6 +468,11 @@ public class FlareDbIO {
 
   // WRITE
 
+  /**
+   * A {@link PTransform} that writes a {@link PCollection} of elements into FlareDB.
+   *
+   * @param <T> the type of elements written to FlareDB
+   */
   @AutoValue
   public abstract static class Write<T> extends PTransform<PCollection<T>, PDone> {
 
@@ -464,17 +495,32 @@ public class FlareDbIO {
       abstract Write<T> build();
     }
 
-    /** Sets the FlareDB URL (e.g. {@code "grpc://localhost:8099"}). */
+    /**
+     * Sets the FlareDB URL (e.g. {@code "grpc://localhost:8099"}).
+     *
+     * @param dbUrl the FlareDB connection URL
+     * @return a new {@link Write} transform with the given URL
+     */
     public Write<T> withDbUrl(String dbUrl) {
       return builder().setDbUrl(dbUrl).build();
     }
 
-    /** Sets the destination table (e.g. {@code "flare.default.my_table"}). */
+    /**
+     * Sets the destination table (e.g. {@code "flare.default.my_table"}).
+     *
+     * @param table the destination table name
+     * @return a new {@link Write} transform with the given table
+     */
     public Write<T> to(String table) {
       return builder().setTable(table).build();
     }
 
-    /** Sets batch size for writing rows. */
+    /**
+     * Sets batch size for writing rows.
+     *
+     * @param batchSize the number of rows per batch (must be positive)
+     * @return a new {@link Write} transform with the given batch size
+     */
     public Write<T> withBatchSize(int batchSize) {
       checkArgument(batchSize > 0, "batchSize must be positive");
       return builder().setBatchSize(batchSize).build();

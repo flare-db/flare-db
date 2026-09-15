@@ -307,12 +307,26 @@ public class ArrowConversion {
    *
    * <p>Note this is a lazy interface. The data in the underlying Arrow buffer is not read until a
    * field of one of the returned {@link Row}s is accessed.
+   *
+   * @param schema the Beam row schema describing the record batch
+   * @param vectorSchemaRoot the Arrow record batch holding the columnar data
+   * @return an iterator over the rows of the record batch
    */
   public static RecordBatchRowIterator rowsFromRecordBatch(
       Schema schema, VectorSchemaRoot vectorSchemaRoot) {
     return new RecordBatchRowIterator(schema, vectorSchemaRoot);
   }
 
+  /**
+   * Deserializes a serialized Arrow record batch and returns a {@link RecordBatchRowIterator} over
+   * its rows.
+   *
+   * @param arrowSchema the Arrow schema of the serialized record batch
+   * @param inputStream the stream containing the serialized record batch
+   * @param allocator the Arrow memory allocator to use
+   * @return an iterator over the rows of the deserialized record batch
+   * @throws IOException if the record batch cannot be deserialized
+   */
   @SuppressWarnings("nullness")
   public static RecordBatchRowIterator rowsFromSerializedRecordBatch(
       org.apache.arrow.vector.types.pojo.Schema arrowSchema,
@@ -331,12 +345,23 @@ public class ArrowConversion {
     return rowsFromRecordBatch(ArrowSchemaTranslator.toBeamSchema(arrowSchema), vectorRoot);
   }
 
+  /**
+   * Reads and deserializes an Arrow schema from the given stream.
+   *
+   * @param input the stream containing a serialized Arrow schema
+   * @return the deserialized Arrow schema
+   * @throws IOException if the schema cannot be read
+   */
   public static org.apache.arrow.vector.types.pojo.Schema arrowSchemaFromInput(InputStream input)
       throws IOException {
     ReadChannel readChannel = new ReadChannel(Channels.newChannel(input));
     return MessageSerializer.deserializeSchema(readChannel);
   }
 
+  /**
+   * An {@link Iterator} over the {@link Row}s of an Arrow record batch, backed directly by the
+   * underlying Arrow {@link VectorSchemaRoot}. Each {@link Row} is materialized lazily on access.
+   */
   @SuppressWarnings("rawtypes")
   public static class RecordBatchRowIterator implements Iterator<Row>, AutoCloseable {
     private static final ArrowValueConverterVisitor valueConverterVisitor =
@@ -602,7 +627,12 @@ public class ArrowConversion {
   /** Converts Arrow schema to Beam row schema. */
   public static class ArrowSchemaTranslator {
 
-    /** Converts a supported Beam row schema to an Arrow schema. */
+    /**
+     * Converts a supported Beam row schema to an Arrow schema.
+     *
+     * @param schema the Beam row schema to convert
+     * @return the equivalent Arrow schema
+     */
     public static org.apache.arrow.vector.types.pojo.Schema toArrowSchema(Schema schema) {
       return new org.apache.arrow.vector.types.pojo.Schema(
           schema.getFields().stream()
@@ -610,10 +640,22 @@ public class ArrowConversion {
               .collect(Collectors.toList()));
     }
 
+    /**
+     * Converts an Arrow schema to a Beam row schema.
+     *
+     * @param schema the Arrow schema to convert
+     * @return the equivalent Beam row schema
+     */
     public static Schema toBeamSchema(org.apache.arrow.vector.types.pojo.Schema schema) {
       return toBeamSchema(schema.getFields());
     }
 
+    /**
+     * Converts a list of Arrow fields to a Beam row schema.
+     *
+     * @param fields the Arrow fields to convert
+     * @return the equivalent Beam row schema
+     */
     public static Schema toBeamSchema(List<org.apache.arrow.vector.types.pojo.Field> fields) {
       Schema.Builder builder = Schema.builder();
       for (org.apache.arrow.vector.types.pojo.Field field : fields) {
