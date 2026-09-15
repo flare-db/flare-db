@@ -14,6 +14,7 @@ flare-db/
 ├── beam-model-rs/        # Rust Beam model (generated from beam/model protos)
 ├── beam/model/           # Vendored Apache Beam protos (codegen input, not built)
 ├── runner-sdk/java/      # :flaredb-runner — Apache Beam runner for FlareDB
+├── runner-sdk/python/    # flaredb-runner — Apache Beam portable runner for FlareDB (Python)
 ├── flare-io/java/        # :flareio-java — FlareDB I/O for Beam (Arrow/Flight SQL)
 ├── example/wordcount/    # :wordcount — WordCount pipeline example
 ├── example/flare-io-write/  # :flareio-write — FlareDB I/O write example pipeline
@@ -38,6 +39,9 @@ cargo build -p flaredb -p flare-cli
 
 # Rust: single crate
 cargo build -p flaredb
+
+# Python: install the runner-sdk in editable mode
+pip install -e runner-sdk/python/flarerunner
 ```
 
 ## Test
@@ -55,6 +59,9 @@ cargo test -p flaredb
 
 # Rust: tests of a single module
 cargo test -p flaredb engine::
+
+# Python: runner-sdk
+cd runner-sdk/python/flarerunner && python -m unittest discover -s tests -p "*_test.py"
 ```
 
 ## Run
