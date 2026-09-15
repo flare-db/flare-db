@@ -21,7 +21,6 @@ import org.apache.beam.sdk.options.PipelineOptions;
 import org.apache.beam.sdk.options.PipelineOptionsValidator;
 import org.apache.beam.sdk.util.construction.PipelineOptionsTranslation;
 import org.apache.beam.sdk.util.construction.PipelineTranslation;
-import org.apache.beam.vendor.grpc.v1p69p0.com.google.protobuf.ByteString;
 import org.apache.beam.vendor.grpc.v1p69p0.io.grpc.ManagedChannel;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -153,9 +152,12 @@ public class FlareRunner extends PipelineRunner<FlarePipelineJob> {
 
       LOG.info("RunJobResponse received jobName={}", options.getJobName());
       LOG.info("Job Eexecution Completed");
-      ByteString jobId = runJobResponse.getJobIdBytes();
 
-      return new FlarePipelineJob(jobId);
+      // Transfer ownership of the job-service channel to the returned job: getState() and
+      // cancel() need it for the lifetime of the job, not just for submission, so it must
+      // outlive this try-with-resources block instead of being shut down on the way out.
+      return new FlarePipelineJob(
+          runJobResponse.getJobId(), jobServerTimeout, wrappedJobService.transfer());
     } catch (CloseException e) {
       throw new RuntimeException(e);
     }
