@@ -24,11 +24,19 @@ enum Commands {
     Down,
     // Launch the interactive SQL shell.
     Sql,
-    /// View or stream job logs
+    // View or stream job logs.
+    //
+    // Usage:
+    //   flare logs                      # Stream logs for the most recent job
+    //   flare logs <JOB_ID>             # Stream logs for a specific job ID
     Logs {
-        /// Job ID to view logs for
-        #[arg(short = 'j', long)]
-        job_id: Option<String>,
+        /// Job ID to view logs for (positional). If omitted, defaults to the most recent job.
+        #[arg(value_name = "JOB_ID")]
+        job_id_pos: Option<String>,
+
+        /// Job ID to view logs for. If omitted, defaults to the most recent job.
+        #[arg(short = 'j', long = "jobid", value_name = "JOB_ID")]
+        job_id_flag: Option<String>,
 
         /// Follow log output (stream continuously)
         #[arg(short, long, default_value_t = true)]
@@ -45,7 +53,14 @@ async fn main() -> Result<()> {
         Commands::Up => server::up().await?,
         Commands::Down => server::down().await?,
         Commands::Sql => flare_sql::run().await?,
-        Commands::Logs { job_id, follow } => logs::stream_logs(job_id, follow).await?,
+        Commands::Logs {
+            job_id_pos,
+            job_id_flag,
+            follow,
+        } => {
+            let job_id = job_id_flag.or(job_id_pos);
+            logs::stream_logs(job_id, follow).await?
+        }
     }
 
     Ok(())
@@ -703,57 +718,190 @@ pub mod logs {
             None
         };
 
+        let clean_id = |id: &str| -> String {
+            let s = id
+                .trim()
+                .trim_matches(|c| c == '"' || c == '\'' || c == '=');
+            if s.starts_with('-') {
+                s.trim_start_matches('-').to_string()
+            } else {
+                s.to_string()
+            }
+        };
+
+        let is_match = |job_id: &str, req: &str| -> bool {
+            let j = job_id.to_lowercase();
+            let r = clean_id(req).to_lowercase();
+            if j.is_empty() || r.is_empty() {
+                return false;
+            }
+            j == r
+                || j.contains(&r)
+                || r.contains(&j)
+                || (j.starts_with("jobid") && j[5..].starts_with(&r))
+                || (r.starts_with("jobid") && r[5..].starts_with(&j))
+                || (r.starts_with("obid") && j.contains(&r[4..]))
+        };
+
         let (resolved_job_id, log_path) = match target_job_id {
             Some(ref req_id) => {
-                let mut found_path = None;
+                let mut found = None;
+
+                // 1. Search state.json
                 if let Some(ref st) = state_opt {
-                    if let Some(j) = st.jobs.iter().find(|j| j.id == *req_id || j.id.starts_with(req_id)) {
-                        found_path = Some((j.id.clone(), PathBuf::from(&j.worker_log)));
+                    if let Some(j) = st.jobs.iter().find(|j| is_match(&j.id, req_id)) {
+                        found = Some((j.id.clone(), PathBuf::from(&j.worker_log)));
                     }
                 }
-                if found_path.is_none() {
+
+                // 2. Search filesystem instances directory
+                if found.is_none() {
                     let instances_dir = base_dir.join("instances");
                     if instances_dir.exists() {
-                        if let Ok(entries) = std::fs::read_dir(&instances_dir) {
-                            for entry in entries.flatten() {
-                                let candidate = entry.path().join("jobs").join(req_id).join("logs").join("flare-worker.log");
-                                if candidate.exists() {
-                                    found_path = Some((req_id.clone(), candidate));
-                                    break;
+                        if let Ok(inst_entries) = std::fs::read_dir(&instances_dir) {
+                            'search: for inst_entry in inst_entries.flatten() {
+                                let jobs_dir = inst_entry.path().join("jobs");
+                                if jobs_dir.exists() {
+                                    if let Ok(job_entries) = std::fs::read_dir(&jobs_dir) {
+                                        for job_entry in job_entries.flatten() {
+                                            let folder_name =
+                                                job_entry.file_name().to_string_lossy().to_string();
+                                            if is_match(&folder_name, req_id) {
+                                                let log1 = job_entry
+                                                    .path()
+                                                    .join("logs")
+                                                    .join("flare-worker.log");
+                                                let log2 = job_entry
+                                                    .path()
+                                                    .join("logs")
+                                                    .join("flare-worker.logs");
+                                                if log1.exists() {
+                                                    found = Some((folder_name, log1));
+                                                    break 'search;
+                                                } else if log2.exists() {
+                                                    found = Some((folder_name, log2));
+                                                    break 'search;
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
                 }
 
-                match found_path {
+                match found {
                     Some(res) => res,
                     None => {
+                        let mut available = Vec::new();
                         if let Some(ref st) = state_opt {
-                            if !st.jobs.is_empty() {
-                                let available: Vec<String> = st.jobs.iter().map(|j| j.id.clone()).collect();
-                                bail!("Job ID '{}' not found. Available jobs: {}", req_id, available.join(", "));
+                            available.extend(st.jobs.iter().map(|j| j.id.clone()));
+                        }
+                        if available.is_empty() {
+                            let instances_dir = base_dir.join("instances");
+                            if let Ok(inst_entries) = std::fs::read_dir(&instances_dir) {
+                                for inst_entry in inst_entries.flatten() {
+                                    let jobs_dir = inst_entry.path().join("jobs");
+                                    if let Ok(job_entries) = std::fs::read_dir(&jobs_dir) {
+                                        for job_entry in job_entries.flatten() {
+                                            available.push(
+                                                job_entry.file_name().to_string_lossy().to_string(),
+                                            );
+                                        }
+                                    }
+                                }
                             }
                         }
-                        bail!("Job ID '{}' not found.", req_id);
+
+                        if !available.is_empty() {
+                            bail!(
+                                "Job ID '{}' not found. Available jobs:\n  {}",
+                                req_id,
+                                available.join("\n  ")
+                            );
+                        } else {
+                            bail!(
+                                "Job ID '{}' not found and no jobs were found in instance logs.",
+                                req_id
+                            );
+                        }
                     }
                 }
             }
             None => {
+                let mut latest_job: Option<(String, PathBuf, std::time::SystemTime)> = None;
+
                 if let Some(ref st) = state_opt {
-                    if let Some(last_job) = st.jobs.last() {
-                        println!("Targeting most recent job: {}", last_job.id);
-                        (last_job.id.clone(), PathBuf::from(&last_job.worker_log))
-                    } else {
-                        bail!("No jobs found in state. Please specify --job-id <job-id>.");
+                    if let Some(j) = st.jobs.last() {
+                        let p = PathBuf::from(&j.worker_log);
+                        if p.exists() {
+                            let mtime = std::fs::metadata(&p)
+                                .and_then(|m| m.modified())
+                                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                            latest_job = Some((j.id.clone(), p, mtime));
+                        }
                     }
-                } else {
-                    bail!("No state file found at {}. Start flaredb and submit a job first.", state_path.display());
+                }
+
+                if latest_job.is_none() {
+                    let instances_dir = base_dir.join("instances");
+                    if instances_dir.exists() {
+                        if let Ok(inst_entries) = std::fs::read_dir(&instances_dir) {
+                            for inst_entry in inst_entries.flatten() {
+                                let jobs_dir = inst_entry.path().join("jobs");
+                                if let Ok(job_entries) = std::fs::read_dir(&jobs_dir) {
+                                    for job_entry in job_entries.flatten() {
+                                        let folder_name =
+                                            job_entry.file_name().to_string_lossy().to_string();
+                                        let log1 =
+                                            job_entry.path().join("logs").join("flare-worker.log");
+                                        let log2 =
+                                            job_entry.path().join("logs").join("flare-worker.logs");
+                                        let target_log = if log1.exists() {
+                                            Some(log1)
+                                        } else if log2.exists() {
+                                            Some(log2)
+                                        } else {
+                                            None
+                                        };
+                                        if let Some(log_path) = target_log {
+                                            let mtime = std::fs::metadata(&log_path)
+                                                .and_then(|m| m.modified())
+                                                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                                            if latest_job
+                                                .as_ref()
+                                                .map_or(true, |(_, _, best_time)| {
+                                                    mtime > *best_time
+                                                })
+                                            {
+                                                latest_job = Some((folder_name, log_path, mtime));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                match latest_job {
+                    Some((id, path, _)) => {
+                        println!("Targeting most recent job: {}", id);
+                        (id, path)
+                    }
+                    None => {
+                        bail!("No jobs found. Run a job first or specify --job-id <job-id>.");
+                    }
                 }
             }
         };
 
-        println!("Streaming logs for job {} from {}...", resolved_job_id, log_path.display());
+        println!(
+            "Streaming logs for job {} from {}...",
+            resolved_job_id,
+            log_path.display()
+        );
 
         let mut attempts = 0;
         while !log_path.exists() && attempts < 20 {
@@ -794,4 +942,3 @@ pub mod logs {
         Ok(())
     }
 }
-

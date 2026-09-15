@@ -27,11 +27,11 @@ public class WordCount {
         options.setRunner(FlareRunner.class);
         options.setJobEndpoint("127.0.0.1:8099");
         options.setUberJar(
-                "/home/ganesh/flare-db/sdf/flare-db/example/wordcount/target/wordcount-1.0-SNAPSHOT.jar");
+                "/home/ganesh/flare-db/clilogs/flare-db/example/wordcount/build/libs/wordcount-0.2.0-all.jar");
 
         Pipeline p = Pipeline.create(options);
 
-        p.apply("ReadLines", TextIO.read().from("/home/ganesh/flare-db/sdf/flare-db/para.txt"))
+        p.apply("ReadLines", TextIO.read().from("/home/ganesh/flare-db/clilogs/flare-db/test-data/thirukkural.txt"))
                 .apply("Split lines into words", FlatMapElements.into(TypeDescriptors.strings())
                         .via(line -> Arrays.asList(line.split(" "))))
                 .apply("Remove empty words", Filter.by(word -> !word.isEmpty()))
