@@ -21,6 +21,7 @@ use crate::jobservice::artifact::ArtifactStore;
 use crate::jobservice::job::Job;
 use crate::jobservice::job::JobStore;
 use crate::jobservice::state::record_job_state;
+use crate::worker::manager::WorkerRuntime;
 
 pub struct FlareJobService {
     job_store: JobStore,
@@ -149,7 +150,22 @@ impl JobService for FlareJobService {
                 Status::not_found(format!("unknown preparation_id: {}", preparation_id))
             })?;
 
+            let staging_dir = self.artifact_store.root_path();
             let staged_jar = self.artifact_store.staged_path();
+            let pickled_session_path = format!("{}/staged/pickled_main_session", staging_dir);
+
+            let is_python = tokio::fs::try_exists(&pickled_session_path)
+                .await
+                .unwrap_or(false)
+                || job_graph.components.environments.values().any(|env| {
+                    env.urn == "beam:env:process:v1" || env.urn.contains("python")
+                });
+
+            let runtime = if is_python {
+                WorkerRuntime::Python { python_bin: None }
+            } else {
+                WorkerRuntime::Java { staged_jar }
+            };
 
             if let Err(e) = record_job_state(&self.instance_id, &preparation_id) {
                 log::warn!("failed to record job state for {}: {}", preparation_id, e);
@@ -159,7 +175,7 @@ impl JobService for FlareJobService {
             self.dispatcher.lock().await.reset_channels().await;
 
             self.worker_manager
-                .spawn_worker(&preparation_id, &staged_jar, &self.instance_id)
+                .spawn_worker(&preparation_id, &runtime, staging_dir, &self.instance_id)
                 .await?;
 
             self.dispatcher
