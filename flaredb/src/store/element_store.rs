@@ -305,8 +305,8 @@ mod element_store_tests {
                         PrimitiveValue::String(s) => s.clone(),
                         other => panic!("expected string key, got {other:?}"),
                     };
-                    let value = match &kv.value {
-                        PrimitiveValue::Int64(v) => *v,
+                    let value = match kv.value.as_ref() {
+                        BeamRecord::PRIMITIVE(PrimitiveValue::Int64(v)) => *v,
                         other => panic!("expected int64 value, got {other:?}"),
                     };
                     (key, value)
@@ -330,7 +330,7 @@ mod element_store_tests {
                         .list
                         .iter()
                         .map(|v| match v {
-                            PrimitiveValue::Int64(v) => *v,
+                            BeamRecord::PRIMITIVE(PrimitiveValue::Int64(v)) => *v,
                             other => panic!("expected int64 group value, got {other:?}"),
                         })
                         .collect();
@@ -501,11 +501,11 @@ mod element_store_tests {
         let records = vec![
             BeamRecord::KV(BeamKV {
                 key: PrimitiveValue::String("a".into()),
-                value: PrimitiveValue::Int64(10),
+                value: Box::new(BeamRecord::PRIMITIVE(PrimitiveValue::Int64(10))),
             }),
             BeamRecord::KV(BeamKV {
                 key: PrimitiveValue::String("b".into()),
-                value: PrimitiveValue::Int64(20),
+                value: Box::new(BeamRecord::PRIMITIVE(PrimitiveValue::Int64(20))),
             }),
         ];
         store

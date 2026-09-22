@@ -3,7 +3,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow};
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Float64Array, Int64Array, ListArray, NullArray,
-    RecordBatch, StringArray,
+    RecordBatch, StringArray, StructArray, builder::BooleanBuilder,
 };
 use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema, TimeUnit};
@@ -23,12 +23,18 @@ use crate::{
     jobservice::urns,
 };
 
-#[derive(Debug, Clone)]
+/// A decoded Beam element, in the shapes the store can materialize.
+///
+/// This is the in-memory form of a PCollection element: a primitive, a
+/// primitive list, a keyed value (whose value may itself be a tuple), a grouped
+/// value, or a tuple.
+#[derive(Debug, Clone, PartialEq)]
 pub enum BeamRecord {
     PRIMITIVE(PrimitiveValue),
     ITERABLE(IterableValue),
     KV(BeamKV),
     GBK(BeamGbk),
+    TUPLE(TupleValue),
 }
 
 #[derive(Debug, Clone)]
@@ -37,6 +43,7 @@ pub enum BeamRecordType {
     Iterable,
     Kv,
     Gbk,
+    Tuple,
 }
 
 impl BeamRecord {
@@ -46,6 +53,7 @@ impl BeamRecord {
             BeamRecord::ITERABLE(_) => BeamRecordType::Iterable,
             BeamRecord::GBK(_) => BeamRecordType::Gbk,
             BeamRecord::KV(_) => BeamRecordType::Kv,
+            BeamRecord::TUPLE(_) => BeamRecordType::Tuple,
         }
     }
 
@@ -76,28 +84,63 @@ impl BeamRecord {
             _ => Err(anyhow!("excluded other types")),
         }
     }
+
+    pub fn get_tuple(&self) -> Result<TupleValue> {
+        match self {
+            BeamRecord::TUPLE(value) => Ok(value.clone()),
+            _ => Err(anyhow!("excluded other types")),
+        }
+    }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BeamGbk {
     pub(crate) key: PrimitiveValue,
     pub(crate) value: IterableValue,
 }
 
-#[derive(Debug, Clone)]
+/// A keyed element. The key is always a [`PrimitiveValue`]; the value may be a
+/// bare primitive or a fixed-arity tuple (e.g. Beam's `KV[K, Tuple[...]]`), so
+/// it is boxed to keep [`BeamRecord`] sized.
+#[derive(Debug, Clone, PartialEq)]
 pub struct BeamKV {
     pub(crate) key: PrimitiveValue,
-    pub(crate) value: PrimitiveValue,
+    pub(crate) value: Box<BeamRecord>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct IterableValue {
-    pub(crate) list: Vec<PrimitiveValue>,
+    pub(crate) list: Vec<BeamRecord>,
 }
 
 impl IterableValue {
+    /// Build an iterable from primitive values (convenience for primitive
+    /// element coders).
     pub fn new(list: Vec<PrimitiveValue>) -> Self {
+        Self {
+            list: list.into_iter().map(BeamRecord::PRIMITIVE).collect(),
+        }
+    }
+
+    /// Build an iterable from already-materialized element records.
+    pub fn from_records(list: Vec<BeamRecord>) -> Self {
         Self { list }
+    }
+}
+
+/// A fixed-arity, possibly heterogeneous tuple of primitive values.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TupleValue {
+    pub(crate) values: Vec<PrimitiveValue>,
+}
+
+impl TupleValue {
+    pub fn new(values: Vec<PrimitiveValue>) -> Self {
+        Self { values }
+    }
+
+    pub fn values(&self) -> &[PrimitiveValue] {
+        &self.values
     }
 }
 
@@ -169,6 +212,8 @@ pub enum TableType {
     Kv,
     /// Two columns: `key` (primitive), `value` (List<Primitive>).
     Gbk,
+    /// A single `value` column holding a `Struct<f0, f1, ...>` tuple.
+    Tuple,
     /// A full Beam row schema stored as its named Arrow columns.
     Row,
 }
@@ -180,6 +225,7 @@ impl TableType {
             TableType::Iterable => "iterable",
             TableType::Kv => "kv",
             TableType::Gbk => "gbk",
+            TableType::Tuple => "tuple",
             TableType::Row => "row",
         }
     }
@@ -190,6 +236,7 @@ impl TableType {
             "iterable" => Ok(TableType::Iterable),
             "kv" => Ok(TableType::Kv),
             "gbk" => Ok(TableType::Gbk),
+            "tuple" => Ok(TableType::Tuple),
             "row" => Ok(TableType::Row),
             other => Err(anyhow!("unknown table type: {other}")),
         }
@@ -202,6 +249,7 @@ fn table_type_of(record: &BeamRecord) -> TableType {
         BeamRecord::ITERABLE(_) => TableType::Iterable,
         BeamRecord::KV(_) => TableType::Kv,
         BeamRecord::GBK(_) => TableType::Gbk,
+        BeamRecord::TUPLE(_) => TableType::Tuple,
     }
 }
 
@@ -239,17 +287,26 @@ fn primitive_type_matches(value: &PrimitiveValue, data_type: &ArrowDataType) -> 
     &primitive_data_type(value) == data_type
 }
 
-fn iterable_values(iterable: &IterableValue) -> &[PrimitiveValue] {
-    iterable.list.as_slice()
+/// Arrow type used to store one element of an iterable.
+///
+/// `Void` elements become nullable `Boolean`: Arrow cannot hold `Null` inside a
+/// `List`, and Paimon has no `Null` type (a null reads back as `Void`).
+fn iterable_element_data_type(record: &BeamRecord) -> Result<ArrowDataType> {
+    match nested_value_storage_type(record)? {
+        ArrowDataType::Null => Ok(ArrowDataType::Boolean),
+        other => Ok(other),
+    }
 }
 
-fn infer_iterable_item_data_type(iterables: &[IterableValue]) -> ArrowDataType {
-    iterables
-        .iter()
-        .flat_map(iterable_values)
-        .next()
-        .map(primitive_data_type)
-        .unwrap_or(ArrowDataType::Null)
+/// Infer the Arrow element type of an iterable column from its elements.
+/// Falls back to nullable `Boolean` when every iterable is empty.
+fn infer_iterable_item_data_type(iterables: &[IterableValue]) -> Result<ArrowDataType> {
+    for iterable in iterables {
+        if let Some(first) = iterable.list.first() {
+            return iterable_element_data_type(first);
+        }
+    }
+    Ok(ArrowDataType::Boolean)
 }
 
 fn build_offsets(lengths: &[usize]) -> Result<OffsetBuffer<i32>> {
@@ -313,17 +370,22 @@ pub fn primitive_values_to_array(
             Ok(Arc::new(Int64Array::from(ints)))
         }
         ArrowDataType::Boolean => {
-            let bools = values
-                .iter()
-                .map(|value| match value {
-                    PrimitiveValue::Bool(value) => Ok(*value),
-                    other => Err(anyhow!(
-                        "mixed primitive variants in batch: expected Bool, found {:?}",
-                        other
-                    )),
-                })
-                .collect::<Result<Vec<_>>>()?;
-            Ok(Arc::new(BooleanArray::from(bools)))
+            let mut builder = BooleanBuilder::with_capacity(values.len());
+            for value in values {
+                match value {
+                    PrimitiveValue::Bool(value) => builder.append_value(*value),
+                    // `Void` components are stored as null booleans (Paimon has no
+                    // Null type); on read a null maps back to `Void`.
+                    PrimitiveValue::Void => builder.append_null(),
+                    other => {
+                        return Err(anyhow!(
+                            "mixed primitive variants in batch: expected Bool, found {:?}",
+                            other
+                        ));
+                    }
+                }
+            }
+            Ok(Arc::new(builder.finish()))
         }
         ArrowDataType::Float64 => {
             let floats = values
@@ -359,18 +421,17 @@ pub fn iterable_values_to_array(
     item_data_type: &ArrowDataType,
 ) -> Result<ArrayRef> {
     let mut lengths = Vec::with_capacity(iterables.len());
-    let mut flattened = Vec::new();
+    let mut flattened: Vec<BeamRecord> = Vec::new();
 
     for iterable in iterables {
-        let values = iterable_values(iterable);
-        lengths.push(values.len());
-        flattened.extend(values.iter().cloned());
+        lengths.push(iterable.list.len());
+        flattened.extend(iterable.list.iter().cloned());
     }
 
     let offsets = build_offsets(&lengths)?;
-    let child = primitive_values_to_array(&flattened, item_data_type)?;
+    let child = nested_values_to_array(&flattened, item_data_type)?;
 
-    let nullable = matches!(item_data_type, ArrowDataType::Null);
+    let nullable = matches!(item_data_type, ArrowDataType::Null | ArrowDataType::Boolean);
     let item_field = Arc::new(ArrowField::new("item", item_data_type.clone(), nullable));
 
     Ok(Arc::new(ListArray::new(item_field, offsets, child, None)))
@@ -438,7 +499,7 @@ fn iterable_value_from_array_row(
     };
 
     if array.is_null(row) {
-        return Ok(IterableValue::new(Vec::new()));
+        return Ok(IterableValue::from_records(Vec::new()));
     }
 
     let list_array = array
@@ -449,18 +510,124 @@ fn iterable_value_from_array_row(
     let offsets = list_array.value_offsets();
     let start = usize::try_from(offsets[row]).context("negative list offset")?;
     let end = usize::try_from(offsets[row + 1]).context("negative list offset")?;
+    let child_type = item_field.data_type();
     let values_array = list_array.values();
 
     let mut values = Vec::with_capacity(end.saturating_sub(start));
     for index in start..end {
-        values.push(primitive_value_from_array_row(
+        values.push(nested_value_from_array_row(
             values_array.as_ref(),
-            item_field.data_type(),
+            child_type,
             index,
         )?);
     }
 
-    Ok(IterableValue::new(values))
+    Ok(IterableValue::from_records(values))
+}
+
+// Nested value (primitive or tuple) helpers
+
+/// Arrow storage type for a tuple component. `Void` components become nullable
+/// `Boolean` because Paimon cannot store Arrow `Null` inside a `Struct`; a null
+/// boolean maps back to `Void` on read.
+fn tuple_component_data_type(value: &PrimitiveValue) -> ArrowDataType {
+    match primitive_data_type(value) {
+        ArrowDataType::Null => ArrowDataType::Boolean,
+        other => other,
+    }
+}
+
+/// Arrow storage type for a tuple: a `Struct<f0, f1, ...>` of component types.
+fn tuple_storage_type(tuple: &TupleValue) -> ArrowDataType {
+    let fields: Vec<ArrowField> = tuple
+        .values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            ArrowField::new(format!("f{index}"), tuple_component_data_type(value), true)
+        })
+        .collect();
+    ArrowDataType::Struct(fields.into())
+}
+
+/// Arrow storage type for a nested value that is either a primitive or a tuple.
+fn nested_value_storage_type(record: &BeamRecord) -> Result<ArrowDataType> {
+    match record {
+        BeamRecord::PRIMITIVE(value) => Ok(primitive_data_type(value)),
+        BeamRecord::TUPLE(tuple) => Ok(tuple_storage_type(tuple)),
+        other => Err(anyhow!(
+            "unsupported nested value record type: {:?}",
+            other.record_type()
+        )),
+    }
+}
+
+/// Build an Arrow array for a nested value column whose elements are primitives
+/// or tuples.
+fn nested_values_to_array(records: &[BeamRecord], data_type: &ArrowDataType) -> Result<ArrayRef> {
+    match data_type {
+        ArrowDataType::Struct(fields) => {
+            let arity = fields.len();
+            let mut children: Vec<ArrayRef> = Vec::with_capacity(arity);
+            for index in 0..arity {
+                let child_type = fields[index].data_type();
+                let mut child_values = Vec::with_capacity(records.len());
+                for record in records {
+                    let BeamRecord::TUPLE(tuple) = record else {
+                        return Err(anyhow!("expected tuple record"));
+                    };
+                    let value = tuple.values.get(index).ok_or_else(|| {
+                        anyhow!("tuple component count mismatch: expected at least {arity}")
+                    })?;
+                    child_values.push(value.clone());
+                }
+                children.push(primitive_values_to_array(&child_values, child_type)?);
+            }
+            Ok(Arc::new(StructArray::try_new(
+                fields.clone(),
+                children,
+                None,
+            )?))
+        }
+        other => {
+            let values = records
+                .iter()
+                .map(|record| match record {
+                    BeamRecord::PRIMITIVE(value) => Ok(value.clone()),
+                    _ => Err(anyhow!("expected primitive record")),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            primitive_values_to_array(&values, other)
+        }
+    }
+}
+
+/// Decode a single nested value (primitive or tuple) from an Arrow array row.
+fn nested_value_from_array_row(
+    array: &dyn Array,
+    data_type: &ArrowDataType,
+    row: usize,
+) -> Result<BeamRecord> {
+    match data_type {
+        ArrowDataType::Struct(fields) => {
+            let struct_array = array
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .ok_or_else(|| anyhow!("expected StructArray for tuple column"))?;
+            let mut values = Vec::with_capacity(fields.len());
+            for index in 0..fields.len() {
+                values.push(primitive_value_from_array_row(
+                    struct_array.column(index).as_ref(),
+                    fields[index].data_type(),
+                    row,
+                )?);
+            }
+            Ok(BeamRecord::TUPLE(TupleValue { values }))
+        }
+        other => Ok(BeamRecord::PRIMITIVE(primitive_value_from_array_row(
+            array, other, row,
+        )?)),
+    }
 }
 
 // Schema derivation
@@ -471,12 +638,13 @@ fn validate_iterable_item_types(
     item_data_type: &ArrowDataType,
 ) -> Result<()> {
     for iterable in iterables {
-        for value in iterable_values(iterable) {
-            if !primitive_type_matches(value, item_data_type) {
+        for value in &iterable.list {
+            let actual = iterable_element_data_type(value)?;
+            if &actual != item_data_type {
                 return Err(anyhow!(
                     "mixed iterable item types in pcollection {pcollection_id}: expected {:?}, found {:?}",
                     item_data_type,
-                    primitive_data_type(value)
+                    actual
                 ));
             }
         }
@@ -536,9 +704,9 @@ pub fn derive_table_schema(
                 iterables.push(iterable.clone());
             }
 
-            let item_data_type = infer_iterable_item_data_type(&iterables);
+            let item_data_type = infer_iterable_item_data_type(&iterables)?;
             validate_iterable_item_types(pcollection_id, &iterables, &item_data_type)?;
-            let nullable = matches!(item_data_type, ArrowDataType::Null);
+            let nullable = matches!(item_data_type, ArrowDataType::Null | ArrowDataType::Boolean);
 
             Arc::new(Schema::new(vec![ArrowField::new(
                 VALUE_COLUMN,
@@ -547,13 +715,13 @@ pub fn derive_table_schema(
             )]))
         }
 
-        //KV: `key` + `value` (both primitive)
+        //KV: `key` (primitive) + `value` (primitive or tuple)
         TableType::Kv => {
             let BeamRecord::KV(first_kv) = first else {
                 unreachable!();
             };
             let key_data_type = primitive_data_type(&first_kv.key);
-            let value_data_type = primitive_data_type(&first_kv.value);
+            let value_data_type = nested_value_storage_type(&first_kv.value)?;
 
             for record in records {
                 let BeamRecord::KV(kv) = record else {
@@ -568,17 +736,21 @@ pub fn derive_table_schema(
                         primitive_data_type(&kv.key)
                     ));
                 }
-                if !primitive_type_matches(&kv.value, &value_data_type) {
+                let actual_value_type = nested_value_storage_type(&kv.value)?;
+                if actual_value_type != value_data_type {
                     return Err(anyhow!(
                         "mixed KV value types in pcollection {pcollection_id}: expected {:?}, found {:?}",
                         value_data_type,
-                        primitive_data_type(&kv.value)
+                        actual_value_type
                     ));
                 }
             }
 
             let key_nullable = matches!(key_data_type, ArrowDataType::Null);
-            let value_nullable = matches!(value_data_type, ArrowDataType::Null);
+            let value_nullable = matches!(
+                value_data_type,
+                ArrowDataType::Null | ArrowDataType::Struct(_)
+            );
 
             Arc::new(Schema::new(vec![
                 ArrowField::new(KEY_COLUMN, key_data_type, key_nullable),
@@ -610,9 +782,9 @@ pub fn derive_table_schema(
                 values.push(gbk.value.clone());
             }
 
-            let item_data_type = infer_iterable_item_data_type(&values);
+            let item_data_type = infer_iterable_item_data_type(&values)?;
             validate_iterable_item_types(pcollection_id, &values, &item_data_type)?;
-            let nullable = matches!(item_data_type, ArrowDataType::Null);
+            let nullable = matches!(item_data_type, ArrowDataType::Null | ArrowDataType::Boolean);
 
             Arc::new(Schema::new(vec![
                 ArrowField::new(KEY_COLUMN, key_data_type, false),
@@ -626,6 +798,36 @@ pub fn derive_table_schema(
                     true,
                 ),
             ]))
+        }
+
+        // Tuple: single `value` column holding a `Struct<f0, f1, ...>`
+        TableType::Tuple => {
+            let BeamRecord::TUPLE(first_tuple) = first else {
+                unreachable!();
+            };
+            let data_type = tuple_storage_type(first_tuple);
+
+            for record in records {
+                let BeamRecord::TUPLE(tuple) = record else {
+                    return Err(anyhow!(
+                        "mixed BeamRecord variants in pcollection {pcollection_id}: expected tuple"
+                    ));
+                };
+                let actual = tuple_storage_type(tuple);
+                if actual != data_type {
+                    return Err(anyhow!(
+                        "mixed tuple component types in pcollection {pcollection_id}: expected {:?}, found {:?}",
+                        data_type,
+                        actual
+                    ));
+                }
+            }
+
+            Arc::new(Schema::new(vec![ArrowField::new(
+                VALUE_COLUMN,
+                data_type,
+                true,
+            )]))
         }
 
         TableType::Row => unreachable!("BeamRecord cannot derive a row table"),
@@ -698,18 +900,18 @@ pub fn beamrecords_to_record_batch(
                 .with_context(|| format!("missing {VALUE_COLUMN} column"))?
                 .data_type();
             let mut keys = Vec::with_capacity(row_count);
-            let mut values = Vec::with_capacity(row_count);
+            let mut values: Vec<BeamRecord> = Vec::with_capacity(row_count);
 
             for record in records {
                 let BeamRecord::KV(kv) = record else {
                     return Err(anyhow!("expected kv record"));
                 };
                 keys.push(kv.key.clone());
-                values.push(kv.value.clone());
+                values.push((*kv.value).clone());
             }
 
             columns.push(primitive_values_to_array(&keys, key_data_type)?);
-            columns.push(primitive_values_to_array(&values, value_data_type)?);
+            columns.push(nested_values_to_array(&values, value_data_type)?);
         }
         TableType::Gbk => {
             let key_data_type = table_schema
@@ -739,6 +941,14 @@ pub fn beamrecords_to_record_batch(
 
             columns.push(primitive_values_to_array(&keys, key_data_type)?);
             columns.push(iterable_values_to_array(&values, item_field.data_type())?);
+        }
+        TableType::Tuple => {
+            let data_type = table_schema
+                .arrow_schema
+                .field_with_name(VALUE_COLUMN)
+                .with_context(|| format!("missing {VALUE_COLUMN} column"))?
+                .data_type();
+            columns.push(nested_values_to_array(records, data_type)?);
         }
         TableType::Row => {
             return Err(anyhow!(
@@ -798,11 +1008,11 @@ pub fn record_batch_to_beamrecords(
                         key_column.data_type(),
                         row,
                     )?,
-                    value: primitive_value_from_array_row(
+                    value: Box::new(nested_value_from_array_row(
                         value_column.as_ref(),
                         value_column.data_type(),
                         row,
-                    )?,
+                    )?),
                 }));
             }
         }
@@ -827,6 +1037,18 @@ pub fn record_batch_to_beamrecords(
                         row,
                     )?,
                 }));
+            }
+        }
+        TableType::Tuple => {
+            let column = batch
+                .column_by_name(VALUE_COLUMN)
+                .ok_or_else(|| anyhow!("missing {VALUE_COLUMN} column"))?;
+            for row in 0..batch.num_rows() {
+                records.push(nested_value_from_array_row(
+                    column.as_ref(),
+                    column.data_type(),
+                    row,
+                )?);
             }
         }
         TableType::Row => {
@@ -1141,24 +1363,38 @@ mod tests {
         match record {
             BeamRecord::KV(kv) => {
                 assert_eq!(&kv.key, key);
-                assert_eq!(&kv.value, value);
+                match kv.value.as_ref() {
+                    BeamRecord::PRIMITIVE(v) => assert_eq!(v, value),
+                    other => panic!("expected primitive KV value, got {other:?}"),
+                }
             }
             other => panic!("expected KV, got {other:?}"),
         }
     }
 
+    fn assert_tuple(record: &BeamRecord, expected: &[PrimitiveValue]) {
+        match record {
+            BeamRecord::TUPLE(t) => assert_eq!(t.values, expected),
+            other => panic!("expected TUPLE, got {other:?}"),
+        }
+    }
+
     fn assert_iterable(record: &BeamRecord, expected: &[PrimitiveValue]) {
         match record {
-            BeamRecord::ITERABLE(it) => assert_eq!(it.list, expected),
+            BeamRecord::ITERABLE(it) => assert_eq!(it.list, records(expected)),
             other => panic!("expected ITERABLE, got {other:?}"),
         }
+    }
+
+    fn records(values: &[PrimitiveValue]) -> Vec<BeamRecord> {
+        values.iter().cloned().map(BeamRecord::PRIMITIVE).collect()
     }
 
     fn assert_gbk(record: &BeamRecord, key: &PrimitiveValue, values: &[PrimitiveValue]) {
         match record {
             BeamRecord::GBK(gbk) => {
                 assert_eq!(&gbk.key, key);
-                assert_eq!(gbk.value.list, values);
+                assert_eq!(gbk.value.list, records(values));
             }
             other => panic!("expected GBK, got {other:?}"),
         }
@@ -1195,6 +1431,7 @@ mod tests {
             TableType::Iterable,
             TableType::Kv,
             TableType::Gbk,
+            TableType::Tuple,
         ] {
             assert_eq!(TableType::from_str(tt.as_str()).unwrap(), tt);
         }
@@ -1239,7 +1476,7 @@ mod tests {
         assert_eq!(BeamRecord::PRIMITIVE(i(7)).get_primitive().unwrap(), i(7));
         let kv = BeamRecord::KV(BeamKV {
             key: i(1),
-            value: i(2),
+            value: Box::new(BeamRecord::PRIMITIVE(i(2))),
         });
         assert!(kv.get_primitive().is_err());
     }
@@ -1248,11 +1485,14 @@ mod tests {
     fn beam_record_get_kv_happy_and_wrong_variant() {
         let kv = BeamRecord::KV(BeamKV {
             key: s("k"),
-            value: i(9),
+            value: Box::new(BeamRecord::PRIMITIVE(i(9))),
         });
         let extracted = kv.clone().get_kv().unwrap();
         assert_eq!(extracted.key, s("k"));
-        assert_eq!(extracted.value, i(9));
+        assert!(matches!(
+            *extracted.value,
+            BeamRecord::PRIMITIVE(PrimitiveValue::Int64(9))
+        ));
         assert!(BeamRecord::PRIMITIVE(i(1)).get_kv().is_err());
     }
 
@@ -1264,14 +1504,14 @@ mod tests {
         });
         let extracted = gbk.clone().get_gbk().unwrap();
         assert_eq!(extracted.key, s("k"));
-        assert_eq!(extracted.value.list, vec![i(1), i(2)]);
+        assert_eq!(extracted.value.list, records(&[i(1), i(2)]));
         assert!(BeamRecord::PRIMITIVE(i(1)).get_gbk().is_err());
     }
 
     #[test]
     fn beam_record_get_iterable_happy_and_wrong_variant() {
         let it = BeamRecord::ITERABLE(IterableValue::new(vec![i(1)]));
-        assert_eq!(it.get_iterable().unwrap().list, vec![i(1)]);
+        assert_eq!(it.get_iterable().unwrap().list, records(&[i(1)]));
         assert!(BeamRecord::PRIMITIVE(i(1)).get_iterable().is_err());
     }
 
@@ -1452,10 +1692,10 @@ mod tests {
         let list_type = DataType::List(Arc::new(ArrowField::new("item", DataType::Int64, false)));
 
         let row0 = iterable_value_from_array_row(array.as_ref(), &list_type, 0).unwrap();
-        assert_eq!(row0.list, vec![i(1), i(2), i(3)]);
+        assert_eq!(row0.list, records(&[i(1), i(2), i(3)]));
 
         let row1 = iterable_value_from_array_row(array.as_ref(), &list_type, 1).unwrap();
-        assert_eq!(row1.list, Vec::<PrimitiveValue>::new());
+        assert!(row1.list.is_empty());
     }
 
     #[test]
@@ -1468,7 +1708,7 @@ mod tests {
 
         let list_type = DataType::List(Arc::new(ArrowField::new("item", DataType::Int64, false)));
         let result = iterable_value_from_array_row(&list, &list_type, 0).unwrap();
-        assert_eq!(result.list, Vec::<PrimitiveValue>::new());
+        assert!(result.list.is_empty());
     }
 
     #[test]
@@ -1522,11 +1762,11 @@ mod tests {
         let records = vec![
             BeamRecord::KV(BeamKV {
                 key: s("k1"),
-                value: i(1),
+                value: Box::new(BeamRecord::PRIMITIVE(i(1))),
             }),
             BeamRecord::KV(BeamKV {
                 key: s("k2"),
-                value: i(2),
+                value: Box::new(BeamRecord::PRIMITIVE(i(2))),
             }),
         ];
         let schema = derive_table_schema("pc3", &records).unwrap();
@@ -1554,11 +1794,11 @@ mod tests {
         let records = vec![
             BeamRecord::KV(BeamKV {
                 key: s("k1"),
-                value: i(1),
+                value: Box::new(BeamRecord::PRIMITIVE(i(1))),
             }),
             BeamRecord::KV(BeamKV {
                 key: i(9),
-                value: i(2),
+                value: Box::new(BeamRecord::PRIMITIVE(i(2))),
             }),
         ];
         assert!(derive_table_schema("pc3", &records).is_err());
@@ -1569,11 +1809,11 @@ mod tests {
         let records = vec![
             BeamRecord::KV(BeamKV {
                 key: s("k1"),
-                value: i(1),
+                value: Box::new(BeamRecord::PRIMITIVE(i(1))),
             }),
             BeamRecord::KV(BeamKV {
                 key: s("k2"),
-                value: s("oops"),
+                value: Box::new(BeamRecord::PRIMITIVE(s("oops"))),
             }),
         ];
         assert!(derive_table_schema("pc3", &records).is_err());
@@ -1639,10 +1879,77 @@ mod tests {
             BeamRecord::PRIMITIVE(i(1)),
             BeamRecord::KV(BeamKV {
                 key: i(1),
-                value: i(2),
+                value: Box::new(BeamRecord::PRIMITIVE(i(2))),
             }),
         ];
         assert!(derive_table_schema("pc6", &records).is_err());
+    }
+
+    #[test]
+    fn derive_table_schema_tuple() {
+        let records = vec![
+            BeamRecord::TUPLE(TupleValue::new(vec![s("a"), i(1), bytes(&[1, 2])])),
+            BeamRecord::TUPLE(TupleValue::new(vec![s("b"), i(2), bytes(&[3])])),
+        ];
+        let schema = derive_table_schema("pc-tup", &records).unwrap();
+        assert_eq!(schema.table_type, TableType::Tuple);
+        match schema
+            .arrow_schema
+            .field_with_name(VALUE_COLUMN)
+            .unwrap()
+            .data_type()
+        {
+            DataType::Struct(fields) => {
+                assert_eq!(fields.len(), 3);
+                assert_eq!(fields[0].name(), "f0");
+                assert_eq!(fields[0].data_type(), &DataType::Utf8);
+                assert_eq!(fields[1].data_type(), &DataType::Int64);
+                assert_eq!(fields[2].data_type(), &DataType::Binary);
+            }
+            other => panic!("expected Struct, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn derive_table_schema_tuple_mixed_arity_errors() {
+        let records = vec![
+            BeamRecord::TUPLE(TupleValue::new(vec![i(1), i(2)])),
+            BeamRecord::TUPLE(TupleValue::new(vec![i(1), i(2), i(3)])),
+        ];
+        assert!(derive_table_schema("pc-tup", &records).is_err());
+    }
+
+    #[test]
+    fn derive_table_schema_kv_with_tuple_value() {
+        let records = vec![
+            BeamRecord::KV(BeamKV {
+                key: i(1),
+                value: Box::new(BeamRecord::TUPLE(TupleValue::new(vec![s("a"), i(7)]))),
+            }),
+            BeamRecord::KV(BeamKV {
+                key: i(2),
+                value: Box::new(BeamRecord::TUPLE(TupleValue::new(vec![s("b"), i(8)]))),
+            }),
+        ];
+        let schema = derive_table_schema("pc-kvt", &records).unwrap();
+        assert_eq!(schema.table_type, TableType::Kv);
+        assert_eq!(
+            schema
+                .arrow_schema
+                .field_with_name(KEY_COLUMN)
+                .unwrap()
+                .data_type(),
+            &DataType::Int64
+        );
+        match schema
+            .arrow_schema
+            .field_with_name(VALUE_COLUMN)
+            .unwrap()
+            .data_type()
+        {
+            DataType::Struct(fields) => assert_eq!(fields.len(), 2),
+            other => panic!("expected Struct value, got {other:?}"),
+        }
     }
 
     //  beamrecords_to_record_batch / record_batch_to_beamrecords roundtrips
@@ -1670,11 +1977,11 @@ mod tests {
         let records = vec![
             BeamRecord::KV(BeamKV {
                 key: s("a"),
-                value: i(1),
+                value: Box::new(BeamRecord::PRIMITIVE(i(1))),
             }),
             BeamRecord::KV(BeamKV {
                 key: s("b"),
-                value: i(2),
+                value: Box::new(BeamRecord::PRIMITIVE(i(2))),
             }),
         ];
         let schema = derive_table_schema("pc", &records).unwrap();
@@ -1719,6 +2026,47 @@ mod tests {
     }
 
     #[test]
+    fn roundtrip_tuple() {
+        let records = vec![
+            BeamRecord::TUPLE(TupleValue::new(vec![s("a"), i(1), bytes(&[1, 2])])),
+            BeamRecord::TUPLE(TupleValue::new(vec![s("b"), i(2), bytes(&[])])),
+        ];
+        let schema = derive_table_schema("pc", &records).unwrap();
+        let batch = beamrecords_to_record_batch(&records, &schema).unwrap();
+        let back = record_batch_to_beamrecords(&batch, &schema).unwrap();
+        assert_tuple(&back[0], &[s("a"), i(1), bytes(&[1, 2])]);
+        assert_tuple(&back[1], &[s("b"), i(2), bytes(&[])]);
+    }
+
+    #[test]
+    fn roundtrip_kv_with_tuple_value() {
+        let records = vec![
+            BeamRecord::KV(BeamKV {
+                key: i(1),
+                value: Box::new(BeamRecord::TUPLE(TupleValue::new(vec![s("a"), i(7)]))),
+            }),
+            BeamRecord::KV(BeamKV {
+                key: i(2),
+                value: Box::new(BeamRecord::TUPLE(TupleValue::new(vec![s("b"), i(8)]))),
+            }),
+        ];
+        let schema = derive_table_schema("pc", &records).unwrap();
+        let batch = beamrecords_to_record_batch(&records, &schema).unwrap();
+        let back = record_batch_to_beamrecords(&batch, &schema).unwrap();
+
+        for (record, expected_key, expected_value) in [
+            (&back[0], i(1), [s("a"), i(7)]),
+            (&back[1], i(2), [s("b"), i(8)]),
+        ] {
+            let BeamRecord::KV(kv) = record else {
+                panic!("expected KV, got {record:?}");
+            };
+            assert_eq!(kv.key, expected_key);
+            assert_tuple(&kv.value, &expected_value);
+        }
+    }
+
+    #[test]
     fn roundtrip_boolean_and_bytes_primitive() {
         let records = vec![
             BeamRecord::PRIMITIVE(b(true)),
@@ -1756,7 +2104,7 @@ mod tests {
         // Schema derived as Kv, but records passed in are Primitive.
         let kv_seed = vec![BeamRecord::KV(BeamKV {
             key: i(1),
-            value: i(2),
+            value: Box::new(BeamRecord::PRIMITIVE(i(2))),
         })];
         let schema = derive_table_schema("pc", &kv_seed).unwrap();
         let wrong_records = vec![BeamRecord::PRIMITIVE(i(1))];

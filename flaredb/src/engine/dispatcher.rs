@@ -63,7 +63,11 @@ impl ExecutorDispatcher {
         self.channels.stream_elements();
         // Start control channel dispatcher to route responses to waiting futures.
         self.channels.stream_responses();
-        self.pipeline_coders = Arc::new(pipeline_graph.components.coders.clone());
+        // Resolve `pickled_python` leaves through length-prefixed wrappers so the
+        // runner's decoder sees the same coder graph the SDK is asked to emit.
+        let mut coders = pipeline_graph.components.coders.clone();
+        crate::coders::length_prefix_pickled_leaves(&mut coders);
+        self.pipeline_coders = Arc::new(coders);
         self.pipeline_components = Arc::new(pipeline_graph.components.clone());
     }
 
