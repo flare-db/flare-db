@@ -1,7 +1,7 @@
 // Nexmark benchmark suite module for FlareDB.
 //
 // Run with:   ./gradlew :nexmark:run -Pnexmark.args="--query=0 --numEvents=10000 --streaming=false"
-// Fat jar:    ./gradlew :nexmark:shadowJar  (build/libs/nexmark-0.1.0-all.jar)
+// Fat jar:    ./gradlew :nexmark:shadowJar  (build/libs/nexmark-<version>-all.jar)
 
 plugins {
     id 'java'
@@ -28,6 +28,9 @@ shadowJar {
 }
 
 run {
+    // The FlareRunner stages the shadow (uber) JAR to the FlareDB workers, so it must exist
+    // before the benchmark starts.
+    dependsOn tasks.named('shadowJar')
     if (project.hasProperty('nexmark.args')) {
         args = project.property('nexmark.args').toString().split('\\s+').findAll { !it.isEmpty() }
     }

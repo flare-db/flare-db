@@ -2,6 +2,8 @@ package com.flaredb.benchmarks.nexmark;
 
 import java.io.File;
 import java.io.IOException;
+import java.util.Arrays;
+import java.util.Comparator;
 
 import org.apache.beam.sdk.Pipeline;
 import org.apache.beam.sdk.nexmark.NexmarkConfiguration;
@@ -51,12 +53,14 @@ public class FlareNexmarkLauncher {
 
     // Auto-detect shadow jar if uberJar path is missing
     if (options.getUberJar() == null || options.getUberJar().isEmpty()) {
-      File shadowJar = new File("benchmarks/nexmark/build/libs/nexmark-0.1.0-all.jar");
-      if (!shadowJar.exists()) {
-        shadowJar = new File("build/libs/nexmark-0.1.0-all.jar");
-      }
-      if (shadowJar.exists()) {
+      File shadowJar = findShadowJar();
+      if (shadowJar != null) {
         options.setUberJar(shadowJar.getAbsolutePath());
+        LOG.info("Auto-detected uber JAR: {}", shadowJar.getAbsolutePath());
+      } else {
+        LOG.warn(
+            "No uber JAR found. Build one with './gradlew :nexmark:shadowJar' or pass "
+                + "--uberJar=<path> explicitly.");
       }
     }
 
@@ -114,5 +118,27 @@ public class FlareNexmarkLauncher {
     LOG.info("Completed query {} in {}s (Events/sec: {})", queryName, String.format("%.2f", runtimeSec), String.format("%.1f", perf.eventsPerSec));
 
     return perf;
+  }
+
+  /**
+   * Locates the Nexmark shadow (uber) JAR produced by the {@code shadowJar} task.
+   *
+   * <p>Both candidate directories are checked because the process working directory depends on how
+   * the benchmark is launched: it is the module directory when run via Gradle's {@code :nexmark:run}
+   * task and the repository root when the fat JAR is run directly. The JAR name embeds the project
+   * version, so the newest matching artifact is selected rather than relying on a hardcoded name.
+   */
+  private static File findShadowJar() {
+    String[] candidateDirs = {"build/libs", "benchmarks/nexmark/build/libs"};
+    for (String dir : candidateDirs) {
+      File[] matches =
+          new File(dir)
+              .listFiles((d, name) -> name.startsWith("nexmark-") && name.endsWith("-all.jar"));
+      if (matches != null && matches.length > 0) {
+        Arrays.sort(matches, Comparator.comparing(File::getName));
+        return matches[matches.length - 1];
+      }
+    }
+    return null;
   }
 }
