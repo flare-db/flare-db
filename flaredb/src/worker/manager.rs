@@ -13,6 +13,10 @@ pub struct WorkerLaunchConfig {
     pub control_url: String,
     pub pipeline_options: String,
     pub connect_timeout_secs: u64,
+    /// Fallback interpreter used to launch a Python SDK harness when the job's
+    /// PROCESS environment does not advertise one. `None` means `python3` from
+    /// `PATH`.
+    pub python_bin: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -77,9 +81,9 @@ impl WorkerManager {
                     )));
                 }
 
-                let staged_exists = tokio::fs::try_exists(staged_jar)
-                    .await
-                    .map_err(|e| Status::internal(format!("failed to stat staged artifact: {}", e)))?;
+                let staged_exists = tokio::fs::try_exists(staged_jar).await.map_err(|e| {
+                    Status::internal(format!("failed to stat staged artifact: {}", e))
+                })?;
                 if !staged_exists {
                     return Err(Status::internal(format!(
                         "staged artifact not found at {}",
@@ -158,11 +162,15 @@ impl WorkerManager {
                     )
                     .env("SEMI_PERSISTENT_DIRECTORY", staging_dir)
                     .env("PIPELINE_OPTIONS", &self.config.pipeline_options)
+                    .env("PYTHONUNBUFFERED", "1")
                     .stdout(Stdio::from(stdout_file))
                     .stderr(Stdio::from(stderr_file));
 
                 let child = cmd.spawn().map_err(|e| {
-                    Status::internal(format!("failed to spawn python harness ({}) : {}", py_bin, e))
+                    Status::internal(format!(
+                        "failed to spawn python harness ({}) : {}",
+                        py_bin, e
+                    ))
                 })?;
 
                 let pid = child.id();
@@ -179,12 +187,22 @@ impl WorkerManager {
                 Ok(())
             }
             WorkerRuntime::Docker { image } => {
-                log::warn!("Docker worker runtime requested for image '{}', but docker runtime is not supported in in-process mode.", image);
-                Err(Status::unimplemented("Docker worker runtime is not implemented"))
+                log::warn!(
+                    "Docker worker runtime requested for image '{}', but docker runtime is not supported in in-process mode.",
+                    image
+                );
+                Err(Status::unimplemented(
+                    "Docker worker runtime is not implemented",
+                ))
             }
             WorkerRuntime::External { endpoint } => {
-                log::warn!("External worker runtime requested at endpoint '{}', but external runtime is not supported in in-process mode.", endpoint);
-                Err(Status::unimplemented("External worker runtime is not implemented"))
+                log::warn!(
+                    "External worker runtime requested at endpoint '{}', but external runtime is not supported in in-process mode.",
+                    endpoint
+                );
+                Err(Status::unimplemented(
+                    "External worker runtime is not implemented",
+                ))
             }
         }
     }

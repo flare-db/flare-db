@@ -140,14 +140,37 @@ impl FlareElementStore {
 
     /// Full scan of a PCollection, reads all rows from Paimon and converts
     /// them back into [`BeamRecord`]s.
+    ///
+    /// Returns an empty `Vec` when no elements are present
     pub async fn scan_collection(&self, req: ScanCollectionRequest) -> Result<Vec<BeamRecord>> {
-        let table_schema = self
-            .registry
-            .get(&req.pcollection_id)
-            .ok_or_else(|| anyhow!("table schema not found for pcollection"))?;
+        // If nothing was ever written to this PCollection the schema registry
+        // will have no entry for it.  That is not an error; it simply means
+        // zero elements are available.
+        let table_schema = match self.registry.get(&req.pcollection_id) {
+            Some(ts) => ts,
+            None => {
+                log::info!(
+                    "scan_collection: no schema registered for '{}' (0 elements written), returning empty",
+                    req.pcollection_id
+                );
+                return Ok(Vec::new());
+            }
+        };
 
         let identifier = self.table_identifier(&req.pcollection_id);
-        let table = self.catalog.get_table(&identifier).await?;
+        let table = match self.catalog.get_table(&identifier).await {
+            Ok(t) => t,
+            Err(paimon::Error::TableNotExist { .. }) => {
+                // Schema was registered (e.g. by a runner transform) but no
+                // rows were ever committed, so Paimon never created the table.
+                log::info!(
+                    "scan_collection: Paimon table for '{}' does not exist (0 elements committed), returning empty",
+                    req.pcollection_id
+                );
+                return Ok(Vec::new());
+            }
+            Err(err) => return Err(err.into()),
+        };
 
         let read_builder = table.new_read_builder();
         let plan = read_builder.new_scan().plan().await?;
@@ -608,16 +631,24 @@ mod element_store_tests {
     }
 
     #[tokio::test]
-    async fn scan_without_prior_write_errors() {
+    async fn scan_without_prior_write_returns_empty() {
+        // A PCollection that was never written to (e.g. the output of a GBK
+        // whose input was empty) has no schema entry and no Paimon table.
+        // scan_collection must return an empty Vec rather than an error so
+        // that downstream stages can receive zero elements and complete normally.
         let (_dir, store) = make_store().await;
 
         let result = store
             .scan_collection(ScanCollectionRequest {
                 pcollection_id: "pc-never-written".to_string(),
             })
-            .await;
+            .await
+            .expect("scan of unwritten pcollection should succeed with empty result");
 
-        assert!(result.is_err());
+        assert!(
+            result.is_empty(),
+            "expected empty result for never-written pcollection, got {result:?}"
+        );
     }
 
     #[tokio::test]

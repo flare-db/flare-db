@@ -33,7 +33,8 @@ impl ExecutableStage {
     pub fn get_output_pcol_ids(&self) -> HashSet<String> {
         self.output_pcols
             .iter()
-            .map(|pcol| pcol.collection.unique_name.clone())
+            //.map(|pcol| pcol.collection.unique_name.clone())
+            .map(|pcol| pcol.id.clone())
             .collect()
     }
 }

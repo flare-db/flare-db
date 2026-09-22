@@ -14,6 +14,7 @@ use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
 };
+use paimon::Error as PaimonError;
 
 use crate::store::record::{RecordTableSchema, TableType};
 
@@ -55,7 +56,21 @@ impl FlareTransform for GroupByKey {
     async fn execute(&self, ctx: ExecutionContext) -> Result<(), Error> {
         let identifier = ctx.store.table_identifier(&ctx.input_pcollection_id);
 
-        let table = ctx.store.catalog.get_table(&identifier).await?;
+        // The input table may not exist when the upstream stage produced zero
+        // elements (write_beamrecord_batch is never called for empty output).
+        // An empty input to GroupByKey correctly yields an empty output.
+        let table = match ctx.store.catalog.get_table(&identifier).await {
+            Ok(table) => table,
+            Err(PaimonError::TableNotExist { .. }) => {
+                info!(
+                    "GroupByKey: input PCollection table '{}' does not exist (0 elements), \
+                     producing empty output",
+                    ctx.input_pcollection_id
+                );
+                return Ok(());
+            }
+            Err(err) => return Err(err.into()),
+        };
         let provider = PaimonTableProvider::try_new(table)?;
         let df_ctx = SessionContext::new();
 
