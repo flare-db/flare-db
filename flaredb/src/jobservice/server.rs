@@ -23,29 +23,8 @@ use crate::fusion::pipeline::ExecutableGraph;
 use crate::jobservice::artifact::ArtifactStore;
 use crate::jobservice::job::Job;
 use crate::jobservice::job::JobStore;
-use crate::jobservice::state::record_job_state;
+use crate::jobservice::status::{is_terminal_state, job_state_event, record_job_state};
 use crate::worker::manager::WorkerRuntime;
-
-/// Terminal job states, mirroring Beam's `JobState` contract. A state stream
-/// may close once it has published one of these.
-fn is_terminal_state(state: JobStateEnum) -> bool {
-    matches!(
-        state,
-        JobStateEnum::Done
-            | JobStateEnum::Failed
-            | JobStateEnum::Cancelled
-            | JobStateEnum::Stopped
-            | JobStateEnum::Drained
-    )
-}
-
-/// Wraps a `JobState` enum value in the event type returned by the Job API.
-fn job_state_event(state: JobStateEnum) -> JobStateEvent {
-    JobStateEvent {
-        state: state as i32,
-        timestamp: None,
-    }
-}
 
 pub struct FlareJobService {
     job_store: JobStore,
@@ -55,8 +34,7 @@ pub struct FlareJobService {
     staging_tokens: Arc<DashSet<String>>,
     instance_id: String,
     /// Per-job state, published to `GetStateStream` subscribers. FlareDB runs a
-    /// job synchronously inside `Run`, so a `watch` channel is exactly the
-    /// level of state propagation the Job API stream needs.
+    /// job synchronously inside `Run`
     job_states: Arc<DashMap<String, watch::Sender<JobStateEnum>>>,
 }
 
