@@ -7,8 +7,7 @@ use std::path::{Path, PathBuf};
 
 use crate::utils::path;
 
-/// Terminal job states, mirroring Beam's `JobState` contract. A state stream
-/// may close once it has published one of these.
+/// Terminal job states, A state stream may close once it has published one of these.
 pub fn is_terminal_state(state: JobStateEnum) -> bool {
     matches!(
         state,
