@@ -26,10 +26,14 @@ pub mod beam_urns {
     pub const VARINT_CODER: &str = "beam:coder:varint:v1";
     pub const DOUBLE_CODER: &str = "beam:coder:double:v1";
     pub const ITERABLE_CODER: &str = "beam:coder:iterable:v1";
+    pub const NULLABLE_CODER: &str = "beam:coder:nullable:v1";
+    pub const LENGTH_PREFIX_CODER: &str = "beam:coder:length_prefix:v1";
     pub const GLOBAL_WINDOW_CODER: &str = "beam:coder:global_window:v1";
     pub const WINDOWED_VALUE_CODER: &str = "beam:coder:windowed_value:v1";
     pub const ROW_CODER: &str = "beam:coder:row:v1";
     pub const JAVA_SDK_CODER: &str = "beam:coders:javasdk:0.1";
+    pub const PYTHON_PICKLE_CODER: &str = "beam:coder:pickled_python:v1";
+    pub const TUPLE_CODER: &str = "beam:coder:tuple:v1";
 
     //Deprecated
     pub const CREATE_VIEW_TRANSFORM: &str = "beam:transform:create_view:v1";
@@ -47,6 +51,12 @@ pub mod beam_urns {
         MERGE_WINDOWS_TRANSFORM,
         TO_STRING_TRANSFORM,
         MANAGED_TRANSFORM,
+        // Combine sub-components. SDKs expand `CombinePerKey`/`CombineGlobally`
+        // into these leaves; they must participate in the pipeline graph so the
+        // fuser can fuse them (see `COMBINE_FUSIBLE` in `fusion::fuser`).
+        COMBINE_PER_KEY_PRECOMBINE_TRANSFORM_URN,
+        COMBINE_PER_KEY_MERGE_ACCUMULATORS_TRANSFORM_URN,
+        COMBINE_PER_KEY_EXTRACT_OUTPUTS_TRANSFORM_URN,
         // Splittable DoFn
         SPLITTABLE_PAIR_WITH_RESTRICTION_URN,
         SPLITTABLE_SPLIT_AND_SIZE_RESTRICTIONS_URN,

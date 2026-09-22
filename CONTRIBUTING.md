@@ -80,8 +80,15 @@ cd runner-sdk/python/flarerunner && python -m unittest discover -s tests -p "*_t
 
 3. Submit a pipeline from another terminal:
 
+   **Java (WordCount):**
    ```sh
    ./gradlew :wordcount:run
+   ```
+
+   **Python (WordCount):**
+   Ensure you have the `apache-beam` package installed (`pip install apache-beam`) and the `flarerunner` SDK installed (`pip install -e runner-sdk/python/flarerunner`).
+   ```sh
+   python3 example/python/wordcount/wordcount.py
    ```
 
 ## Useful Gradle commands

@@ -60,6 +60,7 @@ async fn flare_up() -> Result<(), Box<dyn std::error::Error>> {
         control_url: flaredb::DEFAULT_API_SERVICE_URL.to_string(),
         pipeline_options: "{}".to_string(),
         connect_timeout_secs: 20,
+        python_bin: std::env::var("FLAREDB_PYTHON_BIN").ok(),
     };
     let worker_manager = WorkerManager::new(worker_cfg);
     let job_service = FlareJobService::with(

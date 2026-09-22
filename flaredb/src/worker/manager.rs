@@ -13,6 +13,18 @@ pub struct WorkerLaunchConfig {
     pub control_url: String,
     pub pipeline_options: String,
     pub connect_timeout_secs: u64,
+    /// Fallback interpreter used to launch a Python SDK harness when the job's
+    /// PROCESS environment does not advertise one. `None` means `python3` from
+    /// `PATH`.
+    pub python_bin: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub enum WorkerRuntime {
+    Java { staged_jar: String },
+    Python { python_bin: Option<String> },
+    Docker { image: String },
+    External { endpoint: String },
 }
 
 #[derive(Clone)]
@@ -36,31 +48,10 @@ impl WorkerManager {
     pub async fn spawn_worker(
         &self,
         job_id: &str,
-        staged_jar: &str,
+        runtime: &WorkerRuntime,
+        staging_dir: &str,
         instance_id: &str,
     ) -> Result<(), Status> {
-        let worker_jar = &self.config.worker_jar;
-
-        let worker_exists = tokio::fs::try_exists(worker_jar)
-            .await
-            .map_err(|e| Status::internal(format!("failed to stat worker jar: {}", e)))?;
-        if !worker_exists {
-            return Err(Status::internal(format!(
-                "worker jar not found at {}",
-                worker_jar
-            )));
-        }
-
-        let staged_exists = tokio::fs::try_exists(staged_jar)
-            .await
-            .map_err(|e| Status::internal(format!("failed to stat staged artifact: {}", e)))?;
-        if !staged_exists {
-            return Err(Status::internal(format!(
-                "staged artifact not found at {}",
-                staged_jar
-            )));
-        }
-
         let logs_dir = logs_dir(instance_id, job_id);
         tokio::fs::create_dir_all(&logs_dir)
             .await
@@ -76,51 +67,144 @@ impl WorkerManager {
             .try_clone()
             .map_err(|e| Status::internal(format!("failed to clone harness log handle: {}", e)))?;
 
-        let classpath = format!("{}:{}", worker_jar, staged_jar);
-        let mut cmd = Command::new("java");
+        match runtime {
+            WorkerRuntime::Java { staged_jar } => {
+                let worker_jar = &self.config.worker_jar;
 
-        cmd.arg("--add-opens=java.base/java.nio=org.apache.arrow.memory.core,ALL-UNNAMED") // arrow vector needs it
-            .arg("-Dio.netty.tryReflectionSetAccessible=true")
-            .arg("-cp")
-            .arg(&classpath)
-            .arg("org.apache.beam.fn.harness.FnHarness")
-            .env("HARNESS_ID", job_id)
-            .env(
-                "CONTROL_API_SERVICE_DESCRIPTOR",
-                format!(r#"url: "{}""#, self.config.control_url),
-            )
-            .env(
-                "LOGGING_API_SERVICE_DESCRIPTOR",
-                format!(r#"url: "{}""#, self.config.control_url),
-            )
-            .env(
-                "DATA_API_SERVICE_DESCRIPTOR",
-                format!(r#"url: "{}""#, self.config.control_url),
-            )
-            .env(
-                "STATE_API_SERVICE_DESCRIPTOR",
-                format!(r#"url: "{}""#, self.config.control_url),
-            )
-            .env("PIPELINE_OPTIONS", &self.config.pipeline_options)
-            .stdout(Stdio::from(stdout_file))
-            .stderr(Stdio::from(stderr_file));
+                let worker_exists = tokio::fs::try_exists(worker_jar)
+                    .await
+                    .map_err(|e| Status::internal(format!("failed to stat worker jar: {}", e)))?;
+                if !worker_exists {
+                    return Err(Status::internal(format!(
+                        "worker jar not found at {}",
+                        worker_jar
+                    )));
+                }
 
-        let child = cmd
-            .spawn()
-            .map_err(|e| Status::internal(format!("failed to spawn harness: {}", e)))?;
+                let staged_exists = tokio::fs::try_exists(staged_jar).await.map_err(|e| {
+                    Status::internal(format!("failed to stat staged artifact: {}", e))
+                })?;
+                if !staged_exists {
+                    return Err(Status::internal(format!(
+                        "staged artifact not found at {}",
+                        staged_jar
+                    )));
+                }
 
-        let pid = child.id();
-        log::info!(
-            "spawned harness: job_id={}, pid={:?}, classpath={}, log={}",
-            job_id,
-            pid,
-            classpath,
-            log_path
-        );
+                let classpath = format!("{}:{}", worker_jar, staged_jar);
+                let mut cmd = Command::new("java");
 
-        self.active_workers.insert(job_id.to_string(), child);
+                cmd.arg("--add-opens=java.base/java.nio=org.apache.arrow.memory.core,ALL-UNNAMED") // arrow vector needs it
+                    .arg("-Dio.netty.tryReflectionSetAccessible=true")
+                    .arg("-cp")
+                    .arg(&classpath)
+                    .arg("org.apache.beam.fn.harness.FnHarness")
+                    .env("HARNESS_ID", job_id)
+                    .env(
+                        "CONTROL_API_SERVICE_DESCRIPTOR",
+                        format!(r#"url: "{}""#, self.config.control_url),
+                    )
+                    .env(
+                        "LOGGING_API_SERVICE_DESCRIPTOR",
+                        format!(r#"url: "{}""#, self.config.control_url),
+                    )
+                    .env(
+                        "DATA_API_SERVICE_DESCRIPTOR",
+                        format!(r#"url: "{}""#, self.config.control_url),
+                    )
+                    .env(
+                        "STATE_API_SERVICE_DESCRIPTOR",
+                        format!(r#"url: "{}""#, self.config.control_url),
+                    )
+                    .env("PIPELINE_OPTIONS", &self.config.pipeline_options)
+                    .stdout(Stdio::from(stdout_file))
+                    .stderr(Stdio::from(stderr_file));
 
-        Ok(())
+                let child = cmd
+                    .spawn()
+                    .map_err(|e| Status::internal(format!("failed to spawn harness: {}", e)))?;
+
+                let pid = child.id();
+                log::info!(
+                    "spawned java harness: job_id={}, pid={:?}, classpath={}, log={}",
+                    job_id,
+                    pid,
+                    classpath,
+                    log_path
+                );
+
+                self.active_workers.insert(job_id.to_string(), child);
+                Ok(())
+            }
+            WorkerRuntime::Python { python_bin } => {
+                let py_bin = python_bin.as_deref().unwrap_or("python3");
+                let mut cmd = Command::new(py_bin);
+
+                cmd.arg("-m")
+                    .arg("apache_beam.runners.worker.sdk_worker_main")
+                    .env("HARNESS_ID", job_id)
+                    .env("WORKER_ID", job_id)
+                    .env(
+                        "CONTROL_API_SERVICE_DESCRIPTOR",
+                        format!(r#"url: "{}""#, self.config.control_url),
+                    )
+                    .env(
+                        "LOGGING_API_SERVICE_DESCRIPTOR",
+                        format!(r#"url: "{}""#, self.config.control_url),
+                    )
+                    .env(
+                        "DATA_API_SERVICE_DESCRIPTOR",
+                        format!(r#"url: "{}""#, self.config.control_url),
+                    )
+                    .env(
+                        "STATE_API_SERVICE_DESCRIPTOR",
+                        format!(r#"url: "{}""#, self.config.control_url),
+                    )
+                    .env("SEMI_PERSISTENT_DIRECTORY", staging_dir)
+                    .env("PIPELINE_OPTIONS", &self.config.pipeline_options)
+                    .env("PYTHONUNBUFFERED", "1")
+                    .stdout(Stdio::from(stdout_file))
+                    .stderr(Stdio::from(stderr_file));
+
+                let child = cmd.spawn().map_err(|e| {
+                    Status::internal(format!(
+                        "failed to spawn python harness ({}) : {}",
+                        py_bin, e
+                    ))
+                })?;
+
+                let pid = child.id();
+                log::info!(
+                    "spawned python harness: job_id={}, pid={:?}, python={}, staging_dir={}, log={}",
+                    job_id,
+                    pid,
+                    py_bin,
+                    staging_dir,
+                    log_path
+                );
+
+                self.active_workers.insert(job_id.to_string(), child);
+                Ok(())
+            }
+            WorkerRuntime::Docker { image } => {
+                log::warn!(
+                    "Docker worker runtime requested for image '{}', but docker runtime is not supported in in-process mode.",
+                    image
+                );
+                Err(Status::unimplemented(
+                    "Docker worker runtime is not implemented",
+                ))
+            }
+            WorkerRuntime::External { endpoint } => {
+                log::warn!(
+                    "External worker runtime requested at endpoint '{}', but external runtime is not supported in in-process mode.",
+                    endpoint
+                );
+                Err(Status::unimplemented(
+                    "External worker runtime is not implemented",
+                ))
+            }
+        }
     }
 
     pub async fn stop_worker(&self, job_id: &str) -> Result<(), Status> {

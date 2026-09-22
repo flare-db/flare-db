@@ -17,7 +17,10 @@ use prost::Message;
 use tokio::sync::{Mutex, mpsc::UnboundedReceiver};
 
 use crate::{
-    coders::{BeamCoder, StandardBeamCoders, primitives::WindowedValueCoder},
+    coders::{
+        BeamCoder, StandardBeamCoders, length_prefix_pickled_leaves,
+        primitives::WindowedValueCoder, resolve_length_prefixed_coder_id,
+    },
     engine::harness::{
         control::{ControlChannel, ControlResponse},
         data::{DataChannel, DataKey, ElementStreamPayload},
@@ -96,6 +99,10 @@ impl BundleRuntime {
 
         let transforms = stage_transforms_with_data_boundaries(stage, endpoint.clone());
         let mut components = stage.components();
+        // The Python SDK emits several distinguishable coders under the single
+        // `pickled_python` URN. Ask the SDK to length-prefix those leaves so the
+        // runner can store their bytes opaquely (mirrors Prism's runner).
+        length_prefix_pickled_leaves(&mut components.coders);
         add_stage_data_boundary_coders(stage, &mut components.coders);
 
         // ToDo: validate if we need to pass stage scoped or pipeline scoped values
@@ -285,6 +292,14 @@ impl BundleRuntime {
         Ok(())
     }
 
+    /// Encode a stage's input elements and push them to the worker's source.
+    ///
+    /// Wire framing (matches how the SDKs themselves write output): the encoded
+    /// elements go out on an `Elements.Data` message with `is_last = false`,
+    /// followed by an empty `is_last = true` marker. The Python harness drops the
+    /// payload of an `is_last` message (it only marks the input done), so a
+    /// payload sent with `is_last = true` would be lost; the Java harness decodes
+    /// both, so the split framing is the portable-safe choice.
     pub async fn process_input_elements(
         &self,
         input_instruction_id: String,
@@ -342,13 +357,34 @@ impl BundleRuntime {
             }
         }
 
+        let payload = encoded.freeze();
+
+        // Wire framing must satisfy both SDK harnesses:
+        // - Python (`data_plane.py` `input_elements`) never yields the payload of an
+        //   `is_last` Data message; it only marks the input done.
+        // - Java (`BeamFnDataInboundObserver.multiplexElements`) decodes the payload
+        //   first, then marks the input done.
+        // Sending the elements separately with `is_last = false` followed by an empty
+        // `is_last = true` terminator is the portable-safe framing, and the only one
+        // the Python harness accepts.
+        let mut data: Vec<elements::Data> = Vec::new();
+        if !payload.is_empty() {
+            data.push(elements::Data {
+                instruction_id: input_instruction_id.clone(),
+                transform_id: consumer_transform_id.clone(),
+                data: payload.to_vec(),
+                is_last: false,
+            });
+        }
+        data.push(elements::Data {
+            instruction_id: input_instruction_id,
+            transform_id: consumer_transform_id,
+            data: Vec::new(),
+            is_last: true,
+        });
+
         let elements = Elements {
-            data: vec![elements::Data {
-                instruction_id: input_instruction_id,
-                transform_id: consumer_transform_id,
-                data: encoded.freeze().to_vec(),
-                is_last: true,
-            }],
+            data,
             timers: Vec::new(),
         };
 
@@ -437,6 +473,12 @@ pub fn insert_windowed_value_coder(
     );
 }
 
+/// Register the windowed-value source/sink coders for a stage's input and output
+/// PCollections.
+///
+/// Element coder ids are resolved through [`resolve_length_prefixed_coder_id`]
+/// so that opaque leaves the runner asked the SDK to length-prefix are referenced
+/// by their wrapper.
 pub fn add_stage_data_boundary_coders(
     stage: &ExecutableStage,
     coders: &mut HashMap<String, Coder>,
@@ -447,7 +489,7 @@ pub fn add_stage_data_boundary_coders(
     insert_windowed_value_coder(
         coders,
         windowed_value_coder_id(stage, input_pcol.id()),
-        input_pcol.node().coder_id.clone(),
+        resolve_length_prefixed_coder_id(&input_pcol.node().coder_id, coders),
         global_window_coder_id.clone(),
     );
 
@@ -455,7 +497,7 @@ pub fn add_stage_data_boundary_coders(
         insert_windowed_value_coder(
             coders,
             windowed_value_coder_id(stage, output_pcol.id()),
-            output_pcol.node().coder_id.clone(),
+            resolve_length_prefixed_coder_id(&output_pcol.node().coder_id, coders),
             global_window_coder_id.clone(),
         );
     }

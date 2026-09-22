@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use beam_model_rs::v1::{JobStateEvent, job_state::Enum as JobStateEnum};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
@@ -6,8 +7,28 @@ use std::path::{Path, PathBuf};
 
 use crate::utils::path;
 
+/// Terminal job states, A state stream may close once it has published one of these.
+pub fn is_terminal_state(state: JobStateEnum) -> bool {
+    matches!(
+        state,
+        JobStateEnum::Done
+            | JobStateEnum::Failed
+            | JobStateEnum::Cancelled
+            | JobStateEnum::Stopped
+            | JobStateEnum::Drained
+    )
+}
+
+/// Wraps a `JobState` enum value in the event type returned by the Job API.
+pub fn job_state_event(state: JobStateEnum) -> JobStateEvent {
+    JobStateEvent {
+        state: state as i32,
+        timestamp: None,
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct JobState {
+pub struct JobStatus {
     pub id: String,
     pub worker_log: String,
     pub flaredb_log: String,
@@ -20,7 +41,7 @@ pub struct State {
     pub instance_id: String,
     pub port: u16,
     pub log_dir: String,
-    pub jobs: Vec<JobState>,
+    pub jobs: Vec<JobStatus>,
 }
 
 pub fn state_path() -> PathBuf {
@@ -60,10 +81,12 @@ pub fn record_job_state(instance_id: &str, job_id: &str) -> Result<()> {
 
     let logs_directory = path::logs_dir(instance_id, job_id);
     let worker_log_path = logs_directory.join("flare-worker.log");
-    let flaredb_log_path = path::instance_dir(instance_id).join("logs").join("flare-server.log");
+    let flaredb_log_path = path::instance_dir(instance_id)
+        .join("logs")
+        .join("flare-server.log");
     let graph_path = path::debug_executable_graph_path(instance_id, job_id);
 
-    let job_entry = JobState {
+    let job_entry = JobStatus {
         id: job_id.to_string(),
         worker_log: worker_log_path.display().to_string(),
         flaredb_log: flaredb_log_path.display().to_string(),
@@ -77,7 +100,10 @@ pub fn record_job_state(instance_id: &str, job_id: &str) -> Result<()> {
                 pid: std::process::id(),
                 instance_id: instance_id.to_string(),
                 port: 8099,
-                log_dir: path::instance_dir(instance_id).join("logs").display().to_string(),
+                log_dir: path::instance_dir(instance_id)
+                    .join("logs")
+                    .display()
+                    .to_string(),
                 jobs: Vec::new(),
             },
         }
@@ -86,7 +112,10 @@ pub fn record_job_state(instance_id: &str, job_id: &str) -> Result<()> {
             pid: std::process::id(),
             instance_id: instance_id.to_string(),
             port: 8099,
-            log_dir: path::instance_dir(instance_id).join("logs").display().to_string(),
+            log_dir: path::instance_dir(instance_id)
+                .join("logs")
+                .display()
+                .to_string(),
             jobs: Vec::new(),
         }
     };

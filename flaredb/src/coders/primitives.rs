@@ -89,6 +89,10 @@ impl BeamCoder<f64> for DoubleCoder {
     }
 }
 
+/// Coder for `beam:coder:iterable:v1`.
+///
+/// Elements are decoded recursively, so an iterable may hold primitives or
+/// tuples (e.g. a GroupByKey value of reified metadata tuples).
 #[derive(Debug, Clone)]
 pub struct IterableCoder {
     element_coder: Box<StandardBeamCoders>,
@@ -103,24 +107,24 @@ impl IterableCoder {
 }
 
 // ToDo: add seperate method for encoding list
-impl BeamCoder<Vec<PrimitiveValue>> for IterableCoder {
-    fn encode(&self, val: Vec<PrimitiveValue>, buf: &mut impl BufMut) {
+impl BeamCoder<Vec<BeamRecord>> for IterableCoder {
+    fn encode(&self, val: Vec<BeamRecord>, buf: &mut impl BufMut) {
         let values = val;
         let count = i32::try_from(values.len()).expect("IterableCoder length exceeds i32::MAX");
         buf.put_i32(count);
 
         for element in values {
-            self.element_coder.encode_primitive(element, buf);
+            self.element_coder.encode(element, buf);
         }
     }
 
-    fn decode(&self, buf: &mut impl Buf) -> Result<Vec<PrimitiveValue>, CodersError> {
+    fn decode(&self, buf: &mut impl Buf) -> Result<Vec<BeamRecord>, CodersError> {
         let count = buf.get_i32();
         let mut values = Vec::new();
 
         if count >= 0 {
             for _ in 0..count {
-                values.push(self.element_coder.decode_primitive(buf)?);
+                values.push(self.element_coder.decode_nested(buf)?);
             }
             return Ok(values);
         }
@@ -134,11 +138,154 @@ impl BeamCoder<Vec<PrimitiveValue>> for IterableCoder {
             }
 
             for _ in 0..chunk_count {
-                values.push(self.element_coder.decode_primitive(buf)?);
+                values.push(self.element_coder.decode_nested(buf)?);
             }
         }
 
         Ok(values)
+    }
+}
+
+/// Coder for Beam tuple objects (`beam:coder:tuple:v1`).
+///
+/// A tuple is encoded as its components in order, each with its own component
+/// coder, and carries no length prefix of its own. Every component must be
+/// self-delimiting when nested, which is why each component is encoded/decoded
+/// as if it were nested (mirroring Beam's `TupleCoderImpl`, which marks all but
+/// the last component as nested).
+#[derive(Debug, Clone)]
+pub struct TupleCoder {
+    component_coders: Vec<StandardBeamCoders>,
+}
+
+impl TupleCoder {
+    pub fn new(component_coders: Vec<StandardBeamCoders>) -> Self {
+        Self { component_coders }
+    }
+
+    pub fn component_coders(&self) -> &[StandardBeamCoders] {
+        &self.component_coders
+    }
+}
+
+impl BeamCoder<Vec<PrimitiveValue>> for TupleCoder {
+    fn encode(&self, val: Vec<PrimitiveValue>, buf: &mut impl BufMut) {
+        assert_eq!(
+            val.len(),
+            self.component_coders.len(),
+            "TupleCoder: value has {} components but the coder has {}",
+            val.len(),
+            self.component_coders.len()
+        );
+
+        for (coder, value) in self.component_coders.iter().zip(val) {
+            // Use the full `encode` (not `encode_primitive`): a component coder
+            // may itself be composite (e.g. `Nullable`, `length_prefix`), which
+            // `encode_primitive` does not know how to handle.
+            coder.encode(BeamRecord::PRIMITIVE(value), buf);
+        }
+    }
+
+    fn decode(&self, buf: &mut impl Buf) -> Result<Vec<PrimitiveValue>, CodersError> {
+        let mut values = Vec::with_capacity(self.component_coders.len());
+        for coder in &self.component_coders {
+            values.push(coder.decode_primitive(buf)?);
+        }
+        Ok(values)
+    }
+}
+
+/// Coder for Python pickled payloads (`beam:coder:pickled_python:v1`).
+///
+/// The runner deliberately does not decode Python pickles. The payload is
+/// treated as opaque bytes and stored as [`PrimitiveValue::Bytes`], preserving
+/// the exact pickled representation across a round trip. The wire format is a
+/// varint length prefix followed by the pickled bytes (the same framing as
+/// `beam:coder:bytes:v1`), matching Beam's nested pickle encoding.
+#[derive(Debug, Clone)]
+pub struct PickleCoder;
+
+impl BeamCoder<Vec<u8>> for PickleCoder {
+    fn encode(&self, val: Vec<u8>, buf: &mut impl BufMut) {
+        encode_varint(val.len() as u64, buf);
+        buf.put_slice(val.as_slice());
+    }
+
+    fn decode(&self, buf: &mut impl Buf) -> Result<Vec<u8>, CodersError> {
+        let len = decode_varint(buf) as usize;
+        let mut bytes = vec![0u8; len];
+        buf.copy_to_slice(&mut bytes);
+        Ok(bytes)
+    }
+}
+
+/// Coder for `beam:coder:nullable:v1` (`typing.Optional`).
+///
+/// The wire format matches the standard coder (`standard_coders.yaml`): a
+/// single prefix byte (`0x00` for null, `0x01` for present) followed by the
+/// component value when present. A null is surfaced as
+/// [`PrimitiveValue::Void`]. The component is encoded in the same nested
+/// context as the nullable coder itself, mirroring `NullableCoderImpl`.
+#[derive(Debug, Clone)]
+pub struct NullableCoder {
+    value_coder: Box<StandardBeamCoders>,
+}
+
+impl NullableCoder {
+    pub fn new(value_coder: StandardBeamCoders) -> Self {
+        Self {
+            value_coder: Box::new(value_coder),
+        }
+    }
+}
+
+const NULLABLE_ENCODE_NULL: u8 = 0;
+const NULLABLE_ENCODE_PRESENT: u8 = 1;
+
+impl BeamCoder<BeamRecord> for NullableCoder {
+    fn encode(&self, val: BeamRecord, buf: &mut impl BufMut) {
+        match val {
+            BeamRecord::PRIMITIVE(PrimitiveValue::Void) => buf.put_u8(NULLABLE_ENCODE_NULL),
+            present => {
+                buf.put_u8(NULLABLE_ENCODE_PRESENT);
+                self.value_coder.encode(present, buf);
+            }
+        }
+    }
+
+    fn decode(&self, buf: &mut impl Buf) -> Result<BeamRecord, CodersError> {
+        match buf.get_u8() {
+            NULLABLE_ENCODE_NULL => Ok(BeamRecord::PRIMITIVE(PrimitiveValue::Void)),
+            NULLABLE_ENCODE_PRESENT => self.value_coder.decode_nested(buf),
+            other => Err(CodersError::WhileDecoding(format!(
+                "NullableCoder: unexpected null indicator byte {other}"
+            ))),
+        }
+    }
+}
+
+/// Coder for `beam:coder:length_prefix:v1`.
+///
+/// Wraps an inner coder with a varint byte length. The runner uses this to make
+/// opaque Python leaf coders self-delimiting: several distinct Python coders
+/// (`PickleCoder`, `FastPrimitivesCoder`, `PaneInfoCoder`) are all emitted under
+/// the single `beam:coder:pickled_python:v1` URN yet use different wire formats,
+/// so the runner asks the SDK to length-prefix them and stores the bytes without
+/// interpreting them.
+#[derive(Debug, Clone)]
+pub struct LengthPrefixCoder;
+
+impl BeamCoder<Vec<u8>> for LengthPrefixCoder {
+    fn encode(&self, val: Vec<u8>, buf: &mut impl BufMut) {
+        encode_varint(val.len() as u64, buf);
+        buf.put_slice(val.as_slice());
+    }
+
+    fn decode(&self, buf: &mut impl Buf) -> Result<Vec<u8>, CodersError> {
+        let len = decode_varint(buf) as usize;
+        let mut bytes = vec![0u8; len];
+        buf.copy_to_slice(&mut bytes);
+        Ok(bytes)
     }
 }
 
@@ -419,9 +566,11 @@ pub(crate) fn decode_varint(buf: &mut impl Buf) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::BytesMut;
+    use bytes::{Bytes, BytesMut};
 
-    use crate::store::record::{BeamGbk, BeamKV, BeamRecord, IterableValue, PrimitiveValue};
+    use crate::store::record::{
+        BeamGbk, BeamKV, BeamRecord, IterableValue, PrimitiveValue, TupleValue,
+    };
 
     fn roundtrip(coder: &StandardBeamCoders, value: BeamRecord) -> BeamRecord {
         let mut buf = BytesMut::new();
@@ -438,6 +587,10 @@ mod tests {
 
     fn bytes_value(v: &[u8]) -> PrimitiveValue {
         PrimitiveValue::Bytes(v.to_vec())
+    }
+
+    fn records(values: Vec<PrimitiveValue>) -> Vec<BeamRecord> {
+        values.into_iter().map(BeamRecord::PRIMITIVE).collect()
     }
 
     #[test]
@@ -556,27 +709,25 @@ mod tests {
             VarIntCoder,
         )));
 
-        let original = BeamRecord::ITERABLE(IterableValue {
-            list: vec![
-                PrimitiveValue::Int64(1),
-                PrimitiveValue::Int64(2),
-                PrimitiveValue::Int64(3),
-                PrimitiveValue::Int64(100),
-            ],
-        });
+        let original = BeamRecord::ITERABLE(IterableValue::new(vec![
+            PrimitiveValue::Int64(1),
+            PrimitiveValue::Int64(2),
+            PrimitiveValue::Int64(3),
+            PrimitiveValue::Int64(100),
+        ]));
 
         let decoded = roundtrip(&coder, original);
 
         match decoded {
             BeamRecord::ITERABLE(values) => {
                 assert_eq!(
-                    values.list.as_slice(),
-                    &[
+                    values.list,
+                    records(vec![
                         PrimitiveValue::Int64(1),
                         PrimitiveValue::Int64(2),
                         PrimitiveValue::Int64(3),
                         PrimitiveValue::Int64(100),
-                    ]
+                    ])
                 );
             }
             _ => panic!("expected iterable"),
@@ -602,6 +753,147 @@ mod tests {
     }
 
     #[test]
+    fn tuple_roundtrip() {
+        let coder = StandardBeamCoders::Tuple(TupleCoder::new(vec![
+            StandardBeamCoders::StringUtf8(StringUtf8Coder),
+            StandardBeamCoders::VarInt(VarIntCoder),
+            StandardBeamCoders::Double(DoubleCoder),
+        ]));
+
+        let original = BeamRecord::TUPLE(TupleValue::new(vec![
+            str_value("hello"),
+            PrimitiveValue::Int64(42),
+            PrimitiveValue::Float64(1.5),
+        ]));
+
+        let decoded = roundtrip(&coder, original);
+
+        match decoded {
+            BeamRecord::TUPLE(values) => {
+                assert_eq!(
+                    values.values.as_slice(),
+                    &[
+                        str_value("hello"),
+                        PrimitiveValue::Int64(42),
+                        PrimitiveValue::Float64(1.5),
+                    ]
+                );
+            }
+            _ => panic!("expected tuple"),
+        }
+    }
+
+    #[test]
+    fn tuple_with_nullable_component_roundtrip() {
+        // Mirrors the reshuffle metadata tuple: `(bytes, nullable[opaque], opaque)`.
+        // Regression test for encoding a tuple whose component coder is composite
+        // (`Nullable` / `length_prefix`) rather than a bare primitive.
+        let coder = StandardBeamCoders::Tuple(TupleCoder::new(vec![
+            StandardBeamCoders::Bytes(BytesCoder),
+            StandardBeamCoders::Nullable(NullableCoder::new(StandardBeamCoders::LengthPrefix(
+                LengthPrefixCoder,
+            ))),
+            StandardBeamCoders::LengthPrefix(LengthPrefixCoder),
+        ]));
+
+        // Present nullable component.
+        let present = roundtrip(
+            &coder,
+            BeamRecord::TUPLE(TupleValue::new(vec![
+                PrimitiveValue::Bytes(b"key".to_vec()),
+                PrimitiveValue::Bytes(b"window".to_vec()),
+                PrimitiveValue::Bytes(b"pane".to_vec()),
+            ])),
+        );
+        match present {
+            BeamRecord::TUPLE(values) => assert_eq!(
+                values.values,
+                vec![
+                    PrimitiveValue::Bytes(b"key".to_vec()),
+                    PrimitiveValue::Bytes(b"window".to_vec()),
+                    PrimitiveValue::Bytes(b"pane".to_vec()),
+                ]
+            ),
+            other => panic!("expected tuple, got {other:?}"),
+        }
+
+        // Null nullable component.
+        let null = roundtrip(
+            &coder,
+            BeamRecord::TUPLE(TupleValue::new(vec![
+                PrimitiveValue::Bytes(b"key".to_vec()),
+                PrimitiveValue::Void,
+                PrimitiveValue::Bytes(b"pane".to_vec()),
+            ])),
+        );
+        match null {
+            BeamRecord::TUPLE(values) => assert_eq!(
+                values.values,
+                vec![
+                    PrimitiveValue::Bytes(b"key".to_vec()),
+                    PrimitiveValue::Void,
+                    PrimitiveValue::Bytes(b"pane".to_vec()),
+                ]
+            ),
+            other => panic!("expected tuple, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pickle_roundtrip_preserves_raw_bytes() {
+        let coder = StandardBeamCoders::Pickle(PickleCoder);
+
+        // A byte sequence that begins with a pickle protocol-5 opcode stream.
+        let payload = vec![0x80, 0x05, 0x95, 0x00, 0x01, 0x00, 0x00, 0x00, 0x2e];
+        let decoded = roundtrip(
+            &coder,
+            BeamRecord::PRIMITIVE(PrimitiveValue::Bytes(payload.clone())),
+        );
+
+        match decoded {
+            BeamRecord::PRIMITIVE(PrimitiveValue::Bytes(v)) => {
+                assert_eq!(v, payload);
+            }
+            _ => panic!("expected bytes"),
+        }
+    }
+
+    #[test]
+    fn nullable_roundtrip_matches_standard_coder() {
+        // Matches standard_coders.yaml for `beam:coder:nullable:v1` with a bytes
+        // component: "\u0001\u0003abc" -> "abc", "\u0000" -> null.
+        let coder =
+            StandardBeamCoders::Nullable(NullableCoder::new(StandardBeamCoders::Bytes(BytesCoder)));
+
+        // null encodes as a single 0x00 byte.
+        let mut buf = BytesMut::new();
+        coder.encode(BeamRecord::PRIMITIVE(PrimitiveValue::Void), &mut buf);
+        assert_eq!(buf.as_ref(), b"\x00");
+
+        // present "abc" encodes as 0x01 followed by the nested bytes coder.
+        let mut buf = BytesMut::new();
+        coder.encode(
+            BeamRecord::PRIMITIVE(PrimitiveValue::Bytes(b"abc".to_vec())),
+            &mut buf,
+        );
+        assert_eq!(buf.as_ref(), b"\x01\x03abc");
+
+        // decoding the yaml example yields "abc".
+        let mut present = Bytes::from_static(b"\x01\x03abc");
+        match coder.decode(&mut present).unwrap() {
+            BeamRecord::PRIMITIVE(PrimitiveValue::Bytes(v)) => assert_eq!(v, b"abc"),
+            other => panic!("expected bytes, got {other:?}"),
+        }
+
+        // decoding the null example yields Void.
+        let mut null = Bytes::from_static(b"\x00");
+        assert!(matches!(
+            coder.decode(&mut null).unwrap(),
+            BeamRecord::PRIMITIVE(PrimitiveValue::Void)
+        ));
+    }
+
+    #[test]
     fn kv_roundtrip() {
         let coder = StandardBeamCoders::Kv(
             Box::new(StandardBeamCoders::StringUtf8(StringUtf8Coder)),
@@ -610,7 +902,7 @@ mod tests {
 
         let original = BeamRecord::KV(BeamKV {
             key: str_value("user-1"),
-            value: PrimitiveValue::Int64(42),
+            value: Box::new(BeamRecord::PRIMITIVE(PrimitiveValue::Int64(42))),
         });
 
         let decoded = roundtrip(&coder, original);
@@ -618,7 +910,10 @@ mod tests {
         match decoded {
             BeamRecord::KV(kv) => {
                 assert_eq!(kv.key, str_value("user-1"));
-                assert_eq!(kv.value, PrimitiveValue::Int64(42));
+                assert!(matches!(
+                    *kv.value,
+                    BeamRecord::PRIMITIVE(PrimitiveValue::Int64(42))
+                ));
             }
             _ => panic!("expected kv"),
         }
@@ -633,13 +928,11 @@ mod tests {
 
         let original = BeamRecord::GBK(BeamGbk {
             key: str_value("group"),
-            value: IterableValue {
-                list: vec![
-                    PrimitiveValue::Int64(10),
-                    PrimitiveValue::Int64(20),
-                    PrimitiveValue::Int64(30),
-                ],
-            },
+            value: IterableValue::new(vec![
+                PrimitiveValue::Int64(10),
+                PrimitiveValue::Int64(20),
+                PrimitiveValue::Int64(30),
+            ]),
         });
 
         let decoded = roundtrip(&coder, original);
@@ -649,12 +942,12 @@ mod tests {
                 assert_eq!(gbk.key, str_value("group"));
 
                 assert_eq!(
-                    gbk.value.list.as_slice(),
-                    &[
+                    gbk.value.list,
+                    records(vec![
                         PrimitiveValue::Int64(10),
                         PrimitiveValue::Int64(20),
                         PrimitiveValue::Int64(30),
-                    ]
+                    ])
                 );
             }
             _ => panic!("expected gbk"),
@@ -716,12 +1009,12 @@ mod tests {
         ];
 
         let mut buf = BytesMut::new();
-        coder.encode(values.clone(), &mut buf);
+        coder.encode(records(values.clone()), &mut buf);
 
         let mut bytes = buf.freeze();
         let decoded = coder.decode(&mut bytes).unwrap();
 
-        assert_eq!(decoded.as_slice(), values.as_slice());
+        assert_eq!(decoded, records(values));
     }
 }
 
@@ -735,6 +1028,10 @@ mod beam_wire_tests {
 
     fn str_value(s: &str) -> PrimitiveValue {
         PrimitiveValue::String(s.to_string())
+    }
+
+    fn records(values: Vec<PrimitiveValue>) -> Vec<BeamRecord> {
+        values.into_iter().map(BeamRecord::PRIMITIVE).collect()
     }
 
     /*  fn bytes_value(v: &[u8]) -> PrimitiveValue {
@@ -862,7 +1159,7 @@ mod beam_wire_tests {
         coder.encode(
             BeamRecord::KV(BeamKV {
                 key: str_value("abc"),
-                value: PrimitiveValue::Int64(10),
+                value: Box::new(BeamRecord::PRIMITIVE(PrimitiveValue::Int64(10))),
             }),
             &mut buf,
         );
@@ -882,7 +1179,10 @@ mod beam_wire_tests {
         match coder.decode(&mut bytes).unwrap() {
             BeamRecord::KV(kv) => {
                 assert_eq!(kv.key, str_value("abc"));
-                assert_eq!(kv.value, PrimitiveValue::Int64(10));
+                assert!(matches!(
+                    *kv.value,
+                    BeamRecord::PRIMITIVE(PrimitiveValue::Int64(10))
+                ));
             }
             _ => panic!("expected kv"),
         }
@@ -900,7 +1200,7 @@ mod beam_wire_tests {
         ];
 
         let mut buf = BytesMut::new();
-        coder.encode(values, &mut buf);
+        coder.encode(records(values), &mut buf);
 
         assert_eq!(
             buf.as_ref(),
@@ -918,13 +1218,13 @@ mod beam_wire_tests {
         let decoded = coder.decode(&mut bytes).unwrap();
 
         assert_eq!(
-            decoded.as_slice(),
-            &[
+            decoded,
+            records(vec![
                 PrimitiveValue::Int64(1),
                 PrimitiveValue::Int64(10),
                 PrimitiveValue::Int64(200),
                 PrimitiveValue::Int64(1000),
-            ]
+            ])
         );
     }
 }

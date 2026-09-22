@@ -69,7 +69,18 @@ impl BeamFnLogging for FlareLogService {
         Self: 'async_trait,
     {
         Box::pin(async move {
-            *self.inner.incoming.lock().await = Some(request.into_inner());
+            let mut stream = request.into_inner();
+            tokio::spawn(async move {
+                while let Ok(Some(list)) = stream.message().await {
+                    for entry in list.log_entries {
+                        log::info!(
+                            "[SDK WORKER LOG] level={:?} message={}",
+                            entry.severity,
+                            entry.message
+                        );
+                    }
+                }
+            });
 
             let rx = {
                 let mut rx_guard = self.inner.outgoing_rx.lock().await;
