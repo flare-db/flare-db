@@ -1,0 +1,25 @@
+// Run with:   ./gradlew :flatten:run
+// Fat jar:    ./gradlew :flatten:shadowJar  
+
+plugins {
+    id 'java'
+    id 'application'
+    alias(libs.plugins.shadow)
+}
+
+application {
+    mainClass = 'com.flaredb.example.FlattenExample'
+}
+
+dependencies {
+    implementation project(':flaredb-runner')
+    implementation libs.beam.core
+    runtimeOnly libs.slf4j.simple
+}
+
+shadowJar {
+    mergeServiceFiles()
+    zip64 = true // Shaded Beam deps can exceed the 65535-entry zip limit.
+}
+
+
