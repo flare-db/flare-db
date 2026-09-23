@@ -40,7 +40,7 @@ public class FlareNexmarkLauncher {
 
   public NexmarkPerf run() throws IOException {
     // Configure default runner to FlareRunner if not specified or set to DirectRunner
-    if (options.getRunner() == null 
+    if (options.getRunner() == null
         || options.getRunner().getName().equals("org.apache.beam.sdk.PipelineRunner")
         || options.getRunner().getName().equals("org.apache.beam.runners.direct.DirectRunner")) {
       options.setRunner(FlareRunner.class);
@@ -122,11 +122,6 @@ public class FlareNexmarkLauncher {
 
   /**
    * Locates the Nexmark shadow (uber) JAR produced by the {@code shadowJar} task.
-   *
-   * <p>Both candidate directories are checked because the process working directory depends on how
-   * the benchmark is launched: it is the module directory when run via Gradle's {@code :nexmark:run}
-   * task and the repository root when the fat JAR is run directly. The JAR name embeds the project
-   * version, so the newest matching artifact is selected rather than relying on a hardcoded name.
    */
   private static File findShadowJar() {
     String[] candidateDirs = {"build/libs", "benchmarks/nexmark/build/libs"};
