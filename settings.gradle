@@ -9,6 +9,7 @@ def javaModules = [
     'flareio-write'  : 'example/flare-io-write',
     'flareio-read'   : 'example/flare-io-read',
     'flatten'        : 'example/flatten',
+    'co-groupby-key' : 'example/co-groupby-key',
     'nexmark'        : 'benchmarks/nexmark',
 ]
 

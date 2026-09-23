@@ -1,0 +1,24 @@
+// Run with:   ./gradlew :co-groupby-key:run
+// Fat jar:    ./gradlew :co-groupby-key:shadowJar  (build/libs/wordcount-0.1.0-all.jar)
+
+
+plugins {
+    id 'java'
+    id 'application'
+    alias(libs.plugins.shadow)
+}
+
+application {
+    mainClass = 'com.flaredb.example.CoGroupByKeyExample'
+}
+
+dependencies {
+    implementation project(':flaredb-runner')
+    implementation libs.beam.core
+    runtimeOnly libs.slf4j.simple
+}
+
+shadowJar {
+    mergeServiceFiles()
+    zip64 = true
+}
