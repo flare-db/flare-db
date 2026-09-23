@@ -15,19 +15,13 @@ import org.apache.beam.sdk.values.TypeDescriptors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.flaredb.runner.FlareRunner;
-
 public class WordCount {
     private static final Logger LOG = LoggerFactory.getLogger(WordCount.class);
 
     public static void main(String[] args) {
-        WordCountPipelineOptions options = PipelineOptionsFactory.fromArgs(args)
-                .as(WordCountPipelineOptions.class);
-
-        options.setRunner(FlareRunner.class);
-        options.setJobEndpoint("127.0.0.1:8099");
-        options.setUberJar(
-                "/home/ganesh/flare-db/clilogs/flare-db/example/wordcount/build/libs/wordcount-0.2.0-all.jar");
+        WordCountPipelineOptions options =
+                WordCountPipelineOptions.applyFlareDefaults(
+                        PipelineOptionsFactory.fromArgs(args).as(WordCountPipelineOptions.class));
 
         Pipeline p = Pipeline.create(options);
 

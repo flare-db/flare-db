@@ -1,5 +1,5 @@
 // Run with:   ./gradlew :co-groupby-key:run
-// Fat jar:    ./gradlew :co-groupby-key:shadowJar  (build/libs/wordcount-0.1.0-all.jar)
+// Fat jar:    ./gradlew :co-groupby-key:shadowJar  (build/libs/co-groupby-key-0.2.0-all.jar)
 
 
 plugins {
@@ -21,4 +21,10 @@ dependencies {
 shadowJar {
     mergeServiceFiles()
     zip64 = true
+}
+
+run {
+    // The FlareRunner stages the shadow (uber) JAR to the FlareDB workers, so it must exist
+    // before the example starts.
+    dependsOn tasks.named('shadowJar')
 }

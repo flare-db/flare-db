@@ -12,7 +12,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.flaredb.io.FlareDbIO;
-import com.flaredb.runner.FlareRunner;
 
 /**
  * Example pipeline that loads a CSV file into FlareDB using {@link FlareDbIO}.
@@ -77,13 +76,9 @@ public class WritePipeline {
 
   public static void main(String[] args) {
     WritePipelineOptions options =
-        PipelineOptionsFactory.fromArgs(args).as(WritePipelineOptions.class);
-    options.setRunner(FlareRunner.class);
+        WritePipelineOptions.applyFlareDefaults(
+            PipelineOptionsFactory.fromArgs(args).as(WritePipelineOptions.class));
     options.setJobName("flareio-write-scores");
-    options.setJobEndpoint("127.0.0.1:8099");
-    options.setUberJar(
-        "/home/ganesh/flare-db/flareio/flare-db/example/flare-io-write/build/libs/"
-            + "flareio-write-0.1.0-all.jar"); // set your jar path
 
     Pipeline pipeline = Pipeline.create(options);
 

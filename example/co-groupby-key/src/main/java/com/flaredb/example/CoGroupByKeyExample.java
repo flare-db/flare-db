@@ -15,8 +15,6 @@ import org.apache.beam.sdk.options.PipelineOptionsFactory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.flaredb.runner.FlareRunner;
-
 
 public class CoGroupByKeyExample {
 
@@ -24,15 +22,11 @@ public class CoGroupByKeyExample {
 
     public static void main(String[] args) {
 
-        CoGroupByKeyPipelineOptions options = PipelineOptionsFactory.fromArgs(args)
-                .as(CoGroupByKeyPipelineOptions.class);
+        CoGroupByKeyPipelineOptions options =
+                CoGroupByKeyPipelineOptions.applyFlareDefaults(
+                        PipelineOptionsFactory.fromArgs(args).as(CoGroupByKeyPipelineOptions.class));
 
-        options.setRunner(FlareRunner.class);
-        options.setJobEndpoint("127.0.0.1:8099");
-        options.setUberJar(
-                "/home/ganesh/flare-db/clilogs/flare-db/example/wordcount/build/libs/wordcount-0.2.0-all.jar");
-
-        Pipeline pipeline = Pipeline.create();
+        Pipeline pipeline = Pipeline.create(options);
 
         TupleTag<Integer> leftTag = new TupleTag<>();
         TupleTag<String> rightTag = new TupleTag<>();
