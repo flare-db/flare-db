@@ -64,7 +64,7 @@ pub mod beam_urns {
         SPLITTABLE_PROCESS_SIZED_ELEMENTS_AND_RESTRICTIONS_URN,
     ];
 
-    pub const FLARE: &[&str] = &[GROUP_BY_KEY_TRANSFORM, IMPULSE_TRANSFORM];
+    pub const FLARE: &[&str] = &[GROUP_BY_KEY_TRANSFORM, IMPULSE_TRANSFORM, FLATTEN_TRANSFORM];
 
     // Composites
     pub const COMBINE_PER_KEY_TRANSFORM_URN: &str = "beam:transform:combine_per_key:v1";

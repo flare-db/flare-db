@@ -3,27 +3,22 @@ use async_trait::async_trait;
 use beam_model_rs::v1::{
     Coder, Components, Environment, FunctionSpec, PCollection, PTransform, WindowingStrategy,
 };
-use datafusion::execution::context::SessionContext;
-use datafusion::functions_aggregate::expr_fn::array_agg;
-use datafusion::prelude::*;
-//use flare_datafusion::tonbo_table::TonboTable;
 use log::info;
-use paimon::Catalog;
-use paimon::Error as PaimonError;
-use paimon_datafusion::PaimonTableProvider;
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
-
-use crate::store::record::{RecordTableSchema, TableType};
+use std::collections::{HashMap, HashSet};
 
 use crate::{
     jobservice::urns::beam_urns,
+    store::element_store::{NewCollectionRequest, ScanCollectionRequest},
     transforms::{ExecutionContext, FlareTransform},
 };
+
+/// Merges multiple input PCollections into a single output PCollection.
+///
+/// Flatten is a pure concatenation: every element from every input is emitted,
+/// unchanged, into the single output. Each input PCollection has already been
+/// materialized into the element store by its upstream (worker or runner)
 #[derive(Clone)]
-pub struct GroupByKey {
+pub struct Flatten {
     name: String,
     id: String,
     inputs: HashMap<String, String>,
@@ -31,12 +26,12 @@ pub struct GroupByKey {
 }
 
 #[async_trait]
-impl FlareTransform for GroupByKey {
+impl FlareTransform for Flatten {
     fn urn() -> &'static str
     where
         Self: Sized,
     {
-        beam_urns::GROUP_BY_KEY_TRANSFORM
+        beam_urns::FLATTEN_TRANSFORM
     }
 
     fn with(
@@ -54,54 +49,37 @@ impl FlareTransform for GroupByKey {
     }
 
     async fn execute(&self, ctx: ExecutionContext) -> Result<(), Error> {
-        // GroupByKey consumes exactly one input PCollection.
-        let input_pcollection_id = ctx
-            .input_pcollection_ids
-            .first()
-            .cloned()
-            .expect("GroupByKey expects exactly one input PCollection");
-        let identifier = ctx.store.table_identifier(&input_pcollection_id);
+        let mut merged = Vec::new();
 
-        // The input table may not exist when the upstream stage produced zero
-        // elements (write_beamrecord_batch is never called for empty output).
-        // An empty input to GroupByKey correctly yields an empty output.
-        let table = match ctx.store.catalog.get_table(&identifier).await {
-            Ok(table) => table,
-            Err(PaimonError::TableNotExist { .. }) => {
-                info!(
-                    "GroupByKey: input PCollection table '{}' does not exist (0 elements), \
-                     producing empty output",
-                    input_pcollection_id
-                );
-                return Ok(());
-            }
-            Err(err) => return Err(err.into()),
-        };
-        let provider = PaimonTableProvider::try_new(table)?;
-        let df_ctx = SessionContext::new();
-
-        df_ctx.register_table("gbk", Arc::new(provider))?;
-
-        let query = df_ctx.table("gbk").await?.aggregate(
-            vec![col("key")],
-            vec![array_agg(col("value")).alias("value")],
-        )?;
-
-        let batches = query.collect().await?;
-
-        let output_groups: usize = batches.iter().map(|b| b.num_rows()).sum();
-        info!("Executed GroupByKey: {} output groups", output_groups);
-
-        for batch in batches {
-            let table_schema = Arc::new(RecordTableSchema {
-                table_type: TableType::Gbk,
-                arrow_schema: batch.schema(),
-            });
-
-            ctx.store
-                .write_record_batch(&ctx.output_pcollection_id, batch, table_schema)
+        // Read every input collection from the store.
+        for input_id in &ctx.input_pcollection_ids {
+            let records = ctx
+                .store
+                .scan_collection(ScanCollectionRequest {
+                    pcollection_id: input_id.clone(),
+                })
                 .await?;
+            merged.extend(records);
         }
+
+        info!(
+            "Executed Flatten: {} input collections, {} total elements",
+            ctx.input_pcollection_ids.len(),
+            merged.len()
+        );
+
+        // A Flatten whose inputs are all empty correctly produces an empty output.
+        if merged.is_empty() {
+            return Ok(());
+        }
+
+        ctx.store
+            .write_beamrecord_batch(NewCollectionRequest {
+                pcollection_id: ctx.output_pcollection_id.clone(),
+                elements: merged,
+            })
+            .await?;
+
         Ok(())
     }
 

@@ -12,9 +12,10 @@ use uuid::Uuid;
 use crate::{
     jobservice::urns::beam_urns,
     store::element_store::FlareElementStore,
-    transforms::{gbk::GroupByKey, impluse::Impulse},
+    transforms::{flatten::Flatten, gbk::GroupByKey, impluse::Impulse},
 };
 
+pub mod flatten;
 pub mod gbk;
 pub mod impluse;
 
@@ -71,7 +72,12 @@ pub struct ExecutionContext {
     //pub instruction_id: String,
     ///pub transform_id: String,
     pub store: Arc<FlareElementStore>,
-    pub input_pcollection_id: String,
+    /// Input PCollections, in the order their incoming edges were discovered.
+    ///
+    /// Single-input runner transforms (e.g. [`GroupByKey`]) receive a one-element
+    /// list; fan-in transforms such as [`Flatten`] receive all of their inputs so
+    /// each can be mapped back to its producer/coder at the data boundary.
+    pub input_pcollection_ids: Vec<String>,
     pub output_pcollection_id: String,
     pub consumer_transfrom_id: String, //pub coder: String,
 }
@@ -91,6 +97,12 @@ pub fn from_urn(
             name,
         )),
         beam_urns::GROUP_BY_KEY_TRANSFORM => Arc::new(GroupByKey::with(
+            Uuid::new_v4().to_string(),
+            inputs,
+            outputs,
+            name,
+        )),
+        beam_urns::FLATTEN_TRANSFORM => Arc::new(Flatten::with(
             Uuid::new_v4().to_string(),
             inputs,
             outputs,

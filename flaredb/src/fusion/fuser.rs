@@ -84,7 +84,7 @@ impl GreedyPipelineFuser {
         let dedup = ensure_single_producer(&self.pipeline, &stages, &unfused_pt)?;
 
         Ok(FusedPipeline::of(
-            // dedup.components(),
+            dedup.components(),
             dedup.get_sdk_stages(&stages),
             dedup.get_runner_stages(&unfused_pt),
         ))
@@ -1245,6 +1245,67 @@ mod tests {
     }
 
     //
+    // Graph query regression: edge direction
+    //
+
+    /// Regression for the spurious multi-producer detection that made
+    /// `ensure_single_producer` rewrite single-producer PCollections (and then
+    /// panic when the synthetic partial ids were missing from the components).
+    ///
+    /// `get_output_pcol` must follow only *outgoing* edges. `Graph::neighbors`
+    /// returns neighbours in both directions, so a transform's inputs were
+    /// previously reported as its outputs — which led `collect_producers` to
+    /// record a transform as a producer of its own inputs.
+    #[test]
+    fn get_output_pcol_follows_only_outgoing_edges() {
+        let env = make_env("env1");
+        let clean = clean_pardo_payload();
+        // a -> p -> b -> q
+        let a = make_pardo_transform(
+            "a",
+            beam_urns::PAR_DO_TRANSFORM,
+            &[],
+            &[("out", "p")],
+            "env1",
+            &clean,
+        );
+        let b = make_pardo_transform(
+            "b",
+            beam_urns::PAR_DO_TRANSFORM,
+            &[("in", "p")],
+            &[("out", "q")],
+            "env1",
+            &clean,
+        );
+        let mut envs = HashMap::new();
+        envs.insert("env1".to_string(), env);
+
+        let pipeline = build_pipeline(
+            vec![a.clone(), b.clone()],
+            vec![make_pcol("p"), make_pcol("q")],
+            envs,
+        );
+
+        let a_outputs: HashSet<String> = pipeline
+            .get_output_pcol(&a)
+            .iter()
+            .map(|c| c.id.clone())
+            .collect();
+        assert_eq!(a_outputs, HashSet::from(["p".to_string()]));
+
+        let b_outputs: HashSet<String> = pipeline
+            .get_output_pcol(&b)
+            .iter()
+            .map(|c| c.id.clone())
+            .collect();
+        assert_eq!(
+            b_outputs,
+            HashSet::from(["q".to_string()]),
+            "a transform's inputs must not be reported as its outputs"
+        );
+    }
+
+    //
     // Group 1: baseline fusion regression
     //
 
@@ -1904,6 +1965,27 @@ mod tests {
             flatten.transform.outputs.get("output"),
             Some(&common_pcol_id.to_string()),
             "Flatten output should be the original PCollection ID"
+        );
+
+        // Every partial input of the introduced Flatten must be registered in the
+        // deduplicated components. The fused stages have their outputs rewritten
+        // to these partial ids, so if they are absent from the component set used
+        // to build the executable graph, graph construction cannot resolve them.
+        for partial_id in flatten.transform.inputs.values() {
+            assert_ne!(partial_id, common_pcol_id);
+            assert!(
+                result.components.pcollections.contains_key(partial_id),
+                "deduplicated components must contain partial PCollection '{partial_id}'"
+            );
+        }
+        // The original PCollection is preserved and the merging Flatten is present.
+        assert!(
+            result.components.pcollections.contains_key(common_pcol_id),
+            "deduplicated components must still contain the original PCollection"
+        );
+        assert!(
+            result.components.transforms.contains_key(&flatten.id),
+            "deduplicated components must contain the introduced Flatten"
         );
     }
 

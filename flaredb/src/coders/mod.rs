@@ -6,7 +6,7 @@ use crate::store::record::{BeamGbk, BeamKV, BeamRecord, IterableValue, TupleValu
 use crate::{
     coders::primitives::{
         BoolCoder, BytesCoder, DoubleCoder, IterableCoder, LengthPrefixCoder, NullableCoder,
-        PickleCoder, StringUtf8Coder, TupleCoder, VarIntCoder, VoidCoder,
+        PickleCoder, StringUtf8Coder, TupleCoder, VarInt32Coder, VarIntCoder, VoidCoder,
     },
     jobservice::urns::beam_urns,
     store::record::PrimitiveValue,
@@ -37,6 +37,8 @@ pub enum StandardBeamCoders {
     StringUtf8(StringUtf8Coder),
     Bytes(BytesCoder),
     VarInt(VarIntCoder),
+    /// Java's 32-bit `VarIntCoder`,
+    VarInt32(VarInt32Coder),
     Bool(BoolCoder),
     Double(DoubleCoder),
     Void(VoidCoder),
@@ -86,13 +88,11 @@ impl StandardBeamCoders {
             beam_urns::DOUBLE_CODER => StandardBeamCoders::Double(DoubleCoder),
             beam_urns::PYTHON_PICKLE_CODER => StandardBeamCoders::Pickle(PickleCoder),
             beam_urns::LENGTH_PREFIX_CODER => StandardBeamCoders::LengthPrefix(LengthPrefixCoder),
-            beam_urns::JAVA_SDK_CODER => {
-                if id == "VoidCoder" {
-                    StandardBeamCoders::Void(VoidCoder)
-                } else {
-                    StandardBeamCoders::Bytes(BytesCoder)
-                }
-            }
+            beam_urns::JAVA_SDK_CODER => match id {
+                "VoidCoder" => StandardBeamCoders::Void(VoidCoder),
+                "VarIntCoder" => StandardBeamCoders::VarInt32(VarInt32Coder),
+                _ => StandardBeamCoders::Bytes(BytesCoder),
+            },
             beam_urns::ITERABLE_CODER => {
                 let ids = component_coder_ids
                     .as_ref()
@@ -250,6 +250,9 @@ impl StandardBeamCoders {
             (StandardBeamCoders::VarInt(coder), PrimitiveValue::Int64(value)) => {
                 coder.encode(value, buf)
             }
+            (StandardBeamCoders::VarInt32(coder), PrimitiveValue::Int64(value)) => {
+                coder.encode(value, buf)
+            }
             (StandardBeamCoders::Bool(coder), PrimitiveValue::Bool(value)) => {
                 coder.encode(value, buf)
             }
@@ -282,6 +285,9 @@ impl StandardBeamCoders {
             StandardBeamCoders::VarInt(coder) => Ok(BeamRecord::PRIMITIVE(PrimitiveValue::Int64(
                 coder.decode(buf)?,
             ))),
+            StandardBeamCoders::VarInt32(coder) => Ok(BeamRecord::PRIMITIVE(
+                PrimitiveValue::Int64(coder.decode(buf)?),
+            )),
             StandardBeamCoders::Bool(coder) => Ok(BeamRecord::PRIMITIVE(PrimitiveValue::Bool(
                 coder.decode(buf)?,
             ))),
@@ -409,6 +415,34 @@ mod tests {
             }),
             component_coder_ids: components.iter().map(|c| c.to_string()).collect(),
         }
+    }
+
+    #[test]
+    fn java_sdk_coders_resolve_custom_ids() {
+        let mut coders = HashMap::new();
+        coders.insert(
+            "VoidCoder".to_string(),
+            coder(beam_urns::JAVA_SDK_CODER, &[]),
+        );
+        coders.insert(
+            "VarIntCoder".to_string(),
+            coder(beam_urns::JAVA_SDK_CODER, &[]),
+        );
+        coders.insert(
+            "SomethingElseCoder".to_string(),
+            coder(beam_urns::JAVA_SDK_CODER, &[]),
+        );
+
+        assert!(StandardBeamCoders::from_urn("VoidCoder", None, Some(&coders)).is_void());
+        assert!(matches!(
+            StandardBeamCoders::from_urn("VarIntCoder", None, Some(&coders)),
+            StandardBeamCoders::VarInt32(_)
+        ));
+        // Unrecognized java-sdk coders still fall back to opaque bytes.
+        assert!(matches!(
+            StandardBeamCoders::from_urn("SomethingElseCoder", None, Some(&coders)),
+            StandardBeamCoders::Bytes(_)
+        ));
     }
 
     #[test]
