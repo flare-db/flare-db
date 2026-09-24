@@ -4,7 +4,6 @@ plugins {
     id 'java-library'
     id 'maven-publish'
     id 'signing'
-    alias(libs.plugins.spotless)
 }
 
 java {
@@ -20,11 +19,6 @@ dependencies {
     testImplementation libs.junit
 }
 
-spotless {
-    java {
-        googleJavaFormat('1.27.0')
-    }
-}
 
 publishing {
     publications {
