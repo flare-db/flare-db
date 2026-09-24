@@ -107,47 +107,55 @@ impl ExecutableGraph {
         let mut splittable_cache: HashMap<String, ExecutableNode> = HashMap::new();
 
         let mut work_queue = VecDeque::<ExecutableNode>::new();
+        // Tracks every node already scheduled for expansion. A node reachable
+        // from more than one upstream branch (a fan-in such as a Flatten) must
+        // only be expanded once, otherwise its outgoing edges are duplicated.
+        let mut queued: HashSet<String> = HashSet::new();
+
         info!("Created work queue");
-        // Create Root node and immidate consumer pair
-        if let Some(root) = Self::get_root(&runner_stages) {
-            if let Some(spec) = root.transform.spec.as_ref() {
-                let urn = &spec.urn;
-                info!("Root node urn: {}", urn);
-                let root_node = ExecutableNode::Runner(from_urn(
-                    urn,
-                    root.node().unique_name.clone(),
-                    root.transform.inputs.clone(),
-                    root.transform.outputs.clone(),
-                ));
+        // Seed the traversal from every root node, not just the first one. A
+        // pipeline can have multiple roots (e.g. several `Create`/`Impulse`
+        // sources whose outputs are later merged by a Flatten).
+        for root in Self::get_roots(&runner_stages) {
+            let Some(spec) = root.transform.spec.as_ref() else {
+                continue;
+            };
+            let urn = &spec.urn;
+            info!("Root node urn: {}", urn);
+            let root_node = ExecutableNode::Runner(from_urn(
+                urn,
+                root.node().unique_name.clone(),
+                root.transform.inputs.clone(),
+                root.transform.outputs.clone(),
+            ));
 
-                let runner_index = self.graph.add_node(root_node.clone());
+            let runner_index = self.ensure_node_exists(&root_node);
+            queued.insert(root_node.id());
 
-                self.node_indices
-                    .insert(root_node.id().clone(), runner_index);
+            for (_output_key, output_id) in root.node().outputs.iter() {
+                if let Some(consumer_links) = consumer_map.get(output_id).cloned() {
+                    for consumer_link in consumer_links {
+                        let consumer_node = self.resolve_consumer(
+                            &consumer_link.node,
+                            &sdk_stages,
+                            &runner_stages,
+                            &consumer_map,
+                            &mut splittable_cache,
+                        );
 
-                for (_output_key, output_id) in root.node().outputs.iter() {
-                    if let Some(consumer_links) = consumer_map.get(output_id).cloned() {
-                        for consumer_link in consumer_links {
-                            let consumer_node = self.resolve_consumer(
-                                &consumer_link.node,
-                                &sdk_stages,
-                                &runner_stages,
-                                &consumer_map,
-                                &mut splittable_cache,
-                            );
+                        let consumer_index = self.ensure_node_exists(&consumer_node);
 
-                            let consumer_index = self.ensure_node_exists(&consumer_node);
+                        let edge = self.build_consumer_metadata(
+                            output_id,
+                            &consumer_link.transform_id,
+                            &sdk_stages,
+                            &runner_stages,
+                        );
 
-                            let edge = self.build_consumer_metadata(
-                                output_id,
-                                &consumer_link.transform_id,
-                                &sdk_stages,
-                                &runner_stages,
-                            );
+                        self.root_metadata.get_or_insert_with(|| edge.clone());
 
-                            self.root_metadata.get_or_insert_with(|| edge.clone());
-
-                            self.graph.add_edge(runner_index, consumer_index, edge);
+                        self.graph.add_edge(runner_index, consumer_index, edge);
+                        if queued.insert(consumer_node.id()) {
                             work_queue.push_back(consumer_node);
                         }
                     }
@@ -197,8 +205,10 @@ impl ExecutableGraph {
 
                         // Connect the producer and consumer nodes with PCollection metadata
                         self.graph.add_edge(producer_index, consumer_index, edge);
-                        // Add consumer node to queue to itterate and do the same for its downstream nodes.
-                        work_queue.push_back(consumer_node);
+                        // Expand the consumer's downstream nodes exactly once.
+                        if queued.insert(consumer_node.id()) {
+                            work_queue.push_back(consumer_node);
+                        }
                     }
                 }
             }
@@ -396,16 +406,16 @@ impl ExecutableGraph {
         index
     }
 
-    fn get_root(runner_stages: &IndexSet<PTransformNode>) -> Option<&PTransformNode> {
-        info!("fetching root node");
-        for pt in runner_stages.iter() {
-            if pt.node().inputs.is_empty() {
-                info!("Root transfrom: {}", pt.id);
-                return Some(pt);
-            }
+    fn get_roots(runner_stages: &IndexSet<PTransformNode>) -> Vec<&PTransformNode> {
+        info!("fetching root nodes");
+        let roots: Vec<&PTransformNode> = runner_stages
+            .iter()
+            .filter(|pt| pt.node().inputs.is_empty())
+            .collect();
+        for pt in &roots {
+            info!("Root transfrom: {}", pt.id);
         }
-        None
-        /* `PTransformNode` value */
+        roots
     }
 
     pub fn get_root_metadata(&self) -> &ConsumerMetaData {

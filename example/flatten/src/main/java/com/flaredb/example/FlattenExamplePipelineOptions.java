@@ -31,13 +31,13 @@ public interface FlattenExamplePipelineOptions extends FlarePipelineOptions {
 
     /** Locates the shadow (uber) JAR produced by this module's {@code shadowJar} task. */
     private static File findShadowJar() {
-        String[] candidateDirs = {"build/libs", "example/co-groupby-key/build/libs"};
+        String[] candidateDirs = {"build/libs", "example/flatten/build/libs"};
         for (String dir : candidateDirs) {
             File[] matches =
                     new File(dir)
                             .listFiles(
                                     (d, name) ->
-                                            name.startsWith("co-groupby-key-") && name.endsWith("-all.jar"));
+                                            name.startsWith("flatten-") && name.endsWith("-all.jar"));
             if (matches != null && matches.length > 0) {
                 Arrays.sort(matches, Comparator.comparing(File::getName));
                 return matches[matches.length - 1];
