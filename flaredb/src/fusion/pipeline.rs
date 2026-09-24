@@ -628,11 +628,7 @@ pub struct ConsumerMetaData {
 pub struct FusedPipeline {
     /// Components after single-producer deduplication: the original pipeline
     /// components plus the synthetic "partial" PCollections and merging
-    /// Flattens that `ensure_single_producer` injected. This is the component
-    /// set the fused stages were rewritten against, so it must be the one used
-    /// to build the executable graph — otherwise the partial PCollection ids
-    /// referenced by those stages are missing and graph construction fails to
-    /// resolve them.
+    /// Flattens that `ensure_single_producer` injected.
     components: Components,
     sdk_stages: IndexSet<ExecutableStage>,
     runner_stages: IndexSet<PTransformNode>,
@@ -824,9 +820,7 @@ impl QueryablePipeline {
 
     pub fn get_output_pcol(&self, transfrom: &PTransformNode) -> HashSet<PCollectionNode> {
         if let Some(&node_idx) = self.transform_ids.get(&transfrom.id) {
-            // Only follow outgoing edges: a transform's *inputs* must not be
-            // reported as its outputs. `Graph::neighbors` returns neighbours in
-            // both directions, which would make every input look like an output.
+            // Only follow outgoing edges
             self.graph
                 .neighbors_directed(node_idx, petgraph::Direction::Outgoing)
                 .filter_map(|neighbor_idx| {
