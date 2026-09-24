@@ -57,6 +57,40 @@ impl BeamCoder<i64> for VarIntCoder {
     }
 }
 
+/// Coder for Java's `org.apache.beam.sdk.coders.VarIntCoder`, 32-bit
+/// `Integer` coder.
+/// It differs from [`VarIntCoder`] (the model's 64-bit `beam:coder:varint:v1`)
+/// only for negative values: it zero-extends the 32-bit two's-complement pattern
+/// before LEB128-encoding, so `-1` is 5 bytes (`FF FF FF FF 0F`) and reads back
+/// as `0xFFFFFFFF`, whereas the 64-bit coder sign-extends `-1` to 10 bytes.
+/// Values in `0..=i32::MAX` are byte-identical between the two.
+#[derive(Debug, Clone)]
+pub struct VarInt32Coder;
+
+impl BeamCoder<i64> for VarInt32Coder {
+    fn encode(&self, val: i64, buf: &mut impl BufMut) {
+        debug_assert!(
+            (i32::MIN as i64..=i32::MAX as i64).contains(&val),
+            "VarInt32Coder value out of i32 range: {val}"
+        );
+        // Mirror Java's `VarInt.convertIntToLongNoSignExtend(v) = v & 0xFFFFFFFFL`.
+        encode_varint((val as i32 as u32) as u64, buf);
+    }
+
+    fn decode(&self, buf: &mut impl Buf) -> Result<i64, CodersError> {
+        let raw = decode_varint(buf);
+        // Java's `VarInt.decodeInt` rejects anything outside the 32-bit range
+        // (this also rejects values whose top bit is set, i.e. `raw` as i64 < 0).
+        if raw >= (1u64 << 32) {
+            return Err(CodersError::WhileDecoding(format!(
+                "VarInt32Coder: varint value {raw} out of 32-bit range"
+            )));
+        }
+        // Reinterpret the 32-bit pattern as signed, then widen to i64.
+        Ok((raw as u32 as i32) as i64)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BoolCoder;
 
@@ -637,6 +671,73 @@ mod tests {
                 _ => panic!("expected int"),
             }
         }
+    }
+
+    #[test]
+    fn varint32_roundtrip() {
+        let coder = StandardBeamCoders::VarInt32(VarInt32Coder);
+
+        let values = [0, 1, -1, 42, 1000, i32::MAX as i64, i32::MIN as i64];
+
+        for value in values {
+            let decoded = roundtrip(&coder, BeamRecord::PRIMITIVE(PrimitiveValue::Int64(value)));
+
+            match decoded {
+                BeamRecord::PRIMITIVE(PrimitiveValue::Int64(v)) => {
+                    assert_eq!(v, value, "roundtrip mismatch for {value}");
+                }
+                other => panic!("expected int64, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn varint32_matches_java_wire_format() {
+        // Byte-for-byte the encodings produced by Java's VarIntCoder.
+        let coder = VarInt32Coder;
+        let cases: [(i64, &[u8]); 6] = [
+            (0, &[0x00]),
+            (1, &[0x01]),
+            (42, &[0x2A]),
+            (127, &[0x7F]),
+            (128, &[0x80, 0x01]),
+            // Java zero-extends the 32-bit pattern: -1 -> 0xFFFFFFFF (5 bytes).
+            (-1, &[0xFF, 0xFF, 0xFF, 0xFF, 0x0F]),
+        ];
+
+        for (value, expected) in cases {
+            let mut buf = BytesMut::new();
+            coder.encode(value, &mut buf);
+            assert_eq!(buf.as_ref(), expected, "encoding mismatch for {value}");
+
+            let mut bytes = buf.freeze();
+            assert_eq!(coder.decode(&mut bytes).unwrap(), value);
+        }
+    }
+
+    #[test]
+    fn varint32_agrees_with_varlong_for_non_negative_values() {
+        // Both coders share the LEB128 algorithm for non-negative values.
+        let varlong = StandardBeamCoders::VarInt(VarIntCoder);
+        let varint32 = StandardBeamCoders::VarInt32(VarInt32Coder);
+
+        for value in [0i64, 1, 127, 128, 1000, i32::MAX as i64] {
+            let record = BeamRecord::PRIMITIVE(PrimitiveValue::Int64(value));
+
+            let mut a = BytesMut::new();
+            varlong.encode(record.clone(), &mut a);
+            let mut b = BytesMut::new();
+            varint32.encode(record, &mut b);
+
+            assert_eq!(a.as_ref(), b.as_ref(), "mismatch for {value}");
+        }
+    }
+
+    #[test]
+    fn varint32_rejects_out_of_range_value() {
+        // 2^32 = 0x1_0000_0000 -> LEB128 80 80 80 80 10
+        let mut bytes = Bytes::from_static(&[0x80, 0x80, 0x80, 0x80, 0x10]);
+        assert!(VarInt32Coder.decode(&mut bytes).is_err());
     }
 
     #[test]
