@@ -122,6 +122,7 @@ impl ExecutableGraph {
             };
             let urn = &spec.urn;
             info!("Root node urn: {}", urn);
+            info!("root outputs: {:?}", root.transform.outputs.clone());
             let root_node = ExecutableNode::Runner(from_urn(
                 urn,
                 root.node().unique_name.clone(),
@@ -625,7 +626,14 @@ pub struct ConsumerMetaData {
 
 #[derive(Debug, Clone)]
 pub struct FusedPipeline {
-    //components: Components,
+    /// Components after single-producer deduplication: the original pipeline
+    /// components plus the synthetic "partial" PCollections and merging
+    /// Flattens that `ensure_single_producer` injected. This is the component
+    /// set the fused stages were rewritten against, so it must be the one used
+    /// to build the executable graph — otherwise the partial PCollection ids
+    /// referenced by those stages are missing and graph construction fails to
+    /// resolve them.
+    components: Components,
     sdk_stages: IndexSet<ExecutableStage>,
     runner_stages: IndexSet<PTransformNode>,
     //requirements: HashSet<String>,
@@ -633,17 +641,21 @@ pub struct FusedPipeline {
 
 impl FusedPipeline {
     pub fn of(
-        // components: Components,
+        components: Components,
         sdk_stages: IndexSet<ExecutableStage>,
         runner_stages: IndexSet<PTransformNode>,
         //requirements: HashSet<String>,
     ) -> Self {
         Self {
-            // components,
+            components,
             sdk_stages,
             runner_stages,
             // requirements,
         }
+    }
+
+    pub fn components(&self) -> &Components {
+        &self.components
     }
 
     pub fn sdk_stages(&self) -> &IndexSet<ExecutableStage> {
@@ -812,8 +824,11 @@ impl QueryablePipeline {
 
     pub fn get_output_pcol(&self, transfrom: &PTransformNode) -> HashSet<PCollectionNode> {
         if let Some(&node_idx) = self.transform_ids.get(&transfrom.id) {
+            // Only follow outgoing edges: a transform's *inputs* must not be
+            // reported as its outputs. `Graph::neighbors` returns neighbours in
+            // both directions, which would make every input look like an output.
             self.graph
-                .neighbors(node_idx)
+                .neighbors_directed(node_idx, petgraph::Direction::Outgoing)
                 .filter_map(|neighbor_idx| {
                     if let PipelineNode::Collection(collection) = &self.graph[neighbor_idx] {
                         Some(collection.clone())

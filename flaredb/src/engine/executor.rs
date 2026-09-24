@@ -9,16 +9,21 @@ use crate::{
     engine::{
         harness::{control::ControlResponse, data::DataKey},
         runtime::{
-            BundleRuntime, metadata_pcollection_id, runner_consumer_transform_id,
-            runner_output_pcollection_id, stage_sink_transform_id, stage_source_transform_id,
+            BundleRuntime, runner_consumer_transform_id, runner_output_pcollection_id,
+            stage_sink_transform_id, stage_source_transform_id,
         },
     },
     fusion::pipeline::{ConsumerMetaData, ExecutableNode},
     transforms::ExecutionContext,
 };
 
-/// Executor managing worker communication and bundle processing.
-/// Owns control and data channels, coordinates input/output element flow.
+/// Executor for worker and runner stage nodes.
+///
+/// Drives bundle execution end-to-end: for SDK worker stages it registers the
+/// bundle and pumps encoded elements over the data channel; for
+/// runner-implemented transforms it executes them directly against the element
+/// store. A node may consume multiple input PCollections (fan-in), each
+/// described by its own [`ConsumerMetaData`].
 pub struct StageExecutor {
     runtime: BundleRuntime,
 }
@@ -34,7 +39,7 @@ pub trait Executor {
     async fn execute(
         &mut self,
         node: ExecutableNode,
-        input_edge_metadata: Option<ConsumerMetaData>,
+        input_edge_metadata: Vec<ConsumerMetaData>,
         output_edge_metadata: Option<ConsumerMetaData>,
     ) -> anyhow::Result<ControlResponse>;
 }
@@ -44,7 +49,7 @@ impl Executor for StageExecutor {
     async fn execute(
         &mut self,
         node: ExecutableNode,
-        input_edge_metadata: Option<ConsumerMetaData>,
+        input_edge_metadata: Vec<ConsumerMetaData>,
         output_edge_metadata: Option<ConsumerMetaData>,
     ) -> anyhow::Result<ControlResponse> {
         self.execute_node(node, input_edge_metadata, output_edge_metadata, None)
@@ -54,10 +59,14 @@ impl Executor for StageExecutor {
 
 impl StageExecutor {
     /// Execute a worker or runner stage node.
+    ///
+    /// `input_edge_metadata` carries one entry per incoming PCollection: a
+    /// single entry for most transforms, several for fan-in transforms such as
+    /// `Flatten`.
     pub async fn execute_node(
         &mut self,
         node: ExecutableNode,
-        input_edge_metadata: Option<ConsumerMetaData>,
+        input_edge_metadata: Vec<ConsumerMetaData>,
         output_edge_metadata: Option<ConsumerMetaData>,
         _instruction_id: Option<String>,
     ) -> anyhow::Result<ControlResponse> {
@@ -85,8 +94,8 @@ impl StageExecutor {
                             info!("Process instruction id {}", instruction_id);
 
                             // Spawn background task to send input elements to worker.
-                            if let Some(meta_data) = &input_edge_metadata {
-                                info!("Input edge metadata: {:?}", meta_data.clone());
+                            if !input_edge_metadata.is_empty() {
+                                info!("Input edge metadata: {:?}", input_edge_metadata);
                             }
                             let output_meta_data = output_edge_metadata;
                             if let Some(meta_data) = &output_meta_data {
@@ -213,14 +222,20 @@ impl StageExecutor {
             ExecutableNode::Runner(runner_transform) => {
                 info!("Executing runner node");
 
-                let input_metadata = input_edge_metadata.as_ref();
                 let output_metadata = output_edge_metadata.as_ref();
 
-                let input_pcollection_id = metadata_pcollection_id(input_metadata);
+                // A runner transform may consume several PCollections (e.g. a
+                // Flatten). Map each incoming edge to its input PCollection id;
+                // each edge's `coder_id`/`component_coder` describe how
+                // the producing stage encoded those elements.
+                let input_pcollection_ids: Vec<String> = input_edge_metadata
+                    .iter()
+                    .map(|meta| meta.produced_pcol_id.clone())
+                    .collect();
                 let output_pcollection_id =
                     runner_output_pcollection_id(&runner_transform, output_metadata);
                 let consumer_transfrom_id =
-                    runner_consumer_transform_id(input_metadata, output_metadata);
+                    runner_consumer_transform_id(input_edge_metadata.first(), output_metadata);
 
                 info!("Runner node input metadata: {:?}", input_edge_metadata);
                 info!("Runner node output metadata: {:?}", output_edge_metadata);
@@ -249,7 +264,7 @@ impl StageExecutor {
                             info!("Runer bundle registred at worker");
                             let ctx = ExecutionContext {
                                 store: self.runtime.store().clone(),
-                                input_pcollection_id,
+                                input_pcollection_ids,
                                 output_pcollection_id,
                                 consumer_transfrom_id,
                             };

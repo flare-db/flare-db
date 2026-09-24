@@ -61,29 +61,27 @@ impl NodeScheduler {
         self.executed.insert(idx);
     }
 
-    /// Returns metadata for an incoming edge to `idx`, if present.
+    /// Returns metadata for every incoming edge to `idx`.
     ///
-    /// - If the node has an incoming edge, returns that edge's
-    ///   `ConsumerMetaData`.
-    /// - If the node has no predecessors (i.e. it's a root), returns the
-    ///   graph's root metadata.
-    /// - Otherwise returns `None`.
-    pub fn input_edge_metadata(&self, idx: NodeIndex) -> Option<ConsumerMetaData> {
+    /// - If the node has incoming edges, returns each edge's `ConsumerMetaData`
+    ///   (a fan-in node such as a Flatten has one entry per input).
+    /// - If the node has no predecessors (i.e. it's a root), returns a
+    ///   single-element vector holding the graph's root metadata.
+    pub fn input_edge_metadata(&self, idx: NodeIndex) -> Vec<ConsumerMetaData> {
         let graph = self.graph.get_executable_graph();
 
-        if let Some(edge) = graph.edges_directed(idx, Direction::Incoming).next() {
-            return Some(edge.weight().clone());
-        }
+        let incoming: Vec<ConsumerMetaData> = graph
+            .edges_directed(idx, Direction::Incoming)
+            .map(|edge| edge.weight().clone())
+            .collect();
 
-        if graph
-            .neighbors_directed(idx, Direction::Incoming)
-            .next()
-            .is_none()
-        {
-            return Some(self.root_metadata().clone());
+        if incoming.is_empty() {
+            // sometimes, a graph might have multiple roots
+            // we need to identify the apporiate inpluse/root for a pirticular transfrom and return it
+            vec![self.root_metadata().clone()]
+        } else {
+            incoming
         }
-
-        None
     }
 
     /// Returns metadata for the first outgoing edge from `idx`, if any.

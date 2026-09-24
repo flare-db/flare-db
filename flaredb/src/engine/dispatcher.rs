@@ -15,8 +15,7 @@ use std::{collections::HashMap, sync::Arc};
 use tokio::task::JoinSet;
 
 /// Owns the harness channels and per-job state needed to prepare a pipeline for
-/// execution. A [`StageExecutor`] is built from this prepared state so that the
-/// executor itself only concerns itself with executing bundles.
+/// execution. A [`StageExecutor`] is built from this prepared state.
 pub struct ExecutorDispatcher {
     channels: Channels,
     store: Arc<FlareElementStore>,

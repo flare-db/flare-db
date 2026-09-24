@@ -57,7 +57,7 @@ impl Job {
         let executable_graph = ExecutableGraph::from(
             fused_pipeline.sdk_stages().clone(),
             fused_pipeline.runner_stages().clone(),
-            pipeline_with_sdf_expanded.components.clone().unwrap(),
+            fused_pipeline.components().clone(),
         );
         if let Err(error) = fs::write(&debug_path, executable_graph_to_dot(&executable_graph)) {
             warn!("Failed to write executable graph DOT debug file: {error}");

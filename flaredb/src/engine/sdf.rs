@@ -36,7 +36,7 @@ impl Executor for SplittableStageExecutor {
     async fn execute(
         &mut self,
         node: ExecutableNode,
-        input_edge_metadata: Option<ConsumerMetaData>,
+        input_edge_metadata: Vec<ConsumerMetaData>,
         output_edge_metadata: Option<ConsumerMetaData>,
     ) -> anyhow::Result<ControlResponse> {
         let ExecutableNode::Splittable(stage) = node else {
@@ -54,7 +54,7 @@ impl SplittableStageExecutor {
     async fn execute_splittable_stage(
         &mut self,
         stage: &SplittableStage,
-        _input_edge_metadata: Option<ConsumerMetaData>,
+        _input_edge_metadata: Vec<ConsumerMetaData>,
         output_edge_metadata: Option<ConsumerMetaData>,
     ) -> anyhow::Result<ControlResponse> {
         let plan = stage.plan();
