@@ -1,10 +1,11 @@
 package com.flaredb.benchmarks.nexmark;
 
+import com.flaredb.benchmarks.nexmark.queries.BatchQueryRegistry;
+import com.flaredb.runner.FlareRunner;
 import java.io.File;
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.Comparator;
-
 import org.apache.beam.sdk.Pipeline;
 import org.apache.beam.sdk.nexmark.NexmarkConfiguration;
 import org.apache.beam.sdk.nexmark.NexmarkPerf;
@@ -13,20 +14,12 @@ import org.apache.beam.sdk.nexmark.NexmarkUtils;
 import org.apache.beam.sdk.nexmark.model.Event;
 import org.apache.beam.sdk.nexmark.model.KnownSize;
 import org.apache.beam.sdk.nexmark.queries.NexmarkQuery;
-import org.apache.beam.sdk.transforms.Count;
-import org.apache.beam.sdk.transforms.DoFn;
-import org.apache.beam.sdk.transforms.ParDo;
 import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.sdk.values.TimestampedValue;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.flaredb.benchmarks.nexmark.queries.BatchQueryRegistry;
-import com.flaredb.runner.FlareRunner;
-
-/**
- * Launcher for running Nexmark benchmark queries against FlareDB runner.
- */
+/** Launcher for running Nexmark benchmark queries against FlareDB runner. */
 public class FlareNexmarkLauncher {
   private static final Logger LOG = LoggerFactory.getLogger(FlareNexmarkLauncher.class);
 
@@ -72,13 +65,17 @@ public class FlareNexmarkLauncher {
     }
 
     String queryName = query.getName();
-    LOG.info("Configuring pipeline for Nexmark Query: {} ({})", queryName, configuration.toShortString());
+    LOG.info(
+        "Configuring pipeline for Nexmark Query: {} ({})",
+        queryName,
+        configuration.toShortString());
 
     Pipeline p = Pipeline.create(options);
     NexmarkUtils.setupPipeline(configuration.coderStrategy, p);
 
     // Generate batch event source in default global window
-    PCollection<Event> source = p.apply(queryName + ".ReadEvents", NexmarkUtils.batchEventsSource(configuration));
+    PCollection<Event> source =
+        p.apply(queryName + ".ReadEvents", NexmarkUtils.batchEventsSource(configuration));
 
     if (query.getTransform().needsSideInput()) {
       query.getTransform().setSideInput(NexmarkUtils.prepareSideInput(p, configuration));
@@ -115,14 +112,16 @@ public class FlareNexmarkLauncher {
     perf.eventsPerSec = configuration.numEvents / runtimeSec;
     perf.numResults = 0; // Estimated or reported
 
-    LOG.info("Completed query {} in {}s (Events/sec: {})", queryName, String.format("%.2f", runtimeSec), String.format("%.1f", perf.eventsPerSec));
+    LOG.info(
+        "Completed query {} in {}s (Events/sec: {})",
+        queryName,
+        String.format("%.2f", runtimeSec),
+        String.format("%.1f", perf.eventsPerSec));
 
     return perf;
   }
 
-  /**
-   * Locates the Nexmark shadow (uber) JAR produced by the {@code shadowJar} task.
-   */
+  /** Locates the Nexmark shadow (uber) JAR produced by the {@code shadowJar} task. */
   private static File findShadowJar() {
     String[] candidateDirs = {"build/libs", "benchmarks/nexmark/build/libs"};
     for (String dir : candidateDirs) {

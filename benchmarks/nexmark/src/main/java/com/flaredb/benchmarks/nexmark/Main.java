@@ -4,16 +4,13 @@ import java.io.IOException;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Set;
-
 import org.apache.beam.sdk.nexmark.NexmarkConfiguration;
 import org.apache.beam.sdk.nexmark.NexmarkPerf;
 import org.apache.beam.sdk.options.PipelineOptionsFactory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-/**
- * Main entrypoint for launching Nexmark benchmarks against FlareDB.
- */
+/** Main entrypoint for launching Nexmark benchmarks against FlareDB. */
 public class Main {
   private static final Logger LOG = LoggerFactory.getLogger(Main.class);
   private static final String LINE =
@@ -21,13 +18,13 @@ public class Main {
 
   public static void main(String[] args) throws IOException {
     PipelineOptionsFactory.register(FlareNexmarkOptions.class);
-    FlareNexmarkOptions options = PipelineOptionsFactory.fromArgs(args)
-        .as(FlareNexmarkOptions.class);
+    FlareNexmarkOptions options =
+        PipelineOptionsFactory.fromArgs(args).as(FlareNexmarkOptions.class);
 
     if (options.getJobEndpoint() == null || options.getJobEndpoint().isEmpty()) {
       options.setJobEndpoint("127.0.0.1:8099");
     }
-    if (options.getRunner() == null 
+    if (options.getRunner() == null
         || options.getRunner().getName().equals("org.apache.beam.sdk.PipelineRunner")
         || options.getRunner().getName().equals("org.apache.beam.runners.direct.DirectRunner")) {
       options.setRunner(com.flaredb.runner.FlareRunner.class);
@@ -57,8 +54,7 @@ public class Main {
   }
 
   private static void printSummary(
-      Set<NexmarkConfiguration> configurations,
-      Map<NexmarkConfiguration, NexmarkPerf> actual) {
+      Set<NexmarkConfiguration> configurations, Map<NexmarkConfiguration, NexmarkPerf> actual) {
 
     System.out.println();
     System.out.println(LINE);
@@ -66,11 +62,7 @@ public class Main {
     System.out.println(LINE);
     System.out.println(
         String.format(
-            "  %4s  %12s  %16s  %12s",
-            "Conf",
-            "Runtime(sec)",
-            "Events(/sec)",
-            "Results"));
+            "  %4s  %12s  %16s  %12s", "Conf", "Runtime(sec)", "Events(/sec)", "Results"));
 
     int conf = 0;
     for (NexmarkConfiguration configuration : configurations) {
@@ -79,7 +71,9 @@ public class Main {
       if (perf == null) {
         line += "*** not run / skipped ***";
       } else {
-        line += String.format("%12.1f  %16.1f  %12d", perf.runtimeSec, perf.eventsPerSec, perf.numResults);
+        line +=
+            String.format(
+                "%12.1f  %16.1f  %12d", perf.runtimeSec, perf.eventsPerSec, perf.numResults);
       }
       System.out.println(line);
     }
