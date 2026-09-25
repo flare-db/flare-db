@@ -1,5 +1,6 @@
 // Shared configuration for every Java module in the repository.
-
+// ./gradlew :flaredb-runner:build
+// ./gradlew :flaredb-runner:publishToMavenLocal
 plugins {
     alias(libs.plugins.spotless) apply false
 }
