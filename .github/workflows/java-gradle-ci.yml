@@ -9,12 +9,10 @@ name: Java CI
 on:
   workflow_dispatch:
   pull_request:
-    types: [labeled]
     branches: ["main"]
 
 jobs:
   build:
-    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'acceptance'
     runs-on: ubuntu-latest
 
     permissions:
