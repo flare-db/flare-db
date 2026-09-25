@@ -1,0 +1,30 @@
+// Run with:   ./gradlew :co-groupby-key:run
+// Fat jar:    ./gradlew :co-groupby-key:shadowJar  (build/libs/co-groupby-key-0.2.0-all.jar)
+
+
+plugins {
+    id 'java'
+    id 'application'
+    alias(libs.plugins.shadow)
+}
+
+application {
+    mainClass = 'com.flaredb.example.CoGroupByKeyExample'
+}
+
+dependencies {
+    implementation project(':flaredb-runner')
+    implementation libs.beam.core
+    runtimeOnly libs.slf4j.simple
+}
+
+shadowJar {
+    mergeServiceFiles()
+    zip64 = true
+}
+
+run {
+    // The FlareRunner stages the shadow (uber) JAR to the FlareDB workers, so it must exist
+    // before the example starts.
+    dependsOn tasks.named('shadowJar')
+}

@@ -10,7 +10,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.flaredb.io.FlareDbIO;
-import com.flaredb.runner.FlareRunner;
 
 /**
  * Example pipeline that reads rows from FlareDB using {@link FlareDbIO}.
@@ -29,13 +28,9 @@ public class ReadPipeline {
 
   public static void main(String[] args) {
     ReadPipelineOptions options =
-        PipelineOptionsFactory.fromArgs(args).as(ReadPipelineOptions.class);
-    options.setRunner(FlareRunner.class);
+        ReadPipelineOptions.applyFlareDefaults(
+            PipelineOptionsFactory.fromArgs(args).as(ReadPipelineOptions.class));
     options.setJobName("flareio-read-scores");
-    options.setJobEndpoint("127.0.0.1:8099");
-    options.setUberJar(
-        "/home/ganesh/flare-db/clilogs/flare-db/example/flare-io-read/build/libs/"
-            + "flareio-read-0.2.0-all.jar"); // set your jar path
 
     Pipeline pipeline = Pipeline.create(options);
 
