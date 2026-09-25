@@ -1,5 +1,6 @@
 package com.flaredb.example.flareio;
 
+import com.flaredb.io.FlareDbIO;
 import org.apache.beam.sdk.Pipeline;
 import org.apache.beam.sdk.options.PipelineOptionsFactory;
 import org.apache.beam.sdk.transforms.DoFn;
@@ -8,8 +9,6 @@ import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.sdk.values.Row;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import com.flaredb.io.FlareDbIO;
 
 /**
  * Example pipeline that reads rows from FlareDB using {@link FlareDbIO}.
@@ -41,8 +40,9 @@ public class ReadPipeline {
         pipeline.apply(
             "ReadFromFlareDb",
             FlareDbIO.read()
-            .fromQuery("SELECT id, name, score FROM flare.default.scores WHERE score > 90 ORDER BY id")
-            .withDbUrl(options.getDbUrl()));
+                .fromQuery(
+                    "SELECT id, name, score FROM flare.default.scores WHERE score > 90 ORDER BY id")
+                .withDbUrl(options.getDbUrl()));
 
     rows.apply(
         "LogRows",

@@ -17,8 +17,8 @@ import org.apache.beam.sdk.values.PCollection;
 import org.checkerframework.checker.nullness.qual.Nullable;
 
 /**
- * Query 8 (Batch / Global Window): Monitor New Users.
- * Select people who have entered the system and created auctions in the batch dataset (Global Window).
+ * Query 8 (Batch / Global Window): Monitor New Users. Select people who have entered the system and
+ * created auctions in the batch dataset (Global Window).
  */
 public class Query8BatchGlobal extends NexmarkQueryTransform<IdNameReserve> {
   private final NexmarkConfiguration configuration;
