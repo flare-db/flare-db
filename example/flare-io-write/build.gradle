@@ -3,9 +3,9 @@
 // Depends on the in-tree flaredb-runner project so the example always
 // exercises the local runner and the local FlareDB I/O.
 //
+// Build the pipeline:    ./gradlew :flareio-write:shadowJar
+//
 // Run with:   ./gradlew :flareio-write:run
-// Fat jar:    ./gradlew :flareio-write:shadowJar
-//             (build/libs/flareio-write-0.2.0-all.jar)
 
 plugins {
     id 'java'

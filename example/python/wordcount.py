@@ -1,15 +1,22 @@
-"""WordCount example pipeline for FlareDB.
-
-Python port of the Java reference at
-example/wordcount/src/main/java/com/flaredb/example/WordCount.java.
+"""WordCount example pipeline.
 
 The pipeline creates input text, splits them into words, removes
 empty words, counts occurrences, formats the results, and logs each result.
 
 Run from the repository root with a FlareDB instance already started:
 
+    Create a python virtual env:
+
+    python3 -m venv .venv
+    source .venv/bin/activate
+
+    and install beam and flaredb depedency:
+
+    pip install apache-beam
     pip install -e runner-sdk/python/flarerunner
-    python examples/python/wordcount/wordcount.py
+
+    run the example:
+    python3 example/python/wordcount.py
 
 See the repository root README.md for how to start FlareDB.
 """
