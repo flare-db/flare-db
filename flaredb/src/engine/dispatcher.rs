@@ -42,6 +42,12 @@ impl ExecutorDispatcher {
         self.channels.reset().await;
     }
 
+    /// Route SDK worker log entries for a job into that job's per-job
+    /// `flare-worker.log`.
+    pub async fn set_log_target(&self, instance_id: &str, job_id: &str) -> anyhow::Result<()> {
+        self.channels.set_log_target(instance_id, job_id).await
+    }
+
     /// Point the element store at the job's warehouse database.
     pub async fn set_job_store(&mut self, job_id: &str) -> anyhow::Result<()> {
         let store_path = crate::utils::path::warehouse_dir();

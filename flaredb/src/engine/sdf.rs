@@ -354,19 +354,38 @@ impl SplittableStageExecutor {
         ))
     }
 
+    /// Send raw Beam-encoded bytes to an SDF stage's source transform.
     async fn send_raw_elements(
         &self,
         instruction_id: &str,
         source_transform_id: &str,
         data: Vec<u8>,
     ) -> anyhow::Result<()> {
-        let elements = beam_model_rs::v1::Elements {
-            data: vec![beam_model_rs::v1::elements::Data {
+        info!(
+            "Sending SDF raw elements: instruction_id={}, transform_id={}, bytes={}",
+            instruction_id,
+            source_transform_id,
+            data.len()
+        );
+
+        let mut messages: Vec<beam_model_rs::v1::elements::Data> = Vec::new();
+        if !data.is_empty() {
+            messages.push(beam_model_rs::v1::elements::Data {
                 instruction_id: instruction_id.to_string(),
                 transform_id: source_transform_id.to_string(),
                 data,
-                is_last: true,
-            }],
+                is_last: false,
+            });
+        }
+        messages.push(beam_model_rs::v1::elements::Data {
+            instruction_id: instruction_id.to_string(),
+            transform_id: source_transform_id.to_string(),
+            data: Vec::new(),
+            is_last: true,
+        });
+
+        let elements = beam_model_rs::v1::Elements {
+            data: messages,
             timers: Vec::new(),
         };
 

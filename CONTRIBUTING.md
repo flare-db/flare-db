@@ -86,9 +86,19 @@ cd runner-sdk/python/flarerunner && python -m unittest discover -s tests -p "*_t
    ```
 
    **Python (WordCount):**
-   Ensure you have the `apache-beam` package installed (`pip install apache-beam`) and the `flarerunner` SDK installed (`pip install -e runner-sdk/python/flarerunner`).
+
+   For running python  pipelines create a python venv 
+
+   ``` bash
+   python3 -m venv .venv
+   source .venv/bin/activate
+   ```
+   
+   ensure you have the `apache-beam` package installed (`pip install apache-beam`) and the `flarerunner` SDK installed (`pip install -e runner-sdk/python/flarerunner`).
+
+   run pipeline: 
    ```sh
-   python3 example/python/wordcount/wordcount.py
+   python3 example/python/wordcount.py
    ```
 
 ## Useful Gradle commands

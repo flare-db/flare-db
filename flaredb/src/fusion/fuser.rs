@@ -2426,4 +2426,102 @@ mod tests {
             "pair/split stage and process stage must be different ExecutableStages"
         );
     }
+
+    /// With the *real* SDF process URN in the graph, a plain downstream ParDo
+    /// fuses into the process stage. This is what makes `PCollection_3` (the
+    /// process output) an *internal* PCollection of the process stage: the stage
+    /// therefore has no boundary outputs, which is why the executable graph shows
+    /// `outputs (0)` for that node and no SDK stage sink transform is registered
+    /// for the process stage. It also means the fix for a `ReadFromText` SDF that
+    /// produces no output is the framing of the seed bytes on the process stage's
+    /// source, not the construction of an output edge.
+    #[test]
+    fn downstream_pardo_fuses_into_real_process_stage() {
+        let env = make_env("env1");
+        let clean = clean_pardo_payload();
+
+        let impulse = make_transform(
+            "impulse",
+            beam_urns::IMPULSE_TRANSFORM,
+            &[],
+            &[("out", "p0")],
+            "",
+        );
+        let pair = make_pardo_transform(
+            "pair",
+            beam_urns::SPLITTABLE_PAIR_WITH_RESTRICTION_URN,
+            &[("in", "p0")],
+            &[("out", "p1")],
+            "env1",
+            &clean,
+        );
+        let split = make_pardo_transform(
+            "split",
+            beam_urns::SPLITTABLE_SPLIT_AND_SIZE_RESTRICTIONS_URN,
+            &[("in", "p1")],
+            &[("out", "p2")],
+            "env1",
+            &clean,
+        );
+        let process = make_pardo_transform(
+            "process",
+            beam_urns::SPLITTABLE_PROCESS_SIZED_ELEMENTS_AND_RESTRICTIONS_URN,
+            &[("in", "p2")],
+            &[("out", "p3")],
+            "env1",
+            &clean,
+        );
+        let downstream = make_pardo_transform(
+            "downstream",
+            beam_urns::PAR_DO_TRANSFORM,
+            &[("in", "p3")],
+            &[("out", "p4")],
+            "env1",
+            &clean,
+        );
+
+        let pcols = vec![
+            make_pcol("p0"),
+            make_pcol("p1"),
+            make_pcol("p2"),
+            make_pcol("p3"),
+            make_pcol("p4"),
+        ];
+        let transforms = vec![impulse, pair, split, process, downstream];
+        let mut envs = HashMap::new();
+        envs.insert("env1".to_string(), env);
+
+        let pipeline = build_pipeline(transforms, pcols, envs);
+        let fuser = GreedyPipelineFuser::with(pipeline);
+        let (initial_unfused, initial_consumers) = extract_initial_sets(&fuser.pipeline, &fuser);
+        let fused = fuser
+            .fuse_pipeline(initial_unfused, initial_consumers)
+            .unwrap();
+
+        let stages = fused.sdk_stages();
+        let process_stage =
+            find_stage_with(&stages, "process").expect("process transform should be in a stage");
+        let ids: HashSet<String> = process_stage
+            .transforms()
+            .iter()
+            .map(|t| t.id.clone())
+            .collect();
+
+        // process and its downstream ParDo share one ExecutableStage.
+        assert!(
+            ids.contains("process") && ids.contains("downstream"),
+            "downstream should fuse into the process stage, got: {ids:?}"
+        );
+
+        // p3 is consumed only inside the stage, so it is not a boundary output.
+        assert!(
+            process_stage.get_output_pcols().is_empty(),
+            "process stage should have no boundary outputs, got: {:?}",
+            process_stage
+                .get_output_pcols()
+                .iter()
+                .map(|p| p.id.clone())
+                .collect::<Vec<_>>()
+        );
+    }
 }

@@ -69,6 +69,12 @@ impl Channels {
         //self.store.reset();
         info!("stage executor channels reset");
     }
+
+    /// Route SDK worker log entries for a job into that job's per-job
+    /// `flare-worker.log`.
+    pub async fn set_log_target(&self, instance_id: &str, job_id: &str) -> Result<()> {
+        self.log.set_target(instance_id, job_id).await
+    }
 }
 
 /// The gRPC services that correspond to a [`Channels`] bundle.

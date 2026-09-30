@@ -535,6 +535,13 @@ pub fn stage_transforms_with_data_boundaries(
         },
     );
 
+    if stage.output_pcols().is_empty() {
+        info!(
+            "Stage {} has no boundary output PCollections: every output is consumed inside the stage (fused downstream) or is terminal, so no sink transform is registered",
+            stage.id()
+        );
+    }
+
     for output_pcol in stage.output_pcols() {
         let sink_id = stage_sink_transform_id(stage, output_pcol.id());
         let output_element_coder_id = output_pcol.node().coder_id.clone();

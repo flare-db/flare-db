@@ -1,5 +1,6 @@
+// Build jar:    ./gradlew :flatten:shadowJar
+//
 // Run with:   ./gradlew :flatten:run
-// Fat jar:    ./gradlew :flatten:shadowJar  
 
 plugins {
     id 'java'
@@ -21,5 +22,3 @@ shadowJar {
     mergeServiceFiles()
     zip64 = true // Shaded Beam deps can exceed the 65535-entry zip limit.
 }
-
-
