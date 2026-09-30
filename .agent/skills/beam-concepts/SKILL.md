@@ -273,5 +273,4 @@ result = pipeline | ReadFromKafka(
 2. **Use schemas** for type-safe operations
 3. **Minimize side inputs** for performance
 4. **Handle late data** explicitly
-5. **Test with DirectRunner** before deploying
 6. **Use TestPipeline** for unit tests

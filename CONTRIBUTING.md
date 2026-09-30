@@ -131,6 +131,18 @@ cargo build -p flaredb
 
 # Python
 pip install -e runner-sdk/python/flarerunner
+```
+
+## GitHub Actions workflows
+
+The repository has two main CI workflows under [`.github/workflows/`](.github/workflows/):
+
+- [`rust-ci.yml`](.github/workflows/rust-ci.yml) runs for pushes to `main`, pull requests targeting `main`, and manual workflow dispatch. It runs the workspace build and test suite:
+  - `cargo build --verbose`
+  - `cargo test --verbose`
+- [`java-gradle-ci.yml`](.github/workflows/java-gradle-ci.yml) runs for pull requests targeting `main` and manual workflow dispatch. It uses JDK 17, checks Java formatting, and builds the Gradle project:
+  - `./gradlew spotlessCheck`
+  - `./gradlew build`
 
 ## Tests and formatting
 
@@ -182,5 +194,5 @@ Before opening a pull request:
 2. Update or add a focused test when behavior changes.
 3. Run formatting and the narrowest relevant tests.
 4. Run broader Rust, Java, or Python checks when the change crosses those boundaries.
-5. Check that generated files, protocol fields, URNs, and public interfaces were changed only through their source-of-truth path.
+5. Check that generated files, protocol fields, URNs, and public interfaces were changed only through their build path.
 6. Include any setup requirements or known limitations in the pull request description.
