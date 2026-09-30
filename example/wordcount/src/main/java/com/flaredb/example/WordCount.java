@@ -26,7 +26,7 @@ public class WordCount {
 
     p.apply(
             "ReadLines",
-            TextIO.read().from("/home/ganesh/flare-db/clilogs/flare-db/test-data/thirukkural.txt"))
+            TextIO.read().from(options.getInputFile()))
         .apply(
             "Split lines into words",
             FlatMapElements.into(TypeDescriptors.strings())

@@ -3,8 +3,17 @@
 // Depends on the in-tree flaredb-runner project instead of the published
 // artifact, so examples always exercise the local runner.
 //
-// Run with:   ./gradlew :wordcount:run
-// Fat jar:    ./gradlew :wordcount:shadowJar  (build/libs/wordcount-0.2.0-all.jar)
+// Run:
+// By default this runs with sample text (test-data/thirukkural.txt) automatically.
+//
+//   ./gradlew :wordcount:run
+//
+// To Point it at any other text file pass the file path as argument --inputFile:
+//
+//   ./gradlew :wordcount:run --args="--inputFile=/path/to/other.txt"
+//
+// Fat jar:
+//   ./gradlew :wordcount:shadowJar  (build/libs/wordcount-0.2.0-all.jar)
 
 plugins {
     id 'java'

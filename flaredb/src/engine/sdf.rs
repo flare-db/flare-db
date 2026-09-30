@@ -354,19 +354,47 @@ impl SplittableStageExecutor {
         ))
     }
 
+    /// Send raw Beam-encoded bytes to an SDF stage's source transform.
+    ///
+    /// Framing matters here. The Python SDK harness treats the payload of an
+    /// `is_last = true` Data message as a terminator and *drops it*, so the bytes
+    /// must go out as a separate `is_last = false` message followed by an empty
+    /// `is_last = true` marker. This is the same split framing
+    /// [`BundleRuntime::process_input_elements`] uses for a normal stage input;
+    /// sending the payload together with `is_last = true` works on the Java
+    /// harness but silently delivers *nothing* to a Python SDF process stage
+    /// (the bundle then reports success with zero residuals and no output).
     async fn send_raw_elements(
         &self,
         instruction_id: &str,
         source_transform_id: &str,
         data: Vec<u8>,
     ) -> anyhow::Result<()> {
-        let elements = beam_model_rs::v1::Elements {
-            data: vec![beam_model_rs::v1::elements::Data {
+        info!(
+            "Sending SDF raw elements: instruction_id={}, transform_id={}, bytes={}",
+            instruction_id,
+            source_transform_id,
+            data.len()
+        );
+
+        let mut messages: Vec<beam_model_rs::v1::elements::Data> = Vec::new();
+        if !data.is_empty() {
+            messages.push(beam_model_rs::v1::elements::Data {
                 instruction_id: instruction_id.to_string(),
                 transform_id: source_transform_id.to_string(),
                 data,
-                is_last: true,
-            }],
+                is_last: false,
+            });
+        }
+        messages.push(beam_model_rs::v1::elements::Data {
+            instruction_id: instruction_id.to_string(),
+            transform_id: source_transform_id.to_string(),
+            data: Vec::new(),
+            is_last: true,
+        });
+
+        let elements = beam_model_rs::v1::Elements {
+            data: messages,
             timers: Vec::new(),
         };
 
