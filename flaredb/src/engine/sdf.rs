@@ -355,15 +355,6 @@ impl SplittableStageExecutor {
     }
 
     /// Send raw Beam-encoded bytes to an SDF stage's source transform.
-    ///
-    /// Framing matters here. The Python SDK harness treats the payload of an
-    /// `is_last = true` Data message as a terminator and *drops it*, so the bytes
-    /// must go out as a separate `is_last = false` message followed by an empty
-    /// `is_last = true` marker. This is the same split framing
-    /// [`BundleRuntime::process_input_elements`] uses for a normal stage input;
-    /// sending the payload together with `is_last = true` works on the Java
-    /// harness but silently delivers *nothing* to a Python SDF process stage
-    /// (the bundle then reports success with zero residuals and no output).
     async fn send_raw_elements(
         &self,
         instruction_id: &str,

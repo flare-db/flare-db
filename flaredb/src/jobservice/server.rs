@@ -227,6 +227,22 @@ impl JobService for FlareJobService {
             // Reset channels so the new harness can connect on fresh streams.
             self.dispatcher.lock().await.reset_channels().await;
 
+            // Route SDK worker log entries into this job's flare-worker.log
+            // before the harness starts, so early startup logs are captured.
+            if let Err(e) = self
+                .dispatcher
+                .lock()
+                .await
+                .set_log_target(&self.instance_id, &preparation_id)
+                .await
+            {
+                log::warn!(
+                    "failed to set worker log target for {}: {}",
+                    preparation_id,
+                    e
+                );
+            }
+
             self.worker_manager
                 .spawn_worker(&preparation_id, &runtime, staging_dir, &self.instance_id)
                 .await?;
