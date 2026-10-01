@@ -1,4 +1,4 @@
-use anyhow::Error;
+use anyhow::{Error, anyhow};
 use async_trait::async_trait;
 use beam_model_rs::v1::{
     Coder, Components, Environment, FunctionSpec, PCollection, PTransform, WindowingStrategy,
@@ -16,12 +16,23 @@ use std::{
     sync::Arc,
 };
 
-use crate::store::record::{RecordTableSchema, TableType};
+use crate::store::record::{BeamRecord, RecordTableSchema, TableType, record_batch_to_beamrecords};
 
 use crate::{
     jobservice::urns::beam_urns,
     transforms::{ExecutionContext, FlareTransform},
 };
+/// Runner-native implementation of Beam's `GroupByKey` transform.
+///
+/// Reads the input PCollection from Paimon table, groups rows by their logical key, and
+/// aggregates each key's values into a single iterable (via DataFusion
+/// `array_agg`), writing one output group per key.
+///
+/// Window metadata is carried forward from the input rather than recomputed: each
+/// output group reuses the [`WindowedValue`](crate::coders::primitives::WindowedValue)
+/// of the first input element whose key matches. Grouping is still **key-only**,
+/// so when the same key appears in more than one window the resulting metadata is
+/// only representative of one of them.
 #[derive(Clone)]
 pub struct GroupByKey {
     name: String,
@@ -65,6 +76,15 @@ impl FlareTransform for GroupByKey {
         // The input table may not exist when the upstream stage produced zero
         // elements (write_beamrecord_batch is never called for empty output).
         // An empty input to GroupByKey correctly yields an empty output.
+        // Preserve a representative input window on GBK output without changing
+        // the current key-only grouping behavior.
+        let input_windows = ctx
+            .store
+            .scan_windowed_values(crate::store::element_store::ScanCollectionRequest {
+                pcollection_id: input_pcollection_id.clone(),
+            })
+            .await?;
+
         let table = match ctx.store.catalog.get_table(&identifier).await {
             Ok(table) => table,
             Err(PaimonError::TableNotExist { .. }) => {
@@ -96,10 +116,31 @@ impl FlareTransform for GroupByKey {
             let table_schema = Arc::new(RecordTableSchema {
                 table_type: TableType::Gbk,
                 arrow_schema: batch.schema(),
+                has_windowed_metadata: false,
             });
 
+            let output_records = record_batch_to_beamrecords(&batch, &table_schema)?;
+            let mut metadata = Vec::with_capacity(output_records.len());
+            for output in &output_records {
+                let BeamRecord::GBK(group) = output else {
+                    return Err(anyhow!("GBK output row was not decoded as a GBK record"));
+                };
+                let matching_input = input_windows
+                    .iter()
+                    .find(|input| match &input.value {
+                        BeamRecord::KV(kv) => kv.key == group.key,
+                        _ => false,
+                    })
+                    .ok_or_else(|| anyhow!("GBK output key has no input WindowedValue metadata"))?;
+                metadata.push(matching_input.clone());
+            }
             ctx.store
-                .write_record_batch(&ctx.output_pcollection_id, batch, table_schema)
+                .write_record_batch_with_windowed_metadata(
+                    &ctx.output_pcollection_id,
+                    batch,
+                    table_schema,
+                    metadata,
+                )
                 .await?;
         }
         Ok(())

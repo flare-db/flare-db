@@ -2,8 +2,9 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use arrow_array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Float64Array, Int64Array, ListArray, NullArray,
-    RecordBatch, StringArray, StructArray, builder::BooleanBuilder,
+    Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Float64Array, Int64Array,
+    LargeBinaryArray, LargeStringArray, ListArray, NullArray, RecordBatch, StringArray,
+    StringViewArray, StructArray, builder::BooleanBuilder,
 };
 use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema, TimeUnit};
@@ -19,7 +20,10 @@ use paimon::spec::{
 use super::{KEY_COLUMN, VALUE_COLUMN};
 
 use crate::{
-    coders::schema::{BeamField, BeamFieldType, BeamSchema, BeamTypeKind},
+    coders::{
+        primitives::{BeamWindow, PaneInfo, WindowedValue},
+        schema::{BeamField, BeamFieldType, BeamSchema, BeamTypeKind},
+    },
     jobservice::urns,
 };
 
@@ -258,6 +262,38 @@ fn table_type_of(record: &BeamRecord) -> TableType {
 pub struct RecordTableSchema {
     pub table_type: TableType,
     pub arrow_schema: Arc<Schema>,
+    /// True when each row includes persisted Beam WindowedValue metadata.
+    pub has_windowed_metadata: bool,
+}
+
+/// The persisted form of Beam window metadata, independent of an element's logical coder.
+///
+/// The element's table row stores this metadata in the reserved
+/// `__flare_window_metadata` binary column as JSON. This separates Beam's
+/// execution metadata from the logical element columns while keeping both in
+/// the same persisted row.
+///
+/// Both this type and its nested [`BeamWindow`]/[`PaneInfo`] values derive
+/// `serde`, so the JSON layout stays stable as long as those deriving types keep
+/// their variant and field names.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WindowMetadata {
+    /// Event timestamp in milliseconds since the Unix epoch.
+    pub timestamp_millis: i64,
+    /// Beam windows assigned to the element.
+    pub windows: Vec<BeamWindow>,
+    /// Beam pane timing and firing indices.
+    pub pane: PaneInfo,
+}
+
+impl From<&WindowedValue> for WindowMetadata {
+    fn from(value: &WindowedValue) -> Self {
+        Self {
+            timestamp_millis: value.timestamp_millis,
+            windows: value.windows.clone(),
+            pane: value.pane.clone(),
+        }
+    }
 }
 
 impl RecordTableSchema {
@@ -266,6 +302,7 @@ impl RecordTableSchema {
         Self {
             table_type: TableType::Row,
             arrow_schema,
+            has_windowed_metadata: false,
         }
     }
 }
@@ -437,6 +474,17 @@ pub fn iterable_values_to_array(
     Ok(Arc::new(ListArray::new(item_field, offsets, child, None)))
 }
 
+/// Decodes one primitive cell from an Arrow array at `row`.
+///
+/// Accepts every concrete Arrow storage type that DataFusion and Paimon may
+/// produce for the same logical Beam primitive. Beyond the canonical `Utf8` and
+/// `Binary`, the large-offset and view variants (`LargeUtf8`, `Utf8View`,
+/// `LargeBinary`, `BinaryView`) decode to the same [`PrimitiveValue::String`] or
+/// [`PrimitiveValue::Bytes`], because DataFusion can read a Paimon `Utf8`/`Binary`
+/// column back as a view or large-offset array.
+///
+/// A null cell decodes to [`PrimitiveValue::Void`]; any other storage type is
+/// rejected as an unsupported primitive storage type.
 fn primitive_value_from_array_row(
     array: &dyn Array,
     data_type: &ArrowDataType,
@@ -454,11 +502,41 @@ fn primitive_value_from_array_row(
                 .ok_or_else(|| anyhow!("expected StringArray for Utf8 primitive column"))?;
             Ok(PrimitiveValue::String(array.value(row).to_string()))
         }
+        ArrowDataType::LargeUtf8 => {
+            let array = array
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .ok_or_else(|| {
+                    anyhow!("expected LargeStringArray for LargeUtf8 primitive column")
+                })?;
+            Ok(PrimitiveValue::String(array.value(row).to_string()))
+        }
+        ArrowDataType::Utf8View => {
+            let array = array
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .ok_or_else(|| anyhow!("expected StringViewArray for Utf8View primitive column"))?;
+            Ok(PrimitiveValue::String(array.value(row).to_string()))
+        }
         ArrowDataType::Binary => {
             let array = array
                 .as_any()
                 .downcast_ref::<BinaryArray>()
                 .ok_or_else(|| anyhow!("expected BinaryArray for Binary primitive column"))?;
+            Ok(PrimitiveValue::Bytes(array.value(row).to_vec()))
+        }
+        ArrowDataType::LargeBinary => {
+            let array = array
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .ok_or_else(|| anyhow!("expected LargeBinaryArray for LargeBinary column"))?;
+            Ok(PrimitiveValue::Bytes(array.value(row).to_vec()))
+        }
+        ArrowDataType::BinaryView => {
+            let array = array
+                .as_any()
+                .downcast_ref::<BinaryViewArray>()
+                .ok_or_else(|| anyhow!("expected BinaryViewArray for BinaryView column"))?;
             Ok(PrimitiveValue::Bytes(array.value(row).to_vec()))
         }
         ArrowDataType::Int64 => {
@@ -836,6 +914,7 @@ pub fn derive_table_schema(
     Ok(RecordTableSchema {
         table_type,
         arrow_schema,
+        has_windowed_metadata: false,
     })
 }
 
@@ -1637,6 +1716,12 @@ mod tests {
         assert_eq!(
             primitive_value_from_array_row(&strings, &DataType::Utf8, 1).unwrap(),
             s("y")
+        );
+
+        let string_views = StringViewArray::from(vec!["key-a", "key-b"]);
+        assert_eq!(
+            primitive_value_from_array_row(&string_views, &DataType::Utf8View, 1).unwrap(),
+            s("key-b")
         );
 
         let ints = Int64Array::from(vec![10, 20]);

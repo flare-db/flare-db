@@ -19,7 +19,7 @@ use tokio::sync::{Mutex, mpsc::UnboundedReceiver};
 use crate::{
     coders::{
         BeamCoder, StandardBeamCoders, length_prefix_pickled_leaves,
-        primitives::{WindowCoder, WindowedValueCoder},
+        primitives::{WindowCoder, WindowedValue, WindowedValueCoder},
         resolve_length_prefixed_coder_id,
     },
     engine::harness::{
@@ -29,7 +29,7 @@ use crate::{
     fusion::{pipeline::ConsumerMetaData, stage::ExecutableStage},
     jobservice::urns::beam_urns,
     store::{
-        element_store::{FlareElementStore, NewCollectionRequest, ScanCollectionRequest},
+        element_store::{FlareElementStore, ScanCollectionRequest},
         record::{BeamRecord, PrimitiveValue},
     },
     transforms::FlareRunnerTransform,
@@ -199,7 +199,7 @@ impl BundleRuntime {
             WindowedValueCoder::with_window_coder(element_coder, window_coder);
 
         let mut stream_buffer = BytesMut::new();
-        let mut batch: Vec<BeamRecord> = Vec::with_capacity(target_batch_size);
+        let mut batch = Vec::with_capacity(target_batch_size);
         let pcollection_id = edge_metadata.produced_pcol_id.clone();
         let mut stream_ended = false;
         let mut total_decoded: usize = 0;
@@ -258,19 +258,25 @@ impl BundleRuntime {
                                 stream_buffer.advance(consumed);
 
                                 total_decoded += 1;
-                                match opaque_element {
-                                    Some(raw) => batch
-                                        .push(BeamRecord::PRIMITIVE(PrimitiveValue::Bytes(raw))),
-                                    None => batch.push(windowed_value.value),
-                                }
+                                let value = match opaque_element {
+                                    Some(raw) => BeamRecord::PRIMITIVE(PrimitiveValue::Bytes(raw)),
+                                    None => windowed_value.value.clone(),
+                                };
+                                batch.push(WindowedValue {
+                                    value,
+                                    timestamp_millis: windowed_value.timestamp_millis,
+                                    windows: windowed_value.windows,
+                                    pane: windowed_value.pane,
+                                });
                                 if batch.len() >= target_batch_size {
                                     let batch_size = batch.len();
-                                    let request = NewCollectionRequest {
-                                        pcollection_id: pcollection_id.clone(),
-                                        elements: std::mem::take(&mut batch),
-                                    };
                                     let start = Instant::now();
-                                    store.write_beamrecord_batch(request).await?;
+                                    store
+                                        .write_windowed_value_batch(
+                                            &pcollection_id,
+                                            std::mem::take(&mut batch),
+                                        )
+                                        .await?;
                                     batch_size_estimator.record(batch_size, start.elapsed());
                                     target_batch_size = batch_size_estimator.next_batch_size();
                                 }
@@ -316,12 +322,10 @@ impl BundleRuntime {
         // Flush any remaining elements in the batch.
         if !batch.is_empty() {
             let batch_size = batch.len();
-            let request = NewCollectionRequest {
-                pcollection_id: pcollection_id.clone(),
-                elements: batch,
-            };
             let start = Instant::now();
-            store.write_beamrecord_batch(request).await?;
+            store
+                .write_windowed_value_batch(&pcollection_id, batch)
+                .await?;
             batch_size_estimator.record(batch_size, start.elapsed());
         }
 
@@ -359,7 +363,7 @@ impl BundleRuntime {
             pcollection_id: input_pcollection_id.clone(),
         };
 
-        let elements = self.store.scan_collection(request).await?;
+        let elements = self.store.scan_windowed_values(request).await?;
         info!("Input element coder: {}", input_coder_id);
 
         let element_coder = StandardBeamCoders::from_urn(
@@ -381,7 +385,7 @@ impl BundleRuntime {
                 elements.len()
             );
             for element in elements {
-                match element {
+                match element.value {
                     BeamRecord::PRIMITIVE(PrimitiveValue::Bytes(raw)) => {
                         encoded.extend_from_slice(&raw);
                     }
@@ -389,14 +393,14 @@ impl BundleRuntime {
                         return Err(anyhow!(
                             "expected opaque bytes for VoidCoder pcollection {}, found {:?}",
                             input_pcollection_id,
-                            other.record_type()
+                            other
                         ));
                     }
                 }
             }
         } else {
             for element in elements {
-                windowed_value_coder.encode_value(element, &mut encoded);
+                windowed_value_coder.encode(element, &mut encoded);
             }
         }
 

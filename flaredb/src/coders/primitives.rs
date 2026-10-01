@@ -366,7 +366,10 @@ impl WindowedValue {
 ///
 /// Interval bounds are expressed in milliseconds since the Unix epoch and use
 /// Beam's half-open interval convention: `[start_millis, end_millis)`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Derives `serde` so a window can be round-tripped through the JSON-encoded
+/// window metadata persisted by the element store.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum BeamWindow {
     /// The single global window.
     Global,
@@ -374,7 +377,8 @@ pub enum BeamWindow {
     Interval { start_millis: i64, end_millis: i64 },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Beam pane timing, mirroring the portable `PaneInfo` timing enumeration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PaneTiming {
     Early = 0,
     OnTime = 1,
@@ -393,7 +397,13 @@ impl PaneTiming {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Beam pane information carried by a [`WindowedValue`].
+///
+/// Fields mirror the portable `PaneInfo` message and describe how a particular
+/// firing of a window relates to the whole (first/last, timing, and indices).
+/// Derives `serde` so it can round-trip through the store's JSON window
+/// metadata.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PaneInfo {
     pub is_first: bool,
     pub is_last: bool,
