@@ -29,6 +29,7 @@ pub mod beam_urns {
     pub const NULLABLE_CODER: &str = "beam:coder:nullable:v1";
     pub const LENGTH_PREFIX_CODER: &str = "beam:coder:length_prefix:v1";
     pub const GLOBAL_WINDOW_CODER: &str = "beam:coder:global_window:v1";
+    pub const INTERVAL_WINDOW_CODER: &str = "beam:coder:interval_window:v1";
     pub const WINDOWED_VALUE_CODER: &str = "beam:coder:windowed_value:v1";
     pub const ROW_CODER: &str = "beam:coder:row:v1";
     pub const JAVA_SDK_CODER: &str = "beam:coders:javasdk:0.1";

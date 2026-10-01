@@ -19,7 +19,8 @@ use tokio::sync::{Mutex, mpsc::UnboundedReceiver};
 use crate::{
     coders::{
         BeamCoder, StandardBeamCoders, length_prefix_pickled_leaves,
-        primitives::WindowedValueCoder, resolve_length_prefixed_coder_id,
+        primitives::{WindowCoder, WindowedValue, WindowedValueCoder},
+        resolve_length_prefixed_coder_id,
     },
     engine::harness::{
         control::{ControlChannel, ControlResponse},
@@ -28,7 +29,7 @@ use crate::{
     fusion::{pipeline::ConsumerMetaData, stage::ExecutableStage},
     jobservice::urns::beam_urns,
     store::{
-        element_store::{FlareElementStore, NewCollectionRequest, ScanCollectionRequest},
+        element_store::{FlareElementStore, ScanCollectionRequest},
         record::{BeamRecord, PrimitiveValue},
     },
     transforms::FlareRunnerTransform,
@@ -88,6 +89,40 @@ impl BundleRuntime {
         self.data.get_receiver(data_key)
     }
 
+    fn window_coder_for_pcollection(&self, pcollection_id: &str) -> WindowCoder {
+        let pcollection = self
+            .pipeline_components
+            .pcollections
+            .get(pcollection_id)
+            .unwrap_or_else(|| panic!("PCollection not found: {pcollection_id}"));
+        let strategy = self
+            .pipeline_components
+            .windowing_strategies
+            .get(&pcollection.windowing_strategy_id);
+        let window_coder_id = strategy
+            .map(|strategy| strategy.window_coder_id.as_str())
+            .filter(|id| !id.is_empty())
+            .or_else(|| {
+                strategy
+                    .and_then(|strategy| strategy.window_fn.as_ref())
+                    .filter(|window_fn| window_fn.urn == "beam:window_fn:fixed_windows:v1")
+                    .and_then(|_| {
+                        self.pipeline_coders.iter().find_map(|(id, coder)| {
+                            (coder.spec.as_ref()?.urn == beam_urns::INTERVAL_WINDOW_CODER)
+                                .then_some(id.as_str())
+                        })
+                    })
+            })
+            .unwrap_or(beam_urns::GLOBAL_WINDOW_CODER);
+        let urn = self
+            .pipeline_coders
+            .get(window_coder_id)
+            .and_then(|coder| coder.spec.as_ref())
+            .map(|spec| spec.urn.as_str())
+            .unwrap_or(window_coder_id);
+        WindowCoder::from_urn(urn)
+    }
+
     pub async fn register_bundle(
         &mut self,
         stage: &ExecutableStage,
@@ -103,7 +138,11 @@ impl BundleRuntime {
         // `pickled_python` URN. Ask the SDK to length-prefix those leaves so the
         // runner can store their bytes opaquely (mirrors Prism's runner).
         length_prefix_pickled_leaves(&mut components.coders);
-        add_stage_data_boundary_coders(stage, &mut components.coders);
+        add_stage_data_boundary_coders(
+            stage,
+            &mut components.coders,
+            self.pipeline_components.as_ref(),
+        );
 
         // ToDo: validate if we need to pass stage scoped or pipeline scoped values
         let descriptor = ProcessBundleDescriptor {
@@ -151,14 +190,16 @@ impl BundleRuntime {
             component_coder,
             Some(pipeline_coders.as_ref()),
         );
+        let window_coder = self.window_coder_for_pcollection(&edge_metadata.produced_pcol_id);
         // VoidCoder elements carry no payload, so round-tripping them through
         // `BeamRecord`/Arrow/Paimon is both unnecessary and lossy for the
         // WindowedValue framing. Preserve the original encoded bytes instead.
         let opaque_void = element_coder.is_void();
-        let windowed_value_coder = WindowedValueCoder::new(element_coder);
+        let windowed_value_coder =
+            WindowedValueCoder::with_window_coder(element_coder, window_coder);
 
         let mut stream_buffer = BytesMut::new();
-        let mut batch: Vec<BeamRecord> = Vec::with_capacity(target_batch_size);
+        let mut batch = Vec::with_capacity(target_batch_size);
         let pcollection_id = edge_metadata.produced_pcol_id.clone();
         let mut stream_ended = false;
         let mut total_decoded: usize = 0;
@@ -217,19 +258,25 @@ impl BundleRuntime {
                                 stream_buffer.advance(consumed);
 
                                 total_decoded += 1;
-                                match opaque_element {
-                                    Some(raw) => batch
-                                        .push(BeamRecord::PRIMITIVE(PrimitiveValue::Bytes(raw))),
-                                    None => batch.push(windowed_value.value),
-                                }
+                                let value = match opaque_element {
+                                    Some(raw) => BeamRecord::PRIMITIVE(PrimitiveValue::Bytes(raw)),
+                                    None => windowed_value.value.clone(),
+                                };
+                                batch.push(WindowedValue {
+                                    value,
+                                    timestamp_millis: windowed_value.timestamp_millis,
+                                    windows: windowed_value.windows,
+                                    pane: windowed_value.pane,
+                                });
                                 if batch.len() >= target_batch_size {
                                     let batch_size = batch.len();
-                                    let request = NewCollectionRequest {
-                                        pcollection_id: pcollection_id.clone(),
-                                        elements: std::mem::take(&mut batch),
-                                    };
                                     let start = Instant::now();
-                                    store.write_beamrecord_batch(request).await?;
+                                    store
+                                        .write_windowed_value_batch(
+                                            &pcollection_id,
+                                            std::mem::take(&mut batch),
+                                        )
+                                        .await?;
                                     batch_size_estimator.record(batch_size, start.elapsed());
                                     target_batch_size = batch_size_estimator.next_batch_size();
                                 }
@@ -275,12 +322,10 @@ impl BundleRuntime {
         // Flush any remaining elements in the batch.
         if !batch.is_empty() {
             let batch_size = batch.len();
-            let request = NewCollectionRequest {
-                pcollection_id: pcollection_id.clone(),
-                elements: batch,
-            };
             let start = Instant::now();
-            store.write_beamrecord_batch(request).await?;
+            store
+                .write_windowed_value_batch(&pcollection_id, batch)
+                .await?;
             batch_size_estimator.record(batch_size, start.elapsed());
         }
 
@@ -318,7 +363,7 @@ impl BundleRuntime {
             pcollection_id: input_pcollection_id.clone(),
         };
 
-        let elements = self.store.scan_collection(request).await?;
+        let elements = self.store.scan_windowed_values(request).await?;
         info!("Input element coder: {}", input_coder_id);
 
         let element_coder = StandardBeamCoders::from_urn(
@@ -328,7 +373,9 @@ impl BundleRuntime {
         );
 
         let opaque_void = element_coder.is_void();
-        let windowed_value_coder = WindowedValueCoder::new(element_coder);
+        let window_coder = self.window_coder_for_pcollection(&input_pcollection_id);
+        let windowed_value_coder =
+            WindowedValueCoder::with_window_coder(element_coder, window_coder);
         let mut encoded = BytesMut::new();
 
         if opaque_void {
@@ -338,7 +385,7 @@ impl BundleRuntime {
                 elements.len()
             );
             for element in elements {
-                match element {
+                match element.value {
                     BeamRecord::PRIMITIVE(PrimitiveValue::Bytes(raw)) => {
                         encoded.extend_from_slice(&raw);
                     }
@@ -346,14 +393,14 @@ impl BundleRuntime {
                         return Err(anyhow!(
                             "expected opaque bytes for VoidCoder pcollection {}, found {:?}",
                             input_pcollection_id,
-                            other.record_type()
+                            other
                         ));
                     }
                 }
             }
         } else {
             for element in elements {
-                windowed_value_coder.encode_value(element, &mut encoded);
+                windowed_value_coder.encode(element, &mut encoded);
             }
         }
 
@@ -445,21 +492,23 @@ pub fn windowed_value_coder_id(stage: &ExecutableStage, pcollection_id: &str) ->
     format!("{}/windowed_value/{}", stage.id(), pcollection_id)
 }
 
+/// Adds a Beam `windowed_value:v1` coder whose components are the element
+/// coder followed by the PCollection's window coder.
 pub fn insert_windowed_value_coder(
     coders: &mut HashMap<String, Coder>,
     windowed_value_coder_id: String,
     element_coder_id: String,
-    global_window_coder_id: String,
+    window_coder_id: String,
 ) {
-    coders
-        .entry(global_window_coder_id.clone())
-        .or_insert(Coder {
+    if window_coder_id.ends_with("/global_window") {
+        coders.entry(window_coder_id.clone()).or_insert(Coder {
             spec: Some(FunctionSpec {
                 urn: beam_urns::GLOBAL_WINDOW_CODER.to_string(),
                 payload: Vec::new(),
             }),
             component_coder_ids: Vec::new(),
         });
+    }
 
     coders.insert(
         windowed_value_coder_id,
@@ -468,29 +517,70 @@ pub fn insert_windowed_value_coder(
                 urn: beam_urns::WINDOWED_VALUE_CODER.to_string(),
                 payload: Vec::new(),
             }),
-            component_coder_ids: vec![element_coder_id, global_window_coder_id],
+            // Beam defines these components as element coder, then window coder.
+            component_coder_ids: vec![element_coder_id, window_coder_id],
         },
     );
 }
 
-/// Register the windowed-value source/sink coders for a stage's input and output
+fn stage_window_coder_id(
+    stage: &ExecutableStage,
+    pcollection_id: &str,
+    pipeline_components: &Components,
+) -> String {
+    let components = pipeline_components;
+    let pcollection = components
+        .pcollections
+        .get(pcollection_id)
+        .unwrap_or_else(|| panic!("PCollection not found: {pcollection_id}"));
+    let strategy = components
+        .windowing_strategies
+        .get(&pcollection.windowing_strategy_id);
+    let window_coder_id = strategy
+        .map(|strategy| strategy.window_coder_id.clone())
+        .filter(|id| !id.is_empty())
+        .or_else(|| {
+            strategy
+                .and_then(|strategy| strategy.window_fn.as_ref())
+                .filter(|window_fn| window_fn.urn == "beam:window_fn:fixed_windows:v1")
+                .and_then(|_| {
+                    components.coders.iter().find_map(|(id, coder)| {
+                        (coder.spec.as_ref()?.urn == beam_urns::INTERVAL_WINDOW_CODER)
+                            .then_some(id.clone())
+                    })
+                })
+        });
+    let resolved = window_coder_id.unwrap_or_else(|| format!("{}/global_window", stage.id()));
+    info!(
+        "Resolved boundary window coder: stage={}, pcollection={}, strategy={}, window_coder_id={}",
+        stage.id(),
+        pcollection_id,
+        pcollection.windowing_strategy_id,
+        resolved
+    );
+    resolved
+}
+
+/// Registers windowed-value source/sink coders for a stage's input and output
 /// PCollections.
 ///
-/// Element coder ids are resolved through [`resolve_length_prefixed_coder_id`]
-/// so that opaque leaves the runner asked the SDK to length-prefix are referenced
-/// by their wrapper.
+/// The window coder is resolved from the pipeline's
+/// `PCollection → WindowingStrategy → window_coder_id` path. Element coder ids
+/// are resolved through [`resolve_length_prefixed_coder_id`] so opaque leaves
+/// that the runner asked the SDK to length-prefix are referenced by their
+/// wrapper.
 pub fn add_stage_data_boundary_coders(
     stage: &ExecutableStage,
     coders: &mut HashMap<String, Coder>,
+    pipeline_components: &Components,
 ) {
-    let global_window_coder_id = global_window_coder_id(stage);
     let input_pcol = stage.input_pcol();
 
     insert_windowed_value_coder(
         coders,
         windowed_value_coder_id(stage, input_pcol.id()),
         resolve_length_prefixed_coder_id(&input_pcol.node().coder_id, coders),
-        global_window_coder_id.clone(),
+        stage_window_coder_id(stage, input_pcol.id(), pipeline_components),
     );
 
     for output_pcol in stage.output_pcols() {
@@ -498,7 +588,7 @@ pub fn add_stage_data_boundary_coders(
             coders,
             windowed_value_coder_id(stage, output_pcol.id()),
             resolve_length_prefixed_coder_id(&output_pcol.node().coder_id, coders),
-            global_window_coder_id.clone(),
+            stage_window_coder_id(stage, output_pcol.id(), pipeline_components),
         );
     }
 }
