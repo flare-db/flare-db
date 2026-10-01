@@ -359,6 +359,7 @@ impl WindowedValue {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BeamWindow {
     Global,
+    Interval { start_millis: i64, end_millis: i64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -380,7 +381,7 @@ impl PaneTiming {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaneInfo {
     pub is_first: bool,
     pub is_last: bool,
@@ -401,14 +402,38 @@ impl PaneInfo {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowCoder {
+    Global,
+    Interval,
+}
+
+impl WindowCoder {
+    pub fn from_urn(urn: &str) -> Self {
+        match urn {
+            crate::jobservice::urns::beam_urns::GLOBAL_WINDOW_CODER => Self::Global,
+            crate::jobservice::urns::beam_urns::INTERVAL_WINDOW_CODER => Self::Interval,
+            _ => panic!("Unsupported Beam window coder: {urn}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct WindowedValueCoder {
     element_coder: StandardBeamCoders,
+    window_coder: WindowCoder,
 }
 
 impl WindowedValueCoder {
     pub fn new(element_coder: StandardBeamCoders) -> Self {
-        Self { element_coder }
+        Self::with_window_coder(element_coder, WindowCoder::Global)
+    }
+
+    pub fn with_window_coder(element_coder: StandardBeamCoders, window_coder: WindowCoder) -> Self {
+        Self {
+            element_coder,
+            window_coder,
+        }
     }
 
     pub fn encode_value(&self, value: BeamRecord, buf: &mut impl BufMut) {
@@ -420,14 +445,14 @@ impl WindowedValueCoder {
 impl BeamCoder<WindowedValue> for WindowedValueCoder {
     fn encode(&self, val: WindowedValue, buf: &mut impl BufMut) {
         encode_timestamp_millis(val.timestamp_millis, buf);
-        encode_global_windows(&val.windows, buf);
+        encode_windows(&val.windows, self.window_coder, buf);
         encode_pane_info(&val.pane, buf);
         self.element_coder.encode(val.value, buf);
     }
 
     fn decode(&self, buf: &mut impl Buf) -> Result<WindowedValue, CodersError> {
         let timestamp_millis = decode_timestamp_millis(buf);
-        let windows = decode_global_windows(buf);
+        let windows = decode_windows(buf, self.window_coder);
         let pane = decode_pane_info(buf);
         let value = self.element_coder.decode_nested(buf)?;
 
@@ -450,25 +475,36 @@ fn decode_timestamp_millis(buf: &mut impl Buf) -> i64 {
     (shifted ^ 0x8000_0000_0000_0000) as i64
 }
 
-fn encode_global_windows(windows: &[BeamWindow], buf: &mut impl BufMut) {
+fn encode_windows(windows: &[BeamWindow], coder: WindowCoder, buf: &mut impl BufMut) {
     buf.put_i32(windows.len() as i32);
 
     for window in windows {
-        match window {
-            BeamWindow::Global => {
-                // GlobalWindowCoder has an empty payload.
+        match (coder, window) {
+            (WindowCoder::Global, BeamWindow::Global) => {}
+            (
+                WindowCoder::Interval,
+                BeamWindow::Interval {
+                    start_millis,
+                    end_millis,
+                },
+            ) => {
+                // IntervalWindowCoder encodes the end timestamp followed by the
+                // non-negative span (end - start), both in Beam's timestamp/varint format.
+                encode_timestamp_millis(*end_millis, buf);
+                encode_varint((*end_millis - *start_millis) as u64, buf);
             }
+            _ => panic!("Window value does not match the configured Beam window coder"),
         }
     }
 }
 
-fn decode_global_windows(buf: &mut impl Buf) -> Vec<BeamWindow> {
+fn decode_windows(buf: &mut impl Buf, coder: WindowCoder) -> Vec<BeamWindow> {
     let count = buf.get_i32();
     let mut windows = Vec::new();
 
     if count >= 0 {
         for _ in 0..count {
-            windows.push(BeamWindow::Global);
+            windows.push(decode_window(buf, coder));
         }
         return windows;
     }
@@ -482,11 +518,25 @@ fn decode_global_windows(buf: &mut impl Buf) -> Vec<BeamWindow> {
         }
 
         for _ in 0..chunk_count {
-            windows.push(BeamWindow::Global);
+            windows.push(decode_window(buf, coder));
         }
     }
 
     windows
+}
+
+fn decode_window(buf: &mut impl Buf, coder: WindowCoder) -> BeamWindow {
+    match coder {
+        WindowCoder::Global => BeamWindow::Global,
+        WindowCoder::Interval => {
+            let end_millis = decode_timestamp_millis(buf);
+            let span_millis = decode_varint(buf) as i64;
+            BeamWindow::Interval {
+                start_millis: end_millis - span_millis,
+                end_millis,
+            }
+        }
+    }
 }
 
 fn encode_pane_info(pane: &PaneInfo, buf: &mut impl BufMut) {
@@ -1078,6 +1128,114 @@ mod tests {
             }
             _ => panic!("expected int"),
         }
+    }
+
+    #[test]
+    fn interval_window_roundtrip_preserves_windowed_value_metadata() {
+        let coder = WindowedValueCoder::with_window_coder(
+            StandardBeamCoders::VarInt(VarIntCoder),
+            WindowCoder::Interval,
+        );
+        let original = WindowedValue {
+            value: BeamRecord::PRIMITIVE(PrimitiveValue::Int64(12345)),
+            timestamp_millis: 17_000,
+            windows: vec![BeamWindow::Interval {
+                start_millis: 0,
+                end_millis: 60_000,
+            }],
+            pane: PaneInfo {
+                is_first: false,
+                is_last: true,
+                timing: PaneTiming::OnTime,
+                index: 3,
+                non_speculative_index: 3,
+            },
+        };
+
+        let mut buf = BytesMut::new();
+        coder.encode(original.clone(), &mut buf);
+        // IntervalWindowCoder is end timestamp followed by unsigned span.
+        assert_eq!(
+            &buf[8..23],
+            &[
+                0, 0, 0, 1, 0x80, 0, 0, 0, 0, 0, 0xea, 0x60, 0xe0, 0xd4, 0x03,
+            ]
+        );
+
+        let mut bytes = buf.freeze();
+        let decoded = coder.decode(&mut bytes).unwrap();
+        assert_eq!(decoded.timestamp_millis, original.timestamp_millis);
+        assert_eq!(decoded.windows, original.windows);
+        assert_eq!(decoded.pane, original.pane);
+        assert_eq!(decoded.value, original.value);
+    }
+
+    #[test]
+    fn interval_window_matches_standard_coders_yaml_wire_example() {
+        let mut encoded = BytesMut::new();
+        encode_windows(
+            &[BeamWindow::Interval {
+                start_millis: 1454293425000 - 3_600_000,
+                end_millis: 1454293425000,
+            }],
+            WindowCoder::Interval,
+            &mut encoded,
+        );
+        assert_eq!(
+            encoded.as_ref(),
+            &[
+                0, 0, 0, 1, 0x80, 0x00, 0x01, 0x52, 0x9a, 0xa4, 0x9b, 0x68, 0x80, 0xdd, 0xdb, 0x01,
+            ]
+        );
+
+        let mut bytes = encoded.freeze();
+        assert_eq!(
+            decode_windows(&mut bytes, WindowCoder::Interval),
+            vec![BeamWindow::Interval {
+                start_millis: 1454293425000 - 3_600_000,
+                end_millis: 1454293425000,
+            }]
+        );
+    }
+
+    #[test]
+    fn interval_window_coder_resolves_from_beam_urn() {
+        assert_eq!(
+            WindowCoder::from_urn(crate::jobservice::urns::beam_urns::INTERVAL_WINDOW_CODER),
+            WindowCoder::Interval
+        );
+        assert_eq!(
+            WindowCoder::from_urn(crate::jobservice::urns::beam_urns::GLOBAL_WINDOW_CODER),
+            WindowCoder::Global
+        );
+    }
+
+    #[test]
+    fn multiple_interval_windows_roundtrip() {
+        let coder = WindowedValueCoder::with_window_coder(
+            StandardBeamCoders::VarInt(VarIntCoder),
+            WindowCoder::Interval,
+        );
+        let original = WindowedValue {
+            value: BeamRecord::PRIMITIVE(PrimitiveValue::Int64(1)),
+            timestamp_millis: 1,
+            windows: vec![
+                BeamWindow::Interval {
+                    start_millis: 0,
+                    end_millis: 60_000,
+                },
+                BeamWindow::Interval {
+                    start_millis: 120_000,
+                    end_millis: 180_000,
+                },
+            ],
+            pane: PaneInfo::no_firing(),
+        };
+        let mut buf = BytesMut::new();
+        coder.encode(original.clone(), &mut buf);
+        let mut bytes = buf.freeze();
+        let decoded = coder.decode(&mut bytes).unwrap();
+        assert_eq!(decoded.windows, original.windows);
     }
 
     #[test]
