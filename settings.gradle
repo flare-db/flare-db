@@ -10,6 +10,7 @@ def javaModules = [
     'flareio-read'   : 'example/flare-io-read',
     'flatten'        : 'example/flatten',
     'co-groupby-key' : 'example/co-groupby-key',
+    'fixed-window'   : 'example/fixed-window',
     'nexmark'        : 'benchmarks/nexmark',
 ]
 
