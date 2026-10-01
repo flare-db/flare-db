@@ -4,14 +4,13 @@ import org.apache.beam.sdk.Pipeline;
 import org.apache.beam.sdk.io.TextIO;
 import org.apache.beam.sdk.options.PipelineOptionsFactory;
 import org.apache.beam.sdk.transforms.DoFn;
+import org.apache.beam.sdk.transforms.GroupByKey;
 import org.apache.beam.sdk.transforms.ParDo;
 import org.apache.beam.sdk.transforms.windowing.BoundedWindow;
 import org.apache.beam.sdk.transforms.windowing.FixedWindows;
 import org.apache.beam.sdk.transforms.windowing.Window;
-import org.apache.beam.sdk.transforms.GroupByKey;
 import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PCollection;
-
 import org.joda.time.Duration;
 import org.joda.time.Instant;
 import org.slf4j.Logger;
@@ -19,22 +18,18 @@ import org.slf4j.LoggerFactory;
 
 public class FixedWindowExample {
 
-  private static final Logger LOG =
-      LoggerFactory.getLogger(FixedWindowExample.class);
+  private static final Logger LOG = LoggerFactory.getLogger(FixedWindowExample.class);
 
   public static void main(String[] args) {
 
     FixedWindowPipelineOptions options =
         FixedWindowPipelineOptions.applyFlareDefaults(
-            PipelineOptionsFactory.fromArgs(args)
-                .as(FixedWindowPipelineOptions.class));
+            PipelineOptionsFactory.fromArgs(args).as(FixedWindowPipelineOptions.class));
 
     Pipeline pipeline = Pipeline.create(options);
 
     PCollection<String> lines =
-        pipeline.apply(
-            "ReadCSV",
-            TextIO.read().from(options.getInputFile()));
+        pipeline.apply("ReadCSV", TextIO.read().from(options.getInputFile()));
 
     PCollection<KV<String, Integer>> records =
         lines.apply(
@@ -59,28 +54,19 @@ public class FixedWindowExample {
                     int score = Integer.parseInt(fields[4]);
 
                     // Deterministic event timestamp.
-                    Instant timestamp =
-                        Instant.ofEpochSecond(id - 1);
+                    Instant timestamp = Instant.ofEpochSecond(id - 1);
 
-                    c.outputWithTimestamp(
-                        KV.of(name, score),
-                        timestamp);
+                    c.outputWithTimestamp(KV.of(name, score), timestamp);
                   }
                 }));
 
     PCollection<KV<String, Integer>> windowed =
-        records.apply(
-            "FixedWindow",
-            Window.into(
-                FixedWindows.of(
-                    Duration.standardSeconds(60))));
+        records.apply("FixedWindow", Window.into(FixedWindows.of(Duration.standardSeconds(60))));
 
     // Runner-owned GroupByKey.
     // Elements with the same key are grouped independently per window.
     PCollection<KV<String, Iterable<Integer>>> grouped =
-        windowed.apply(
-            "GroupByKey",
-            GroupByKey.create());
+        windowed.apply("GroupByKey", GroupByKey.create());
 
     grouped.apply(
         "PrintGroupedResults",
@@ -88,9 +74,7 @@ public class FixedWindowExample {
             new DoFn<KV<String, Iterable<Integer>>, Void>() {
 
               @ProcessElement
-              public void processElement(
-                  ProcessContext c,
-                  BoundedWindow window) {
+              public void processElement(ProcessContext c, BoundedWindow window) {
 
                 LOG.info(
                     "key={} values={} timestamp={} window={}",

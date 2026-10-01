@@ -2,23 +2,22 @@ package com.flaredb.example;
 
 import com.flaredb.runner.FlarePipelineOptions;
 import com.flaredb.runner.FlareRunner;
-import org.apache.beam.sdk.options.Description;
 import java.io.File;
 import java.util.Arrays;
 import java.util.Comparator;
+import org.apache.beam.sdk.options.Description;
 
 public interface FixedWindowPipelineOptions extends FlarePipelineOptions {
 
+  /**
+   * Returns the text file to count words in. Defaults to the bundled sample ({@code
+   * test-data/scores.csv}) when not set; override with {@code --inputFile=/path/to/file}.
+   */
+  @Description("Path to the text file to count words in")
+  String getInputFile();
 
-    /**
-     * Returns the text file to count words in. Defaults to the bundled sample ({@code
-     * test-data/scores.csv}) when not set; override with {@code --inputFile=/path/to/file}.
-     */
-    @Description("Path to the text file to count words in")
-    String getInputFile();
-
-    /** Sets the text file to count words in. */
-    void setInputFile(String path);
+  /** Sets the text file to count words in. */
+  void setInputFile(String path);
 
   /**
    * Applies the standard FlareDB example defaults: run on {@link FlareRunner}, target the local
