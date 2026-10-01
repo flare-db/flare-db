@@ -337,15 +337,21 @@ impl BeamCoder<()> for VoidCoder {
     }
 }
 
+/// A Beam element together with its event-time and window metadata.
 #[derive(Debug, Clone)]
 pub struct WindowedValue {
+    /// The logical element payload.
     pub value: BeamRecord,
+    /// Event timestamp in milliseconds since the Unix epoch.
     pub timestamp_millis: i64,
+    /// Windows assigned to the element by the SDK.
     pub windows: Vec<BeamWindow>,
+    /// Beam trigger/pane metadata.
     pub pane: PaneInfo,
 }
 
 impl WindowedValue {
+    /// Creates a value in the global window with Beam's minimum timestamp.
     pub fn global(value: BeamRecord) -> Self {
         Self {
             value,
@@ -356,9 +362,15 @@ impl WindowedValue {
     }
 }
 
+/// A Beam window carried by a [`WindowedValue`].
+///
+/// Interval bounds are expressed in milliseconds since the Unix epoch and use
+/// Beam's half-open interval convention: `[start_millis, end_millis)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BeamWindow {
+    /// The single global window.
     Global,
+    /// A half-open interval window.
     Interval { start_millis: i64, end_millis: i64 },
 }
 
@@ -402,13 +414,21 @@ impl PaneInfo {
     }
 }
 
+/// The Beam window coder selected from a PCollection's coder graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowCoder {
+    /// `beam:coder:global_window:v1`.
     Global,
+    /// `beam:coder:interval_window:v1`.
     Interval,
 }
 
 impl WindowCoder {
+    /// Resolves a Beam window-coder URN.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the URN is not a supported Beam window coder.
     pub fn from_urn(urn: &str) -> Self {
         match urn {
             crate::jobservice::urns::beam_urns::GLOBAL_WINDOW_CODER => Self::Global,
@@ -418,6 +438,12 @@ impl WindowCoder {
     }
 }
 
+/// Encodes and decodes Beam `WindowedValue` framing around an element coder.
+///
+/// The window coder is part of the Beam `windowed_value:v1` coder graph and
+/// must match the windows carried by each value. Use [`Self::new`] when FlareDB
+/// intentionally creates global-window values, or [`Self::with_window_coder`]
+/// when resolving an existing PCollection boundary.
 #[derive(Debug, Clone)]
 pub struct WindowedValueCoder {
     element_coder: StandardBeamCoders,
@@ -425,10 +451,12 @@ pub struct WindowedValueCoder {
 }
 
 impl WindowedValueCoder {
+    /// Creates a coder for values that FlareDB creates in the global window.
     pub fn new(element_coder: StandardBeamCoders) -> Self {
         Self::with_window_coder(element_coder, WindowCoder::Global)
     }
 
+    /// Creates a coder using the window coder resolved from the Beam graph.
     pub fn with_window_coder(element_coder: StandardBeamCoders, window_coder: WindowCoder) -> Self {
         Self {
             element_coder,
@@ -436,6 +464,10 @@ impl WindowedValueCoder {
         }
     }
 
+    /// Encodes a new element as a global-window `WindowedValue`.
+    ///
+    /// This helper is for newly created FlareDB values. Existing window,
+    /// timestamp, and pane metadata must be encoded with [`Self::encode`].
     pub fn encode_value(&self, value: BeamRecord, buf: &mut impl BufMut) {
         let windowed_value = WindowedValue::global(value.clone());
         self.encode(windowed_value, buf);

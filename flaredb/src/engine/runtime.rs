@@ -488,6 +488,8 @@ pub fn windowed_value_coder_id(stage: &ExecutableStage, pcollection_id: &str) ->
     format!("{}/windowed_value/{}", stage.id(), pcollection_id)
 }
 
+/// Adds a Beam `windowed_value:v1` coder whose components are the element
+/// coder followed by the PCollection's window coder.
 pub fn insert_windowed_value_coder(
     coders: &mut HashMap<String, Coder>,
     windowed_value_coder_id: String,
@@ -555,12 +557,14 @@ fn stage_window_coder_id(
     resolved
 }
 
-/// Register the windowed-value source/sink coders for a stage's input and output
+/// Registers windowed-value source/sink coders for a stage's input and output
 /// PCollections.
 ///
-/// Element coder ids are resolved through [`resolve_length_prefixed_coder_id`]
-/// so that opaque leaves the runner asked the SDK to length-prefix are referenced
-/// by their wrapper.
+/// The window coder is resolved from the pipeline's
+/// `PCollection → WindowingStrategy → window_coder_id` path. Element coder ids
+/// are resolved through [`resolve_length_prefixed_coder_id`] so opaque leaves
+/// that the runner asked the SDK to length-prefix are referenced by their
+/// wrapper.
 pub fn add_stage_data_boundary_coders(
     stage: &ExecutableStage,
     coders: &mut HashMap<String, Coder>,
