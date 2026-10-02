@@ -10,16 +10,16 @@ import org.apache.beam.model.pipeline.v1.RunnerApi.FunctionSpec;
  * the FlareDB runner can carry as self-delimiting bytes.
  *
  * <p>The runner cannot interpret an SDK-private serialized coder blob, so it treats such coders as
- * opaque {@code VarInt(length) | bytes}. That only works if the SDK length-prefixes the value;
- * many SDK-private coders are not self-delimiting (e.g. Java's {@code CoGroupByKey} union coders,
- * or the Nexmark {@code Event} custom coder), which desynchronizes the element stream. Wrapping
- * each such coder in {@code beam:coder:length_prefix:v1} makes both sides agree — the harness
- * encodes with {@code LengthPrefixCoder.of(original)} and the runner reads opaque bytes — without
- * forcing any wire-format change on the SDK.
+ * opaque {@code VarInt(length) | bytes}. That only works if the SDK length-prefixes the value; many
+ * SDK-private coders are not self-delimiting (e.g. Java's {@code CoGroupByKey} union coders, or the
+ * Nexmark {@code Event} custom coder), which desynchronizes the element stream. Wrapping each such
+ * coder in {@code beam:coder:length_prefix:v1} makes both sides agree — the harness encodes with
+ * {@code LengthPrefixCoder.of(original)} and the runner reads opaque bytes — without forcing any
+ * wire-format change on the SDK.
  *
  * <p>Coders the runner already understands natively ({@code VoidCoder}, {@code VarIntCoder}) are
- * left untouched to avoid double length-prefixing. This mirrors the Python portable runner's
- * {@code maybe_length_prefixed_and_safe_coder}.
+ * left untouched to avoid double length-prefixing. This mirrors the Python portable runner's {@code
+ * maybe_length_prefixed_and_safe_coder}.
  */
 final class PortableCoderRewrites {
 
