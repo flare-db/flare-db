@@ -63,7 +63,6 @@ public class FixedWindowExample {
     PCollection<KV<String, Integer>> windowed =
         records.apply("FixedWindow", Window.into(FixedWindows.of(Duration.standardSeconds(60))));
 
-    // Runner-owned GroupByKey.
     // Elements with the same key are grouped independently per window.
     PCollection<KV<String, Iterable<Integer>>> grouped =
         windowed.apply("GroupByKey", GroupByKey.create());

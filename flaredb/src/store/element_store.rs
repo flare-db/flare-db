@@ -1,8 +1,11 @@
 use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{Result, anyhow};
-use arrow_array::{Array, BinaryArray, RecordBatch};
-use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+use arrow_array::{
+    Array, BinaryArray, RecordBatch,
+    builder::{ListBuilder, StringBuilder},
+};
+use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use dashmap::DashMap;
 use paimon::spec::Schema as PaimonSchema;
 use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options, Table, catalog::Identifier};
@@ -149,7 +152,7 @@ impl FlareElementStore {
                         .arrow_schema
                         .fields()
                         .iter()
-                        .filter(|field| field.name() != WINDOW_METADATA_COLUMN)
+                        .filter(|field| !is_reserved_window_column(field.name()))
                         .map(|field| field.as_ref().clone())
                         .collect::<Vec<_>>(),
                 )),
@@ -206,7 +209,7 @@ impl FlareElementStore {
                         .arrow_schema
                         .fields()
                         .iter()
-                        .filter(|field| field.name() != WINDOW_METADATA_COLUMN)
+                        .filter(|field| !is_reserved_window_column(field.name()))
                         .map(|field| field.as_ref().clone())
                         .collect::<Vec<_>>(),
                 )),
@@ -385,6 +388,21 @@ impl FlareElementStore {
         }
     }
 
+    /// Resolve an already-created Paimon table for a PCollection without
+    /// creating it when absent.
+    ///
+    /// Returns `Ok(None)` when the PCollection has never been committed to, so a
+    /// transform can distinguish "no input" from a read error without the
+    /// side effect of materializing an empty table.
+    pub async fn get_existing_table(&self, pcollection_id: &str) -> Result<Option<Table>> {
+        let identifier = self.table_identifier(pcollection_id);
+        match self.catalog.get_table(&identifier).await {
+            Ok(table) => Ok(Some(table)),
+            Err(paimon::Error::TableNotExist { .. }) => Ok(None),
+            Err(err) => Err(err.into()),
+        }
+    }
+
     pub(crate) fn table_identifier(&self, pcollection_id: &str) -> Identifier {
         Identifier::new(
             self.db_name.as_str(),
@@ -406,11 +424,30 @@ impl FlareElementStore {
 /// names.
 const WINDOW_METADATA_COLUMN: &str = "__flare_window_metadata";
 
-/// Appends the reserved [`WINDOW_METADATA_COLUMN`] to `batch`, JSON-encoding one
-/// [`WindowMetadata`] per row.
+/// Reserved Paimon column holding one canonical window key per element window.
+///
+/// Stored as a `List<Utf8>` so a runner-native transform can `unnest` it and
+/// group by `(key, window)` inside the query engine (see
+/// [`BeamWindow::canonical_key`](crate::coders::primitives::BeamWindow::canonical_key))
+/// rather than decoding every element's JSON metadata in memory. The column is
+/// written together with [`WINDOW_METADATA_COLUMN`] and carries the same window
+/// information in a form that is directly groupable.
+pub(crate) const WINDOW_KEY_COLUMN: &str = "__flare_window_key";
+
+/// True for the reserved columns the store appends to windowed PCollections.
+///
+/// Used to strip them when reconstructing the logical element schema so they are
+/// never treated as user fields and never duplicated across successive writes.
+fn is_reserved_window_column(name: &str) -> bool {
+    name == WINDOW_METADATA_COLUMN || name == WINDOW_KEY_COLUMN
+}
+
+/// Appends the reserved [`WINDOW_METADATA_COLUMN`] and [`WINDOW_KEY_COLUMN`] to
+/// `batch`, encoding one [`WindowMetadata`] per row and one canonical window key
+/// per element window.
 ///
 /// Fails when `metadata` does not have exactly one entry per batch row, so a
-/// caller can never persist a batch whose metadata column is misaligned.
+/// caller can never persist a batch whose metadata columns are misaligned.
 fn append_window_metadata(batch: RecordBatch, metadata: &[WindowMetadata]) -> Result<RecordBatch> {
     if batch.num_rows() != metadata.len() {
         return Err(anyhow!(
@@ -424,6 +461,20 @@ fn append_window_metadata(batch: RecordBatch, metadata: &[WindowMetadata]) -> Re
         .map(serde_json::to_vec)
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let metadata_array = BinaryArray::from_iter_values(encoded.iter().map(Vec::as_slice));
+
+    // One canonical key per element window, as a `List<Utf8>` column the query
+    // engine can `unnest` and group on without decoding the JSON per element.
+    let mut window_key_builder = ListBuilder::new(StringBuilder::new());
+    for entry in metadata {
+        for window in &entry.windows {
+            window_key_builder
+                .values()
+                .append_value(window.canonical_key());
+        }
+        window_key_builder.append(true);
+    }
+    let window_key_array = window_key_builder.finish();
+
     let mut fields: Vec<ArrowField> = batch
         .schema()
         .fields()
@@ -432,11 +483,19 @@ fn append_window_metadata(batch: RecordBatch, metadata: &[WindowMetadata]) -> Re
         .collect();
     fields.push(ArrowField::new(
         WINDOW_METADATA_COLUMN,
-        arrow_schema::DataType::Binary,
+        DataType::Binary,
         false,
     ));
+    fields.push(ArrowField::new(
+        WINDOW_KEY_COLUMN,
+        DataType::List(Arc::new(ArrowField::new("item", DataType::Utf8, true))),
+        true,
+    ));
+
     let mut columns = batch.columns().to_vec();
     columns.push(Arc::new(metadata_array));
+    columns.push(Arc::new(window_key_array));
+
     Ok(RecordBatch::try_new(
         Arc::new(ArrowSchema::new(fields)),
         columns,

@@ -9,6 +9,16 @@ use bytes::{Buf, BufMut};
 /// Beam's minimum timestamp in millis (`BoundedWindow.TIMESTAMP_MIN_VALUE`).
 pub const BEAM_MIN_TIMESTAMP_MILLIS: i64 = -9_223_372_036_854_775;
 
+/// Beam's maximum timestamp in millis (`BoundedWindow.TIMESTAMP_MAX_VALUE`).
+pub const BEAM_MAX_TIMESTAMP_MILLIS: i64 = 9_223_372_036_854_775;
+
+/// Max timestamp of Beam's global window in millis
+/// (`BeamConstants.Constants.GLOBAL_WINDOW_MAX_TIMESTAMP_MILLIS`).
+///
+/// One standard day is subtracted from [`BEAM_MAX_TIMESTAMP_MILLIS`] so the value
+/// stays below the absolute maximum even after rounding up to coarser units.
+pub const GLOBAL_WINDOW_MAX_TIMESTAMP_MILLIS: i64 = 9_223_371_950_454_775;
+
 #[derive(Debug, Clone)]
 pub struct StringUtf8Coder;
 
@@ -368,13 +378,64 @@ impl WindowedValue {
 /// Beam's half-open interval convention: `[start_millis, end_millis)`.
 ///
 /// Derives `serde` so a window can be round-tripped through the JSON-encoded
-/// window metadata persisted by the element store.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// window metadata persisted by the element store, and `Hash`/`Eq` so it can
+/// participate in a grouping key (for example `GroupByKey`'s `(key, window)`
+/// identity).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum BeamWindow {
     /// The single global window.
     Global,
     /// A half-open interval window.
     Interval { start_millis: i64, end_millis: i64 },
+}
+
+impl BeamWindow {
+    /// The maximum timestamp this window can hold, in milliseconds since the Unix
+    /// epoch, mirroring Beam's `BoundedWindow.maxTimestamp()`.
+    ///
+    /// Interval bounds are half-open `[start, end)`, so the last instant inside the
+    /// window is `end - 1`. The global window's max timestamp is the Beam constant
+    /// `GLOBAL_WINDOW_MAX_TIMESTAMP_MILLIS`, which is deliberately smaller than
+    /// [`BEAM_MAX_TIMESTAMP_MILLIS`].
+    pub fn max_timestamp_millis(&self) -> i64 {
+        match self {
+            BeamWindow::Global => GLOBAL_WINDOW_MAX_TIMESTAMP_MILLIS,
+            BeamWindow::Interval { end_millis, .. } => end_millis - 1,
+        }
+    }
+
+    /// A compact, deterministic string identity for this window.
+    ///
+    /// The element store persists one such key per window in the reserved
+    /// `__flare_window_key` column so runner-native transforms (for example
+    /// `GroupByKey`) can group by window in the query engine instead of decoding
+    /// the JSON metadata per element. Use [`Self::from_canonical_key`] to recover
+    /// the window.
+    pub fn canonical_key(&self) -> String {
+        match self {
+            BeamWindow::Global => "global".to_string(),
+            BeamWindow::Interval {
+                start_millis,
+                end_millis,
+            } => format!("interval:{start_millis}:{end_millis}"),
+        }
+    }
+
+    /// Parses a key produced by [`Self::canonical_key`] back into a window.
+    ///
+    /// Returns `None` for an unrecognized key rather than guessing, so callers
+    /// surface malformed stored metadata instead of silently mis-grouping.
+    pub fn from_canonical_key(key: &str) -> Option<Self> {
+        if key == "global" {
+            return Some(BeamWindow::Global);
+        }
+        let bounds = key.strip_prefix("interval:")?;
+        let (start, end) = bounds.split_once(':')?;
+        Some(BeamWindow::Interval {
+            start_millis: start.parse().ok()?,
+            end_millis: end.parse().ok()?,
+        })
+    }
 }
 
 /// Beam pane timing, mirroring the portable `PaneInfo` timing enumeration.
@@ -418,6 +479,21 @@ impl PaneInfo {
             is_first: true,
             is_last: true,
             timing: PaneTiming::Unknown,
+            index: 0,
+            non_speculative_index: 0,
+        }
+    }
+
+    /// A single on-time firing that both opens and closes the window's triggering.
+    ///
+    /// Used when a runner-native transform (for example `GroupByKey`) emits exactly
+    /// one aggregated pane per window: the output is the first and last pane and is
+    /// produced on time rather than speculatively.
+    pub fn on_time_firing() -> Self {
+        Self {
+            is_first: true,
+            is_last: true,
+            timing: PaneTiming::OnTime,
             index: 0,
             non_speculative_index: 0,
         }
