@@ -485,7 +485,7 @@ pub fn iterable_values_to_array(
 ///
 /// A null cell decodes to [`PrimitiveValue::Void`]; any other storage type is
 /// rejected as an unsupported primitive storage type.
-fn primitive_value_from_array_row(
+pub(crate) fn primitive_value_from_array_row(
     array: &dyn Array,
     data_type: &ArrowDataType,
     row: usize,
@@ -565,7 +565,7 @@ fn primitive_value_from_array_row(
     }
 }
 
-fn iterable_value_from_array_row(
+pub(crate) fn iterable_value_from_array_row(
     array: &dyn Array,
     data_type: &ArrowDataType,
     row: usize,
