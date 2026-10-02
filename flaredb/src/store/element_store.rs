@@ -2,12 +2,15 @@ use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{Result, anyhow};
 use arrow_array::{
-    Array, BinaryArray, RecordBatch,
+    Array, BinaryArray, Int8Array, RecordBatch,
     builder::{ListBuilder, StringBuilder},
 };
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use dashmap::DashMap;
-use paimon::spec::Schema as PaimonSchema;
+use paimon::spec::{
+    DataType as PaimonDataType, RowKind, Schema as PaimonSchema, VALUE_KIND_FIELD_NAME,
+    VarBinaryType,
+};
 use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options, Table, catalog::Identifier};
 use tokio_stream::StreamExt;
 
@@ -413,6 +416,137 @@ impl FlareElementStore {
     fn sanitize_pcollection_id(id: &str) -> String {
         id.replace(['/', '.', ' ', '(', ')'], "_")
     }
+
+    // -------------------------------------------------------------------------
+    // Bag user state storage
+    //
+    // Backs the Beam Fn State API (`BagUserState`). State lives in a dedicated
+    // primary-key Paimon table mapping a composite `state_key` (opaque bytes) to
+    // a single `value` blob. The default `deduplicate` merge engine provides
+    // last-write-wins upserts, and deletes are expressed as `-D` changelog rows
+    // via the `_VALUE_KIND` column. This layer only moves opaque bytes in and
+    // out of Paimon; the Beam bag semantics (append = read-modify-write, clear =
+    // delete) live in `store/state.rs`.
+    // -------------------------------------------------------------------------
+
+    /// Identifier for the shared bag-user-state table in this database.
+    fn state_identifier(&self) -> Identifier {
+        Identifier::new(self.db_name.as_str(), STATE_TABLE)
+    }
+
+    /// Resolve (or create) the primary-key bag-user-state table.
+    async fn state_table(&self) -> Result<Table> {
+        let identifier = self.state_identifier();
+        match self.catalog.get_table(&identifier).await {
+            Ok(table) => Ok(table),
+            Err(paimon::Error::TableNotExist { .. }) => {
+                self.catalog
+                    .create_table(&identifier, state_paimon_schema()?, false)
+                    .await?;
+                Ok(self.catalog.get_table(&identifier).await?)
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    /// Read the value stored for `state_key`, or `None` when absent.
+    pub async fn state_get(&self, state_key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let identifier = self.state_identifier();
+        let table = match self.catalog.get_table(&identifier).await {
+            Ok(table) => table,
+            Err(paimon::Error::TableNotExist { .. }) => return Ok(None),
+            Err(err) => return Err(err.into()),
+        };
+
+        let read_builder = table.new_read_builder();
+        let plan = read_builder.new_scan().plan().await?;
+        let read = read_builder.new_read()?;
+        let mut stream = read.to_arrow(plan.splits())?;
+
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            let keys = batch
+                .column_by_name(STATE_KEY_COLUMN)
+                .and_then(|c| c.as_any().downcast_ref::<BinaryArray>())
+                .ok_or_else(|| anyhow!("state table {} column is not Binary", STATE_KEY_COLUMN))?;
+            let values = batch
+                .column_by_name(STATE_VALUE_COLUMN)
+                .and_then(|c| c.as_any().downcast_ref::<BinaryArray>())
+                .ok_or_else(|| {
+                    anyhow!("state table {} column is not Binary", STATE_VALUE_COLUMN)
+                })?;
+
+            for row in 0..batch.num_rows() {
+                if keys.value(row) == state_key {
+                    return Ok(Some(values.value(row).to_vec()));
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Upsert `value` for `state_key` (last-write-wins).
+    pub async fn state_put(&self, state_key: &[u8], value: &[u8]) -> Result<()> {
+        self.write_state_row(state_key, value, RowKind::Insert)
+            .await
+    }
+
+    /// Delete the row for `state_key` (no-op when absent).
+    pub async fn state_delete(&self, state_key: &[u8]) -> Result<()> {
+        self.write_state_row(state_key, &[], RowKind::Delete).await
+    }
+
+    /// Write a single insert/delete row and commit it to the state table.
+    async fn write_state_row(&self, state_key: &[u8], value: &[u8], kind: RowKind) -> Result<()> {
+        let table = self.state_table().await?;
+        let batch = build_state_record_batch(state_key, value, kind)?;
+        let builder = table.new_write_builder();
+        let mut writer = builder.new_write()?;
+        writer.write_arrow_batch(&batch).await?;
+        let messages = writer.prepare_commit().await?;
+        builder.new_commit().commit(messages).await?;
+        Ok(())
+    }
+}
+
+/// Paimon schema for the primary-key bag-user-state table.
+fn state_paimon_schema() -> Result<PaimonSchema> {
+    let schema = PaimonSchema::builder()
+        .column(
+            STATE_KEY_COLUMN,
+            PaimonDataType::VarBinary(VarBinaryType::try_new(false, VarBinaryType::MAX_LENGTH)?),
+        )
+        .column(
+            STATE_VALUE_COLUMN,
+            PaimonDataType::VarBinary(VarBinaryType::try_new(false, VarBinaryType::MAX_LENGTH)?),
+        )
+        .primary_key([STATE_KEY_COLUMN])
+        .option("bucket", "1")
+        .build()?;
+    Ok(schema)
+}
+
+/// Build a single-row [`RecordBatch`] for the state table, carrying the
+/// `_VALUE_KIND` changelog column so inserts and deletes share one path.
+fn build_state_record_batch(state_key: &[u8], value: &[u8], kind: RowKind) -> Result<RecordBatch> {
+    let schema = ArrowSchema::new(vec![
+        ArrowField::new(STATE_KEY_COLUMN, DataType::Binary, false),
+        ArrowField::new(STATE_VALUE_COLUMN, DataType::Binary, false),
+        ArrowField::new(VALUE_KIND_FIELD_NAME, DataType::Int8, false),
+    ]);
+    let key_array = BinaryArray::from_iter_values([state_key]);
+    let value_array = BinaryArray::from_iter_values([value]);
+    let kind_array = Int8Array::from_iter_values([kind.to_value()]);
+
+    Ok(RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(key_array),
+            Arc::new(value_array),
+            Arc::new(kind_array),
+        ],
+    )?)
 }
 
 /// Reserved Paimon column holding a JSON-encoded [`WindowMetadata`] per row.
@@ -423,6 +557,13 @@ impl FlareElementStore {
 /// namespaced with a `__flare_` prefix to avoid colliding with user Beam field
 /// names.
 const WINDOW_METADATA_COLUMN: &str = "__flare_window_metadata";
+
+/// Paimon table name backing the Beam Fn bag-user-state API.
+const STATE_TABLE: &str = "__flare_state";
+
+/// Column names for the bag-user-state table.
+const STATE_KEY_COLUMN: &str = "state_key";
+const STATE_VALUE_COLUMN: &str = "value";
 
 /// Reserved Paimon column holding one canonical window key per element window.
 ///
@@ -1131,5 +1272,58 @@ mod element_store_tests {
         // isn't the right accessor, swap in whatever paimon::spec::Schema
         // exposes (e.g. `.columns()`), the intent is: 2 columns, same names.
         assert_eq!(paimon_schema.fields().len(), 2);
+    }
+
+    //  bag user state storage
+
+    #[tokio::test]
+    async fn state_put_get_delete_roundtrip() {
+        let (_dir, store) = make_store().await;
+
+        // Missing key reads back None.
+        assert!(store.state_get(b"key").await.unwrap().is_none());
+
+        // Put then get.
+        store.state_put(b"key", b"value-1").await.unwrap();
+        assert_eq!(
+            store.state_get(b"key").await.unwrap().as_deref(),
+            Some(&b"value-1"[..])
+        );
+
+        // Last write wins (deduplicate merge engine).
+        store.state_put(b"key", b"value-2").await.unwrap();
+        assert_eq!(
+            store.state_get(b"key").await.unwrap().as_deref(),
+            Some(&b"value-2"[..])
+        );
+
+        // Delete removes the key.
+        store.state_delete(b"key").await.unwrap();
+        assert!(store.state_get(b"key").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn state_is_isolated_between_keys() {
+        let (_dir, store) = make_store().await;
+
+        store.state_put(b"k1", b"one").await.unwrap();
+        store.state_put(b"k2", b"two").await.unwrap();
+
+        assert_eq!(
+            store.state_get(b"k1").await.unwrap().as_deref(),
+            Some(&b"one"[..])
+        );
+        assert_eq!(
+            store.state_get(b"k2").await.unwrap().as_deref(),
+            Some(&b"two"[..])
+        );
+
+        // Deleting one key leaves the other untouched.
+        store.state_delete(b"k1").await.unwrap();
+        assert!(store.state_get(b"k1").await.unwrap().is_none());
+        assert_eq!(
+            store.state_get(b"k2").await.unwrap().as_deref(),
+            Some(&b"two"[..])
+        );
     }
 }

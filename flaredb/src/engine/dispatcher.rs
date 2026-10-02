@@ -68,6 +68,9 @@ impl ExecutorDispatcher {
         self.channels.stream_elements();
         // Start control channel dispatcher to route responses to waiting futures.
         self.channels.stream_responses();
+        // Start state channel dispatcher to service Fn State requests against the
+        // job's element store (bag user state).
+        self.channels.state().stream_requests(self.store.clone());
         // Resolve `pickled_python` leaves through length-prefixed wrappers so the
         // runner's decoder sees the same coder graph the SDK is asked to emit.
         let mut coders = pipeline_graph.components.coders.clone();

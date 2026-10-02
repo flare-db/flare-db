@@ -45,6 +45,11 @@ impl Channels {
         self.data.clone()
     }
 
+    /// Clone the state channel so the executor can service state requests.
+    pub fn state(&self) -> StateChannel {
+        self.state.clone()
+    }
+
     /// Wait for the worker to connect its control stream.
     pub async fn wait_connected(&self) -> Result<()> {
         self.control.wait_connected().await
