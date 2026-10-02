@@ -85,10 +85,9 @@ public class FlareNexmarkLauncher {
       source = source.apply(queryName + ".Events.Log", NexmarkUtils.log(queryName + ".Events"));
     }
 
-    // Execute query transform
     @SuppressWarnings("unchecked")
     PCollection<TimestampedValue<KnownSize>> results =
-        (PCollection<TimestampedValue<KnownSize>>) source.apply(query);
+        (PCollection<TimestampedValue<KnownSize>>) (PCollection<?>) source.apply(query);
 
     // Output formatting & optional logging
     if (options.getLogResults()) {

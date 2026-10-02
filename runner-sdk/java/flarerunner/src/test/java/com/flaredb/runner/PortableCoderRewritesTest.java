@@ -14,6 +14,7 @@ import org.apache.beam.sdk.coders.Coder;
 import org.apache.beam.sdk.coders.LengthPrefixCoder;
 import org.apache.beam.sdk.coders.StringUtf8Coder;
 import org.apache.beam.sdk.coders.VarIntCoder;
+import org.apache.beam.sdk.coders.VoidCoder;
 import org.apache.beam.sdk.transforms.join.RawUnionValue;
 import org.apache.beam.sdk.transforms.join.UnionCoder;
 import org.apache.beam.sdk.util.SerializableUtils;
@@ -45,7 +46,7 @@ public class PortableCoderRewritesTest {
   @Test
   public void wrapsUnionCoderInLengthPrefixAndRetainsInnerCoder() {
     RunnerApi.Pipeline rewritten =
-        PortableCoderRewrites.wrapJoinCoders(pipelineWith("UnionCoder", unionCoder()));
+        PortableCoderRewrites.wrapOpaqueCoders(pipelineWith("UnionCoder", unionCoder()));
 
     RunnerApi.Coder wrapped = rewritten.getComponents().getCodersOrThrow("UnionCoder");
     assertEquals(PortableCoderRewrites.LENGTH_PREFIX_CODER_URN, wrapped.getSpec().getUrn());
@@ -55,22 +56,47 @@ public class PortableCoderRewritesTest {
     assertEquals(PortableCoderRewrites.JAVA_SERIALIZED_CODER_URN, inner.getSpec().getUrn());
   }
 
+  /**
+   * Regression for Nexmark Query 3: an opaque, non-self-delimiting coder (the anonymous {@code
+   * Event.CODER}, id {@code "Anonymous"}) must be wrapped so the runner can delimit it.
+   */
   @Test
-  public void leavesCodersThatAreNotSdkPrivateJoinCodersUntouched() {
+  public void wrapsOpaqueJavasdkCoderWithArbitraryId() {
+    // "Anonymous" is the exact id the SDK assigns to the Nexmark Event custom coder.
     RunnerApi.Pipeline rewritten =
-        PortableCoderRewrites.wrapJoinCoders(pipelineWith("StringUtf8Coder", StringUtf8Coder.of()));
+        PortableCoderRewrites.wrapOpaqueCoders(pipelineWith("Anonymous", StringUtf8Coder.of()));
 
-    RunnerApi.Coder coder = rewritten.getComponents().getCodersOrThrow("StringUtf8Coder");
+    RunnerApi.Coder wrapped = rewritten.getComponents().getCodersOrThrow("Anonymous");
+    assertEquals(PortableCoderRewrites.LENGTH_PREFIX_CODER_URN, wrapped.getSpec().getUrn());
+    assertEquals(Collections.singletonList("Anonymous_inner"), wrapped.getComponentCoderIdsList());
+  }
+
+  @Test
+  public void leavesVoidCoderUntouched() {
+    RunnerApi.Pipeline rewritten =
+        PortableCoderRewrites.wrapOpaqueCoders(pipelineWith("VoidCoder", VoidCoder.of()));
+
+    RunnerApi.Coder coder = rewritten.getComponents().getCodersOrThrow("VoidCoder");
     assertEquals(PortableCoderRewrites.JAVA_SERIALIZED_CODER_URN, coder.getSpec().getUrn());
-    assertFalse(rewritten.getComponents().containsCoders("StringUtf8Coder_inner"));
+    assertFalse(rewritten.getComponents().containsCoders("VoidCoder_inner"));
+  }
+
+  @Test
+  public void leavesVarIntCoderUntouched() {
+    RunnerApi.Pipeline rewritten =
+        PortableCoderRewrites.wrapOpaqueCoders(pipelineWith("VarIntCoder", VarIntCoder.of()));
+
+    RunnerApi.Coder coder = rewritten.getComponents().getCodersOrThrow("VarIntCoder");
+    assertEquals(PortableCoderRewrites.JAVA_SERIALIZED_CODER_URN, coder.getSpec().getUrn());
+    assertFalse(rewritten.getComponents().containsCoders("VarIntCoder_inner"));
   }
 
   @Test
   public void applyingTwiceIsANoOp() {
     RunnerApi.Pipeline once =
-        PortableCoderRewrites.wrapJoinCoders(pipelineWith("UnionCoder", unionCoder()));
+        PortableCoderRewrites.wrapOpaqueCoders(pipelineWith("UnionCoder", unionCoder()));
 
-    RunnerApi.Pipeline twice = PortableCoderRewrites.wrapJoinCoders(once);
+    RunnerApi.Pipeline twice = PortableCoderRewrites.wrapOpaqueCoders(once);
 
     assertEquals(once, twice);
   }
@@ -87,7 +113,7 @@ public class PortableCoderRewritesTest {
   }) // Context.OUTER models the harness's LengthPrefixCoder framing
   public void harnessRehydratesWrappedUnionCoderAndRoundTrips() throws Exception {
     RunnerApi.Pipeline rewritten =
-        PortableCoderRewrites.wrapJoinCoders(pipelineWith("UnionCoder", unionCoder()));
+        PortableCoderRewrites.wrapOpaqueCoders(pipelineWith("UnionCoder", unionCoder()));
     RehydratedComponents rehydrated = RehydratedComponents.forComponents(rewritten.getComponents());
 
     Coder<?> rehydratedCoder = rehydrated.getCoder("UnionCoder");

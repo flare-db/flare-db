@@ -4,39 +4,24 @@ import java.util.Map;
 import org.apache.beam.model.pipeline.v1.RunnerApi;
 import org.apache.beam.model.pipeline.v1.RunnerApi.Components;
 import org.apache.beam.model.pipeline.v1.RunnerApi.FunctionSpec;
-import org.apache.beam.sdk.transforms.join.CoGbkResult.CoGbkResultCoder;
-import org.apache.beam.sdk.transforms.join.UnionCoder;
-import org.apache.beam.sdk.util.SerializableUtils;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 /**
- * Rewrites SDK-private join coders that a portable runner cannot delimit into a length-prefixed
- * form the FlareDB runner can carry opaquely.
+ * Rewrites opaque, SDK-private {@code beam:coders:javasdk:0.1} coders into a length-prefixed form
+ * the FlareDB runner can carry as self-delimiting bytes.
  *
- * <p>Java's {@code CoGroupByKey} lowers to a {@code Flatten} + {@code GroupByKey} over values
- * encoded with {@link UnionCoder} (a {@code RawUnionValue} is {@code varint tag | element bytes}).
- * It is not a Beam model coder, so {@code PipelineTranslation} emits it as an opaque {@code
- * beam:coders:javasdk:0.1} blob with no {@code component_coder_ids}. The runner sees only the blob
- * and cannot tell where the value ends, so it mis-frames and desynchronizes the element stream (the
- * {@link UnionCoder} tag is a varint, not a length). {@link CoGbkResultCoder} has the same shape.
+ * <p>The runner cannot interpret an SDK-private serialized coder blob, so it treats such coders as
+ * opaque {@code VarInt(length) | bytes}. That only works if the SDK length-prefixes the value;
+ * many SDK-private coders are not self-delimiting (e.g. Java's {@code CoGroupByKey} union coders,
+ * or the Nexmark {@code Event} custom coder), which desynchronizes the element stream. Wrapping
+ * each such coder in {@code beam:coder:length_prefix:v1} makes both sides agree — the harness
+ * encodes with {@code LengthPrefixCoder.of(original)} and the runner reads opaque bytes — without
+ * forcing any wire-format change on the SDK.
  *
- * <p>The fix rewrites each such coder entry <em>in place</em> to {@code
- * beam:coder:length_prefix:v1} wrapping the original, which is retained under a derived {@code
- * "_inner"} id. Because every reference in the pipeline is by coder id, all uses (the union-table
- * {@code KvCoder} and the GBK output {@code IterableCoder}) are rewritten at once. The descriptor
- * is the single source of truth for both the SDK harness and the runner, so both sides agree: the
- * harness resolves {@code LengthPrefixCoder.of(UnionCoder)} and the runner treats the value as
- * opaque, self-delimiting bytes. No wire-format change is forced on the SDK, and the payload
- * round-trips byte-for-byte.
- *
- * <p>This mirrors the Python portable runner, which length-prefixes coders it does not understand
- * and stores them as opaque bytes (see {@code fn_api_runner/translations.py}, {@code
- * maybe_length_prefixed_and_safe_coder}).
+ * <p>Coders the runner already understands natively ({@code VoidCoder}, {@code VarIntCoder}) are
+ * left untouched to avoid double length-prefixing. This mirrors the Python portable runner's
+ * {@code maybe_length_prefixed_and_safe_coder}.
  */
 final class PortableCoderRewrites {
-
-  private static final Logger LOG = LoggerFactory.getLogger(PortableCoderRewrites.class);
 
   /** URN the Java SDK uses to transport a coder as an opaque, SDK-private serialized blob. */
   static final String JAVA_SERIALIZED_CODER_URN = "beam:coders:javasdk:0.1";
@@ -47,13 +32,22 @@ final class PortableCoderRewrites {
   /** Suffix appended to a wrapped coder id to name the retained, unwrapped inner coder. */
   static final String INNER_SUFFIX = "_inner";
 
+  /**
+   * Coder ids the runner decodes natively (rather than as length-prefixed opaque bytes), so they
+   * must not be wrapped. These match the ids the SDK assigns via {@code approximateSimpleName}.
+   */
+  private static final String VOID_CODER_ID = "VoidCoder";
+
+  private static final String VAR_INT_CODER_ID = "VarIntCoder";
+
   private PortableCoderRewrites() {}
 
   /**
-   * Returns {@code pipeline} with every SDK-private join coder wrapped in a {@code length_prefix}
-   * coder. Returns the input unchanged when there is nothing to wrap.
+   * Returns {@code pipeline} with every opaque {@code beam:coders:javasdk:0.1} coder wrapped in a
+   * {@code length_prefix} coder, except the two the runner handles natively. Returns the input
+   * unchanged when there is nothing to wrap.
    */
-  static RunnerApi.Pipeline wrapJoinCoders(RunnerApi.Pipeline pipeline) {
+  static RunnerApi.Pipeline wrapOpaqueCoders(RunnerApi.Pipeline pipeline) {
     Components components = pipeline.getComponents();
     Components.Builder builder = components.toBuilder();
     boolean wrappedAny = false;
@@ -70,7 +64,7 @@ final class PortableCoderRewrites {
       if (!coder.hasSpec() || !JAVA_SERIALIZED_CODER_URN.equals(coder.getSpec().getUrn())) {
         continue;
       }
-      if (!isSdkPrivateJoinCoder(coder)) {
+      if (isRunnerHandledCoder(id)) {
         continue;
       }
 
@@ -92,20 +86,12 @@ final class PortableCoderRewrites {
   }
 
   /**
-   * Whether {@code coder} is one of the SDK-private join coders the runner cannot delimit. Detected
-   * by deserializing the payload rather than matching the id, since ids are uniquified (e.g. {@code
-   * UnionCoder2}).
+   * Whether the runner decodes this coder id natively rather than as length-prefixed opaque bytes.
+   *
+   * <p>Matched by coder id (not payload) because that is the contract the runner itself uses: it
+   * special-cases these two ids and treats every other javasdk coder as length-prefixed bytes.
    */
-  private static boolean isSdkPrivateJoinCoder(RunnerApi.Coder coder) {
-    Object deserialized;
-    try {
-      deserialized =
-          SerializableUtils.deserializeFromByteArray(
-              coder.getSpec().getPayload().toByteArray(), "SDK-private join coder");
-    } catch (RuntimeException e) {
-      LOG.debug("Could not deserialize SDK coder payload; leaving the coder untouched", e);
-      return false;
-    }
-    return deserialized instanceof UnionCoder || deserialized instanceof CoGbkResultCoder;
+  private static boolean isRunnerHandledCoder(String id) {
+    return VOID_CODER_ID.equals(id) || VAR_INT_CODER_ID.equals(id);
   }
 }

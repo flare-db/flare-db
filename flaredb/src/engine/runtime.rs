@@ -345,6 +345,11 @@ impl BundleRuntime {
     /// payload of an `is_last` message (it only marks the input done), so a
     /// payload sent with `is_last = true` would be lost; the Java harness decodes
     /// both, so the split framing is the portable-safe choice.
+    ///
+    /// `timer_endpoints` carries the stage's inbound timer endpoints (see
+    /// [`stage_timer_endpoints`]); each is terminated with an empty
+    /// `Elements.Timers { is_last = true }` so the harness's `awaitCompletion`
+    /// (which waits for data *and* timer endpoints) can return.
     pub async fn process_input_elements(
         &self,
         input_instruction_id: String,
@@ -352,6 +357,7 @@ impl BundleRuntime {
         input_pcollection_id: String,
         input_coder_id: String,
         input_component_coder_ids: Option<Vec<String>>,
+        timer_endpoints: Vec<(String, String)>,
     ) -> anyhow::Result<()> {
         info!("Spawned task to send stage's input elements to worker");
         info!(
@@ -406,6 +412,25 @@ impl BundleRuntime {
 
         let payload = encoded.freeze();
 
+        // Terminate the stage's inbound timer endpoints before sending the data
+        // terminator, so the harness's awaited completion covers both.
+        let timers: Vec<elements::Timers> = timer_endpoints
+            .into_iter()
+            .map(|(transform_id, timer_family_id)| {
+                info!(
+                    "Terminating inbound timer endpoint: instruction_id={}, transform_id={}, timer_family_id={}",
+                    input_instruction_id, transform_id, timer_family_id
+                );
+                elements::Timers {
+                    instruction_id: input_instruction_id.clone(),
+                    transform_id,
+                    timer_family_id,
+                    timers: Vec::new(),
+                    is_last: true,
+                }
+            })
+            .collect();
+
         // Wire framing must satisfy both SDK harnesses:
         // - Python (`data_plane.py` `input_elements`) never yields the payload of an
         //   `is_last` Data message; it only marks the input done.
@@ -430,10 +455,7 @@ impl BundleRuntime {
             is_last: true,
         });
 
-        let elements = Elements {
-            data,
-            timers: Vec::new(),
-        };
+        let elements = Elements { data, timers };
 
         self.data.send_elements(elements).await?;
         info!("Finished sending input elements to worker");
@@ -662,4 +684,25 @@ pub fn stage_transforms_with_data_boundaries(
     }
 
     transforms
+}
+
+/// The inbound timer endpoints `(transform_id, timer_family_id)` a stage's harness
+/// registers for user timers (`@OnTimer`), derived from the timer families the
+/// stage's `ParDo` declares (`ParDoPayload.timer_family_specs`).
+///
+/// The SDK harness blocks in `awaitCompletion` until *every* inbound endpoint —
+/// data **and** timers — receives an `is_last`, so the runner has to terminate
+/// these explicitly; otherwise the bundle hangs even though all data was sent and
+/// all state reads were answered.
+pub fn stage_timer_endpoints(stage: &ExecutableStage) -> Vec<(String, String)> {
+    stage
+        .timers()
+        .iter()
+        .map(|timer| {
+            (
+                timer.transform().id().clone(),
+                timer.local_name().to_string(),
+            )
+        })
+        .collect()
 }

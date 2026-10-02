@@ -395,6 +395,10 @@ impl ControlChannel {
                 match response {
                     Ok(Some(response)) => {
                         let instruction_id = response.instruction_id.clone();
+                        info!(
+                            "control response received: instruction_id={} error={}",
+                            instruction_id, response.error
+                        );
                         if let Some((_, sender)) = stream.pending.remove(&instruction_id) {
                             if sender.send(response).is_err() {
                                 warn!(

@@ -13,9 +13,9 @@ use tokio::sync::{
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Response, Status};
 
-use crate::store::{
-    element_store::FlareElementStore,
-    state::{FlareStateStore, build_state_key},
+use crate::{
+    state::{BagState, StateBackend, build_state_key},
+    store::element_store::FlareElementStore,
 };
 
 pub struct StateInner {
@@ -78,6 +78,7 @@ impl BeamFnState for FlareStateService {
         Self: 'async_trait,
     {
         Box::pin(async move {
+            log::info!("BeamFnState stream connected from worker");
             *self.inner.incoming.lock().await = Some(request.into_inner());
 
             let rx = {
@@ -173,7 +174,7 @@ impl StateChannel {
     pub fn stream_requests(&self, store: Arc<FlareElementStore>) {
         let channel = self.clone();
         let task_slot = self.stream_task.clone();
-        let state_store = FlareStateStore::new(store);
+        let state_store = BagState::new(StateBackend::new(store));
 
         let join_handle = tokio::spawn(async move {
             channel.drive_state_requests(state_store).await;
@@ -182,20 +183,24 @@ impl StateChannel {
         *task_slot.lock().unwrap() = Some(join_handle);
     }
 
-    async fn drive_state_requests(&self, store: FlareStateStore) {
+    async fn drive_state_requests(&self, store: BagState) {
         info!("state request driver started");
         loop {
             match self.recv_request().await {
                 Ok(request) => {
+                    let summary = describe_request(&request);
+                    info!("state request received: {}", summary);
                     let response = handle_state_request(&store, request).await;
                     match response {
                         Ok(response) => {
+                            info!("state response sent: id={}", response.id);
                             if let Err(e) = self.send_response(response).await {
                                 warn!("failed to send state response (worker gone?): {}", e);
                                 break;
                             }
                         }
                         Err((id, error)) => {
+                            warn!("state request failed: id={} error={}", id, error);
                             let response = StateResponse {
                                 id,
                                 error,
@@ -218,12 +223,37 @@ impl StateChannel {
     }
 }
 
+/// Human-readable summary of a [`StateRequest`] for logging.
+fn describe_request(request: &StateRequest) -> String {
+    let key = match request.state_key.as_ref().and_then(|k| k.r#type.as_ref()) {
+        Some(state_key::Type::BagUserState(bag)) => format!(
+            "bag_user_state(transform_id={}, user_state_id={}, window={}B, key={}B)",
+            bag.transform_id,
+            bag.user_state_id,
+            bag.window.len(),
+            bag.key.len()
+        ),
+        Some(_) => "non-bag-user-state".to_string(),
+        None => "no-state-key".to_string(),
+    };
+    let op = match request.request {
+        Some(state_request::Request::Get(_)) => "get",
+        Some(state_request::Request::Append(_)) => "append",
+        Some(state_request::Request::Clear(_)) => "clear",
+        None => "none",
+    };
+    format!(
+        "id={} instruction_id={} op={} key={}",
+        request.id, request.instruction_id, op, key
+    )
+}
+
 /// Dispatch a single [`StateRequest`] to the bag-user-state store.
 ///
 /// Returns `Ok(response)` on success, or `Err((request_id, error))` so the
 /// caller can respond with an error matching the original request id.
 async fn handle_state_request(
-    store: &FlareStateStore,
+    store: &BagState,
     request: StateRequest,
 ) -> std::result::Result<StateResponse, (String, String)> {
     let id = request.id.clone();
@@ -250,7 +280,7 @@ async fn handle_state_request(
             if !get.continuation_token.is_empty() {
                 return Err((id, "continuation tokens are not supported".to_string()));
             }
-            match store.get_bag(&composite).await {
+            match store.get(&composite).await {
                 Ok(data) => Ok(StateResponse {
                     id,
                     error: String::new(),
@@ -263,7 +293,7 @@ async fn handle_state_request(
             }
         }
         Some(state_request::Request::Append(append)) => {
-            match store.append_bag(&composite, &append.data).await {
+            match store.append(&composite, &append.data).await {
                 Ok(()) => Ok(StateResponse {
                     id,
                     error: String::new(),
@@ -272,7 +302,7 @@ async fn handle_state_request(
                 Err(e) => Err((id, format!("append state failed: {e}"))),
             }
         }
-        Some(state_request::Request::Clear(_)) => match store.clear_bag(&composite).await {
+        Some(state_request::Request::Clear(_)) => match store.clear(&composite).await {
             Ok(()) => Ok(StateResponse {
                 id,
                 error: String::new(),
