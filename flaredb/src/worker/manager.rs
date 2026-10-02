@@ -96,6 +96,8 @@ impl WorkerManager {
 
                 cmd.arg("--add-opens=java.base/java.nio=org.apache.arrow.memory.core,ALL-UNNAMED") // arrow vector needs it
                     .arg("-Dio.netty.tryReflectionSetAccessible=true")
+                    .arg("-Dorg.slf4j.simpleLogger.defaultLogLevel=info") //debug logs
+                    //.arg("-Dorg.slf4j.simpleLogger.log.org.apache.beam.fn.harness.state=debug")
                     .arg("-cp")
                     .arg(&classpath)
                     .arg("org.apache.beam.fn.harness.FnHarness")

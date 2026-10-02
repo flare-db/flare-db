@@ -1,4 +1,9 @@
 // FlareDB Apache Beam Runner SDK.
+// ./gradlew :flaredb-runner:build        # compile + run tests
+// ./gradlew :flaredb-runner:test         # tests only
+// ./gradlew :flaredb-runner:publishToMavenLocal    # Publish to Maven Local
+// ./gradlew spotlessApply                  # spotless
+
 
 plugins {
     id 'java-library'

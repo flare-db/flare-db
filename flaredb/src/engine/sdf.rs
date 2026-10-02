@@ -12,7 +12,10 @@ use crate::{
             control::ControlResponse,
             data::{DataKey, ElementStreamPayload},
         },
-        runtime::{BundleRuntime, stage_sink_transform_id, stage_source_transform_id},
+        runtime::{
+            BundleRuntime, stage_sink_transform_id, stage_source_transform_id,
+            stage_timer_endpoints,
+        },
     },
     fusion::{
         pipeline::{ConsumerMetaData, ExecutableNode},
@@ -97,6 +100,7 @@ impl SplittableStageExecutor {
         let init_instruction_id_clone = init_instruction_id.clone();
         let init_pcollection_id = plan.initialization_stage.input_pcol().id().clone();
         let init_consumer_transform_id = stage_source_transform_id(&plan.initialization_stage);
+        let init_timer_endpoints = stage_timer_endpoints(&plan.initialization_stage);
 
         tokio::spawn(async move {
             // Send Splittable stage's input elemnts to worker
@@ -107,6 +111,7 @@ impl SplittableStageExecutor {
                     init_pcollection_id,
                     init_coder_id,
                     None,
+                    init_timer_endpoints,
                 )
                 .await
             {
@@ -211,6 +216,7 @@ impl SplittableStageExecutor {
         info!("SDF process bundle {} registered", process_descriptor_id);
 
         let process_source_transform_id = stage_source_transform_id(&plan.process_stage);
+        let process_timer_endpoints = stage_timer_endpoints(&plan.process_stage);
         let mut pending_residuals: Option<Vec<DelayedBundleApplication>> = None;
         #[allow(unused_assignments)]
         let mut final_response: Option<ProcessBundleResponse> = None;
@@ -235,6 +241,7 @@ impl SplittableStageExecutor {
                         &instruction_id,
                         &process_source_transform_id,
                         captured_bytes.clone(),
+                        &process_timer_endpoints,
                     )
                     .await?;
                 }
@@ -247,8 +254,13 @@ impl SplittableStageExecutor {
                         };
                         encoded.extend_from_slice(&application.element);
                     }
-                    self.send_raw_elements(&instruction_id, &process_source_transform_id, encoded)
-                        .await?;
+                    self.send_raw_elements(
+                        &instruction_id,
+                        &process_source_transform_id,
+                        encoded,
+                        &process_timer_endpoints,
+                    )
+                    .await?;
                 }
             }
 
@@ -355,11 +367,17 @@ impl SplittableStageExecutor {
     }
 
     /// Send raw Beam-encoded bytes to an SDF stage's source transform.
+    ///
+    /// `timer_endpoints` carries the stage's inbound timer endpoints; each is
+    /// terminated with an empty `Elements.Timers { is_last = true }` so the
+    /// harness's `awaitCompletion` (which waits for data *and* timer endpoints)
+    /// can return.
     async fn send_raw_elements(
         &self,
         instruction_id: &str,
         source_transform_id: &str,
         data: Vec<u8>,
+        timer_endpoints: &[(String, String)],
     ) -> anyhow::Result<()> {
         info!(
             "Sending SDF raw elements: instruction_id={}, transform_id={}, bytes={}",
@@ -384,9 +402,26 @@ impl SplittableStageExecutor {
             is_last: true,
         });
 
+        let timers: Vec<beam_model_rs::v1::elements::Timers> = timer_endpoints
+            .iter()
+            .map(|(transform_id, timer_family_id)| {
+                info!(
+                    "Terminating SDF inbound timer endpoint: instruction_id={}, transform_id={}, timer_family_id={}",
+                    instruction_id, transform_id, timer_family_id
+                );
+                beam_model_rs::v1::elements::Timers {
+                    instruction_id: instruction_id.to_string(),
+                    transform_id: transform_id.clone(),
+                    timer_family_id: timer_family_id.clone(),
+                    timers: Vec::new(),
+                    is_last: true,
+                }
+            })
+            .collect();
+
         let elements = beam_model_rs::v1::Elements {
             data: messages,
-            timers: Vec::new(),
+            timers,
         };
 
         self.runtime.data().send_elements(elements).await

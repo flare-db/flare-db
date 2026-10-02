@@ -120,21 +120,16 @@ impl FlareElementStore {
             .await
     }
 
-    /// Persists a batch of decoded [`WindowedValue`]s, keeping each element's
-    /// logical payload and its Beam window metadata in the same row.
+    /// Persists decoded [`WindowedValue`]s, writing each element's logical payload
+    /// and its Beam window metadata (timestamp, windows, pane) into the same row.
+    /// Metadata is stored in the reserved `__flare_window_metadata` column, so
+    /// [`scan_windowed_values`](Self::scan_windowed_values) can restore the full
+    /// `WindowedValue`; row `i` of the metadata always belongs to element `i`.
     ///
-    /// The logical element is materialized through the normal [`BeamRecord`]
-    /// path, while the timestamp, windows, and pane are written to the reserved
-    /// `__flare_window_metadata` column. Scans through
-    /// [`scan_windowed_values`](Self::scan_windowed_values) therefore recover the
-    /// full `WindowedValue` instead of only its value. Row order is preserved:
-    /// the metadata at index `i` always belongs to the element at index `i`.
-    ///
-    /// This is a no-op for empty input, which also avoids deriving a table schema
-    /// from zero rows. When the PCollection has been written to before, its
-    /// cached [`RecordTableSchema`] is reused (the metadata column is stripped and
-    /// re-appended so it is never duplicated); otherwise the schema is derived
-    /// from the decoded records.
+    /// No-op for empty input, which also avoids deriving a schema from zero rows.
+    /// When the PCollection was written before, its cached schema is reused with
+    /// the metadata column stripped and re-appended so it is never duplicated;
+    /// otherwise the schema is derived from the decoded records.
     pub async fn write_windowed_value_batch(
         &self,
         pcollection_id: &str,
@@ -174,17 +169,15 @@ impl FlareElementStore {
         self.ingest_batch(pcollection_id, schema, batch).await
     }
 
-    /// Persists a runner-produced [`RecordBatch`] and attaches one
-    /// [`WindowedValue`] of metadata per output row.
+    /// Persists a runner-built [`RecordBatch`] together with one [`WindowedValue`]
+    /// of Beam window metadata per output row.
     ///
-    /// Used by runner-native transforms (for example `GroupByKey`) that build the
-    /// logical output batch directly in Arrow yet must still carry Beam window
-    /// metadata forward. `metadata` must contain exactly one entry per row of
-    /// `batch` and in the same row order; a count mismatch is rejected rather than
-    /// silently misaligning metadata. If `batch` already carries a
-    /// `__flare_window_metadata` column, it is stored as-is and the `metadata`
-    /// argument is not appended, though the row-count check still applies. The
-    /// table schema is cached for future scans.
+    /// For runner-native transforms (e.g. `GroupByKey`) that build the logical
+    /// output directly in Arrow but must still carry Beam window metadata forward.
+    /// `metadata` must have exactly one entry per row of `batch`, in the same row
+    /// order; a count mismatch is rejected rather than silently misaligning rows.
+    /// If `batch` already carries the reserved metadata column it is stored as-is
+    /// and `metadata` is not appended. The table schema is cached for future scans.
     pub async fn write_record_batch_with_windowed_metadata(
         &self,
         pcollection_id: &str,
@@ -412,6 +405,65 @@ impl FlareElementStore {
 
     fn sanitize_pcollection_id(id: &str) -> String {
         id.replace(['/', '.', ' ', '(', ')'], "_")
+    }
+
+    // -------------------------------------------------------------------------
+    // Generic table operations
+    //
+    // Name-addressed Paimon primitives that operate on an explicit schema/table
+    // rather than a PCollection. Other storage layers (e.g. user state) build on
+    // these instead of reaching into the catalog directly.
+    // -------------------------------------------------------------------------
+
+    /// Resolve a table by its raw (unsanitized) name, creating it from `schema`
+    /// when it does not yet exist.
+    pub async fn get_or_create_table(
+        &self,
+        table_name: &str,
+        schema: PaimonSchema,
+    ) -> Result<Table> {
+        let identifier = Identifier::new(self.db_name.as_str(), table_name);
+        match self.catalog.get_table(&identifier).await {
+            Ok(table) => Ok(table),
+            Err(paimon::Error::TableNotExist { .. }) => {
+                self.catalog
+                    .create_table(&identifier, schema, false)
+                    .await?;
+                Ok(self.catalog.get_table(&identifier).await?)
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    /// Commit a single Arrow [`RecordBatch`] to `table`.
+    pub async fn write_table_batch(&self, table: &Table, batch: &RecordBatch) -> Result<()> {
+        let builder = table.new_write_builder();
+        let mut writer = builder.new_write()?;
+        writer.write_arrow_batch(batch).await?;
+        let messages = writer.prepare_commit().await?;
+        builder.new_commit().commit(messages).await?;
+        Ok(())
+    }
+
+    /// Read all committed batches of `table_name`, or an empty `Vec` when the
+    /// table does not exist (zero committed rows).
+    pub async fn read_table_batches(&self, table_name: &str) -> Result<Vec<RecordBatch>> {
+        let identifier = Identifier::new(self.db_name.as_str(), table_name);
+        let table = match self.catalog.get_table(&identifier).await {
+            Ok(table) => table,
+            Err(paimon::Error::TableNotExist { .. }) => return Ok(Vec::new()),
+            Err(err) => return Err(err.into()),
+        };
+
+        let read_builder = table.new_read_builder();
+        let plan = read_builder.new_scan().plan().await?;
+        let read = read_builder.new_read()?;
+        let mut stream = read.to_arrow(plan.splits())?;
+        let mut batches = Vec::new();
+        while let Some(batch) = stream.next().await {
+            batches.push(batch?);
+        }
+        Ok(batches)
     }
 }
 

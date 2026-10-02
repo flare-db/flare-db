@@ -10,7 +10,7 @@ use crate::{
         harness::{control::ControlResponse, data::DataKey},
         runtime::{
             BundleRuntime, runner_consumer_transform_id, runner_output_pcollection_id,
-            stage_sink_transform_id, stage_source_transform_id,
+            stage_sink_transform_id, stage_source_transform_id, stage_timer_endpoints,
         },
     },
     fusion::pipeline::{ConsumerMetaData, ExecutableNode},
@@ -112,6 +112,7 @@ impl StageExecutor {
                             let input_pcollection_id = executable_stage.input_pcol().id().clone();
                             let input_consumer_transform_id =
                                 stage_source_transform_id(&executable_stage);
+                            let input_timer_endpoints = stage_timer_endpoints(&executable_stage);
 
                             tokio::spawn(async move {
                                 if let Err(err) = input_runtime
@@ -121,6 +122,7 @@ impl StageExecutor {
                                         input_pcollection_id,
                                         input_coder_id,
                                         None,
+                                        input_timer_endpoints,
                                     )
                                     .await
                                 {
