@@ -36,7 +36,7 @@ use crate::{
     jobservice::urns::beam_urns,
     state::timer::{TimeDomain, TimerEntry, TimerKey},
     store::{
-        element_store::{FlareElementStore, ScanCollectionRequest},
+        element_store::FlareElementStore,
         record::{BeamRecord, PrimitiveValue},
     },
     transforms::FlareRunnerTransform,
@@ -364,6 +364,12 @@ impl BundleRuntime {
     /// [`stage_timer_endpoints`]); each is terminated with an empty
     /// `Elements.Timers { is_last = true }` so the harness's `awaitCompletion`
     /// (which waits for data *and* timer endpoints) can return.
+    ///
+    /// Input is read *incrementally*: the first bundle for a stage delivers the
+    /// whole input PCollection, and a later (re-run) bundle delivers only the
+    /// rows the upstream stage appended since. `consumer_transform_id` (the
+    /// stage's `.../source` id) is the reader identity for that cursor, so a
+    /// re-run never re-delivers elements the stage already saw.
     pub async fn process_input_elements(
         &self,
         input_instruction_id: String,
@@ -379,11 +385,10 @@ impl BundleRuntime {
             input_instruction_id, consumer_transform_id,
         );
 
-        let request = ScanCollectionRequest {
-            pcollection_id: input_pcollection_id.clone(),
-        };
-
-        let elements = self.store.scan_windowed_values(request).await?;
+        let elements = self
+            .store
+            .scan_windowed_values_since(&consumer_transform_id, &input_pcollection_id)
+            .await?;
         debug!("Input element coder: {}", input_coder_id);
 
         let element_coder = StandardBeamCoders::from_urn(

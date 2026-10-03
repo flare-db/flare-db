@@ -382,6 +382,7 @@ mod tests {
                 input_pcollection_ids: vec![input.to_string()],
                 output_pcollection_id: output.to_string(),
                 consumer_transfrom_id: "consumer".to_string(),
+                stage_id: "gbk-test".to_string(),
                 input_watermark,
             })
             .await

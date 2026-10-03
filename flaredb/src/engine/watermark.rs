@@ -39,9 +39,11 @@
 //!
 //! A stage is ready for a bundle when it has no main input left unproduced, no
 //! bundle in flight, and its [`StageKind`] gate is satisfied. Completing a bundle
-//! marks the stage done (for a bounded pipeline) and appends each output
-//! PCollection to its consumers' pending inputs. See [`WatermarkManager::ready_stages`],
-//! [`WatermarkManager::start_bundle`] and [`WatermarkManager::complete_bundle`].
+//! marks the stage done *and* push-wakes every consumer by marking each output
+//! PCollection pending for it; a consumer that already ran is thereby re-armed
+//! when its upstream appends more output (the streams-tables table-append signal).
+//! See [`WatermarkManager::ready_stages`], [`WatermarkManager::start_bundle`] and
+//! [`WatermarkManager::complete_bundle`].
 //!
 //! # Subscription
 //!
@@ -166,10 +168,16 @@ struct StageState {
     /// Multiset of watermark holds, keyed by hold timestamp.
     holds: BTreeMap<Timestamp, usize>,
 
-    // -- eligibility --
-    /// Main inputs not yet produced by their producer; empty means every input
-    /// is available and the stage may run.
+    /// Main inputs not yet produced by their producer *for the first time*; empty
+    /// means every input is available. This is the fan-in barrier and never
+    /// regresses once an input has been produced.
     unproduced: BTreeSet<PCollectionId>,
+    /// Main inputs whose producer has appended output that this stage has not yet
+    /// consumed. Populated on every producer bundle completion (push-wake) and
+    /// drained when the stage starts a bundle. This is what re-arms a *completed*
+    /// consumer when an upstream stage produces more output — the streams-tables
+    /// "the table was appended to, so its stream has more" signal.
+    pending: BTreeSet<PCollectionId>,
     /// A bundle for this stage is currently executing.
     in_flight: bool,
     /// The stage has completed at least one bundle.
@@ -204,11 +212,13 @@ impl StageState {
             return false;
         }
         // A stage that has never run starts once its inputs are produced; a
-        // stage that has already run runs again only when re-armed (a fired
-        // timer), or — for a watermark-gated stage — when its input watermark has
-        // advanced past the watermark at its last run.
+        // stage that has already run runs again when it is re-armed (a fired
+        // timer), has unconsumed upstream output (push-wake), or — for a
+        // watermark-gated stage — when its input watermark has advanced past the
+        // watermark at its last run.
         let has_work = if self.completed {
             self.rerun_pending
+                || !self.pending.is_empty()
                 || (self.kind == StageKind::WatermarkGated
                     && self.input > self.watermark_at_last_run)
         } else {
@@ -337,6 +347,7 @@ impl WatermarkManager {
                 output: MIN_TIMESTAMP,
                 holds: BTreeMap::new(),
                 unproduced,
+                pending: BTreeSet::new(),
                 in_flight: false,
                 completed: false,
                 rerun_pending: false,
@@ -520,7 +531,11 @@ impl WatermarkManager {
         }
         let watermark_rerun = stage_state.kind == StageKind::WatermarkGated
             && stage_state.input > stage_state.watermark_at_last_run;
-        if stage_state.completed && !stage_state.rerun_pending && !watermark_rerun {
+        if stage_state.completed
+            && !stage_state.rerun_pending
+            && !watermark_rerun
+            && stage_state.pending.is_empty()
+        {
             bail!("stage '{stage}' has already completed and is not re-armed");
         }
         if !stage_state.unproduced.is_empty() {
@@ -528,18 +543,23 @@ impl WatermarkManager {
         }
         stage_state.in_flight = true;
         stage_state.rerun_pending = false;
+        // This bundle consumes every input currently pending. Anything a producer
+        // appends while this bundle is in flight re-populates `pending` and
+        // re-arms the stage for another run.
+        stage_state.pending.clear();
         // Remember the watermark this bundle ran at, so a later advance re-arms
         // a watermark-gated stage.
         stage_state.watermark_at_last_run = stage_state.input;
         Ok(())
     }
 
-    /// Mark a bundle for `stage` complete and propagate its outputs to
-    /// consumers.
+    /// Mark a bundle for `stage` complete and propagate its outputs to consumers.
     ///
-    /// Each output PCollection is appended to its consumers' pending inputs;
-    /// the returned vector lists the consumers that became ready as a result,
-    /// sorted and deduplicated.
+    /// Push-wake: each output PCollection is recorded as appended, which removes
+    /// it from a consumer's first-run `unproduced` barrier *and* marks it pending,
+    /// so a consumer that already ran is re-armed when its upstream produces more
+    /// (the streams-tables table-append signal). The returned vector lists the
+    /// consumers that became ready as a result, sorted and deduplicated.
     pub fn complete_bundle(&mut self, stage: &str) -> Result<Vec<StageId>> {
         let outputs = {
             let stage_state = self
@@ -567,6 +587,7 @@ impl WatermarkManager {
             for consumer in consumers {
                 if let Some(consumer_state) = self.stages.get_mut(&consumer) {
                     consumer_state.unproduced.remove(&pcollection);
+                    consumer_state.pending.insert(pcollection.clone());
                     if consumer_state.is_ready() {
                         newly_ready.push(consumer);
                     }
@@ -581,12 +602,13 @@ impl WatermarkManager {
 
     /// Whether every stage is done (vacuously true when empty).
     ///
-    /// A stage is not done while it is re-armed, or while it is a completed
-    /// watermark-gated stage whose input watermark has advanced past its last run
-    /// (it still has windows to emit).
+    /// A stage is not done while it has unconsumed upstream output, is re-armed,
+    /// or is a completed watermark-gated stage whose input watermark has advanced
+    /// past its last run (it still has windows to emit).
     pub fn is_complete(&self) -> bool {
         self.stages.values().all(|stage| {
             stage.completed
+                && stage.pending.is_empty()
                 && !stage.rerun_pending
                 && !(stage.kind == StageKind::WatermarkGated
                     && stage.input > stage.watermark_at_last_run)
@@ -1231,6 +1253,51 @@ mod tests {
         assert!(!manager.ready_stages().contains(&"B".to_string()));
         manager.complete_bundle("B").unwrap();
         assert!(manager.is_complete());
+    }
+
+    #[test]
+    fn completing_a_producer_rearms_an_already_completed_consumer() {
+        let mut manager = manager(&[("A", &[], &[], &["p"]), ("B", &["p"], &[], &["q"])]);
+
+        // Both stages run once; the pipeline is done be the bounded definition.
+        manager.start_bundle("A").unwrap();
+        manager.complete_bundle("A").unwrap();
+        manager.start_bundle("B").unwrap();
+        manager.complete_bundle("B").unwrap();
+        assert!(manager.is_complete());
+
+        // A runs again (as a fired timer would): its appended output re-arms B
+        // even though B has already completed.
+        manager.mark_rerun("A").unwrap();
+        manager.start_bundle("A").unwrap();
+        assert_eq!(
+            manager.complete_bundle("A").unwrap(),
+            vec!["B".to_string()],
+            "an upstream append wakes the completed consumer"
+        );
+        assert!(!manager.is_complete());
+        assert_eq!(manager.ready_stages(), vec!["B".to_string()]);
+    }
+
+    #[test]
+    fn starting_a_bundle_drains_pending_inputs() {
+        let mut manager = manager(&[("A", &[], &[], &["p"]), ("B", &["p"], &[], &["q"])]);
+
+        manager.start_bundle("A").unwrap();
+        manager.complete_bundle("A").unwrap();
+        manager.start_bundle("B").unwrap();
+        manager.complete_bundle("B").unwrap();
+        manager.mark_rerun("A").unwrap();
+        manager.start_bundle("A").unwrap();
+        manager.complete_bundle("A").unwrap();
+        assert_eq!(manager.ready_stages(), vec!["B".to_string()]);
+
+        // Consuming the pending input clears it: with no further append, B is
+        // complete again and the pipeline terminates.
+        manager.start_bundle("B").unwrap();
+        manager.complete_bundle("B").unwrap();
+        assert!(manager.is_complete());
+        assert!(manager.ready_stages().is_empty());
     }
 
     fn runner_node(name: &str, outputs: &[&str]) -> ExecutableNode {

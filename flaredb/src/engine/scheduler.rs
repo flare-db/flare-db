@@ -708,4 +708,126 @@ mod tests {
         );
         assert_eq!(promoted[0].0, stateful_id);
     }
+
+    /// End-to-end for the M6a gap: a completed consumer re-runs when its upstream
+    /// appends again, and on that re-run it reads only the newly appended rows
+    /// (incremental cursor), not the whole input again.
+    #[tokio::test]
+    async fn a_completed_consumer_reruns_and_reads_only_newly_appended_rows() {
+        use crate::store::element_store::{FlareElementStore, ScanCollectionRequest};
+        use crate::transforms::ExecutionContext;
+        use std::sync::Arc;
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let warehouse = dir.path().to_str().expect("utf8").to_string();
+        let store = Arc::new(
+            FlareElementStore::new(warehouse, "testdb".to_string(), None)
+                .await
+                .expect("store"),
+        );
+
+        // A (source, Impulse) -> p; B (Flatten) consumes p and emits q.
+        let impulse = ExecutableNode::Runner(from_urn(
+            beam_urns::IMPULSE_TRANSFORM,
+            "A".to_string(),
+            HashMap::new(),
+            HashMap::from([("out".to_string(), "p".to_string())]),
+        ));
+        let flatten = ExecutableNode::Runner(from_urn(
+            beam_urns::FLATTEN_TRANSFORM,
+            "B".to_string(),
+            HashMap::from([("in".to_string(), "p".to_string())]),
+            HashMap::from([("out".to_string(), "q".to_string())]),
+        ));
+        let mut graph = Graph::new();
+        let a = graph.add_node(impulse);
+        let b = graph.add_node(flatten);
+        graph.add_edge(
+            a,
+            b,
+            ConsumerMetaData {
+                producer_transform_id: "A".to_string(),
+                produced_pcol_id: "p".to_string(),
+                coder_id: "c".to_string(),
+                component_coder: None,
+                consumer_transfrom_id: "B".to_string(),
+            },
+        );
+
+        let executable = graph_for_test(graph, dummy_metadata("root"));
+        let a_stage = executable.get_executable_graph()[a].id();
+        let mut scheduler = NodeScheduler::new(executable);
+
+        // One scheduling round: run every ready node once, then mark it complete.
+        // Runner transforms execute directly against the store (no SDK harness),
+        // mirroring `StageExecutor`'s runner branch.
+        async fn run_round(scheduler: &mut NodeScheduler, store: &Arc<FlareElementStore>) {
+            for (idx, node) in scheduler.next_nodes() {
+                let ExecutableNode::Runner(transform) = node else {
+                    panic!("test graph is runner-only");
+                };
+                let inputs = scheduler
+                    .input_edge_metadata(idx)
+                    .iter()
+                    .map(|meta| meta.produced_pcol_id.clone())
+                    .collect();
+                let output = scheduler
+                    .output_edge_metadata(idx)
+                    .map(|meta| meta.produced_pcol_id)
+                    .or_else(|| transform.output_pcol_ids().into_iter().next())
+                    .expect("runner output pcollection");
+                transform
+                    .execute(ExecutionContext {
+                        store: store.clone(),
+                        input_pcollection_ids: inputs,
+                        output_pcollection_id: output,
+                        consumer_transfrom_id: "test".to_string(),
+                        stage_id: transform.id(),
+                        input_watermark: i64::MAX,
+                    })
+                    .await
+                    .expect("runner execute");
+                scheduler.mark_complete(idx);
+            }
+        }
+
+        async fn output_len(store: &Arc<FlareElementStore>) -> usize {
+            store
+                .scan_windowed_values(ScanCollectionRequest {
+                    pcollection_id: "q".to_string(),
+                })
+                .await
+                .expect("scan q")
+                .len()
+        }
+
+        // First run to quiescence: A appends one element, B consumes it.
+        let mut rounds = 0;
+        while !scheduler.is_complete() {
+            run_round(&mut scheduler, &store).await;
+            rounds += 1;
+            assert!(rounds < 10, "first run did not quiesce");
+        }
+        assert_eq!(output_len(&store).await, 1);
+
+        // A re-runs (as a fired timer would): its append must re-wake the already
+        // completed B, and B's incremental read must deliver only the new element.
+        scheduler.watermarks_mut().mark_rerun(&a_stage).unwrap();
+        assert!(!scheduler.is_complete());
+
+        let mut rounds = 0;
+        while !scheduler.is_complete() {
+            run_round(&mut scheduler, &store).await;
+            rounds += 1;
+            assert!(
+                rounds < 10,
+                "re-run did not quiesce (consumer never woken?)"
+            );
+        }
+
+        // 2, not 3: exactly one new element was appended, so B re-read only new
+        // rows rather than re-emitting the whole input.
+        assert_eq!(output_len(&store).await, 2);
+    }
 }

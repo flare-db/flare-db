@@ -379,6 +379,7 @@ impl StageExecutor {
                                 input_pcollection_ids,
                                 output_pcollection_id,
                                 consumer_transfrom_id,
+                                stage_id: runner_transform.id(),
                                 input_watermark,
                             };
 

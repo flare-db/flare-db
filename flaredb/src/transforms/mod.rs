@@ -80,6 +80,10 @@ pub struct ExecutionContext {
     pub input_pcollection_ids: Vec<String>,
     pub output_pcollection_id: String,
     pub consumer_transfrom_id: String, //pub coder: String,
+    /// The owning stage's id. Stable across the stage's re-runs, so it is the
+    /// reader identity for incremental input reads: a re-run reads only the rows
+    /// its upstream appended since the previous run.
+    pub stage_id: String,
     /// The owning stage's input watermark at the start of this bundle.
     ///
     /// A windowed aggregation uses this to decide which windows are ready: Beam's
