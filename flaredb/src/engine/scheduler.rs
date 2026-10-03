@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use petgraph::Direction;
 use petgraph::graph::NodeIndex;
@@ -10,6 +10,7 @@ use crate::engine::watermark::{
     MAX_TIMESTAMP, MIN_TIMESTAMP, StageKind, WatermarkManager, format_timestamp,
 };
 use crate::fusion::pipeline::{ConsumerMetaData, ExecutableGraph, ExecutableNode};
+use crate::state::timer::TimerEntry;
 
 /// Scheduler that manages execution state for an `ExecutableGraph`.
 ///
@@ -24,14 +25,24 @@ pub struct NodeScheduler {
     watermarks: WatermarkManager,
     /// Stage id to graph node index.
     index_of: HashMap<String, NodeIndex>,
+    /// Owning stage id for each transform inside an SDK stage, used to route a
+    /// fired timer back to the stage that must run its `@OnTimer`.
+    transform_to_stage: HashMap<String, String>,
 }
 
 impl NodeScheduler {
     pub fn new(graph: ExecutableGraph) -> Self {
         let watermarks = WatermarkManager::from_executable_graph(&graph);
         let mut index_of = HashMap::new();
+        let mut transform_to_stage = HashMap::new();
         for index in graph.get_executable_graph().node_indices() {
-            index_of.insert(graph.get_executable_graph()[index].id(), index);
+            let node = &graph.get_executable_graph()[index];
+            index_of.insert(node.id(), index);
+            if let ExecutableNode::Worker(stage) = node {
+                for transform in stage.transforms() {
+                    transform_to_stage.insert(transform.id().clone(), stage.id());
+                }
+            }
         }
 
         // One-line plan summary so a job's scheduling shape is visible up front.
@@ -61,6 +72,7 @@ impl NodeScheduler {
             graph,
             watermarks,
             index_of,
+            transform_to_stage,
         }
     }
 
@@ -193,10 +205,19 @@ impl NodeScheduler {
             }
         }
 
-        assert!(
-            new.is_subset(&legacy),
-            "watermark eligibility is more permissive than the dependency rule"
-        );
+        // A completed stage may be legitimately ready again after a timer fires;
+        // the dependency rule only models first-run eligibility. So the new
+        // answer must agree on stages that have not yet run, and every
+        // dependency-ready ordinary stage must be first-run ready.
+        for index in &new {
+            let stage = graph[*index].id();
+            if !self.watermarks.is_stage_completed(&stage) {
+                assert!(
+                    legacy.contains(index),
+                    "first-run stage '{stage}' is not dependency-ready"
+                );
+            }
+        }
 
         for index in &legacy {
             let stage = graph[*index].id();
@@ -207,6 +228,27 @@ impl NodeScheduler {
                 );
             }
         }
+    }
+
+    /// Re-arm the stage that owns each due timer, and return the timers grouped
+    /// by owning stage so they can be delivered when that stage runs again.
+    ///
+    /// Timers whose transform maps to no stage are ignored (a warning is logged
+    /// by the caller).
+    pub fn promote_due_timers(&mut self, due: &[TimerEntry]) -> Vec<(String, Vec<TimerEntry>)> {
+        let mut by_stage: BTreeMap<String, Vec<TimerEntry>> = BTreeMap::new();
+        for entry in due {
+            let Some(stage) = self
+                .transform_to_stage
+                .get(&entry.key.transform_id)
+                .cloned()
+            else {
+                continue;
+            };
+            let _ = self.watermarks.mark_rerun(&stage);
+            by_stage.entry(stage).or_default().push(entry.clone());
+        }
+        by_stage.into_iter().collect()
     }
 
     /// The shared per-stage watermark and eligibility state.

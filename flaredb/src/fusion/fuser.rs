@@ -1683,8 +1683,19 @@ mod tests {
             .fuse_pipeline(initial_unfused, initial_consumers)
             .unwrap();
 
-        let _timer_stage =
+        let timer_stage =
             find_stage_with(&fused.sdk_stages(), "timer_pardo").expect("timer_pardo not found");
+        // The stage must carry the ParDo's timer family so the runner can register
+        // its timer endpoints and route set/cleared timers back to it.
+        let timer_names: Vec<String> = timer_stage
+            .timers()
+            .iter()
+            .map(|timer| timer.local_name().to_string())
+            .collect();
+        assert!(
+            timer_names.contains(&"my_timer".to_string()),
+            "stage must retain the ParDo timer family, found {timer_names:?}"
+        );
         let downstream_stage =
             find_stage_with(&fused.sdk_stages(), "downstream").expect("downstream not found");
 

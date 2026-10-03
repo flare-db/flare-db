@@ -172,8 +172,11 @@ struct StageState {
     unproduced: BTreeSet<PCollectionId>,
     /// A bundle for this stage is currently executing.
     in_flight: bool,
-    /// The stage has completed a bundle. A bounded stage runs exactly once.
+    /// The stage has completed at least one bundle.
     completed: bool,
+    /// The stage has been re-armed to run another bundle (for example by a
+    /// fired timer). Only meaningful once `completed`.
+    rerun_pending: bool,
     kind: StageKind,
     /// Input watermark the stage's work needs before it may run; only consulted
     /// for [`StageKind::WatermarkGated`]. [`MIN_TIMESTAMP`] means no gate.
@@ -193,7 +196,18 @@ impl StageState {
     /// Whether this stage may run a bundle now, given its current input
     /// watermark.
     fn is_ready(&self) -> bool {
-        if self.in_flight || self.completed || !self.unproduced.is_empty() {
+        if self.in_flight || !self.unproduced.is_empty() {
+            return false;
+        }
+        // A stage that has never run starts once its inputs are produced; a
+        // stage that has already run only runs again when re-armed (e.g. by a
+        // fired timer).
+        let has_work = if self.completed {
+            self.rerun_pending
+        } else {
+            true
+        };
+        if !has_work {
             return false;
         }
         match self.kind {
@@ -318,6 +332,7 @@ impl WatermarkManager {
                 unproduced,
                 in_flight: false,
                 completed: false,
+                rerun_pending: false,
                 kind: StageKind::default(),
                 required_watermark: MIN_TIMESTAMP,
             },
@@ -495,13 +510,14 @@ impl WatermarkManager {
         if stage_state.in_flight {
             bail!("stage '{stage}' already has a bundle in flight");
         }
-        if stage_state.completed {
-            bail!("stage '{stage}' has already completed");
+        if stage_state.completed && !stage_state.rerun_pending {
+            bail!("stage '{stage}' has already completed and is not re-armed");
         }
         if !stage_state.unproduced.is_empty() {
             bail!("stage '{stage}' still has unproduced main inputs");
         }
         stage_state.in_flight = true;
+        stage_state.rerun_pending = false;
         Ok(())
     }
 
@@ -527,6 +543,7 @@ impl WatermarkManager {
             let stage_state = self.stages.get_mut(stage).expect("checked above");
             stage_state.in_flight = false;
             stage_state.completed = true;
+            stage_state.rerun_pending = false;
         }
 
         let mut newly_ready = Vec::new();
@@ -551,7 +568,15 @@ impl WatermarkManager {
 
     /// Whether every stage has completed a bundle (vacuously true when empty).
     pub fn is_complete(&self) -> bool {
-        self.stages.values().all(|stage| stage.completed)
+        self.stages
+            .values()
+            .all(|stage| stage.completed && !stage.rerun_pending)
+    }
+
+    /// Re-arm a stage to run another bundle (e.g. after a timer fires).
+    pub fn mark_rerun(&mut self, stage: &str) -> Result<()> {
+        self.stage_mut(stage)?.rerun_pending = true;
+        Ok(())
     }
 
     /// Advance every watermark to a fixpoint and return the stages whose input
@@ -1099,6 +1124,30 @@ mod tests {
         manager.complete_bundle("A").unwrap();
         assert!(!manager.is_complete());
         manager.start_bundle("B").unwrap();
+        manager.complete_bundle("B").unwrap();
+        assert!(manager.is_complete());
+    }
+
+    #[test]
+    fn completed_stage_runs_again_only_when_rearmed() {
+        let mut manager = manager(&[("A", &[], &[], &["p"]), ("B", &["p"], &[], &["q"])]);
+
+        manager.start_bundle("A").unwrap();
+        manager.complete_bundle("A").unwrap();
+        manager.start_bundle("B").unwrap();
+        manager.complete_bundle("B").unwrap();
+        assert!(manager.is_complete());
+        assert!(!manager.ready_stages().contains(&"B".to_string()));
+
+        // Re-arming (as a fired timer does) makes it runnable and the pipeline
+        // incomplete again.
+        manager.mark_rerun("B").unwrap();
+        assert!(!manager.is_complete());
+        assert!(manager.ready_stages().contains(&"B".to_string()));
+
+        // Starting the rerun consumes the re-arm; completing finishes it.
+        manager.start_bundle("B").unwrap();
+        assert!(!manager.ready_stages().contains(&"B".to_string()));
         manager.complete_bundle("B").unwrap();
         assert!(manager.is_complete());
     }

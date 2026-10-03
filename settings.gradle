@@ -12,6 +12,7 @@ def javaModules = [
     'co-groupby-key' : 'example/co-groupby-key',
     'fixed-window'   : 'example/fixed-window',
     'sliding-window' : 'example/sliding-window',
+    'timers-example' : 'example/timers-example',
     'nexmark'        : 'benchmarks/nexmark',
 ]
 

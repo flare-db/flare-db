@@ -5,13 +5,15 @@ use crate::{
         harness::Channels,
         runtime::BundleRuntime,
         scheduler::NodeScheduler,
+        timer::TimerService,
     },
     fusion::pipeline::{ExecutableGraph, ExecutableNode},
+    state::timer::{TimerEntry, TimerStore},
     store::element_store::FlareElementStore,
 };
 use anyhow::anyhow;
 use beam_model_rs::v1::{Coder, Components};
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::task::JoinSet;
 
 /// Owns the harness channels and per-job state needed to prepare a pipeline for
@@ -21,6 +23,7 @@ pub struct ExecutorDispatcher {
     store: Arc<FlareElementStore>,
     pipeline_coders: Arc<HashMap<String, Coder>>,
     pipeline_components: Arc<Components>,
+    timer_service: Arc<TimerService>,
 }
 
 impl ExecutorDispatcher {
@@ -29,11 +32,13 @@ impl ExecutorDispatcher {
         let store_base = store_path.to_str().unwrap_or(".").to_string();
         let store =
             Arc::new(FlareElementStore::new(store_base, "pcollection".to_string(), None).await?);
+        let timer_service = Arc::new(TimerService::new(TimerStore::new(store.clone())));
         Ok(Self {
             channels,
             store,
             pipeline_coders: Arc::new(HashMap::new()),
             pipeline_components: Arc::new(Components::default()),
+            timer_service,
         })
     }
 
@@ -48,11 +53,13 @@ impl ExecutorDispatcher {
         self.channels.set_log_target(instance_id, job_id).await
     }
 
-    /// Point the element store at the job's warehouse database.
+    /// Point the element store (and timer store) at the job's warehouse database.
     pub async fn set_job_store(&mut self, job_id: &str) -> anyhow::Result<()> {
         let store_path = crate::utils::path::warehouse_dir();
         let store_base = store_path.to_str().unwrap_or(".").to_string();
-        self.store = Arc::new(FlareElementStore::new(store_base, job_id.to_string(), None).await?);
+        let store = Arc::new(FlareElementStore::new(store_base, job_id.to_string(), None).await?);
+        self.timer_service = Arc::new(TimerService::new(TimerStore::new(store.clone())));
+        self.store = store;
         Ok(())
     }
 
@@ -84,14 +91,23 @@ impl ExecutorDispatcher {
         StageExecutor::new(self.new_bundle_runtime())
     }
 
+    /// Run the executable graph to completion.
+    ///
+    /// The loop is `refresh -> ready` (via [`NodeScheduler::next_nodes`]) then
+    /// run; when no data work is ready it waits for the next processing-time
+    /// timer, fires it, and re-arms the owning stage so its `@OnTimer` runs.
     pub async fn run_pipeline(&self, scheduler: &mut NodeScheduler) -> anyhow::Result<()> {
         let mut in_flight = JoinSet::new();
+        // Timers to deliver the next time each re-armed stage runs.
+        let mut pending_timers: HashMap<String, Vec<TimerEntry>> = HashMap::new();
 
         loop {
             for (idx, node) in scheduler.next_nodes() {
                 let runtime = self.new_bundle_runtime();
                 let input_metadata = scheduler.input_edge_metadata(idx);
                 let output_metadata = scheduler.output_edge_metadata(idx);
+                let stage_id = node.id();
+                let timers = pending_timers.remove(&stage_id).unwrap_or_default();
 
                 in_flight.spawn(async move {
                     let result = if matches!(node, ExecutableNode::Splittable(_)) {
@@ -102,7 +118,7 @@ impl ExecutorDispatcher {
                     } else {
                         let mut executor = StageExecutor::new(runtime);
                         executor
-                            .execute(node, input_metadata, output_metadata)
+                            .execute_with_timers(node, input_metadata, output_metadata, timers)
                             .await
                     };
                     (idx, result)
@@ -110,12 +126,44 @@ impl ExecutorDispatcher {
             }
 
             if in_flight.is_empty() {
-                if scheduler.is_complete() {
-                    break;
+                match self.timer_service.next_processing_deadline().await? {
+                    Some(deadline) => {
+                        let now = self.timer_service.now();
+                        if now < deadline {
+                            tokio::time::sleep(Duration::from_millis((deadline - now) as u64))
+                                .await;
+                        }
+                        let due = self
+                            .timer_service
+                            .take_due_processing_time(self.timer_service.now())
+                            .await?;
+                        if due.is_empty() {
+                            if scheduler.is_complete() {
+                                break;
+                            }
+                            return Err(anyhow!(
+                                "executable graph deadlocked: timer deadline passed but nothing was due"
+                            ));
+                        }
+                        log::info!(
+                            "firing {} due processing-time timer(s): [{}]",
+                            due.len(),
+                            summarize_due_timers(&due)
+                        );
+                        for (stage, timers) in scheduler.promote_due_timers(&due) {
+                            pending_timers.entry(stage).or_default().extend(timers);
+                        }
+                        continue;
+                    }
+                    None => {
+                        if scheduler.is_complete() {
+                            break;
+                        }
+                        return Err(anyhow!(
+                            "executable graph deadlocked: no ready nodes and no in-flight work"
+                        ));
+                    }
                 }
-                return Err(anyhow!(
-                    "executable graph deadlocked: no ready nodes and no in-flight work"
-                ));
             }
 
             if let Some(joined) = in_flight.join_next().await {
@@ -127,6 +175,7 @@ impl ExecutorDispatcher {
 
         Ok(())
     }
+
     fn new_bundle_runtime(&self) -> BundleRuntime {
         BundleRuntime::new(
             self.channels.control(),
@@ -134,6 +183,29 @@ impl ExecutorDispatcher {
             self.store.clone(),
             self.pipeline_coders.clone(),
             self.pipeline_components.clone(),
+            self.timer_service.clone(),
         )
+    }
+}
+
+/// Render due timers for logging, capping a large batch so one line stays
+/// readable: up to five `transform:family@fire_ms` entries, then `+N more`.
+fn summarize_due_timers(due: &[TimerEntry]) -> String {
+    const SHOWN: usize = 5;
+    let shown = due
+        .iter()
+        .take(SHOWN)
+        .map(|timer| {
+            format!(
+                "{}:{}@{}ms",
+                timer.key.transform_id, timer.key.timer_family_id, timer.fire_timestamp
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    if due.len() > SHOWN {
+        format!("{shown}, +{} more", due.len() - SHOWN)
+    } else {
+        shown
     }
 }

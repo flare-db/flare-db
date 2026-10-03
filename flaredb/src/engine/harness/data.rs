@@ -209,8 +209,18 @@ impl DataChannel {
                             }
 
                             for timers in elements.timers {
+                                debug!(
+                                    "Routing timers from worker: instruction_id={}, transform_id={}, timer_family_id={}, is_last={}, bytes={}",
+                                    timers.instruction_id,
+                                    timers.transform_id,
+                                    timers.timer_family_id,
+                                    timers.is_last,
+                                    timers.timers.len()
+                                );
                                 let timers_key = TimersKey {
                                     instruction_id: timers.instruction_id.clone(),
+                                    transform_id: timers.transform_id.clone(),
+                                    timer_family_id: timers.timer_family_id.clone(),
                                 };
 
                                 let element_key = ElementKey::Timers(timers_key.clone());
@@ -285,6 +295,19 @@ impl DataChannel {
 
         receiver
     }
+
+    /// Receiver for a stage's inbound `Elements.Timers` chunks, keyed by
+    /// `(instruction_id, transform_id, timer_family_id)`.
+    pub fn get_timer_receiver(
+        &self,
+        key: TimersKey,
+    ) -> Arc<Mutex<UnboundedReceiver<ElementStreamPayload>>> {
+        let element_key = ElementKey::Timers(key);
+
+        let (_sender, receiver) = Self::get_or_create_stream(element_key, &self.runner_stream);
+
+        receiver
+    }
 }
 
 /// Key for routing data elements: (instruction_id, transform_id) pair.
@@ -294,12 +317,13 @@ pub struct DataKey {
     pub(crate) transform_id: String,
 }
 
-/// Key for routing timer elements: instruction_id.
+/// Key for routing timer elements: the owning instruction, transform and timer
+/// family, matching the fields of a `beam_fn_api::Elements.Timers` chunk.
 #[derive(PartialEq, Eq, Hash, Clone)]
 pub struct TimersKey {
     pub(crate) instruction_id: String,
-    // pub(crate) transform_id: String,
-    // pub(crate) timer_family_id: String,
+    pub(crate) transform_id: String,
+    pub(crate) timer_family_id: String,
 }
 
 /// Union type for routing keys: either data or timers.

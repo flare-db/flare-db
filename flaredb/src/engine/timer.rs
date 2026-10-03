@@ -93,24 +93,30 @@ impl TimerService {
             .min())
     }
 
-    /// Deliver due processing-time timers into `tx`, earliest first.
+    /// Delete and return the processing-time timers due at `now`, earliest first.
     ///
-    /// Each timer is deleted *before* it is handed off, so a timer set again by
-    /// the fired callback is a distinct new timer. Crash semantics: a crash
-    /// between delete and delivery loses the timer; delivery is at-most-once.
+    /// Deletion happens before the caller can deliver them, so a timer set again
+    /// by the fired callback is a distinct new timer. Delivery is therefore
+    /// at-most-once: a crash after deletion loses the timer.
+    pub async fn take_due_processing_time(&self, now: Timestamp) -> Result<Vec<TimerEntry>> {
+        let due = self.due_processing_time(now).await?;
+        for entry in &due {
+            self.store.delete(&entry.key.storage_key()).await?;
+        }
+        Ok(due)
+    }
+
+    /// Deliver due processing-time timers into `tx`, earliest first.
     pub async fn deliver_due_processing_time(
         &self,
         now: Timestamp,
         tx: &mpsc::UnboundedSender<Vec<TimerEntry>>,
     ) -> Result<usize> {
-        let due = self.due_processing_time(now).await?;
+        let due = self.take_due_processing_time(now).await?;
         if due.is_empty() {
             return Ok(0);
         }
         let count = due.len();
-        for entry in &due {
-            self.store.delete(&entry.key.storage_key()).await?;
-        }
         let _ = tx.send(due);
         Ok(count)
     }
@@ -246,6 +252,31 @@ mod tests {
             .unwrap();
 
         assert_eq!(service.next_processing_deadline().await.unwrap(), Some(100));
+    }
+
+    #[tokio::test]
+    async fn take_due_deletes_and_returns_in_order() {
+        let (_dir, store) = make_store().await;
+        let service = TimerService::new(store);
+
+        service
+            .set(entry(b"b", TimeDomain::ProcessingTime, 20, 20))
+            .await
+            .unwrap();
+        service
+            .set(entry(b"a", TimeDomain::ProcessingTime, 10, 10))
+            .await
+            .unwrap();
+
+        let due = service.take_due_processing_time(20).await.unwrap();
+        assert_eq!(
+            due.iter()
+                .map(|t| t.key.user_key.clone())
+                .collect::<Vec<_>>(),
+            vec![b"a".to_vec(), b"b".to_vec()]
+        );
+        // Taken timers are gone, so they never fire twice.
+        assert!(service.due_processing_time(100).await.unwrap().is_empty());
     }
 
     #[tokio::test(start_paused = true)]
