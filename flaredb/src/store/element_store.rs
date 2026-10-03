@@ -7,7 +7,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use dashmap::DashMap;
-use paimon::spec::Schema as PaimonSchema;
+use paimon::spec::{Datum, PredicateBuilder, Schema as PaimonSchema};
 use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options, Table, catalog::Identifier};
 use tokio_stream::StreamExt;
 
@@ -456,6 +456,42 @@ impl FlareElementStore {
         };
 
         let read_builder = table.new_read_builder();
+        let plan = read_builder.new_scan().plan().await?;
+        let read = read_builder.new_read()?;
+        let mut stream = read.to_arrow(plan.splits())?;
+        let mut batches = Vec::new();
+        while let Some(batch) = stream.next().await {
+            batches.push(batch?);
+        }
+        Ok(batches)
+    }
+
+    /// Read all committed batches of `table_name` whose `key_column` equals
+    /// `key`, or an empty `Vec` when the table does not exist.
+    ///
+    /// The equality predicate is pushed into Paimon scan planning (see
+    /// [`paimon::table::ReadBuilder::with_filter`]). In Paimon 0.3.0 this is
+    /// planner-level pruning: it may still return rows that only share a split
+    /// with the match, so callers must verify returned rows themselves. It is a
+    /// targeted read, not a guaranteed point lookup.
+    pub async fn read_table_batches_by_binary_key(
+        &self,
+        table_name: &str,
+        key_column: &str,
+        key: &[u8],
+    ) -> Result<Vec<RecordBatch>> {
+        let identifier = Identifier::new(self.db_name.as_str(), table_name);
+        let table = match self.catalog.get_table(&identifier).await {
+            Ok(table) => table,
+            Err(paimon::Error::TableNotExist { .. }) => return Ok(Vec::new()),
+            Err(err) => return Err(err.into()),
+        };
+
+        let predicate = PredicateBuilder::new(table.schema().fields())
+            .equal(key_column, Datum::Bytes(key.to_vec()))?;
+
+        let mut read_builder = table.new_read_builder();
+        read_builder.with_filter(predicate);
         let plan = read_builder.new_scan().plan().await?;
         let read = read_builder.new_read()?;
         let mut stream = read.to_arrow(plan.splits())?;

@@ -14,7 +14,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Response, Status};
 
 use crate::{
-    state::{BagState, StateBackend, build_state_key},
+    state::{StateBackend, UserStateAddress, UserStateKind, UserStateStore},
     store::element_store::FlareElementStore,
 };
 
@@ -174,23 +174,23 @@ impl StateChannel {
     pub fn stream_requests(&self, store: Arc<FlareElementStore>) {
         let channel = self.clone();
         let task_slot = self.stream_task.clone();
-        let state_store = BagState::new(StateBackend::new(store));
+        let backend = StateBackend::new(store);
 
         let join_handle = tokio::spawn(async move {
-            channel.drive_state_requests(state_store).await;
+            channel.drive_state_requests(backend).await;
         });
 
         *task_slot.lock().unwrap() = Some(join_handle);
     }
 
-    async fn drive_state_requests(&self, store: BagState) {
+    async fn drive_state_requests(&self, backend: StateBackend) {
         info!("state request driver started");
         loop {
             match self.recv_request().await {
                 Ok(request) => {
                     let summary = describe_request(&request);
                     info!("state request received: {}", summary);
-                    let response = handle_state_request(&store, request).await;
+                    let response = handle_state_request(&backend, request).await;
                     match response {
                         Ok(response) => {
                             info!("state response sent: id={}", response.id);
@@ -248,39 +248,35 @@ fn describe_request(request: &StateRequest) -> String {
     )
 }
 
-/// Dispatch a single [`StateRequest`] to the bag-user-state store.
+/// Dispatch a single [`StateRequest`] through the user-state abstraction.
 ///
-/// Returns `Ok(response)` on success, or `Err((request_id, error))` so the
-/// caller can respond with an error matching the original request id.
+/// `StateKey` is decoded here (transport concern) into a transport-agnostic
+/// [`UserStateAddress`]; the state layer interprets it. Unsupported key types
+/// return an error matching the original request id.
+///
 async fn handle_state_request(
-    store: &BagState,
+    backend: &StateBackend,
     request: StateRequest,
 ) -> std::result::Result<StateResponse, (String, String)> {
     let id = request.id.clone();
     let state_key = request.state_key.and_then(|k| k.r#type);
     let body = request.request;
 
-    let bag = match state_key {
-        Some(state_key::Type::BagUserState(bag)) => bag,
-        Some(_) => {
-            return Err((
-                id,
-                "unsupported state key type (only bag_user_state is supported)".to_string(),
-            ));
-        }
-        None => {
-            return Err((id, "state request has no state key".to_string()));
-        }
+    let address = match state_key {
+        Some(key) => match user_state_address(key) {
+            Ok(address) => address,
+            Err(message) => return Err((id, message)),
+        },
+        None => return Err((id, "state request has no state key".to_string())),
     };
-
-    let composite = build_state_key(&bag.transform_id, &bag.user_state_id, &bag.window, &bag.key);
+    let user_state = UserStateStore::new(backend.clone(), address);
 
     match body {
         Some(state_request::Request::Get(get)) => {
             if !get.continuation_token.is_empty() {
                 return Err((id, "continuation tokens are not supported".to_string()));
             }
-            match store.get(&composite).await {
+            match user_state.get().await {
                 Ok(data) => Ok(StateResponse {
                     id,
                     error: String::new(),
@@ -292,17 +288,16 @@ async fn handle_state_request(
                 Err(e) => Err((id, format!("get state failed: {e}"))),
             }
         }
-        Some(state_request::Request::Append(append)) => {
-            match store.append(&composite, &append.data).await {
-                Ok(()) => Ok(StateResponse {
-                    id,
-                    error: String::new(),
-                    response: Some(state_response::Response::Append(StateAppendResponse {})),
-                }),
-                Err(e) => Err((id, format!("append state failed: {e}"))),
-            }
-        }
-        Some(state_request::Request::Clear(_)) => match store.clear(&composite).await {
+        Some(state_request::Request::Append(append)) => match user_state.append(&append.data).await
+        {
+            Ok(()) => Ok(StateResponse {
+                id,
+                error: String::new(),
+                response: Some(state_response::Response::Append(StateAppendResponse {})),
+            }),
+            Err(e) => Err((id, format!("append state failed: {e}"))),
+        },
+        Some(state_request::Request::Clear(_)) => match user_state.clear().await {
             Ok(()) => Ok(StateResponse {
                 id,
                 error: String::new(),
@@ -311,5 +306,249 @@ async fn handle_state_request(
             Err(e) => Err((id, format!("clear state failed: {e}"))),
         },
         None => Err((id, "state request has no request body".to_string())),
+    }
+}
+
+/// Decode a Beam `StateKey` user-state variant into a [`UserStateAddress`].
+///
+/// Only `BagUserState` is implemented; every other variant (side inputs and the
+/// multimap/ordered-list user-state kinds) is rejected explicitly so the SDK
+/// gets a clear error instead of a silent wrong answer.
+fn user_state_address(key: state_key::Type) -> std::result::Result<UserStateAddress, String> {
+    match key {
+        state_key::Type::BagUserState(bag) => Ok(UserStateAddress::new(
+            UserStateKind::Bag,
+            bag.transform_id,
+            bag.user_state_id,
+            bag.window,
+            bag.key,
+        )),
+        other => Err(format!(
+            "unsupported state key type '{}' (only '{}' is supported)",
+            state_key_kind(&other),
+            UserStateKind::Bag.wire_name(),
+        )),
+    }
+}
+
+/// Human-readable name for a [`state_key::Type`] variant, for diagnostics.
+fn state_key_kind(key: &state_key::Type) -> &'static str {
+    match key {
+        state_key::Type::Runner(_) => "runner",
+        state_key::Type::MultimapSideInput(_) => "multimap_side_input",
+        state_key::Type::BagUserState(_) => "bag_user_state",
+        state_key::Type::IterableSideInput(_) => "iterable_side_input",
+        state_key::Type::MultimapKeysSideInput(_) => "multimap_keys_side_input",
+        state_key::Type::MultimapKeysValuesSideInput(_) => "multimap_keys_values_side_input",
+        state_key::Type::MultimapKeysUserState(_) => "multimap_keys_user_state",
+        state_key::Type::MultimapEntriesUserState(_) => "multimap_entries_user_state",
+        state_key::Type::MultimapUserState(_) => "multimap_user_state",
+        state_key::Type::OrderedListUserState(_) => "ordered_list_user_state",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::element_store::FlareElementStore;
+    use beam_model_rs::v1::{StateKey, state_key};
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    async fn make_backend() -> (tempfile::TempDir, StateBackend) {
+        let dir = tempdir().expect("failed to create tempdir warehouse");
+        let warehouse = dir
+            .path()
+            .to_str()
+            .expect("tempdir path is not valid utf8")
+            .to_string();
+        let store = FlareElementStore::new(warehouse, "testdb".to_string(), None)
+            .await
+            .expect("failed to construct FlareElementStore");
+        (dir, StateBackend::new(Arc::new(store)))
+    }
+
+    /// A `StateRequest` targeting `BagUserState` for the given window/key.
+    fn bag_request(
+        id: &str,
+        window: &[u8],
+        key: &[u8],
+        op: state_request::Request,
+    ) -> StateRequest {
+        StateRequest {
+            id: id.to_string(),
+            instruction_id: "instruction".to_string(),
+            state_key: Some(StateKey {
+                r#type: Some(state_key::Type::BagUserState(state_key::BagUserState {
+                    transform_id: "transform".to_string(),
+                    user_state_id: "state".to_string(),
+                    window: window.to_vec(),
+                    key: key.to_vec(),
+                })),
+            }),
+            request: Some(op),
+        }
+    }
+
+    fn get_op() -> state_request::Request {
+        state_request::Request::Get(beam_model_rs::v1::StateGetRequest {
+            continuation_token: Vec::new(),
+        })
+    }
+
+    fn append_op(data: &[u8]) -> state_request::Request {
+        state_request::Request::Append(beam_model_rs::v1::StateAppendRequest {
+            data: data.to_vec(),
+        })
+    }
+
+    fn clear_op() -> state_request::Request {
+        state_request::Request::Clear(beam_model_rs::v1::StateClearRequest {})
+    }
+
+    fn get_response_data(response: StateResponse) -> Vec<u8> {
+        match response.response {
+            Some(state_response::Response::Get(get)) => get.data,
+            other => panic!("expected get response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn append_then_get_concatenates() {
+        let (_dir, backend) = make_backend().await;
+
+        handle_state_request(&backend, bag_request("1", b"w", b"k", append_op(b"a")))
+            .await
+            .unwrap();
+        handle_state_request(&backend, bag_request("2", b"w", b"k", append_op(b"b")))
+            .await
+            .unwrap();
+
+        let response = handle_state_request(&backend, bag_request("3", b"w", b"k", get_op()))
+            .await
+            .unwrap();
+        assert_eq!(get_response_data(response), b"ab");
+    }
+
+    #[tokio::test]
+    async fn clear_empties_the_cell() {
+        let (_dir, backend) = make_backend().await;
+
+        handle_state_request(&backend, bag_request("1", b"w", b"k", append_op(b"data")))
+            .await
+            .unwrap();
+        handle_state_request(&backend, bag_request("2", b"w", b"k", clear_op()))
+            .await
+            .unwrap();
+
+        let response = handle_state_request(&backend, bag_request("3", b"w", b"k", get_op()))
+            .await
+            .unwrap();
+        assert!(get_response_data(response).is_empty());
+    }
+
+    #[tokio::test]
+    async fn state_is_isolated_per_window_and_key() {
+        let (_dir, backend) = make_backend().await;
+
+        handle_state_request(
+            &backend,
+            bag_request("1", b"w1", b"k", append_op(b"window-1")),
+        )
+        .await
+        .unwrap();
+        handle_state_request(
+            &backend,
+            bag_request("2", b"w2", b"k", append_op(b"window-2")),
+        )
+        .await
+        .unwrap();
+        handle_state_request(
+            &backend,
+            bag_request("3", b"w1", b"other", append_op(b"other-key")),
+        )
+        .await
+        .unwrap();
+
+        let w1 = handle_state_request(&backend, bag_request("4", b"w1", b"k", get_op()))
+            .await
+            .unwrap();
+        let w2 = handle_state_request(&backend, bag_request("5", b"w2", b"k", get_op()))
+            .await
+            .unwrap();
+        let other = handle_state_request(&backend, bag_request("6", b"w1", b"other", get_op()))
+            .await
+            .unwrap();
+
+        assert_eq!(get_response_data(w1), b"window-1");
+        assert_eq!(get_response_data(w2), b"window-2");
+        assert_eq!(get_response_data(other), b"other-key");
+    }
+
+    #[tokio::test]
+    async fn multi_element_bag_supports_value_state_shape() {
+        // The SDK harness backs ValueState/CombiningState with BagUserState; a
+        // single-element bag must round-trip as an opaque encoded value.
+        let (_dir, backend) = make_backend().await;
+
+        let encoded_value = b"\x00\x01single-value";
+        handle_state_request(
+            &backend,
+            bag_request("1", b"w", b"k", append_op(encoded_value)),
+        )
+        .await
+        .unwrap();
+
+        let response = handle_state_request(&backend, bag_request("2", b"w", b"k", get_op()))
+            .await
+            .unwrap();
+        assert_eq!(get_response_data(response), encoded_value);
+    }
+
+    #[tokio::test]
+    async fn unsupported_state_key_reports_kind_and_request_id() {
+        let (_dir, backend) = make_backend().await;
+
+        let request = StateRequest {
+            id: "req-7".to_string(),
+            instruction_id: "instruction".to_string(),
+            state_key: Some(StateKey {
+                r#type: Some(state_key::Type::MultimapUserState(
+                    state_key::MultimapUserState {
+                        transform_id: "t".to_string(),
+                        user_state_id: "s".to_string(),
+                        window: b"w".to_vec(),
+                        key: b"k".to_vec(),
+                        map_key: b"mk".to_vec(),
+                    },
+                )),
+            }),
+            request: Some(get_op()),
+        };
+
+        let (id, error) = handle_state_request(&backend, request).await.unwrap_err();
+        assert_eq!(id, "req-7");
+        assert!(
+            error.contains("multimap_user_state"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn continuation_tokens_are_rejected() {
+        let (_dir, backend) = make_backend().await;
+
+        let request = bag_request(
+            "1",
+            b"w",
+            b"k",
+            state_request::Request::Get(beam_model_rs::v1::StateGetRequest {
+                continuation_token: b"resume".to_vec(),
+            }),
+        );
+
+        let (id, error) = handle_state_request(&backend, request).await.unwrap_err();
+        assert_eq!(id, "1");
+        assert!(error.contains("continuation"), "unexpected error: {error}");
     }
 }

@@ -27,10 +27,16 @@ impl BagState {
     }
 
     /// Append `value` to the bag identified by `state_key`.
+    ///
+    /// The read-modify-write is serialized per key by [`StateBackend`], so
+    /// concurrent appends cannot lose an update.
     pub async fn append(&self, state_key: &[u8], value: &[u8]) -> Result<()> {
-        let mut current = self.backend.get(state_key).await?.unwrap_or_default();
-        current.extend_from_slice(value);
-        self.backend.put(state_key, &current).await
+        self.backend
+            .read_modify_write(state_key, |mut current| {
+                current.extend_from_slice(value);
+                current
+            })
+            .await
     }
 
     /// Remove all values for `state_key`.

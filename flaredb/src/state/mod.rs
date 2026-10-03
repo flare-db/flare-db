@@ -15,6 +15,8 @@ pub mod bag;
 pub use backend::StateBackend;
 pub use bag::BagState;
 
+use anyhow::Result;
+
 /// Deterministic composite key for a user-state entry.
 ///
 /// Every component is length-prefixed (4-byte big-endian) so distinct
@@ -41,6 +43,119 @@ pub fn build_state_key(
     out
 }
 
+/// A Beam Fn user-state kind FlareDB can serve.
+///
+/// The portable Fn API also defines `MultimapUserState`, `OrderedListUserState`,
+/// and side-input keys; those are not implemented yet and are rejected by the
+/// harness before reaching this layer.
+///
+/// Note that the SDK harness backs `ValueState`, `CombiningState`, and
+/// `SetState` with `BagUserState` on the wire (for example
+/// `BagUserState.java` asserts `stateKey.hasBagUserState()`), so `Bag` is the
+/// only kind needed to serve those DoFn state types today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserStateKind {
+    /// `StateKey.BagUserState`.
+    Bag,
+}
+
+impl UserStateKind {
+    /// The `beam_fn_api::StateKey` variant name, for diagnostics and errors.
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            Self::Bag => "bag_user_state",
+        }
+    }
+}
+
+/// Transport-agnostic address of a Beam user-state cell.
+///
+/// Decoding the Fn API `StateKey` proto into this type keeps the proto out of
+/// the state layer, mirroring how the harness owns transport framing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserStateAddress {
+    pub kind: UserStateKind,
+    pub transform_id: String,
+    pub user_state_id: String,
+    /// The window encoded in a nested context, exactly as received.
+    pub window: Vec<u8>,
+    /// The user key encoded in a nested context, exactly as received.
+    pub key: Vec<u8>,
+}
+
+impl UserStateAddress {
+    pub fn new(
+        kind: UserStateKind,
+        transform_id: String,
+        user_state_id: String,
+        window: Vec<u8>,
+        key: Vec<u8>,
+    ) -> Self {
+        Self {
+            kind,
+            transform_id,
+            user_state_id,
+            window,
+            key,
+        }
+    }
+
+    /// The opaque composite Paimon key addressing this cell.
+    pub fn composite_key(&self) -> Vec<u8> {
+        build_state_key(
+            &self.transform_id,
+            &self.user_state_id,
+            &self.window,
+            &self.key,
+        )
+    }
+}
+
+/// Dispatches a Beam user-state operation to the implementation for its kind.
+///
+/// This is the boundary between the Fn State request handler and the
+/// Paimon-backed store: the harness decodes a `StateKey` into a
+/// [`UserStateAddress`], and this type interprets it according to Beam state
+/// semantics.
+pub struct UserStateStore {
+    backend: StateBackend,
+    address: UserStateAddress,
+}
+
+impl UserStateStore {
+    pub fn new(backend: StateBackend, address: UserStateAddress) -> Self {
+        Self { backend, address }
+    }
+
+    pub fn address(&self) -> &UserStateAddress {
+        &self.address
+    }
+
+    /// Read the cell's value, or empty when unset.
+    pub async fn get(&self) -> Result<Vec<u8>> {
+        let key = self.address.composite_key();
+        match self.address.kind {
+            UserStateKind::Bag => BagState::new(self.backend.clone()).get(&key).await,
+        }
+    }
+
+    /// Append `data` to the cell (bag semantics).
+    pub async fn append(&self, data: &[u8]) -> Result<()> {
+        let key = self.address.composite_key();
+        match self.address.kind {
+            UserStateKind::Bag => BagState::new(self.backend.clone()).append(&key, data).await,
+        }
+    }
+
+    /// Clear the cell.
+    pub async fn clear(&self) -> Result<()> {
+        let key = self.address.composite_key();
+        match self.address.kind {
+            UserStateKind::Bag => BagState::new(self.backend.clone()).clear(&key).await,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -62,5 +177,22 @@ mod tests {
             build_state_key("ab", "c", b"", b""),
             build_state_key("a", "bc", b"", b"")
         );
+    }
+
+    #[test]
+    fn user_state_address_composite_key_matches_build_state_key() {
+        let address = UserStateAddress::new(
+            UserStateKind::Bag,
+            "transform".to_string(),
+            "state".to_string(),
+            b"window".to_vec(),
+            b"key".to_vec(),
+        );
+
+        assert_eq!(
+            address.composite_key(),
+            build_state_key("transform", "state", b"window", b"key")
+        );
+        assert_eq!(address.kind.wire_name(), "bag_user_state");
     }
 }

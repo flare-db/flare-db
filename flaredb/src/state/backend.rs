@@ -14,10 +14,12 @@ use std::sync::Arc;
 use anyhow::{Result, anyhow};
 use arrow_array::{Array, BinaryArray, Int8Array, RecordBatch};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+use dashmap::DashMap;
 use paimon::spec::{
     DataType as PaimonDataType, RowKind, Schema as PaimonSchema, VALUE_KIND_FIELD_NAME,
     VarBinaryType,
 };
+use tokio::sync::Mutex;
 
 use crate::store::element_store::FlareElementStore;
 
@@ -33,17 +35,32 @@ const STATE_VALUE_COLUMN: &str = "value";
 #[derive(Clone)]
 pub struct StateBackend {
     store: Arc<FlareElementStore>,
+    /// Per-key locks serializing read-modify-write of a state cell. A cell is
+    /// addressed by its composite `(transform, state id, window, key)` bytes,
+    /// so unrelated cells can be updated concurrently.
+    key_locks: Arc<DashMap<Vec<u8>, Arc<Mutex<()>>>>,
 }
 
 impl StateBackend {
     /// Wrap an element store, reusing its catalog and database for the state table.
     pub fn new(store: Arc<FlareElementStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            key_locks: Arc::new(DashMap::new()),
+        }
     }
 
     /// Read the value stored for `state_key`, or `None` when absent.
+    ///
+    /// Uses a predicate targeted at the primary key rather than scanning the
+    /// whole state table; the returned row is still verified byte-for-byte
+    /// because Paimon filter pushdown is planner-level.
     pub async fn get(&self, state_key: &[u8]) -> Result<Option<Vec<u8>>> {
-        for batch in self.store.read_table_batches(STATE_TABLE).await? {
+        for batch in self
+            .store
+            .read_table_batches_by_binary_key(STATE_TABLE, STATE_KEY_COLUMN, state_key)
+            .await?
+        {
             let keys = batch
                 .column_by_name(STATE_KEY_COLUMN)
                 .and_then(|c| c.as_any().downcast_ref::<BinaryArray>())
@@ -73,6 +90,28 @@ impl StateBackend {
     /// Delete the row for `state_key` (no-op when absent).
     pub async fn delete(&self, state_key: &[u8]) -> Result<()> {
         self.write_row(state_key, &[], RowKind::Delete).await
+    }
+
+    /// Atomically apply `update` to the value stored at `state_key`.
+    ///
+    /// Serialized per key so a concurrent read-modify-write cannot lose an
+    /// update. Paimon offers no cross-operation transaction here, so atomicity
+    /// comes from the per-key lock plus a single-row commit; `update` must be
+    /// pure.
+    pub async fn read_modify_write<F>(&self, state_key: &[u8], update: F) -> Result<()>
+    where
+        F: FnOnce(Vec<u8>) -> Vec<u8>,
+    {
+        let lock = self
+            .key_locks
+            .entry(state_key.to_vec())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        let _guard = lock.lock().await;
+
+        let current = self.get(state_key).await?.unwrap_or_default();
+        let next = update(current);
+        self.put(state_key, &next).await
     }
 
     /// Write a single insert/delete row and commit it to the user-state table.
@@ -192,5 +231,46 @@ mod tests {
             backend.get(b"k2").await.unwrap().as_deref(),
             Some(&b"two"[..])
         );
+    }
+
+    #[tokio::test]
+    async fn keyed_get_returns_the_matching_key_among_many() {
+        let (_dir, backend) = make_backend().await;
+
+        for i in 0..32u8 {
+            backend.put(&[i], &[i, i]).await.unwrap();
+        }
+
+        assert_eq!(
+            backend.get(&[7]).await.unwrap().as_deref(),
+            Some(&[7u8, 7u8][..])
+        );
+        assert!(backend.get(&[99]).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn read_modify_write_does_not_lose_concurrent_updates() {
+        let (_dir, backend) = make_backend().await;
+        let tasks = 16;
+
+        let mut handles = Vec::new();
+        for _ in 0..tasks {
+            let backend = backend.clone();
+            handles.push(tokio::spawn(async move {
+                backend
+                    .read_modify_write(b"counter", |mut current| {
+                        current.push(b'x');
+                        current
+                    })
+                    .await
+                    .unwrap();
+            }));
+        }
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        let value = backend.get(b"counter").await.unwrap().unwrap();
+        assert_eq!(value.len(), tasks, "every concurrent append must survive");
     }
 }
