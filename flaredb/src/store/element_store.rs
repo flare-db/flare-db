@@ -470,7 +470,7 @@ impl FlareElementStore {
     /// `key`, or an empty `Vec` when the table does not exist.
     ///
     /// The equality predicate is pushed into Paimon scan planning (see
-    /// [`paimon::table::ReadBuilder::with_filter`]). In Paimon 0.3.0 this is
+    /// `ReadBuilder::with_filter`). In Paimon 0.3.0 this is
     /// planner-level pruning: it may still return rows that only share a split
     /// with the match, so callers must verify returned rows themselves. It is a
     /// targeted read, not a guaranteed point lookup.

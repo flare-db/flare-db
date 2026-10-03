@@ -38,6 +38,9 @@ pub struct StateBackend {
     /// Per-key locks serializing read-modify-write of a state cell. A cell is
     /// addressed by its composite `(transform, state id, window, key)` bytes,
     /// so unrelated cells can be updated concurrently.
+    ///
+    /// Entries are retained for the process lifetime; window-expiry cleanup
+    /// (a later milestone) is expected to evict them alongside the state rows.
     key_locks: Arc<DashMap<Vec<u8>, Arc<Mutex<()>>>>,
 }
 

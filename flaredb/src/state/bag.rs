@@ -17,6 +17,7 @@ pub struct BagState {
 }
 
 impl BagState {
+    /// Wrap `backend` as Beam bag user state.
     pub fn new(backend: StateBackend) -> Self {
         Self { backend }
     }

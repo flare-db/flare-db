@@ -2,9 +2,11 @@
 //!
 //! This module owns the Beam-specific logic layered on top of the opaque
 //! key/value primitives in [`crate::store::element_store::FlareElementStore`].
-//! Each state variant interprets the shared [`build_state_key`] composite
-//! according to its Beam semantics; e.g. [`bag::BagUserState`] concatenates
-//! appended chunks into an ordered bag.
+//! The harness decodes the Fn API `StateKey` proto into a transport-agnostic
+//! [`UserStateAddress`], and [`UserStateStore`] dispatches the operation to the
+//! implementation for that state kind. Each variant interprets the shared
+//! [`build_state_key`] composite according to its Beam semantics; e.g.
+//! [`bag::BagState`] concatenates appended chunks into an ordered bag.
 //!
 //! The gRPC transport and `BeamFnState` protocol dispatch live in the `harness`
 //! module (`engine/harness/state.rs`); this module is transport-agnostic.
@@ -74,8 +76,11 @@ impl UserStateKind {
 /// the state layer, mirroring how the harness owns transport framing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserStateAddress {
+    /// Which Beam user-state kind this cell belongs to.
     pub kind: UserStateKind,
+    /// Id of the `PTransform` that owns the `StateSpec`.
     pub transform_id: String,
+    /// The `ParDoPayload.state_specs` local name identifying this state.
     pub user_state_id: String,
     /// The window encoded in a nested context, exactly as received.
     pub window: Vec<u8>,
@@ -84,6 +89,7 @@ pub struct UserStateAddress {
 }
 
 impl UserStateAddress {
+    /// Build an address from its decoded components.
     pub fn new(
         kind: UserStateKind,
         transform_id: String,
@@ -123,15 +129,23 @@ pub struct UserStateStore {
 }
 
 impl UserStateStore {
+    /// Bind `address` to `backend`.
+    ///
+    /// The backend is cheap to clone (it wraps shared handles), so a store may
+    /// be constructed per request.
     pub fn new(backend: StateBackend, address: UserStateAddress) -> Self {
         Self { backend, address }
     }
 
+    /// The address this store is bound to.
     pub fn address(&self) -> &UserStateAddress {
         &self.address
     }
 
     /// Read the cell's value, or empty when unset.
+    ///
+    /// For bag state this is the concatenation of all appended chunks, matching
+    /// the Fn State `get` contract.
     pub async fn get(&self) -> Result<Vec<u8>> {
         let key = self.address.composite_key();
         match self.address.kind {
