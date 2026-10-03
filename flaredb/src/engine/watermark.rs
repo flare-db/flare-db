@@ -1,9 +1,11 @@
-//! In-memory watermark propagation over an [`ExecutableGraph`].
+//! In-memory watermark propagation and stage eligibility over an
+//! [`ExecutableGraph`].
 //!
-//! This is a pure, self-contained component: it owns no I/O, no scheduling and
-//! no proto types. A later milestone wires it into the executor (see
-//! `docs/design/streaming-semantics.md`); for now it exists to make the
-//! propagation rules explicit and unit-testable.
+//! This is the single owner of per-stage state: watermarks, holds, and the
+//! pending/in-flight bookkeeping that decides when a stage may run a bundle.
+//! There is deliberately no second copy of this state elsewhere (for example in
+//! [`crate::engine::scheduler`]). It owns no I/O, no transform execution and no
+//! proto types; a later milestone wires external watermark reports into it.
 //!
 //! # Model
 //!
@@ -33,6 +35,14 @@
 //!
 //! All watermarks are monotonic and start at [`MIN_TIMESTAMP`].
 //!
+//! # Eligibility
+//!
+//! A stage is ready for a bundle when it has no main input left unproduced, no
+//! bundle in flight, and its [`StageKind`] gate is satisfied. Completing a bundle
+//! marks the stage done (for a bounded pipeline) and appends each output
+//! PCollection to its consumers' pending inputs. See [`WatermarkManager::ready_stages`],
+//! [`WatermarkManager::start_bundle`] and [`WatermarkManager::complete_bundle`].
+//!
 //! # Subscription
 //!
 //! [`WatermarkManager::refresh`] advances the graph to a fixpoint and returns the
@@ -40,7 +50,7 @@
 //! milestone uses that return value as the push notification that drives
 //! scheduling; this module only computes it.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use anyhow::{Result, anyhow, bail};
 use petgraph::Direction;
@@ -110,17 +120,44 @@ impl SourceState {
     }
 }
 
-/// Per-stage watermark and hold bookkeeping.
+/// How a stage becomes eligible for a bundle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StageKind {
+    /// Ready as soon as every main input has been produced. This is the bounded
+    /// case and matches the previous predecessor-complete scheduler.
+    #[default]
+    Ordinary,
+    /// Additionally waits for the input watermark to advance past the value
+    /// observed at the previous bundle. This is Prism's aggregate/stateful
+    /// readiness: such a stage must not run again until time moves.
+    WatermarkGated,
+}
+
+/// Per-stage watermark, hold and eligibility bookkeeping.
 #[derive(Debug, Clone)]
 struct StageState {
     main_inputs: Vec<PCollectionId>,
     side_inputs: Vec<PCollectionId>,
+    outputs: Vec<PCollectionId>,
     /// Present iff the stage has no main inputs, i.e. it is a source.
     source: Option<SourceState>,
     input: Timestamp,
     output: Timestamp,
     /// Multiset of watermark holds, keyed by hold timestamp.
     holds: BTreeMap<Timestamp, usize>,
+
+    // -- eligibility --
+    /// Main inputs not yet produced by their producer; empty means every input
+    /// is available and the stage may run.
+    unproduced: BTreeSet<PCollectionId>,
+    /// A bundle for this stage is currently executing.
+    in_flight: bool,
+    /// The stage has completed a bundle. A bounded stage runs exactly once.
+    completed: bool,
+    kind: StageKind,
+    /// Input watermark observed when the last bundle started; the gate for
+    /// [`StageKind::WatermarkGated`].
+    last_bundle_input: Timestamp,
 }
 
 impl StageState {
@@ -131,6 +168,18 @@ impl StageState {
     /// The earliest outstanding hold, or `None` when none are held.
     fn min_hold(&self) -> Option<Timestamp> {
         self.holds.keys().next().copied()
+    }
+
+    /// Whether this stage may run a bundle now, given its current input
+    /// watermark.
+    fn is_ready(&self) -> bool {
+        if self.in_flight || self.completed || !self.unproduced.is_empty() {
+            return false;
+        }
+        match self.kind {
+            StageKind::Ordinary => true,
+            StageKind::WatermarkGated => self.input > self.last_bundle_input,
+        }
     }
 }
 
@@ -144,6 +193,8 @@ pub struct WatermarkManager {
     stages: HashMap<StageId, StageState>,
     /// PCollection id to the id of the single stage that produces it.
     producers: HashMap<PCollectionId, StageId>,
+    /// PCollection id to the stages that consume it as a main input.
+    consumers: HashMap<PCollectionId, Vec<StageId>>,
 }
 
 impl WatermarkManager {
@@ -182,7 +233,13 @@ impl WatermarkManager {
             side_inputs.dedup();
 
             let mut outputs: Vec<PCollectionId> = node.output_pcols().into_iter().collect();
+            outputs.extend(
+                graph
+                    .edges_directed(index, Direction::Outgoing)
+                    .map(|edge| edge.weight().produced_pcol_id.clone()),
+            );
             outputs.sort();
+            outputs.dedup();
 
             manager.add_stage(node.id(), main_inputs, side_inputs, outputs);
         }
@@ -205,6 +262,12 @@ impl WatermarkManager {
         for output in &outputs {
             self.producers.insert(output.clone(), stage.clone());
         }
+        for input in &main_inputs {
+            let consumers = self.consumers.entry(input.clone()).or_default();
+            if !consumers.contains(&stage) {
+                consumers.push(stage.clone());
+            }
+        }
         let source = main_inputs.is_empty().then(SourceState::default);
         // A source has no upstream, so its input watermark is already maximal;
         // this keeps `refresh` from reporting it as newly advanced.
@@ -213,15 +276,22 @@ impl WatermarkManager {
         } else {
             MIN_TIMESTAMP
         };
+        let unproduced = main_inputs.iter().cloned().collect();
         self.stages.insert(
             stage,
             StageState {
                 main_inputs,
                 side_inputs,
+                outputs,
                 source,
                 input,
                 output: MIN_TIMESTAMP,
                 holds: BTreeMap::new(),
+                unproduced,
+                in_flight: false,
+                completed: false,
+                kind: StageKind::default(),
+                last_bundle_input: MIN_TIMESTAMP,
             },
         );
     }
@@ -323,6 +393,103 @@ impl WatermarkManager {
     pub fn pcollection_watermark(&self, pcollection: &str) -> Option<Timestamp> {
         let producer = self.producers.get(pcollection)?;
         self.output_watermark(producer)
+    }
+
+    /// The eligibility gate for a stage.
+    pub fn stage_kind(&self, stage: &str) -> Option<StageKind> {
+        self.stages.get(stage).map(|stage| stage.kind)
+    }
+
+    /// Set the eligibility gate for a stage.
+    pub fn set_stage_kind(&mut self, stage: &str, kind: StageKind) -> Result<()> {
+        self.stage_mut(stage)?.kind = kind;
+        Ok(())
+    }
+
+    /// Stages that may run a bundle now, sorted by id.
+    ///
+    /// A stage is ready when every main input has been produced, it has no
+    /// bundle in flight, it has not completed, and its [`StageKind`] gate is
+    /// satisfied. This does not reserve the stages; call [`Self::start_bundle`]
+    /// before executing each one.
+    pub fn ready_stages(&self) -> Vec<StageId> {
+        let mut ready: Vec<StageId> = self
+            .stages
+            .iter()
+            .filter(|(_, stage)| stage.is_ready())
+            .map(|(id, _)| id.clone())
+            .collect();
+        ready.sort();
+        ready
+    }
+
+    /// Mark that a bundle for `stage` has started.
+    pub fn start_bundle(&mut self, stage: &str) -> Result<()> {
+        let stage_state = self
+            .stages
+            .get_mut(stage)
+            .ok_or_else(|| anyhow!("unknown stage '{stage}'"))?;
+        if stage_state.in_flight {
+            bail!("stage '{stage}' already has a bundle in flight");
+        }
+        if stage_state.completed {
+            bail!("stage '{stage}' has already completed");
+        }
+        if !stage_state.unproduced.is_empty() {
+            bail!("stage '{stage}' still has unproduced main inputs");
+        }
+        stage_state.in_flight = true;
+        Ok(())
+    }
+
+    /// Mark a bundle for `stage` complete and propagate its outputs to
+    /// consumers.
+    ///
+    /// Each output PCollection is appended to its consumers' pending inputs;
+    /// the returned vector lists the consumers that became ready as a result,
+    /// sorted and deduplicated.
+    pub fn complete_bundle(&mut self, stage: &str) -> Result<Vec<StageId>> {
+        let (outputs, input) = {
+            let stage_state = self
+                .stages
+                .get(stage)
+                .ok_or_else(|| anyhow!("unknown stage '{stage}'"))?;
+            if !stage_state.in_flight {
+                bail!("stage '{stage}' has no bundle in flight");
+            }
+            (stage_state.outputs.clone(), stage_state.input)
+        };
+
+        {
+            let stage_state = self.stages.get_mut(stage).expect("checked above");
+            stage_state.in_flight = false;
+            stage_state.completed = true;
+            stage_state.last_bundle_input = input;
+        }
+
+        let mut newly_ready = Vec::new();
+        for pcollection in outputs {
+            let Some(consumers) = self.consumers.get(&pcollection).cloned() else {
+                continue;
+            };
+            for consumer in consumers {
+                if let Some(consumer_state) = self.stages.get_mut(&consumer) {
+                    consumer_state.unproduced.remove(&pcollection);
+                    if consumer_state.is_ready() {
+                        newly_ready.push(consumer);
+                    }
+                }
+            }
+        }
+
+        newly_ready.sort();
+        newly_ready.dedup();
+        Ok(newly_ready)
+    }
+
+    /// Whether every stage has completed a bundle (vacuously true when empty).
+    pub fn is_complete(&self) -> bool {
+        self.stages.values().all(|stage| stage.completed)
     }
 
     /// Advance every watermark to a fixpoint and return the stages whose input
@@ -618,6 +785,101 @@ mod tests {
         assert!(manager.report_source_watermark("missing", 1).is_err());
         assert!(manager.report_source_watermark("B", 1).is_err());
         assert!(manager.add_hold("missing", 1).is_err());
+    }
+
+    #[test]
+    fn stage_runs_only_after_all_inputs_are_produced() {
+        let mut manager = manager(&[
+            ("A", &[], &[], &["p"]),
+            ("B", &[], &[], &["q"]),
+            ("C", &["p", "q"], &[], &["r"]),
+        ]);
+
+        // Both roots are sources and are ready immediately.
+        assert_eq!(
+            manager.ready_stages(),
+            vec!["A".to_string(), "B".to_string()]
+        );
+        manager.start_bundle("A").unwrap();
+        manager.start_bundle("B").unwrap();
+        assert!(manager.ready_stages().is_empty());
+
+        // C still waits for "q".
+        assert!(manager.complete_bundle("A").unwrap().is_empty());
+        assert!(manager.ready_stages().is_empty());
+
+        // Completing the other producer readies the fan-in consumer.
+        assert_eq!(manager.complete_bundle("B").unwrap(), vec!["C".to_string()]);
+        assert_eq!(manager.ready_stages(), vec!["C".to_string()]);
+    }
+
+    #[test]
+    fn completing_a_bundle_readies_every_consumer() {
+        let mut manager = manager(&[
+            ("A", &[], &[], &["p1", "p2"]),
+            ("B", &["p1"], &[], &["q"]),
+            ("C", &["p2"], &[], &["r"]),
+        ]);
+
+        assert_eq!(manager.ready_stages(), vec!["A".to_string()]);
+        manager.start_bundle("A").unwrap();
+        assert_eq!(
+            manager.complete_bundle("A").unwrap(),
+            vec!["B".to_string(), "C".to_string()]
+        );
+        assert_eq!(
+            manager.ready_stages(),
+            vec!["B".to_string(), "C".to_string()]
+        );
+    }
+
+    #[test]
+    fn watermark_gated_stage_waits_for_an_advance() {
+        let mut manager = manager(&[("A", &[], &[], &["p"]), ("S", &["p"], &[], &["q"])]);
+        manager
+            .set_stage_kind("S", StageKind::WatermarkGated)
+            .unwrap();
+        assert_eq!(manager.stage_kind("S"), Some(StageKind::WatermarkGated));
+
+        manager.start_bundle("A").unwrap();
+        // No watermark reported yet, so S's input is still MIN and the gate holds.
+        assert!(manager.complete_bundle("A").unwrap().is_empty());
+        assert!(
+            manager.ready_stages().is_empty(),
+            "gated stage must wait for a watermark advance"
+        );
+
+        manager.report_source_watermark("A", 100).unwrap();
+        manager.refresh();
+        assert_eq!(manager.ready_stages(), vec!["S".to_string()]);
+    }
+
+    #[test]
+    fn bundle_lifecycle_guards_are_enforced() {
+        let mut manager = manager(&[("A", &[], &[], &["p"]), ("B", &["p"], &[], &["q"])]);
+
+        manager.start_bundle("B").unwrap_err();
+        manager.complete_bundle("A").unwrap_err();
+        manager.start_bundle("unknown").unwrap_err();
+
+        manager.start_bundle("A").unwrap();
+        manager.start_bundle("A").unwrap_err();
+        manager.complete_bundle("A").unwrap();
+        manager.start_bundle("A").unwrap_err();
+        manager.complete_bundle("A").unwrap_err();
+    }
+
+    #[test]
+    fn is_complete_once_every_stage_has_run() {
+        let mut manager = manager(&[("A", &[], &[], &["p"]), ("B", &["p"], &[], &["q"])]);
+
+        assert!(!manager.is_complete());
+        manager.start_bundle("A").unwrap();
+        manager.complete_bundle("A").unwrap();
+        assert!(!manager.is_complete());
+        manager.start_bundle("B").unwrap();
+        manager.complete_bundle("B").unwrap();
+        assert!(manager.is_complete());
     }
 
     fn runner_node(name: &str, outputs: &[&str]) -> ExecutableNode {

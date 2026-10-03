@@ -1,64 +1,73 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use petgraph::{Direction, graph::NodeIndex};
 
+use crate::engine::watermark::WatermarkManager;
 use crate::fusion::pipeline::{ConsumerMetaData, ExecutableGraph, ExecutableNode};
 
 /// Scheduler that manages execution state for an `ExecutableGraph`.
 ///
-/// Tracks executed and in-flight nodes and provides helpers to query ready
-/// nodes and edge metadata.
+/// Eligibility is delegated to [`WatermarkManager`], the single owner of
+/// per-stage pending/in-flight and watermark state. In the bounded case a node
+/// is ready once every main input PCollection has been produced by a completing
+/// predecessor; this replaces the previous all-predecessors-executed check,
+/// whose executed/in-flight bookkeeping it duplicated.
 pub struct NodeScheduler {
     graph: ExecutableGraph,
-    executed: HashSet<NodeIndex>,
-    in_flight: HashSet<NodeIndex>,
+    bookkeeping: WatermarkManager,
+    /// Stage id to graph node index.
+    index_of: HashMap<String, NodeIndex>,
 }
 
 impl NodeScheduler {
     pub fn new(graph: ExecutableGraph) -> Self {
+        let bookkeeping = WatermarkManager::from_executable_graph(&graph);
+        let mut index_of = HashMap::new();
+        for index in graph.get_executable_graph().node_indices() {
+            index_of.insert(graph.get_executable_graph()[index].id(), index);
+        }
         Self {
             graph,
-            executed: HashSet::new(),
-            in_flight: HashSet::new(),
+            bookkeeping,
+            index_of,
         }
     }
 
-    /// Returns the next ready nodes to execute.
+    /// Returns the next ready nodes to execute, ordered by stage id.
     ///
-    /// A node is considered ready when it is not in the `executed` or
-    /// `in_flight` sets and all of its predecessor nodes have been executed.
-    /// Nodes returned by this method are marked as in-flight.
+    /// A node is ready when all of its main input PCollections have been
+    /// produced and it has no bundle in flight. Nodes returned by this method
+    /// are marked as in-flight.
     pub fn next_nodes(&mut self) -> Vec<(NodeIndex, ExecutableNode)> {
         let mut next = Vec::new();
 
-        for idx in self.graph.get_executable_graph().node_indices() {
-            if self.executed.contains(&idx) || self.in_flight.contains(&idx) {
+        for stage in self.bookkeeping.ready_stages() {
+            let Some(&index) = self.index_of.get(&stage) else {
+                continue;
+            };
+            if self.bookkeeping.start_bundle(&stage).is_err() {
                 continue;
             }
-
-            let all_predecessors_executed = self
-                .graph
-                .get_executable_graph()
-                .neighbors_directed(idx, Direction::Incoming)
-                .all(|pred| self.executed.contains(&pred));
-
-            if all_predecessors_executed {
-                self.in_flight.insert(idx);
-                next.push((idx, self.graph.get_executable_graph()[idx].clone()));
-            }
-            // is
+            next.push((index, self.graph.get_executable_graph()[index].clone()));
         }
 
         next
     }
 
-    /// Marks a node as completed.
-    ///
-    /// Removes the node from the in-flight set and inserts it into the
-    /// executed set.
+    /// Marks a node as completed, propagating its outputs to consumers.
     pub fn mark_complete(&mut self, idx: NodeIndex) {
-        self.in_flight.remove(&idx);
-        self.executed.insert(idx);
+        let stage = self.graph.get_executable_graph()[idx].id();
+        let _ = self.bookkeeping.complete_bundle(&stage);
+    }
+
+    /// The shared per-stage watermark and eligibility state.
+    pub fn bookkeeping(&self) -> &WatermarkManager {
+        &self.bookkeeping
+    }
+
+    /// Mutable access to the shared per-stage watermark and eligibility state.
+    pub fn bookkeeping_mut(&mut self) -> &mut WatermarkManager {
+        &mut self.bookkeeping
     }
 
     /// Returns metadata for every incoming edge to `idx`.
@@ -100,9 +109,8 @@ impl NodeScheduler {
 
     /// Returns `true` when every node in the graph has been executed.
     pub fn is_complete(&self) -> bool {
-        self.executed.len() == self.graph.get_executable_graph().node_count()
+        self.bookkeeping.is_complete()
     }
-    // set_job_store
 }
 
 #[cfg(test)]
