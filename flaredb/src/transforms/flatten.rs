@@ -200,6 +200,7 @@ mod tests {
                 input_pcollection_ids: vec!["in-0".to_string(), "in-1".to_string()],
                 output_pcollection_id: "out".to_string(),
                 consumer_transfrom_id: "consumer".to_string(),
+                input_watermark: i64::MAX,
             })
             .await
             .expect("flatten failed");

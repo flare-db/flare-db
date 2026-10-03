@@ -41,6 +41,7 @@ impl Executor for SplittableStageExecutor {
         node: ExecutableNode,
         input_edge_metadata: Vec<ConsumerMetaData>,
         output_edge_metadata: Option<ConsumerMetaData>,
+        _input_watermark: i64,
     ) -> anyhow::Result<ControlResponse> {
         let ExecutableNode::Splittable(stage) = node else {
             return Err(anyhow!(

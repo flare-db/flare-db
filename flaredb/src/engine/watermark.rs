@@ -181,6 +181,10 @@ struct StageState {
     /// Input watermark the stage's work needs before it may run; only consulted
     /// for [`StageKind::WatermarkGated`]. [`MIN_TIMESTAMP`] means no gate.
     required_watermark: Timestamp,
+    /// The stage's input watermark when it last started a bundle. A completed
+    /// [`StageKind::WatermarkGated`] stage runs again once its input watermark
+    /// advances past this (so newly-ready windows can emit).
+    watermark_at_last_run: Timestamp,
 }
 
 impl StageState {
@@ -200,10 +204,13 @@ impl StageState {
             return false;
         }
         // A stage that has never run starts once its inputs are produced; a
-        // stage that has already run only runs again when re-armed (e.g. by a
-        // fired timer).
+        // stage that has already run runs again only when re-armed (a fired
+        // timer), or — for a watermark-gated stage — when its input watermark has
+        // advanced past the watermark at its last run.
         let has_work = if self.completed {
             self.rerun_pending
+                || (self.kind == StageKind::WatermarkGated
+                    && self.input > self.watermark_at_last_run)
         } else {
             true
         };
@@ -335,6 +342,7 @@ impl WatermarkManager {
                 rerun_pending: false,
                 kind: StageKind::default(),
                 required_watermark: MIN_TIMESTAMP,
+                watermark_at_last_run: MIN_TIMESTAMP,
             },
         );
     }
@@ -510,7 +518,9 @@ impl WatermarkManager {
         if stage_state.in_flight {
             bail!("stage '{stage}' already has a bundle in flight");
         }
-        if stage_state.completed && !stage_state.rerun_pending {
+        let watermark_rerun = stage_state.kind == StageKind::WatermarkGated
+            && stage_state.input > stage_state.watermark_at_last_run;
+        if stage_state.completed && !stage_state.rerun_pending && !watermark_rerun {
             bail!("stage '{stage}' has already completed and is not re-armed");
         }
         if !stage_state.unproduced.is_empty() {
@@ -518,6 +528,9 @@ impl WatermarkManager {
         }
         stage_state.in_flight = true;
         stage_state.rerun_pending = false;
+        // Remember the watermark this bundle ran at, so a later advance re-arms
+        // a watermark-gated stage.
+        stage_state.watermark_at_last_run = stage_state.input;
         Ok(())
     }
 
@@ -566,11 +579,18 @@ impl WatermarkManager {
         Ok(newly_ready)
     }
 
-    /// Whether every stage has completed a bundle (vacuously true when empty).
+    /// Whether every stage is done (vacuously true when empty).
+    ///
+    /// A stage is not done while it is re-armed, or while it is a completed
+    /// watermark-gated stage whose input watermark has advanced past its last run
+    /// (it still has windows to emit).
     pub fn is_complete(&self) -> bool {
-        self.stages
-            .values()
-            .all(|stage| stage.completed && !stage.rerun_pending)
+        self.stages.values().all(|stage| {
+            stage.completed
+                && !stage.rerun_pending
+                && !(stage.kind == StageKind::WatermarkGated
+                    && stage.input > stage.watermark_at_last_run)
+        })
     }
 
     /// Re-arm a stage to run another bundle (e.g. after a timer fires).
@@ -712,20 +732,41 @@ fn aggregation_required_watermark(
         return None;
     }
 
-    let allowed_lateness = graph
-        .edges_directed(index, Direction::Incoming)
-        .find_map(|edge| {
-            let pcol = components
-                .pcollections
-                .get(&edge.weight().produced_pcol_id)?;
-            let strategy = components
-                .windowing_strategies
-                .get(&pcol.windowing_strategy_id)?;
-            Some(strategy.allowed_lateness)
-        })
-        .unwrap_or(0);
+    // Read the incoming edge's windowing strategy: its window fn decides the gate
+    // and its allowed lateness extends the global-window case.
+    let mut window_fn_urn: Option<String> = None;
+    let mut allowed_lateness = 0i64;
+    for edge in graph.edges_directed(index, Direction::Incoming) {
+        let Some(pcol) = components.pcollections.get(&edge.weight().produced_pcol_id) else {
+            continue;
+        };
+        let Some(strategy) = components
+            .windowing_strategies
+            .get(&pcol.windowing_strategy_id)
+        else {
+            continue;
+        };
+        allowed_lateness = allowed_lateness.max(strategy.allowed_lateness);
+        if let Some(window_fn) = strategy.window_fn.as_ref() {
+            window_fn_urn = Some(window_fn.urn.clone());
+        }
+    }
 
-    Some(global_window_completion_watermark(allowed_lateness))
+    let is_global_window = match window_fn_urn.as_deref() {
+        Some(urn) => urn == beam_urns::GLOBAL_WINDOWS_FN,
+        // Unknown/absent window fn: keep the M2.6 global-window guarantee.
+        None => true,
+    };
+    if is_global_window {
+        // The global window has no finite end, so it becomes ready only when a
+        // finished bounded source reports `+inf` (or every partition is idle).
+        Some(global_window_completion_watermark(allowed_lateness))
+    } else {
+        // Interval windows are ready per window (`window.max_timestamp() <= input
+        // watermark`), decided inside `GroupByKey`. Run as soon as inputs are
+        // produced and re-run as the watermark advances.
+        Some(MIN_TIMESTAMP)
+    }
 }
 
 #[cfg(test)]
@@ -1006,6 +1047,46 @@ mod tests {
         manager.report_source_watermark("A", 250).unwrap();
         manager.refresh();
         assert_eq!(manager.output_watermark("S"), Some(250));
+    }
+
+    #[test]
+    fn completed_gated_stage_reruns_only_when_the_watermark_advances() {
+        let mut manager = manager(&[("A", &[], &[], &["p"]), ("S", &["p"], &[], &["q"])]);
+        manager
+            .set_stage_kind("S", StageKind::WatermarkGated)
+            .unwrap();
+        manager.set_required_watermark("S", MIN_TIMESTAMP).unwrap();
+
+        manager.start_bundle("A").unwrap();
+        manager.complete_bundle("A").unwrap();
+        manager.report_source_watermark("A", 100).unwrap();
+        manager.refresh();
+
+        // First run of the gated stage.
+        assert_eq!(manager.ready_stages(), vec!["S".to_string()]);
+        manager.start_bundle("S").unwrap();
+        manager.complete_bundle("S").unwrap();
+
+        // No watermark advance: the completed stage must not re-run.
+        manager.refresh();
+        assert!(
+            manager.ready_stages().is_empty(),
+            "a completed gated stage must not re-run without a watermark advance"
+        );
+        assert!(manager.is_complete());
+
+        // The watermark advances: the gated stage re-runs for newly-ready windows.
+        manager.report_source_watermark("A", 200).unwrap();
+        manager.refresh();
+        assert_eq!(manager.ready_stages(), vec!["S".to_string()]);
+        assert!(
+            !manager.is_complete(),
+            "a pending re-run means the graph is not complete"
+        );
+
+        manager.start_bundle("S").unwrap();
+        manager.complete_bundle("S").unwrap();
+        assert!(manager.is_complete());
     }
 
     #[test]

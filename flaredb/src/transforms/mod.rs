@@ -80,6 +80,13 @@ pub struct ExecutionContext {
     pub input_pcollection_ids: Vec<String>,
     pub output_pcollection_id: String,
     pub consumer_transfrom_id: String, //pub coder: String,
+    /// The owning stage's input watermark at the start of this bundle.
+    ///
+    /// A windowed aggregation uses this to decide which windows are ready: Beam's
+    /// default trigger (`AfterWatermark.pastEndOfWindow`) fires a window once the
+    /// input watermark reaches its end, i.e.
+    /// `window.max_timestamp_millis() <= input_watermark`.
+    pub input_watermark: i64,
 }
 pub type FlareRunnerTransform = Arc<dyn FlareTransform + Send + Sync>;
 

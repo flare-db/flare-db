@@ -45,6 +45,7 @@ pub trait Executor {
         node: ExecutableNode,
         input_edge_metadata: Vec<ConsumerMetaData>,
         output_edge_metadata: Option<ConsumerMetaData>,
+        input_watermark: i64,
     ) -> anyhow::Result<ControlResponse>;
 }
 
@@ -55,6 +56,7 @@ impl Executor for StageExecutor {
         node: ExecutableNode,
         input_edge_metadata: Vec<ConsumerMetaData>,
         output_edge_metadata: Option<ConsumerMetaData>,
+        input_watermark: i64,
     ) -> anyhow::Result<ControlResponse> {
         self.execute_node(
             node,
@@ -62,6 +64,7 @@ impl Executor for StageExecutor {
             output_edge_metadata,
             None,
             Vec::new(),
+            input_watermark,
         )
         .await
     }
@@ -75,6 +78,7 @@ impl StageExecutor {
         input_edge_metadata: Vec<ConsumerMetaData>,
         output_edge_metadata: Option<ConsumerMetaData>,
         timers: Vec<TimerEntry>,
+        input_watermark: i64,
     ) -> anyhow::Result<ControlResponse> {
         self.execute_node(
             node,
@@ -82,6 +86,7 @@ impl StageExecutor {
             output_edge_metadata,
             None,
             timers,
+            input_watermark,
         )
         .await
     }
@@ -118,6 +123,7 @@ impl StageExecutor {
         output_edge_metadata: Option<ConsumerMetaData>,
         _instruction_id: Option<String>,
         timers: Vec<TimerEntry>,
+        input_watermark: i64,
     ) -> anyhow::Result<ControlResponse> {
         match node {
             ExecutableNode::Worker(executable_stage) => {
@@ -373,6 +379,7 @@ impl StageExecutor {
                                 input_pcollection_ids,
                                 output_pcollection_id,
                                 consumer_transfrom_id,
+                                input_watermark,
                             };
 
                             runner_transform.execute(ctx).await?;

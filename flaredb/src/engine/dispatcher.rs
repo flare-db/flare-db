@@ -6,6 +6,7 @@ use crate::{
         runtime::BundleRuntime,
         scheduler::NodeScheduler,
         timer::TimerService,
+        watermark::MIN_TIMESTAMP,
     },
     fusion::pipeline::{ExecutableGraph, ExecutableNode},
     state::timer::{TimerEntry, TimerStore},
@@ -110,17 +111,29 @@ impl ExecutorDispatcher {
                 let output_metadata = scheduler.output_edge_metadata(idx);
                 let stage_id = node.id();
                 let timers = pending_timers.remove(&stage_id).unwrap_or_default();
+                // The stage's input watermark at the start of this bundle, used by
+                // windowed aggregation to decide which windows are ready.
+                let input_watermark = scheduler
+                    .watermarks()
+                    .input_watermark(&stage_id)
+                    .unwrap_or(MIN_TIMESTAMP);
 
                 in_flight.spawn(async move {
                     let result = if matches!(node, ExecutableNode::Splittable(_)) {
                         let mut executor = SplittableStageExecutor::new(runtime);
                         executor
-                            .execute(node, input_metadata, output_metadata)
+                            .execute(node, input_metadata, output_metadata, input_watermark)
                             .await
                     } else {
                         let mut executor = StageExecutor::new(runtime);
                         executor
-                            .execute_with_timers(node, input_metadata, output_metadata, timers)
+                            .execute_with_timers(
+                                node,
+                                input_metadata,
+                                output_metadata,
+                                timers,
+                                input_watermark,
+                            )
                             .await
                     };
                     (idx, result)

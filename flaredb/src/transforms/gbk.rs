@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use anyhow::{Error, anyhow};
@@ -11,7 +11,7 @@ use beam_model_rs::v1::{
 use datafusion::{
     common::TableReference,
     functions_aggregate::expr_fn::array_agg,
-    prelude::{SessionContext, col},
+    prelude::{SessionContext, col, lit},
 };
 use log::info;
 use paimon_datafusion::PaimonTableProvider;
@@ -33,14 +33,25 @@ use crate::{
 /// Runner-native implementation of Beam's `GroupByKey`.
 ///
 /// Groups input `KV<K, V>` elements by `(key, window)` and emits one
-/// `KV<K, Iterable<V>>` per group. Output metadata is derived from the group's
-/// window (max timestamp, single window, on-time pane).
+/// `KV<K, Iterable<V>>` per group, but only for windows the owning stage's input
+/// watermark has reached (Beam's default trigger, `AfterWatermark.pastEndOfWindow`:
+/// `window.max_timestamp_millis() <= input_watermark`). Output metadata is derived
+/// from the group's window (max timestamp, single window, on-time pane).
+///
+/// Emission is pruned by window: the aggregation is filtered to the ready window
+/// keys (`__flare_window_key IN (...)`), so a run only scans/aggregates rows of
+/// the windows it is about to emit rather than the whole table. Windows already
+/// emitted are remembered across runs, so re-running as the watermark advances
+/// never re-emits a window.
 #[derive(Clone)]
 pub struct GroupByKey {
     name: String,
     id: String,
     inputs: HashMap<String, String>,
     outputs: HashMap<String, String>,
+    /// Canonical window keys already emitted. The shared `Arc` survives re-runs of
+    /// this stage (the node holds one instance), so later runs skip them.
+    emitted_windows: Arc<Mutex<HashSet<String>>>,
 }
 
 #[async_trait]
@@ -63,6 +74,7 @@ impl FlareTransform for GroupByKey {
             inputs,
             outputs,
             name,
+            emitted_windows: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -90,15 +102,44 @@ impl FlareTransform for GroupByKey {
             return Ok(());
         };
 
-        // Group by (key, window): unnest `__flare_window_key` so an element in
-        // multiple windows becomes one row per window, then `array_agg` values per
-        // group.
         let session = SessionContext::new();
         let provider = PaimonTableProvider::try_new(table)?;
         session.register_table(TableReference::bare("gbk"), Arc::new(provider))?;
 
+        // Default trigger (`AfterWatermark.pastEndOfWindow`): a window is ready
+        // once the input watermark reaches its end. Keep the ready windows we have
+        // not already emitted (`emitted_windows` survives re-runs).
+        let present = discover_window_keys(&session).await?;
+        let ready: Vec<String> = {
+            let emitted = self
+                .emitted_windows
+                .lock()
+                .expect("emitted windows lock not poisoned");
+            present
+                .into_iter()
+                .filter(|key| {
+                    BeamWindow::from_canonical_key(key)
+                        .map(|window| window.max_timestamp_millis() <= ctx.input_watermark)
+                        .unwrap_or(false)
+                        && !emitted.contains(key)
+                })
+                .collect()
+        };
+
+        if ready.is_empty() {
+            info!(
+                "GroupByKey: no window ready at input watermark {} (all present windows are either not yet complete or already emitted)",
+                ctx.input_watermark
+            );
+            return Ok(());
+        }
+
+        // Prune by window key: one scan, limited to the ready windows, then
+        // `array_agg` per `(key, window)` group.
+        let ready_exprs: Vec<_> = ready.iter().map(|key| lit(key.clone())).collect();
         let df = session.table("gbk").await?;
         let df = df.unnest_columns(&[WINDOW_KEY_COLUMN])?;
+        let df = df.filter(col(WINDOW_KEY_COLUMN).in_list(ready_exprs, false))?;
         let df = df.aggregate(
             vec![col(KEY_COLUMN), col(WINDOW_KEY_COLUMN)],
             vec![array_agg(col(VALUE_COLUMN)).alias(VALUE_COLUMN)],
@@ -107,6 +148,7 @@ impl FlareTransform for GroupByKey {
 
         // Rebuild each group as a WindowedValue, deriving metadata from its window.
         let mut output: Vec<WindowedValue> = Vec::new();
+        let mut emitted_now: HashSet<String> = HashSet::new();
         for batch in batches {
             let key_column = batch
                 .column_by_name(KEY_COLUMN)
@@ -145,6 +187,7 @@ impl FlareTransform for GroupByKey {
                     row,
                 )?;
 
+                emitted_now.insert(window_key);
                 output.push(WindowedValue {
                     value: BeamRecord::GBK(BeamGbk { key, value }),
                     timestamp_millis: window.max_timestamp_millis(),
@@ -154,11 +197,30 @@ impl FlareTransform for GroupByKey {
             }
         }
 
-        info!("Executed GroupByKey: {} output groups", output.len());
+        if output.is_empty() {
+            info!(
+                "GroupByKey: {} ready window(s) produced no output groups",
+                ready.len()
+            );
+            return Ok(());
+        }
+
+        info!(
+            "Executed GroupByKey: {} output groups across {} ready window(s)",
+            output.len(),
+            emitted_now.len()
+        );
 
         ctx.store
             .write_windowed_value_batch(&ctx.output_pcollection_id, output)
             .await?;
+
+        // Remember these windows so a later run does not re-emit them.
+        let mut emitted = self
+            .emitted_windows
+            .lock()
+            .expect("emitted windows lock not poisoned");
+        emitted.extend(emitted_now);
 
         Ok(())
     }
@@ -223,6 +285,34 @@ impl FlareTransform for GroupByKey {
     }
 }
 
+/// The distinct canonical window keys present in the registered `gbk` input table.
+///
+/// Projected to the single `__flare_window_key` column and un-nested, so it does
+/// not read the element values.
+async fn discover_window_keys(session: &SessionContext) -> Result<Vec<String>, Error> {
+    let df = session.table("gbk").await?;
+    let df = df.select(vec![col(WINDOW_KEY_COLUMN)])?;
+    let df = df.unnest_columns(&[WINDOW_KEY_COLUMN])?;
+    let df = df.select(vec![col(WINDOW_KEY_COLUMN)])?;
+    let df = df.distinct()?;
+    let batches = df.collect().await?;
+
+    let mut keys = Vec::new();
+    for batch in batches {
+        let column = batch.column_by_name(WINDOW_KEY_COLUMN).ok_or_else(|| {
+            anyhow!("GroupByKey window discovery is missing the '{WINDOW_KEY_COLUMN}' column")
+        })?;
+        for row in 0..batch.num_rows() {
+            if let PrimitiveValue::String(key) =
+                primitive_value_from_array_row(column.as_ref(), column.data_type(), row)?
+            {
+                keys.push(key);
+            }
+        }
+    }
+    Ok(keys)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,12 +362,27 @@ mod tests {
             HashMap::from([("out".to_string(), output.to_string())]),
             "GroupByKey".to_string(),
         );
+        // A maximal watermark makes every window ready, as at bounded end.
+        run_gbk_with(&transform, store, input, output, i64::MAX).await;
+    }
+
+    /// Run a `GroupByKey` instance at a specific input watermark, so a test can
+    /// exercise the default-trigger readiness and the emit-once behavior across
+    /// runs (the same instance keeps its `emitted_windows` set).
+    async fn run_gbk_with(
+        transform: &GroupByKey,
+        store: &Arc<FlareElementStore>,
+        input: &str,
+        output: &str,
+        input_watermark: i64,
+    ) {
         transform
             .execute(ExecutionContext {
                 store: store.clone(),
                 input_pcollection_ids: vec![input.to_string()],
                 output_pcollection_id: output.to_string(),
                 consumer_transfrom_id: "consumer".to_string(),
+                input_watermark,
             })
             .await
             .expect("GroupByKey execute failed");
@@ -501,5 +606,62 @@ mod tests {
 
         let scanned = scan_output(&store, output).await;
         assert!(scanned.is_empty(), "expected empty output, got {scanned:?}");
+    }
+
+    /// Beam's default trigger: a window emits only once the input watermark has
+    /// reached its end, and only once ever as the watermark advances.
+    #[tokio::test]
+    async fn emits_only_windows_the_input_watermark_has_reached() {
+        let (_dir, store) = make_store().await;
+        let input = "gbk-in-readiness";
+        let output = "gbk-out-readiness";
+
+        // Two interval windows: [0, 100) has max timestamp 99, [100, 200) has 199.
+        let elements = vec![
+            kv_windowed("a", 1, vec![interval(0, 100)], 10),
+            kv_windowed("a", 2, vec![interval(100, 200)], 150),
+        ];
+        store
+            .write_windowed_value_batch(input, elements)
+            .await
+            .unwrap();
+
+        let transform = GroupByKey::with(
+            "gbk-readiness".to_string(),
+            HashMap::from([("in".to_string(), input.to_string())]),
+            HashMap::from([("out".to_string(), output.to_string())]),
+            "GroupByKey".to_string(),
+        );
+
+        // WM = 98: below both window ends, nothing is ready.
+        run_gbk_with(&transform, &store, input, output, 98).await;
+        assert!(
+            scan_output(&store, output).await.is_empty(),
+            "no window should emit before its end"
+        );
+
+        // WM = 99: the first window's end is reached (max 99 <= 99).
+        run_gbk_with(&transform, &store, input, output, 99).await;
+        let groups = collect_groups(&scan_output(&store, output).await);
+        assert_eq!(
+            groups.len(),
+            1,
+            "only the first window is ready, got {groups:?}"
+        );
+        assert_eq!(groups.get(&("a".to_string(), 0, 100)), Some(&vec![1]));
+
+        // WM = 199: the second window is now ready; the first is not re-emitted.
+        run_gbk_with(&transform, &store, input, output, 199).await;
+        let groups = collect_groups(&scan_output(&store, output).await);
+        assert_eq!(groups.len(), 2, "both windows ready, got {groups:?}");
+        assert_eq!(groups.get(&("a".to_string(), 100, 200)), Some(&vec![2]));
+
+        // Re-running at the same watermark emits nothing new (emit-once).
+        run_gbk_with(&transform, &store, input, output, 199).await;
+        assert_eq!(
+            collect_groups(&scan_output(&store, output).await).len(),
+            2,
+            "a re-run at the same watermark must not re-emit"
+        );
     }
 }
