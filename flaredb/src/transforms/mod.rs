@@ -18,6 +18,7 @@ use crate::{
 pub mod flatten;
 pub mod gbk;
 pub mod impluse;
+pub mod trigger;
 
 #[async_trait]
 pub trait FlareTransform {
@@ -84,6 +85,10 @@ pub struct ExecutionContext {
     /// reader identity for incremental input reads: a re-run reads only the rows
     /// its upstream appended since the previous run.
     pub stage_id: String,
+    /// The owning stage's input windowing strategy, when the executor could
+    /// resolve it. Runner-native transforms read its trigger, accumulation mode,
+    /// and allowed lateness (see [`trigger::TriggerSpec`]).
+    pub windowing_strategy: Option<WindowingStrategy>,
     /// The owning stage's input watermark at the start of this bundle.
     ///
     /// A windowed aggregation uses this to decide which windows are ready: Beam's

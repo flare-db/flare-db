@@ -27,7 +27,10 @@ use crate::{
             primitive_value_from_array_row,
         },
     },
-    transforms::{ExecutionContext, FlareTransform},
+    transforms::{
+        ExecutionContext, FlareTransform,
+        trigger::{TriggerContext, TriggerRunner, TriggerSpec},
+    },
 };
 
 /// Runner-native implementation of Beam's `GroupByKey`.
@@ -106,9 +109,16 @@ impl FlareTransform for GroupByKey {
         let provider = PaimonTableProvider::try_new(table)?;
         session.register_table(TableReference::bare("gbk"), Arc::new(provider))?;
 
-        // Default trigger (`AfterWatermark.pastEndOfWindow`): a window is ready
-        // once the input watermark reaches its end. Keep the ready windows we have
-        // not already emitted (`emitted_windows` survives re-runs).
+        // The owning windowing strategy's trigger decides which present windows
+        // fire now — Beam's table -> stream "ungrouping". `emitted_windows`
+        // survives re-runs so a pinned `OnceTrigger`-style firing is not repeated.
+        //
+        // The whole window is re-read each run, so the trigger is evaluated
+        // against the accumulated pane rather than element by element. That is
+        // exact for the default (`AfterWatermark.pastEndOfWindow`, one on-time
+        // firing) and for `Never`/`Always`; early/late and accumulated panes need
+        // element-level trigger state and a processing-time scheduling seam.
+        let spec = TriggerSpec::from_windowing_strategy(ctx.windowing_strategy.as_ref());
         let present = discover_window_keys(&session).await?;
         let ready: Vec<String> = {
             let emitted = self
@@ -118,10 +128,25 @@ impl FlareTransform for GroupByKey {
             present
                 .into_iter()
                 .filter(|key| {
-                    BeamWindow::from_canonical_key(key)
-                        .map(|window| window.max_timestamp_millis() <= ctx.input_watermark)
-                        .unwrap_or(false)
-                        && !emitted.contains(key)
+                    if emitted.contains(key) {
+                        return false;
+                    }
+                    let Some(window) = BeamWindow::from_canonical_key(key) else {
+                        return false;
+                    };
+                    let end = window.max_timestamp_millis();
+                    let end_of_window = end <= ctx.input_watermark;
+                    let expired = spec.earliest_completion(end) <= ctx.input_watermark;
+                    // The on-time pane always fires once the watermark passes the
+                    // window end (the closing pane), plus any later trigger-driven
+                    // firing. This keeps bounded output identical to the default
+                    // trigger even when the strategy names a non-watermark trigger.
+                    end_of_window
+                        || TriggerRunner::new(spec.trigger.clone()).should_fire(TriggerContext {
+                            end_of_window,
+                            expired,
+                            processing_time: 0,
+                        })
                 })
                 .collect()
         };
@@ -383,6 +408,7 @@ mod tests {
                 output_pcollection_id: output.to_string(),
                 consumer_transfrom_id: "consumer".to_string(),
                 stage_id: "gbk-test".to_string(),
+                windowing_strategy: None,
                 input_watermark,
             })
             .await

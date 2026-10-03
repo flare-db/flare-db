@@ -374,12 +374,26 @@ impl StageExecutor {
                     Ok(response) => {
                         if matches!(response, ControlResponse::BundleRegistered) {
                             info!("Runer bundle registred at worker");
+                            // Resolve the primary input's windowing strategy so a
+                            // runner-native transform can read its trigger.
+                            let components = self.runtime.pipeline_components();
+                            let windowing_strategy = input_pcollection_ids
+                                .first()
+                                .and_then(|id| components.pcollections.get(id))
+                                .and_then(|pcol| {
+                                    components
+                                        .windowing_strategies
+                                        .get(&pcol.windowing_strategy_id)
+                                        .cloned()
+                                });
+
                             let ctx = ExecutionContext {
                                 store: self.runtime.store().clone(),
                                 input_pcollection_ids,
                                 output_pcollection_id,
                                 consumer_transfrom_id,
                                 stage_id: runner_transform.id(),
+                                windowing_strategy,
                                 input_watermark,
                             };
 

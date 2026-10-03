@@ -200,6 +200,7 @@ mod tests {
                 output_pcollection_id: "out".to_string(),
                 consumer_transfrom_id: "consumer".to_string(),
                 stage_id: "flatten-test".to_string(),
+                windowing_strategy: None,
                 input_watermark: i64::MAX,
             })
             .await

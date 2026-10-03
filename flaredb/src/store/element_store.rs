@@ -7,7 +7,9 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use dashmap::DashMap;
-use paimon::spec::{Datum, PredicateBuilder, Schema as PaimonSchema};
+use paimon::spec::{
+    DataType as PaimonDataType, Datum, PredicateBuilder, Schema as PaimonSchema, VarBinaryType,
+};
 use paimon::{
     Catalog, CatalogOptions, FileSystemCatalog, IncrementalScanMode, Options, Table,
     catalog::Identifier,
@@ -67,6 +69,11 @@ pub struct FlareElementStore {
     /// `(reader_id, pcollection_id)`. In-memory for M6a; durable cursors are a
     /// later milestone. See [`FlareElementStore::scan_windowed_values_since`].
     cursors: Arc<DashMap<String, i64>>,
+    /// Running minimum event-time among rows committed to a PCollection since the
+    /// producer last reported. Read and cleared by the driver after each producer
+    /// bundle via [`FlareElementStore::take_commit_min_timestamp`], so a consumer
+    /// can clamp its input watermark by the oldest unconsumed input.
+    commit_min_ts: Arc<DashMap<String, i64>>,
 }
 
 impl FlareElementStore {
@@ -84,6 +91,7 @@ impl FlareElementStore {
             catalog,
             db_name,
             cursors: Arc::new(DashMap::new()),
+            commit_min_ts: Arc::new(DashMap::new()),
         })
     }
 
@@ -175,7 +183,12 @@ impl FlareElementStore {
         });
         self.registry
             .register_if_absent(pcollection_id, schema.clone());
-        self.ingest_batch(pcollection_id, schema, batch).await
+        let min_ts = values.iter().map(|value| value.timestamp_millis).min();
+        self.ingest_batch(pcollection_id, schema, batch).await?;
+        if let Some(min_ts) = min_ts {
+            self.record_commit_min_ts(pcollection_id, min_ts);
+        }
+        Ok(())
     }
 
     /// Persists a runner-built [`RecordBatch`] together with one [`WindowedValue`]
@@ -235,7 +248,12 @@ impl FlareElementStore {
         });
         self.registry
             .register_if_absent(pcollection_id, schema.clone());
-        self.ingest_batch(pcollection_id, schema, batch).await
+        let min_ts = metadata.iter().map(|value| value.timestamp_millis).min();
+        self.ingest_batch(pcollection_id, schema, batch).await?;
+        if let Some(min_ts) = min_ts {
+            self.record_commit_min_ts(pcollection_id, min_ts);
+        }
+        Ok(())
     }
 
     /// Reads every element of a PCollection together with its stored Beam window
@@ -295,22 +313,77 @@ impl FlareElementStore {
         Ok(values)
     }
 
+    /// Fold a commit's minimum event-time into the running minimum for a
+    /// PCollection, until the driver takes it.
+    fn record_commit_min_ts(&self, pcollection_id: &str, timestamp: i64) {
+        self.commit_min_ts
+            .entry(pcollection_id.to_string())
+            .and_modify(|current| *current = (*current).min(timestamp))
+            .or_insert(timestamp);
+    }
+
+    /// Take (and clear) the running minimum event-time committed to a PCollection
+    /// since the last take, or `None` when nothing with a timestamp was written.
+    pub fn take_commit_min_timestamp(&self, pcollection_id: &str) -> Option<i64> {
+        self.commit_min_ts
+            .remove(pcollection_id)
+            .map(|(_, timestamp)| timestamp)
+    }
+
     /// The cursor key for a reader's position in a PCollection's changelog.
     fn cursor_key(reader_id: &str, pcollection_id: &str) -> String {
         format!("{reader_id}\u{1}{pcollection_id}")
     }
 
-    /// The last snapshot id `reader_id` has consumed from `pcollection_id`.
-    pub fn cursor(&self, reader_id: &str, pcollection_id: &str) -> Option<i64> {
-        self.cursors
-            .get(&Self::cursor_key(reader_id, pcollection_id))
-            .map(|cursor| *cursor)
+    /// The last snapshot id `reader_id` has consumed from `pcollection_id`, or
+    /// `None` if it has never read it.
+    ///
+    /// Durable: read through the in-memory cache, falling back to the
+    /// `__flare_cursor` Paimon table so a reader's position survives a restart
+    /// (and stays consistent with the durable PCollection store).
+    pub async fn cursor(&self, reader_id: &str, pcollection_id: &str) -> Result<Option<i64>> {
+        let key = Self::cursor_key(reader_id, pcollection_id);
+        if let Some(value) = self.cursors.get(&key) {
+            return Ok(Some(*value));
+        }
+        for batch in self
+            .read_table_batches_by_binary_key(CURSOR_TABLE, CURSOR_KEY_COLUMN, key.as_bytes())
+            .await?
+        {
+            let keys = batch
+                .column_by_name(CURSOR_KEY_COLUMN)
+                .and_then(|column| column.as_any().downcast_ref::<BinaryArray>());
+            let values = batch
+                .column_by_name(CURSOR_VALUE_COLUMN)
+                .and_then(|column| column.as_any().downcast_ref::<BinaryArray>());
+            let (Some(keys), Some(values)) = (keys, values) else {
+                continue;
+            };
+            for row in 0..batch.num_rows() {
+                if keys.value(row) == key.as_bytes() {
+                    let snapshot_id: i64 = std::str::from_utf8(values.value(row))?.parse()?;
+                    self.cursors.insert(key, snapshot_id);
+                    return Ok(Some(snapshot_id));
+                }
+            }
+        }
+        Ok(None)
     }
 
-    /// Advance `reader_id`'s read cursor for `pcollection_id`.
-    pub fn set_cursor(&self, reader_id: &str, pcollection_id: &str, snapshot_id: i64) {
-        self.cursors
-            .insert(Self::cursor_key(reader_id, pcollection_id), snapshot_id);
+    /// Advance `reader_id`'s read cursor for `pcollection_id`, durably.
+    pub async fn set_cursor(
+        &self,
+        reader_id: &str,
+        pcollection_id: &str,
+        snapshot_id: i64,
+    ) -> Result<()> {
+        let key = Self::cursor_key(reader_id, pcollection_id);
+        self.cursors.insert(key.clone(), snapshot_id);
+        let table = self
+            .get_or_create_table(CURSOR_TABLE, cursor_paimon_schema()?)
+            .await?;
+        let batch = build_cursor_record_batch(key.as_bytes(), snapshot_id.to_string().as_bytes())?;
+        self.write_table_batch(&table, &batch).await
     }
 
     /// The latest committed snapshot id of a PCollection's Paimon table, or `None`
@@ -389,7 +462,7 @@ impl FlareElementStore {
         let Some(table_schema) = self.registry.get(pcollection_id) else {
             return Ok(Vec::new());
         };
-        let cursor = self.cursor(reader_id, pcollection_id);
+        let cursor = self.cursor(reader_id, pcollection_id).await?;
         let (batches, latest) = self
             .read_incremental_batches(pcollection_id, cursor)
             .await?;
@@ -398,7 +471,7 @@ impl FlareElementStore {
             values.extend(windowed_values_from_batch(batch, &table_schema)?);
         }
         if let Some(latest) = latest {
-            self.set_cursor(reader_id, pcollection_id, latest);
+            self.set_cursor(reader_id, pcollection_id, latest).await?;
         }
         Ok(values)
     }
@@ -413,7 +486,7 @@ impl FlareElementStore {
         let Some(table_schema) = self.registry.get(pcollection_id) else {
             return Ok(Vec::new());
         };
-        let cursor = self.cursor(reader_id, pcollection_id);
+        let cursor = self.cursor(reader_id, pcollection_id).await?;
         let (batches, latest) = self
             .read_incremental_batches(pcollection_id, cursor)
             .await?;
@@ -422,7 +495,7 @@ impl FlareElementStore {
             records.extend(record_batch_to_beamrecords(batch, &table_schema)?);
         }
         if let Some(latest) = latest {
-            self.set_cursor(reader_id, pcollection_id, latest);
+            self.set_cursor(reader_id, pcollection_id, latest).await?;
         }
         Ok(records)
     }
@@ -742,6 +815,42 @@ pub async fn create_catalog(warehouse: String, db_name: String) -> Result<FileSy
 ///
 /// The resulting schema preserves Arrow field names and converted data types,
 /// and is built with no partition keys, no primary keys, no options, and no comment.
+/// Paimon table backing durable per-reader read cursors.
+const CURSOR_TABLE: &str = "__flare_cursor";
+const CURSOR_KEY_COLUMN: &str = "cursor_key";
+const CURSOR_VALUE_COLUMN: &str = "snapshot_id";
+
+/// Paimon schema for the primary-key read-cursor table.
+fn cursor_paimon_schema() -> Result<PaimonSchema> {
+    let schema = PaimonSchema::builder()
+        .column(
+            CURSOR_KEY_COLUMN,
+            PaimonDataType::VarBinary(VarBinaryType::try_new(false, VarBinaryType::MAX_LENGTH)?),
+        )
+        .column(
+            CURSOR_VALUE_COLUMN,
+            PaimonDataType::VarBinary(VarBinaryType::try_new(false, VarBinaryType::MAX_LENGTH)?),
+        )
+        .primary_key([CURSOR_KEY_COLUMN])
+        .option("bucket", "1")
+        .build()?;
+    Ok(schema)
+}
+
+/// Build a single-row cursor batch; the primary key makes this an upsert.
+fn build_cursor_record_batch(key: &[u8], value: &[u8]) -> Result<RecordBatch> {
+    let schema = ArrowSchema::new(vec![
+        ArrowField::new(CURSOR_KEY_COLUMN, DataType::Binary, false),
+        ArrowField::new(CURSOR_VALUE_COLUMN, DataType::Binary, false),
+    ]);
+    let key_array = BinaryArray::from_iter_values([key]);
+    let value_array = BinaryArray::from_iter_values([value]);
+    Ok(RecordBatch::try_new(
+        Arc::new(schema),
+        vec![Arc::new(key_array), Arc::new(value_array)],
+    )?)
+}
+
 /// Decode one Arrow [`RecordBatch`] of a windowed PCollection back into
 /// [`WindowedValue`]s, restoring timestamp/windows/pane from the reserved
 /// metadata column when the rows carry it.
@@ -1062,7 +1171,7 @@ mod element_store_tests {
             .unwrap();
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].value, int_primitive(1));
-        let cursor = store.cursor("reader-a", pc);
+        let cursor = store.cursor("reader-a", pc).await.unwrap();
         assert!(cursor.is_some(), "reading advances the cursor");
 
         // Nothing appended: a re-read is empty and the cursor does not move.
@@ -1071,7 +1180,7 @@ mod element_store_tests {
             .await
             .unwrap();
         assert!(again.is_empty());
-        assert_eq!(store.cursor("reader-a", pc), cursor);
+        assert_eq!(store.cursor("reader-a", pc).await.unwrap(), cursor);
 
         // A new commit is the only thing a re-read returns.
         store
@@ -1084,7 +1193,7 @@ mod element_store_tests {
             .unwrap();
         assert_eq!(newly.len(), 1);
         assert_eq!(newly[0].value, int_primitive(2));
-        assert!(store.cursor("reader-a", pc) > cursor);
+        assert!(store.cursor("reader-a", pc).await.unwrap() > cursor);
 
         // An independent reader keeps its own cursor and sees the whole table.
         let other = store
@@ -1092,6 +1201,38 @@ mod element_store_tests {
             .await
             .unwrap();
         assert_eq!(other.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn read_cursor_survives_store_recreation() {
+        let dir = tempdir().expect("tempdir");
+        let warehouse = dir.path().to_str().expect("utf8").to_string();
+
+        let store = FlareElementStore::new(warehouse.clone(), "testdb".to_string(), None)
+            .await
+            .expect("store");
+        store
+            .write_windowed_value_batch("pc-durable", vec![windowed_int(1, 10)])
+            .await
+            .unwrap();
+        // Reading advances (and durably records) the cursor.
+        store
+            .scan_windowed_values_since("reader", "pc-durable")
+            .await
+            .unwrap();
+        let cursor = store.cursor("reader", "pc-durable").await.unwrap();
+        assert!(cursor.is_some());
+        drop(store);
+
+        // A fresh store over the same warehouse sees the same cursor, so a
+        // re-run does not re-read from the beginning.
+        let reopened = FlareElementStore::new(warehouse, "testdb".to_string(), None)
+            .await
+            .expect("store");
+        assert_eq!(
+            reopened.cursor("reader", "pc-durable").await.unwrap(),
+            cursor
+        );
     }
 
     #[tokio::test]

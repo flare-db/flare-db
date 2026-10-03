@@ -6,7 +6,7 @@ use crate::{
         runtime::BundleRuntime,
         scheduler::NodeScheduler,
         timer::TimerService,
-        watermark::MIN_TIMESTAMP,
+        watermark::{MIN_TIMESTAMP, Timestamp},
     },
     fusion::pipeline::{ExecutableGraph, ExecutableNode},
     state::timer::{TimerEntry, TimerStore},
@@ -105,6 +105,13 @@ impl ExecutorDispatcher {
         let mut pending_timers: HashMap<String, Vec<TimerEntry>> = HashMap::new();
 
         loop {
+            // Reconcile output-watermark holds with the durable event-time timers
+            // before scheduling: a pending event-time timer holds its owning
+            // stage's output watermark, so a downstream consumer does not see the
+            // stage as complete before the timer fires. Holds clamp output only,
+            // so this cannot deadlock a stage's own readiness.
+            self.sync_event_time_holds(scheduler).await?;
+
             for (idx, node) in scheduler.next_nodes() {
                 let runtime = self.new_bundle_runtime();
                 let input_metadata = scheduler.input_edge_metadata(idx);
@@ -204,10 +211,34 @@ impl ExecutorDispatcher {
             if let Some(joined) = in_flight.join_next().await {
                 let (idx, result) = joined?;
                 result?;
-                scheduler.mark_complete(idx);
+                // The minimum event-time this bundle committed to its primary
+                // output clamps each consumer's input watermark until consumed.
+                let output_min_ts = scheduler
+                    .output_edge_metadata(idx)
+                    .map(|meta| meta.produced_pcol_id)
+                    .and_then(|pcollection| self.store.take_commit_min_timestamp(&pcollection));
+                scheduler.mark_complete_with_min(idx, output_min_ts);
             }
         }
 
+        Ok(())
+    }
+
+    /// Replace the watermark manager's holds with one hold per pending event-time
+    /// timer, at that timer's `hold_timestamp`, on its owning stage.
+    ///
+    /// The durable timer store is the source of truth, so the whole map is
+    /// rebuilt each time (timers set and cleared during bundles both take
+    /// effect). Timers whose transform maps to no stage are ignored.
+    async fn sync_event_time_holds(&self, scheduler: &mut NodeScheduler) -> anyhow::Result<()> {
+        let mut holds: HashMap<String, Vec<Timestamp>> = HashMap::new();
+        for timer in self.timer_service.all_event_time_timers().await? {
+            if let Some(stage) = scheduler.stage_for_transform(&timer.key.transform_id) {
+                holds.entry(stage).or_default().push(timer.hold_timestamp);
+            }
+        }
+        scheduler.watermarks_mut().set_event_time_holds(&holds);
+        scheduler.watermarks_mut().refresh();
         Ok(())
     }
 

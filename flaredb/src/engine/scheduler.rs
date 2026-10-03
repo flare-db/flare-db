@@ -7,7 +7,7 @@ use petgraph::visit::EdgeRef;
 use log::{debug, info};
 
 use crate::engine::watermark::{
-    MAX_TIMESTAMP, MIN_TIMESTAMP, StageKind, WatermarkManager, format_timestamp,
+    MAX_TIMESTAMP, MIN_TIMESTAMP, StageKind, Timestamp, WatermarkManager, format_timestamp,
 };
 use crate::fusion::pipeline::{ConsumerMetaData, ExecutableGraph, ExecutableNode};
 use crate::state::timer::{TimeDomain, TimerEntry};
@@ -136,6 +136,13 @@ impl NodeScheduler {
     /// bundles (including SDF residuals and splits) are done, so a stage's output
     /// never advances after just the first bundle.
     pub fn mark_complete(&mut self, idx: NodeIndex) {
+        self.mark_complete_with_min(idx, None)
+    }
+
+    /// Like [`Self::mark_complete`], but also records the minimum event-time the
+    /// bundle committed, so each consumer's input watermark is clamped by its
+    /// pending input until that input is consumed.
+    pub fn mark_complete_with_min(&mut self, idx: NodeIndex, output_min_ts: Option<Timestamp>) {
         let stage = self.graph.get_executable_graph()[idx].id();
         if self.watermarks.is_source(&stage) {
             let _ = self.watermarks.report_source_finished(&stage);
@@ -144,7 +151,10 @@ impl NodeScheduler {
                 format_timestamp(MAX_TIMESTAMP)
             );
         }
-        let newly_ready = self.watermarks.complete_bundle(&stage).unwrap_or_default();
+        let newly_ready = self
+            .watermarks
+            .complete_bundle_with_min(&stage, output_min_ts)
+            .unwrap_or_default();
         let advanced = self.watermarks.refresh();
         debug!(
             "scheduler: stage '{stage}' completed; newly ready [{}]; advanced [{}]",
@@ -282,9 +292,11 @@ impl NodeScheduler {
             if self.watermarks.is_stage_in_flight(&stage) {
                 continue;
             }
+            // Clamp by pending input: an event-time timer must not fire while
+            // older input for the owning stage is still unconsumed.
             let watermark = self
                 .watermarks
-                .input_watermark(&stage)
+                .effective_input_watermark(&stage)
                 .unwrap_or(MIN_TIMESTAMP);
             if entry.is_due_at_watermark(watermark) {
                 let _ = self.watermarks.mark_rerun(&stage);
@@ -292,6 +304,15 @@ impl NodeScheduler {
             }
         }
         by_stage.into_iter().collect()
+    }
+
+    /// The stage that owns `transform_id`, if any.
+    ///
+    /// Used to route a persisted event-time timer's output hold to its owning
+    /// stage's output watermark (the timer store persists the timer, not the
+    /// hold).
+    pub fn stage_for_transform(&self, transform_id: &str) -> Option<String> {
+        self.transform_to_stage.get(transform_id).cloned()
     }
 
     /// The shared per-stage watermark and eligibility state.
@@ -784,6 +805,7 @@ mod tests {
                         output_pcollection_id: output,
                         consumer_transfrom_id: "test".to_string(),
                         stage_id: transform.id(),
+                        windowing_strategy: None,
                         input_watermark: i64::MAX,
                     })
                     .await

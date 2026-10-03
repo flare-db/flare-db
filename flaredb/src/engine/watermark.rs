@@ -178,6 +178,13 @@ struct StageState {
     /// consumer when an upstream stage produces more output — the streams-tables
     /// "the table was appended to, so its stream has more" signal.
     pending: BTreeSet<PCollectionId>,
+    /// Minimum event-time among the pending inputs; [`MAX_TIMESTAMP`] when nothing
+    /// is pending. Set on push-wake from the producer's committed minimum and
+    /// cleared when a bundle consumes the pending inputs. This is the input
+    /// watermark clamp: the watermark must not advance past data not yet consumed.
+    /// The readiness gate deliberately uses the *unclamped* `input`, mirroring
+    /// Prism's split between its trigger watermark (`upstreamW`) and `ss.input`.
+    pending_min: Timestamp,
     /// A bundle for this stage is currently executing.
     in_flight: bool,
     /// The stage has completed at least one bundle.
@@ -348,6 +355,7 @@ impl WatermarkManager {
                 holds: BTreeMap::new(),
                 unproduced,
                 pending: BTreeSet::new(),
+                pending_min: MAX_TIMESTAMP,
                 in_flight: false,
                 completed: false,
                 rerun_pending: false,
@@ -422,6 +430,28 @@ impl WatermarkManager {
         Ok(())
     }
 
+    /// Replace every stage's watermark holds with `holds`.
+    ///
+    /// The durable timer store is the source of truth for event-time holds: a
+    /// pending event-time timer holds its owning stage's output watermark at the
+    /// timer's `hold_timestamp` until it fires. Because that set changes as
+    /// timers are set and cleared, the caller reconciles the whole map rather
+    /// than incrementally adding/releasing. Stages absent from `holds` are
+    /// cleared. Call [`Self::refresh`] afterwards to propagate the clamp.
+    ///
+    /// Holds only ever *clamp* output watermarks (which are monotonic), so
+    /// releasing one lets the watermark advance again but never regresses it.
+    pub fn set_event_time_holds(&mut self, holds: &HashMap<StageId, Vec<Timestamp>>) {
+        for (id, stage) in self.stages.iter_mut() {
+            stage.holds.clear();
+            if let Some(timestamps) = holds.get(id) {
+                for timestamp in timestamps {
+                    *stage.holds.entry(*timestamp).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+
     /// Release one hold at `timestamp` for `stage`.
     pub fn release_hold(&mut self, stage: &str, timestamp: Timestamp) -> Result<()> {
         let stage = self.stage_mut(stage)?;
@@ -441,9 +471,27 @@ impl WatermarkManager {
 
     /// The stage's input watermark, or `None` if the stage is unknown.
     ///
+    /// This is the *unclamped* watermark (the minimum upstream output), used for
+    /// readiness and for propagating watermarks. For decisions that must not run
+    /// ahead of unconsumed input, use
+    /// [`effective_input_watermark`](Self::effective_input_watermark).
+    ///
     /// For a source this is [`MAX_TIMESTAMP`].
     pub fn input_watermark(&self, stage: &str) -> Option<Timestamp> {
         self.stages.get(stage).map(|stage| stage.input)
+    }
+
+    /// The stage's input watermark clamped by the minimum event-time of its
+    /// pending (unconsumed) input, or `None` if the stage is unknown.
+    ///
+    /// Prism's `In' = MAX(In, MIN(minPendingTimestamp, upstream))`, minus the
+    /// `MAX` because our watermarks are already monotonic: while unconsumed input
+    /// exists, the watermark cannot advance past its oldest element. When nothing
+    /// is pending this equals [`input_watermark`](Self::input_watermark).
+    pub fn effective_input_watermark(&self, stage: &str) -> Option<Timestamp> {
+        self.stages
+            .get(stage)
+            .map(|stage| stage.input.min(stage.pending_min))
     }
 
     /// The stage's output watermark, or `None` if the stage is unknown.
@@ -547,10 +595,17 @@ impl WatermarkManager {
         // appends while this bundle is in flight re-populates `pending` and
         // re-arms the stage for another run.
         stage_state.pending.clear();
+        stage_state.pending_min = MAX_TIMESTAMP;
         // Remember the watermark this bundle ran at, so a later advance re-arms
         // a watermark-gated stage.
         stage_state.watermark_at_last_run = stage_state.input;
         Ok(())
+    }
+
+    /// Mark a bundle for `stage` complete and propagate its outputs to consumers
+    /// without a min-timestamp (no pending-input clamp).
+    pub fn complete_bundle(&mut self, stage: &str) -> Result<Vec<StageId>> {
+        self.complete_bundle_with_min(stage, None)
     }
 
     /// Mark a bundle for `stage` complete and propagate its outputs to consumers.
@@ -558,9 +613,20 @@ impl WatermarkManager {
     /// Push-wake: each output PCollection is recorded as appended, which removes
     /// it from a consumer's first-run `unproduced` barrier *and* marks it pending,
     /// so a consumer that already ran is re-armed when its upstream produces more
-    /// (the streams-tables table-append signal). The returned vector lists the
-    /// consumers that became ready as a result, sorted and deduplicated.
-    pub fn complete_bundle(&mut self, stage: &str) -> Result<Vec<StageId>> {
+    /// (the streams-tables table-append signal).
+    ///
+    /// `output_min_ts` is the minimum event-time committed by this bundle; it
+    /// clamps each consumer's [`effective_input_watermark`](Self::effective_input_watermark)
+    /// until the consumer drains the pending input. `None` means the bundle
+    /// produced nothing with an event-time (no clamp).
+    ///
+    /// The returned vector lists the consumers that became ready as a result,
+    /// sorted and deduplicated.
+    pub fn complete_bundle_with_min(
+        &mut self,
+        stage: &str,
+        output_min_ts: Option<Timestamp>,
+    ) -> Result<Vec<StageId>> {
         let outputs = {
             let stage_state = self
                 .stages
@@ -588,6 +654,9 @@ impl WatermarkManager {
                 if let Some(consumer_state) = self.stages.get_mut(&consumer) {
                     consumer_state.unproduced.remove(&pcollection);
                     consumer_state.pending.insert(pcollection.clone());
+                    if let Some(output_min_ts) = output_min_ts {
+                        consumer_state.pending_min = consumer_state.pending_min.min(output_min_ts);
+                    }
                     if consumer_state.is_ready() {
                         newly_ready.push(consumer);
                     }
@@ -930,6 +999,48 @@ mod tests {
         manager.release_hold("A", 30).unwrap();
         assert_eq!(manager.min_hold("A"), Some(30), "one hold remains");
         manager.release_hold("A", 30).unwrap();
+        assert_eq!(manager.min_hold("A"), None);
+    }
+
+    #[test]
+    fn event_time_holds_clamp_output_and_release_when_cleared() {
+        let mut manager = manager(&[
+            ("A", &[], &[], &["p"]),
+            ("B", &["p"], &[], &["q"]),
+            ("C", &["q"], &[], &["r"]),
+        ]);
+
+        // A pending event-time timer on B holds B's output at 30, so C cannot
+        // see B as complete past 30 even after the source finishes.
+        manager.set_event_time_holds(&HashMap::from([("B".to_string(), vec![30])]));
+        manager.report_source_watermark("A", 100).unwrap();
+        manager.refresh();
+
+        assert_eq!(manager.input_watermark("B"), Some(100));
+        assert_eq!(manager.output_watermark("B"), Some(30));
+        assert_eq!(manager.input_watermark("C"), Some(30));
+
+        // The timer fires: the hold is gone and B's output catches up.
+        manager.set_event_time_holds(&HashMap::new());
+        manager.refresh();
+        assert_eq!(manager.output_watermark("B"), Some(100));
+        assert_eq!(manager.input_watermark("C"), Some(100));
+    }
+
+    #[test]
+    fn reconciling_holds_reflects_added_and_removed_timers() {
+        let mut manager = manager(&[("A", &[], &[], &["p"])]);
+
+        // Two timers at the same hold timestamp: the multiset keeps the hold.
+        manager.set_event_time_holds(&HashMap::from([("A".to_string(), vec![30, 30])]));
+        assert_eq!(manager.min_hold("A"), Some(30));
+
+        // One fires: the other still holds.
+        manager.set_event_time_holds(&HashMap::from([("A".to_string(), vec![30])]));
+        assert_eq!(manager.min_hold("A"), Some(30));
+
+        // All fire: no holds remain.
+        manager.set_event_time_holds(&HashMap::new());
         assert_eq!(manager.min_hold("A"), None);
     }
 
@@ -1298,6 +1409,38 @@ mod tests {
         manager.complete_bundle("B").unwrap();
         assert!(manager.is_complete());
         assert!(manager.ready_stages().is_empty());
+    }
+
+    #[test]
+    fn pending_min_clamps_only_the_effective_input_watermark() {
+        let mut manager = manager(&[("A", &[], &[], &["p"]), ("B", &["p"], &[], &["q"])]);
+
+        // A completes, committing a minimum event-time of 42 that B has not consumed.
+        manager.start_bundle("A").unwrap();
+        manager.complete_bundle_with_min("A", Some(42)).unwrap();
+        manager.report_source_watermark("A", 100).unwrap();
+        manager.refresh();
+
+        // The propagated watermark and the readiness gate stay unclamped...
+        assert_eq!(manager.input_watermark("B"), Some(100));
+        // ...but the effective watermark cannot pass unconsumed input.
+        assert_eq!(manager.effective_input_watermark("B"), Some(42));
+
+        // Consuming the pending input lifts the clamp.
+        manager.start_bundle("B").unwrap();
+        assert_eq!(manager.effective_input_watermark("B"), Some(100));
+    }
+
+    #[test]
+    fn a_bundle_without_event_times_does_not_clamp() {
+        let mut manager = manager(&[("A", &[], &[], &["p"]), ("B", &["p"], &[], &["q"])]);
+
+        manager.start_bundle("A").unwrap();
+        manager.complete_bundle_with_min("A", None).unwrap();
+        manager.report_source_watermark("A", 100).unwrap();
+        manager.refresh();
+
+        assert_eq!(manager.effective_input_watermark("B"), Some(100));
     }
 
     fn runner_node(name: &str, outputs: &[&str]) -> ExecutableNode {
