@@ -10,7 +10,7 @@ use crate::engine::watermark::{
     MAX_TIMESTAMP, MIN_TIMESTAMP, StageKind, WatermarkManager, format_timestamp,
 };
 use crate::fusion::pipeline::{ConsumerMetaData, ExecutableGraph, ExecutableNode};
-use crate::state::timer::TimerEntry;
+use crate::state::timer::{TimeDomain, TimerEntry};
 
 /// Scheduler that manages execution state for an `ExecutableGraph`.
 ///
@@ -251,6 +251,49 @@ impl NodeScheduler {
         by_stage.into_iter().collect()
     }
 
+    /// Re-arm the stage that owns each due **event-time** timer and return the
+    /// timers grouped by owning stage.
+    ///
+    /// Beam fires an event-time timer once its owning stage's input watermark has
+    /// reached the timer's timestamp ([`TimerEntry::is_due_at_watermark`], i.e.
+    /// `fire_timestamp <= input_watermark`). Processing-time timers are ignored
+    /// here; they are driven by [`Self::promote_due_timers`] off the clock.
+    ///
+    /// A timer whose stage currently has a bundle in flight is deliberately left
+    /// un-promoted: re-arming it now would be cleared when that bundle completes
+    /// (`complete_bundle` resets `rerun_pending`), and the caller may have already
+    /// deleted it from the store. It will be promoted after the bundle finishes.
+    pub fn promote_due_event_time_timers(
+        &mut self,
+        timers: &[TimerEntry],
+    ) -> Vec<(String, Vec<TimerEntry>)> {
+        let mut by_stage: BTreeMap<String, Vec<TimerEntry>> = BTreeMap::new();
+        for entry in timers {
+            if entry.domain != TimeDomain::EventTime {
+                continue;
+            }
+            let Some(stage) = self
+                .transform_to_stage
+                .get(&entry.key.transform_id)
+                .cloned()
+            else {
+                continue;
+            };
+            if self.watermarks.is_stage_in_flight(&stage) {
+                continue;
+            }
+            let watermark = self
+                .watermarks
+                .input_watermark(&stage)
+                .unwrap_or(MIN_TIMESTAMP);
+            if entry.is_due_at_watermark(watermark) {
+                let _ = self.watermarks.mark_rerun(&stage);
+                by_stage.entry(stage).or_default().push(entry.clone());
+            }
+        }
+        by_stage.into_iter().collect()
+    }
+
     /// The shared per-stage watermark and eligibility state.
     pub fn watermarks(&self) -> &WatermarkManager {
         &self.watermarks
@@ -313,6 +356,7 @@ mod tests {
     use crate::engine::scheduler::NodeScheduler;
     use crate::fusion::pipeline::{ConsumerMetaData, ExecutableGraph, ExecutableNode};
     use crate::jobservice::urns::beam_urns;
+    use crate::state::timer::{TimeDomain, TimerEntry, TimerKey};
     use crate::transforms::from_urn;
 
     fn runner_node(name: &str) -> ExecutableNode {
@@ -322,6 +366,69 @@ mod tests {
             HashMap::new(),
             HashMap::new(),
         ))
+    }
+
+    /// A minimal SDK (worker) stage with a single transform, so `NodeScheduler`
+    /// maps that transform id to this stage (required for timer routing).
+    fn worker_stage_node(transform_id: &str) -> ExecutableNode {
+        use beam_model_rs::v1::executable_stage_payload::WireCoderSetting;
+        use beam_model_rs::v1::{Components, Environment, PCollection, PTransform};
+        use indexmap::IndexSet;
+
+        use crate::fusion::pipeline::{PCollectionNode, PTransformNode};
+        use crate::fusion::stage::ExecutableStage;
+
+        let mut components = Components::default();
+        let transform = PTransform {
+            unique_name: transform_id.to_string(),
+            ..Default::default()
+        };
+        components
+            .transforms
+            .insert(transform_id.to_string(), transform.clone());
+
+        let mut transforms = IndexSet::new();
+        transforms.insert(PTransformNode {
+            id: transform_id.to_string(),
+            transform,
+        });
+
+        ExecutableNode::Worker(ExecutableStage::from(
+            components,
+            Environment {
+                urn: "test-env".to_string(),
+                ..Default::default()
+            },
+            HashSet::<WireCoderSetting>::new(),
+            PCollectionNode {
+                id: "stage-in".to_string(),
+                collection: PCollection {
+                    unique_name: "stage-in".to_string(),
+                    coder_id: "c".to_string(),
+                    ..Default::default()
+                },
+            },
+            IndexSet::new(),
+            IndexSet::new(),
+            IndexSet::new(),
+            IndexSet::new(),
+            transforms,
+        ))
+    }
+
+    fn event_timer(transform_id: &str, fire: i64) -> TimerEntry {
+        TimerEntry {
+            key: TimerKey {
+                transform_id: transform_id.to_string(),
+                timer_family_id: "f".to_string(),
+                tag: String::new(),
+                window: "global".to_string(),
+                user_key: b"k".to_vec(),
+            },
+            domain: TimeDomain::EventTime,
+            fire_timestamp: fire,
+            hold_timestamp: fire,
+        }
     }
 
     fn gbk_node(name: &str) -> ExecutableNode {
@@ -461,5 +568,144 @@ mod tests {
         let ready = scheduler.next_nodes();
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].0, aggregate);
+    }
+
+    /// Build `source -> stateful(SDK)`, returning the scheduler, the graph node
+    /// indices and the two stage ids.
+    fn source_and_stateful() -> (
+        NodeScheduler,
+        petgraph::graph::NodeIndex,
+        petgraph::graph::NodeIndex,
+        String,
+        String,
+    ) {
+        let mut graph = Graph::<ExecutableNode, ConsumerMetaData>::new();
+        let source = graph.add_node(runner_node("source"));
+        let stateful = graph.add_node(worker_stage_node("stateful"));
+        graph.add_edge(source, stateful, dummy_metadata("ss"));
+
+        let executable_graph = graph_for_test(graph, dummy_metadata("root"));
+        let source_id = executable_graph.get_executable_graph()[source].id();
+        let stateful_id = executable_graph.get_executable_graph()[stateful].id();
+        (
+            NodeScheduler::new(executable_graph),
+            source,
+            stateful,
+            source_id,
+            stateful_id,
+        )
+    }
+
+    /// Beam fires an event-time timer only once the owning stage's input
+    /// watermark has reached the timer's timestamp (`fire_timestamp <= WM`).
+    #[test]
+    fn event_time_timer_fires_only_once_the_stage_watermark_reaches_it() {
+        let (mut scheduler, _source, _stateful, source_id, stateful_id) = source_and_stateful();
+        let timer = event_timer("stateful", 100);
+
+        // No watermark report yet: the source output is MIN, so nothing is due.
+        assert!(
+            scheduler
+                .promote_due_event_time_timers(&[timer.clone()])
+                .is_empty()
+        );
+
+        // WM = 99: still below the timer.
+        scheduler
+            .watermarks_mut()
+            .report_source_watermark(&source_id, 99)
+            .unwrap();
+        scheduler.watermarks_mut().refresh();
+        assert!(
+            scheduler
+                .promote_due_event_time_timers(&[timer.clone()])
+                .is_empty()
+        );
+
+        // WM = 100: the watermark has reached the timer, so it fires (equal timestamps fire).
+        scheduler
+            .watermarks_mut()
+            .report_source_watermark(&source_id, 100)
+            .unwrap();
+        scheduler.watermarks_mut().refresh();
+        let promoted = scheduler.promote_due_event_time_timers(&[timer]);
+        assert_eq!(promoted.len(), 1);
+        assert_eq!(promoted[0].0, stateful_id);
+        assert_eq!(promoted[0].1.len(), 1);
+    }
+
+    /// Processing-time timers are never promoted by the watermark path.
+    #[test]
+    fn processing_time_timer_is_not_promoted_by_the_watermark() {
+        let (mut scheduler, _source, _stateful, source_id, _stateful_id) = source_and_stateful();
+        scheduler
+            .watermarks_mut()
+            .report_source_watermark(&source_id, 1_000)
+            .unwrap();
+        scheduler.watermarks_mut().refresh();
+
+        let mut timer = event_timer("stateful", 100);
+        timer.domain = TimeDomain::ProcessingTime;
+        assert!(scheduler.promote_due_event_time_timers(&[timer]).is_empty());
+    }
+
+    /// A timer whose stage already has a bundle in flight is not promoted (the
+    /// re-arm would be lost when that bundle completes).
+    #[test]
+    fn event_time_timer_for_an_in_flight_stage_is_not_promoted() {
+        let (mut scheduler, source, stateful, _source_id, _stateful_id) = source_and_stateful();
+        let timer = event_timer("stateful", 100);
+
+        // Start and complete the source: +inf, which readies the stateful stage.
+        let ready = scheduler.next_nodes();
+        assert!(ready.iter().any(|(idx, _)| *idx == source));
+        scheduler.mark_complete(source);
+
+        // Start the stateful stage's bundle: it is now in flight.
+        let ready = scheduler.next_nodes();
+        assert!(ready.iter().any(|(idx, _)| *idx == stateful));
+        assert!(
+            scheduler
+                .promote_due_event_time_timers(&[timer.clone()])
+                .is_empty()
+        );
+
+        // Once it completes, the timer is promoted.
+        scheduler.mark_complete(stateful);
+        let promoted = scheduler.promote_due_event_time_timers(&[timer]);
+        assert_eq!(promoted.len(), 1);
+    }
+
+    /// After a bounded source reports +inf, a timer re-armed by the fired
+    /// callback (a new event-time timer) is due again and must drain.
+    #[test]
+    fn event_time_timers_drain_after_a_finished_source() {
+        let (mut scheduler, source, stateful, _source_id, stateful_id) = source_and_stateful();
+
+        // Start and complete the source: bounded end reports +inf.
+        let ready = scheduler.next_nodes();
+        assert!(ready.iter().any(|(idx, _)| *idx == source));
+        scheduler.mark_complete(source);
+
+        // First timer fires at +inf.
+        let first = event_timer("stateful", 100);
+        let promoted = scheduler.promote_due_event_time_timers(&[first]);
+        assert_eq!(promoted.len(), 1);
+        assert_eq!(promoted[0].0, stateful_id);
+
+        // Run the timer-only bundle (this consumes the re-arm).
+        let ready = scheduler.next_nodes();
+        assert!(ready.iter().any(|(idx, _)| *idx == stateful));
+        scheduler.mark_complete(stateful);
+
+        // The callback re-armed: a brand-new event-time timer, also at/below +inf.
+        let rearmed = event_timer("stateful", 100);
+        let promoted = scheduler.promote_due_event_time_timers(&[rearmed]);
+        assert_eq!(
+            promoted.len(),
+            1,
+            "a timer re-armed after +inf must still be promoted, not stranded"
+        );
+        assert_eq!(promoted[0].0, stateful_id);
     }
 }

@@ -75,6 +75,20 @@ pub struct TimerEntry {
     pub hold_timestamp: i64,
 }
 
+impl TimerEntry {
+    /// Whether this timer is due given its owning stage's input watermark.
+    ///
+    /// This is Beam's firing rule: `InMemoryTimerInternals.advanceInputWatermark`
+    /// fires every **event-time** timer whose timestamp is `<=` the new
+    /// watermark (an equal timestamp fires), and never fires a processing-time
+    /// timer on the watermark (those fire on the processing-time clock). Beam's
+    /// watermark is a lower bound on future element timestamps, so once it
+    /// reaches a timer's timestamp no earlier work can still arrive.
+    pub fn is_due_at_watermark(&self, watermark: i64) -> bool {
+        self.domain == TimeDomain::EventTime && self.fire_timestamp <= watermark
+    }
+}
+
 /// Durable keyed storage for Beam user timers.
 #[derive(Clone)]
 pub struct TimerStore {
@@ -292,5 +306,19 @@ mod tests {
         let mut other = a.clone();
         other.tag = "tag".to_string();
         assert_ne!(a.storage_key(), other.storage_key());
+    }
+
+    #[test]
+    fn event_time_timers_are_due_at_or_below_the_watermark() {
+        let timer = entry(b"k", TimeDomain::EventTime, 100, 100);
+
+        // Beam fires a timer once the watermark reaches it: `timestamp <= watermark`.
+        assert!(!timer.is_due_at_watermark(99));
+        assert!(timer.is_due_at_watermark(100));
+        assert!(timer.is_due_at_watermark(1_000));
+
+        // Processing-time timers never fire on the watermark.
+        let processing = entry(b"k", TimeDomain::ProcessingTime, 100, 100);
+        assert!(!processing.is_due_at_watermark(i64::MAX));
     }
 }

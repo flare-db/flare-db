@@ -106,6 +106,36 @@ impl TimerService {
         Ok(due)
     }
 
+    /// All persisted event-time timers.
+    ///
+    /// Event-time timers do not fire on the processing-time clock; which of them
+    /// are due depends on the *owning stage's* input watermark, so the caller
+    /// (the scheduler) filters this list per stage with
+    /// [`TimerEntry::is_due_at_watermark`].
+    pub async fn all_event_time_timers(&self) -> Result<Vec<TimerEntry>> {
+        Ok(self
+            .store
+            .entries()
+            .await?
+            .into_iter()
+            .filter(|timer| timer.domain == TimeDomain::EventTime)
+            .collect())
+    }
+
+    /// Delete the given timers (delete-before-deliver).
+    ///
+    /// Used when an event-time timer is delivered, so it fires at most once per
+    /// delivery. A timer the fired callback re-sets is a distinct new entry.
+    pub async fn delete_all(&self, entries: &[TimerEntry]) -> Result<()> {
+        for entry in entries {
+            self.store.delete(&entry.key.storage_key()).await?;
+        }
+        if !entries.is_empty() {
+            self.notify.notify_waiters();
+        }
+        Ok(())
+    }
+
     /// Deliver due processing-time timers into `tx`, earliest first.
     pub async fn deliver_due_processing_time(
         &self,
@@ -277,6 +307,31 @@ mod tests {
         );
         // Taken timers are gone, so they never fire twice.
         assert!(service.due_processing_time(100).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn all_event_time_timers_filters_by_domain_and_delete_all_removes() {
+        let (_dir, store) = make_store().await;
+        let service = TimerService::new(store);
+
+        service
+            .set(entry(b"event", TimeDomain::EventTime, 100, 100))
+            .await
+            .unwrap();
+        service
+            .set(entry(b"processing", TimeDomain::ProcessingTime, 100, 100))
+            .await
+            .unwrap();
+
+        let event_timers = service.all_event_time_timers().await.unwrap();
+        assert_eq!(event_timers.len(), 1);
+        assert_eq!(event_timers[0].key.user_key, b"event");
+
+        // delete_all removes exactly the delivered event-time timer.
+        service.delete_all(&event_timers).await.unwrap();
+        assert!(service.all_event_time_timers().await.unwrap().is_empty());
+        // The processing-time timer is untouched.
+        assert_eq!(service.due_processing_time(100).await.unwrap().len(), 1);
     }
 
     #[tokio::test(start_paused = true)]

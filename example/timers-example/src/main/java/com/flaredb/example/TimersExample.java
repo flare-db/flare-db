@@ -24,6 +24,7 @@ import org.apache.beam.sdk.transforms.ParDo;
 import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PCollection;
 import org.joda.time.Duration;
+import org.joda.time.Instant;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -61,9 +62,13 @@ public class TimersExample {
 
     // Start from a clean slate so a stale file cannot make a broken run look OK.
     String outputFile = options.getOutputFile();
+    String eventFile = outputFile + ".event";
     Files.deleteIfExists(Paths.get(outputFile));
-    if (Paths.get(outputFile).getParent() != null) {
-      Files.createDirectories(Paths.get(outputFile).getParent());
+    Files.deleteIfExists(Paths.get(eventFile));
+    for (String path : new String[] {outputFile, eventFile}) {
+      if (Paths.get(path).getParent() != null) {
+        Files.createDirectories(Paths.get(path).getParent());
+      }
     }
 
     Pipeline pipeline = Pipeline.create(options);
@@ -92,22 +97,26 @@ public class TimersExample {
                   }
                 }));
 
-    // Terminal stateful stage with a processing-time timer. On firing it records
-    // (key, count) for the key's buffered elements, then clears the bag.
-    records.apply("BufferAndFireOnTimer", ParDo.of(new BufferAndFireOnTimer(outputFile)));
+    // Terminal stateful stage with a processing-time timer and an event-time
+    // timer. On firing each records (key, count) / (key, event) and clears or
+    // re-arms its state.
+    records.apply(
+        "BufferAndFireOnTimer", ParDo.of(new BufferAndFireOnTimer(outputFile, eventFile)));
 
-    // FlareRunner.run blocks until the job completes, so the output file is fully
-    // written when this returns.
+    // FlareRunner.run blocks until the job completes, so the output files are
+    // fully written when this returns.
     pipeline.run();
 
-    verify(options.getInputFile(), outputFile);
+    verify(options.getInputFile(), outputFile, eventFile);
   }
 
   /**
-   * Compares the recorded per-key counts against counts computed from the input, and fails the run
-   * if they differ (or if any key fired more than once).
+   * Compares the recorded results against counts computed from the input, and fails the run if they
+   * differ. The processing-time results must match the input exactly (one line per key); the
+   * event-time timer must fire exactly twice per key (the reset firing plus one re-arm).
    */
-  private static void verify(String inputFile, String outputFile) throws IOException {
+  private static void verify(String inputFile, String outputFile, String eventFile)
+      throws IOException {
     Map<String, Integer> expected = expectedCounts(inputFile);
     Map<String, Integer> actual = readFlushResults(outputFile);
 
@@ -129,10 +138,56 @@ public class TimersExample {
               + "\n  actual="
               + actual);
     }
+
+    // The event-time timer fires at the bounded end (+inf) and re-arms once, so
+    // every key must be recorded exactly twice: the drain after +inf is what
+    // proves a re-armed event-time timer is not stranded.
+    Map<String, Integer> eventFirings = countEventFirings(eventFile);
+    for (String key : expected.keySet()) {
+      int firings = eventFirings.getOrDefault(key, 0);
+      if (firings != 2) {
+        throw new IllegalStateException(
+            "timers-example FAILED: event-time timer for key '"
+                + key
+                + " fired "
+                + firings
+                + " time(s), expected 2 (one plus one re-arm after +inf). firings="
+                + eventFirings);
+      }
+    }
+    if (!eventFirings.keySet().equals(expected.keySet())) {
+      throw new IllegalStateException(
+          "timers-example FAILED: event-time keys do not match the input. event="
+              + eventFirings.keySet()
+              + " expected="
+              + expected.keySet());
+    }
+
     LOG.info(
-        "timers-example PASSED: {} keys each fired once, {} buffered elements flushed",
+        "timers-example PASSED: {} keys each fired once (processing time, {} elements) and {} keys each fired twice (event time)",
         actual.size(),
-        actualTotal);
+        actualTotal,
+        eventFirings.size());
+  }
+
+  /** Per-key number of event-time firings recorded by the pipeline. */
+  private static Map<String, Integer> countEventFirings(String eventFile) throws IOException {
+    Map<String, Integer> firings = new TreeMap<>();
+    Path path = Paths.get(eventFile);
+    if (!Files.exists(path)) {
+      return firings;
+    }
+    for (String line : Files.readAllLines(path, StandardCharsets.UTF_8)) {
+      if (line.isBlank()) {
+        continue;
+      }
+      int comma = line.lastIndexOf(',');
+      if (comma < 0) {
+        continue;
+      }
+      firings.merge(line.substring(0, comma), 1, Integer::sum);
+    }
+    return firings;
   }
 
   /** Per-key element counts read directly from the input CSV (the expected results). */
@@ -182,22 +237,31 @@ public class TimersExample {
   private static class BufferAndFireOnTimer extends DoFn<KV<String, String>, Void> {
 
     private final String outputFile;
+    private final String eventFile;
 
-    BufferAndFireOnTimer(String outputFile) {
+    BufferAndFireOnTimer(String outputFile, String eventFile) {
       this.outputFile = outputFile;
+      this.eventFile = eventFile;
     }
 
     @StateId("buffer")
     private final StateSpec<BagState<String>> bufferSpec = StateSpecs.bag(StringUtf8Coder.of());
 
+    @StateId("eventArmed")
+    private final StateSpec<BagState<String>> eventArmedSpec = StateSpecs.bag(StringUtf8Coder.of());
+
     @TimerId("flush")
     private final TimerSpec flushSpec = TimerSpecs.timer(TimeDomain.PROCESSING_TIME);
+
+    @TimerId("eventFlush")
+    private final TimerSpec eventFlushSpec = TimerSpecs.timer(TimeDomain.EVENT_TIME);
 
     @ProcessElement
     public void processElement(
         @Element KV<String, String> element,
         @StateId("buffer") BagState<String> buffer,
-        @TimerId("flush") Timer flush) {
+        @TimerId("flush") Timer flush,
+        @TimerId("eventFlush") Timer eventFlush) {
       buffer.add(element.getValue());
       // Re-arm the processing-time timer 2 seconds from now; the last element
       // for a key wins, so the flush happens once the key goes quiet.
@@ -206,6 +270,12 @@ public class TimersExample {
       // terminal call (`setRelative()` here) is what actually arms it. Calling
       // `offset(...)` alone is a silent no-op.
       flush.offset(Duration.standardSeconds(2)).setRelative();
+
+      // Arm an event-time timer at timestamp 0. With a bounded source the input
+      // watermark only reaches it when the source reports +inf, so this fires at
+      // the bounded end rather than on the wall clock.
+      eventFlush.set(new Instant(0));
+
       LOG.info("buffered key={} value={}", element.getKey(), element.getValue());
     }
 
@@ -218,17 +288,37 @@ public class TimersExample {
       }
       LOG.info("processing-time timer fired: key={} bufferedElements={}", key, count);
 
-      Path target = Paths.get(outputFile);
+      appendLine(Paths.get(outputFile), key + "," + count);
+      buffer.clear();
+    }
+
+    @OnTimer("eventFlush")
+    public void onEventFlush(
+        @Key String key,
+        @StateId("eventArmed") BagState<String> eventArmed,
+        @TimerId("eventFlush") Timer eventFlush)
+        throws IOException {
+      LOG.info("event-time timer fired: key={}", key);
+      appendLine(Paths.get(eventFile), key + ",event");
+
+      // Re-arm exactly once. The watermark is already +inf here, so the re-armed
+      // timer is immediately due again and must be delivered (drained), not
+      // stranded.
+      if (eventArmed.isEmpty().read()) {
+        eventArmed.add("rearmed");
+        eventFlush.set(new Instant(0));
+      }
+    }
+
+    private static void appendLine(Path target, String line) throws IOException {
       if (target.getParent() != null) {
         Files.createDirectories(target.getParent());
       }
       Files.write(
           target,
-          (key + "," + count + System.lineSeparator()).getBytes(StandardCharsets.UTF_8),
+          (line + System.lineSeparator()).getBytes(StandardCharsets.UTF_8),
           StandardOpenOption.CREATE,
           StandardOpenOption.APPEND);
-
-      buffer.clear();
     }
   }
 }

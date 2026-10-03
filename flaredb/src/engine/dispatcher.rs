@@ -94,8 +94,10 @@ impl ExecutorDispatcher {
     /// Run the executable graph to completion.
     ///
     /// The loop is `refresh -> ready` (via [`NodeScheduler::next_nodes`]) then
-    /// run; when no data work is ready it waits for the next processing-time
-    /// timer, fires it, and re-arms the owning stage so its `@OnTimer` runs.
+    /// run. When no data work is ready it first fires any due **event-time**
+    /// timers (whose owning stage's input watermark has advanced past them), then
+    /// waits for the next processing-time timer, fires it, and re-arms the owning
+    /// stage so its `@OnTimer` runs.
     pub async fn run_pipeline(&self, scheduler: &mut NodeScheduler) -> anyhow::Result<()> {
         let mut in_flight = JoinSet::new();
         // Timers to deliver the next time each re-armed stage runs.
@@ -126,6 +128,19 @@ impl ExecutorDispatcher {
             }
 
             if in_flight.is_empty() {
+                // Watermarks may have advanced since the last round (a bundle
+                // completed, or a source reported). Fire any event-time timers
+                // whose owning stage's input watermark has now reached them; this
+                // also drains timers re-armed from inside `@OnTimer` once the
+                // source has reported `+inf`.
+                if self
+                    .promote_due_event_time_timers(scheduler, &mut pending_timers)
+                    .await?
+                    > 0
+                {
+                    continue;
+                }
+
                 match self.timer_service.next_processing_deadline().await? {
                     Some(deadline) => {
                         let now = self.timer_service.now();
@@ -157,6 +172,13 @@ impl ExecutorDispatcher {
                     }
                     None => {
                         if scheduler.is_complete() {
+                            let stranded = self.timer_service.all_event_time_timers().await?;
+                            if !stranded.is_empty() {
+                                log::warn!(
+                                    "finishing with {} event-time timer(s) never reached by a watermark; they will not fire",
+                                    stranded.len()
+                                );
+                            }
                             break;
                         }
                         return Err(anyhow!(
@@ -174,6 +196,35 @@ impl ExecutorDispatcher {
         }
 
         Ok(())
+    }
+
+    /// Promote every persisted event-time timer whose owning stage's input
+    /// watermark has reached it, deleting each from the store before delivering
+    /// it (at-most-once) and queueing it for that stage's next bundle.
+    ///
+    /// Returns the number of timers promoted.
+    async fn promote_due_event_time_timers(
+        &self,
+        scheduler: &mut NodeScheduler,
+        pending_timers: &mut HashMap<String, Vec<TimerEntry>>,
+    ) -> anyhow::Result<usize> {
+        let event_timers = self.timer_service.all_event_time_timers().await?;
+        if event_timers.is_empty() {
+            return Ok(0);
+        }
+
+        let mut promoted = 0usize;
+        for (stage, timers) in scheduler.promote_due_event_time_timers(&event_timers) {
+            self.timer_service.delete_all(&timers).await?;
+            log::info!(
+                "firing {} due event-time timer(s) for stage '{}'",
+                timers.len(),
+                stage
+            );
+            promoted += timers.len();
+            pending_timers.entry(stage).or_default().extend(timers);
+        }
+        Ok(promoted)
     }
 
     fn new_bundle_runtime(&self) -> BundleRuntime {
