@@ -20,6 +20,17 @@ public interface TimersPipelineOptions extends FlarePipelineOptions {
   void setInputFile(String path);
 
   /**
+   * Returns the file the {@code @OnTimer} results are written to. Defaults to {@code
+   * build/timers-example-flush.txt} (absolute) when not set; override with {@code
+   * --outputFile=/path/to/file}.
+   */
+  @Description("Path to the file the flushed per-key counts are written to")
+  String getOutputFile();
+
+  /** Sets the file the flushed per-key counts are written to. */
+  void setOutputFile(String path);
+
+  /**
    * Applies the standard FlareDB example defaults: run on {@link FlareRunner}, target the local
    * FlareDB job service, and auto-detect the shadow (uber) JAR produced by this module's {@code
    * shadowJar} task, and auto-detect the bundled sample input file. Explicitly configured {@code
@@ -41,6 +52,11 @@ public interface TimersPipelineOptions extends FlarePipelineOptions {
       if (inputFile != null) {
         options.setInputFile(inputFile.getAbsolutePath());
       }
+    }
+    if (options.getOutputFile() == null || options.getOutputFile().isEmpty()) {
+      // Absolute so main() and the SDK harness agree on the location regardless
+      // of their working directories.
+      options.setOutputFile(new File("build/timers-example-flush.txt").getAbsolutePath());
     }
     return options;
   }
