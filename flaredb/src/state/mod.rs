@@ -13,6 +13,7 @@
 
 pub mod backend;
 pub mod bag;
+pub mod timer;
 
 pub use backend::StateBackend;
 pub use bag::BagState;

@@ -4,4 +4,5 @@ pub mod harness;
 pub mod runtime;
 pub mod scheduler;
 pub mod sdf;
+pub mod timer;
 pub mod watermark;

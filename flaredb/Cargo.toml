@@ -47,3 +47,4 @@ features = ["v4"]
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { version = "1.38", features = ["test-util"] }
