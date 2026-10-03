@@ -14,7 +14,7 @@ use crate::{
 };
 use beam_model_rs::v1::{Coder, FunctionSpec};
 use bytes::{Buf, BufMut};
-use log::info;
+use log::debug;
 use std::collections::{HashMap, HashSet};
 
 /// Encodes a value to Beam wire bytes and back.
@@ -75,7 +75,7 @@ impl StandardBeamCoders {
             .map(|spec| spec.urn.as_str())
             .unwrap_or(id);
 
-        info!("Resolving coder: id={}, urn={}", id, urn);
+        debug!("Resolving coder: id={}, urn={}", id, urn);
 
         let component_coder_ids = component_coder_ids
             .or_else(|| pipeline_coder.map(|coder| coder.component_coder_ids.clone()));

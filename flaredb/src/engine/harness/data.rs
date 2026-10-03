@@ -7,7 +7,7 @@ use beam_model_rs::v1::{
     elements::{Data, Timers},
 };
 use dashmap::DashMap;
-use log::{info, warn};
+use log::{debug, info, warn};
 use tokio::sync::{
     Mutex,
     mpsc::{self, UnboundedReceiver, UnboundedSender},
@@ -180,13 +180,13 @@ impl DataChannel {
                     match stream.message().await {
                         Ok(Some(elements)) => {
                             // Demux Elements message into per-instruction queues
-                            info!(
+                            debug!(
                                 "Received Elements from worker: data={}, timers={}",
                                 elements.data.len(),
                                 elements.timers.len()
                             );
                             for data in elements.data {
-                                info!(
+                                debug!(
                                     "Routing data from worker: instruction_id={}, transform_id={}, is_last={}, bytes={}",
                                     data.instruction_id,
                                     data.transform_id,

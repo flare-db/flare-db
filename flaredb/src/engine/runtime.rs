@@ -12,7 +12,7 @@ use beam_model_rs::v1::{
     ProcessBundleDescriptor, RemoteGrpcPort, elements,
 };
 use bytes::{Buf, BytesMut};
-use log::info;
+use log::{debug, info};
 use prost::Message;
 use tokio::sync::{Mutex, mpsc::UnboundedReceiver};
 
@@ -178,8 +178,8 @@ impl BundleRuntime {
         });
         let mut target_batch_size = batch_size_estimator.next_batch_size();
 
-        info!("Spawned task to process stage's output elements");
-        info!(
+        debug!("Spawned task to process stage's output elements");
+        debug!(
             "Decoding with coder_id={}, component_coders={:?}",
             edge_metadata.coder_id, edge_metadata.component_coder
         );
@@ -300,11 +300,11 @@ impl BundleRuntime {
 
                 Some(ElementStreamPayload::Timers(_timer_chunk)) => {
                     //todo!()
-                    info!("Timers chunk");
+                    debug!("Timers chunk");
                 }
 
                 None => {
-                    info!("Receiver channel closed");
+                    debug!("Receiver channel closed");
                     stream_ended = true;
                 }
             }
@@ -359,8 +359,8 @@ impl BundleRuntime {
         input_component_coder_ids: Option<Vec<String>>,
         timer_endpoints: Vec<(String, String)>,
     ) -> anyhow::Result<()> {
-        info!("Spawned task to send stage's input elements to worker");
-        info!(
+        debug!("Spawned task to send stage's input elements to worker");
+        debug!(
             "Sending input elements: instruction_id={}, transform_id={}",
             input_instruction_id, consumer_transform_id,
         );
@@ -370,7 +370,7 @@ impl BundleRuntime {
         };
 
         let elements = self.store.scan_windowed_values(request).await?;
-        info!("Input element coder: {}", input_coder_id);
+        debug!("Input element coder: {}", input_coder_id);
 
         let element_coder = StandardBeamCoders::from_urn(
             input_coder_id.as_str(),
@@ -385,7 +385,7 @@ impl BundleRuntime {
         let mut encoded = BytesMut::new();
 
         if opaque_void {
-            info!(
+            debug!(
                 "VoidCoder pcollection {}: forwarding {} opaque element(s) unchanged",
                 input_pcollection_id,
                 elements.len()
@@ -417,7 +417,7 @@ impl BundleRuntime {
         let timers: Vec<elements::Timers> = timer_endpoints
             .into_iter()
             .map(|(transform_id, timer_family_id)| {
-                info!(
+                debug!(
                     "Terminating inbound timer endpoint: instruction_id={}, transform_id={}, timer_family_id={}",
                     input_instruction_id, transform_id, timer_family_id
                 );
@@ -458,7 +458,7 @@ impl BundleRuntime {
         let elements = Elements { data, timers };
 
         self.data.send_elements(elements).await?;
-        info!("Finished sending input elements to worker");
+        debug!("Finished sending input elements to worker");
         Ok(())
     }
 }
@@ -573,7 +573,7 @@ fn stage_window_coder_id(
                 })
         });
     let resolved = window_coder_id.unwrap_or_else(|| format!("{}/global_window", stage.id()));
-    info!(
+    debug!(
         "Resolved boundary window coder: stage={}, pcollection={}, strategy={}, window_coder_id={}",
         stage.id(),
         pcollection_id,
@@ -626,7 +626,7 @@ pub fn stage_transforms_with_data_boundaries(
     let source_id = stage_source_transform_id(stage);
     let input_element_coder_id = input_pcol.node().coder_id.clone();
     let input_wire_coder_id = windowed_value_coder_id(stage, input_pcol.id());
-    info!(
+    debug!(
         "Adding SDK stage source transform: id={}, output_pcollection={}, element_coder_id={}, wire_coder_id={}",
         source_id,
         input_pcol.id(),
@@ -648,7 +648,7 @@ pub fn stage_transforms_with_data_boundaries(
     );
 
     if stage.output_pcols().is_empty() {
-        info!(
+        debug!(
             "Stage {} has no boundary output PCollections: every output is consumed inside the stage (fused downstream) or is terminal, so no sink transform is registered",
             stage.id()
         );
@@ -658,7 +658,7 @@ pub fn stage_transforms_with_data_boundaries(
         let sink_id = stage_sink_transform_id(stage, output_pcol.id());
         let output_element_coder_id = output_pcol.node().coder_id.clone();
         let output_wire_coder_id = windowed_value_coder_id(stage, output_pcol.id());
-        info!(
+        debug!(
             "Adding SDK stage sink transform: id={}, input_pcollection={}, element_coder_id={}, wire_coder_id={}",
             sink_id,
             output_pcol.id(),

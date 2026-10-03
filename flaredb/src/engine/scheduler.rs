@@ -1,8 +1,14 @@
 use std::collections::HashMap;
 
-use petgraph::{Direction, graph::NodeIndex};
+use petgraph::Direction;
+use petgraph::graph::NodeIndex;
+use petgraph::visit::EdgeRef;
 
-use crate::engine::watermark::WatermarkManager;
+use log::{debug, info};
+
+use crate::engine::watermark::{
+    MAX_TIMESTAMP, MIN_TIMESTAMP, StageKind, WatermarkManager, format_timestamp,
+};
 use crate::fusion::pipeline::{ConsumerMetaData, ExecutableGraph, ExecutableNode};
 
 /// Scheduler that manages execution state for an `ExecutableGraph`.
@@ -11,41 +17,97 @@ use crate::fusion::pipeline::{ConsumerMetaData, ExecutableGraph, ExecutableNode}
 /// per-stage pending/in-flight and watermark state. In the bounded case a node
 /// is ready once every main input PCollection has been produced by a completing
 /// predecessor; this replaces the previous all-predecessors-executed check,
-/// whose executed/in-flight bookkeeping it duplicated.
+/// whose executed/in-flight tracking it duplicated.
 pub struct NodeScheduler {
     graph: ExecutableGraph,
-    bookkeeping: WatermarkManager,
+    /// Shared per-stage watermark, hold and pending/in-flight state.
+    watermarks: WatermarkManager,
     /// Stage id to graph node index.
     index_of: HashMap<String, NodeIndex>,
 }
 
 impl NodeScheduler {
     pub fn new(graph: ExecutableGraph) -> Self {
-        let bookkeeping = WatermarkManager::from_executable_graph(&graph);
+        let watermarks = WatermarkManager::from_executable_graph(&graph);
         let mut index_of = HashMap::new();
         for index in graph.get_executable_graph().node_indices() {
             index_of.insert(graph.get_executable_graph()[index].id(), index);
         }
+
+        // One-line plan summary so a job's scheduling shape is visible up front.
+        let stages = watermarks.stages();
+        let gated: Vec<String> = stages
+            .iter()
+            .filter(|stage| watermarks.stage_kind(stage) == Some(StageKind::WatermarkGated))
+            .map(|stage| {
+                format!(
+                    "{stage}@{}",
+                    format_timestamp(
+                        watermarks
+                            .required_watermark(stage)
+                            .unwrap_or(MIN_TIMESTAMP)
+                    )
+                )
+            })
+            .collect();
+        info!(
+            "scheduler: {} stages, {} watermark-gated [{}]",
+            stages.len(),
+            gated.len(),
+            gated.join(", ")
+        );
+
         Self {
             graph,
-            bookkeeping,
+            watermarks,
             index_of,
         }
     }
 
     /// Returns the next ready nodes to execute, ordered by stage id.
     ///
-    /// A node is ready when all of its main input PCollections have been
-    /// produced and it has no bundle in flight. Nodes returned by this method
-    /// are marked as in-flight.
+    /// Eligibility is `refresh() -> ready_stages()`: watermarks are propagated
+    /// first, then the shared pending/in-flight state decides. A node is ready
+    /// when all of its main input PCollections have been produced and its
+    /// watermark gate (if any) is satisfied. Nodes returned by this method are
+    /// marked in-flight.
     pub fn next_nodes(&mut self) -> Vec<(NodeIndex, ExecutableNode)> {
+        self.watermarks.refresh();
+        let ready = self.watermarks.ready_stages();
+
+        // Per-step eligibility trace. `debug!` keeps this off the default
+        // `info` firehose; enable with `RUST_LOG=flaredb::engine=debug`.
+        debug!(
+            "scheduler: ready [{}]",
+            ready
+                .iter()
+                .map(|stage| format!(
+                    "{stage}(in={}, out={})",
+                    format_timestamp(
+                        self.watermarks
+                            .input_watermark(stage)
+                            .unwrap_or(MIN_TIMESTAMP)
+                    ),
+                    format_timestamp(
+                        self.watermarks
+                            .output_watermark(stage)
+                            .unwrap_or(MIN_TIMESTAMP)
+                    ),
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+
+        #[cfg(debug_assertions)]
+        self.debug_assert_eligibility_matches_dependency_rule(&ready);
+
         let mut next = Vec::new();
 
-        for stage in self.bookkeeping.ready_stages() {
+        for stage in ready {
             let Some(&index) = self.index_of.get(&stage) else {
                 continue;
             };
-            if self.bookkeeping.start_bundle(&stage).is_err() {
+            if self.watermarks.start_bundle(&stage).is_err() {
                 continue;
             }
             next.push((index, self.graph.get_executable_graph()[index].clone()));
@@ -54,20 +116,107 @@ impl NodeScheduler {
         next
     }
 
-    /// Marks a node as completed, propagating its outputs to consumers.
+    /// Marks a node as completed, propagating its outputs.
+    ///
+    /// A bounded source reports `+∞` when it finishes, so a source's completion
+    /// is what satisfies the watermark permit of everything downstream. The
+    /// completion happens once per node, after all of that node's internal
+    /// bundles (including SDF residuals and splits) are done, so a stage's output
+    /// never advances after just the first bundle.
     pub fn mark_complete(&mut self, idx: NodeIndex) {
         let stage = self.graph.get_executable_graph()[idx].id();
-        let _ = self.bookkeeping.complete_bundle(&stage);
+        if self.watermarks.is_source(&stage) {
+            let _ = self.watermarks.report_source_finished(&stage);
+            info!(
+                "scheduler: source '{stage}' finished; output watermark = {}",
+                format_timestamp(MAX_TIMESTAMP)
+            );
+        }
+        let newly_ready = self.watermarks.complete_bundle(&stage).unwrap_or_default();
+        let advanced = self.watermarks.refresh();
+        debug!(
+            "scheduler: stage '{stage}' completed; newly ready [{}]; advanced [{}]",
+            newly_ready.join(", "),
+            advanced
+                .iter()
+                .map(|stage| format!(
+                    "{stage}(in={}, out={})",
+                    format_timestamp(
+                        self.watermarks
+                            .input_watermark(stage)
+                            .unwrap_or(MIN_TIMESTAMP)
+                    ),
+                    format_timestamp(
+                        self.watermarks
+                            .output_watermark(stage)
+                            .unwrap_or(MIN_TIMESTAMP)
+                    ),
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    /// Debug-only cross-check that the watermark-driven eligibility answer agrees
+    /// with the previous all-predecessors-complete rule on a bounded run.
+    ///
+    /// The watermark gate can only restrict, so the new answer must be a subset
+    /// of the dependency answer; for ungated (`Ordinary`) stages the two must be
+    /// equal.
+    #[cfg(debug_assertions)]
+    fn debug_assert_eligibility_matches_dependency_rule(&self, ready: &[String]) {
+        use std::collections::HashSet;
+
+        let graph = self.graph.get_executable_graph();
+        let new: HashSet<NodeIndex> = ready
+            .iter()
+            .filter_map(|stage| self.index_of.get(stage).copied())
+            .collect();
+
+        let mut legacy: HashSet<NodeIndex> = HashSet::new();
+        for index in graph.node_indices() {
+            let stage = graph[index].id();
+            if self.watermarks.is_stage_completed(&stage)
+                || self.watermarks.is_stage_in_flight(&stage)
+            {
+                continue;
+            }
+            let all_predecessors_done =
+                graph
+                    .edges_directed(index, Direction::Incoming)
+                    .all(|edge| {
+                        self.watermarks
+                            .is_stage_completed(&graph[edge.source()].id())
+                    });
+            if all_predecessors_done {
+                legacy.insert(index);
+            }
+        }
+
+        assert!(
+            new.is_subset(&legacy),
+            "watermark eligibility is more permissive than the dependency rule"
+        );
+
+        for index in &legacy {
+            let stage = graph[*index].id();
+            if self.watermarks.stage_kind(&stage) == Some(StageKind::Ordinary) {
+                assert!(
+                    new.contains(index),
+                    "ordinary stage '{stage}' is dependency-ready but not watermark-ready"
+                );
+            }
+        }
     }
 
     /// The shared per-stage watermark and eligibility state.
-    pub fn bookkeeping(&self) -> &WatermarkManager {
-        &self.bookkeeping
+    pub fn watermarks(&self) -> &WatermarkManager {
+        &self.watermarks
     }
 
     /// Mutable access to the shared per-stage watermark and eligibility state.
-    pub fn bookkeeping_mut(&mut self) -> &mut WatermarkManager {
-        &mut self.bookkeeping
+    pub fn watermarks_mut(&mut self) -> &mut WatermarkManager {
+        &mut self.watermarks
     }
 
     /// Returns metadata for every incoming edge to `idx`.
@@ -109,7 +258,7 @@ impl NodeScheduler {
 
     /// Returns `true` when every node in the graph has been executed.
     pub fn is_complete(&self) -> bool {
-        self.bookkeeping.is_complete()
+        self.watermarks.is_complete()
     }
 }
 
@@ -127,6 +276,15 @@ mod tests {
     fn runner_node(name: &str) -> ExecutableNode {
         ExecutableNode::Runner(from_urn(
             beam_urns::IMPULSE_TRANSFORM,
+            name.to_string(),
+            HashMap::new(),
+            HashMap::new(),
+        ))
+    }
+
+    fn gbk_node(name: &str) -> ExecutableNode {
+        ExecutableNode::Runner(from_urn(
+            beam_urns::GROUP_BY_KEY_TRANSFORM,
             name.to_string(),
             HashMap::new(),
             HashMap::new(),
@@ -230,5 +388,36 @@ mod tests {
         let ready = scheduler.next_nodes();
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].0, c);
+    }
+
+    #[test]
+    fn watermark_gated_aggregation_runs_only_after_the_source_completes() {
+        use crate::engine::watermark::StageKind;
+
+        let mut graph = Graph::<ExecutableNode, ConsumerMetaData>::new();
+        let source = graph.add_node(runner_node("source"));
+        let aggregate = graph.add_node(gbk_node("aggregate"));
+        graph.add_edge(source, aggregate, dummy_metadata("sa"));
+
+        let executable_graph = graph_for_test(graph, dummy_metadata("root"));
+        let aggregate_id = executable_graph.get_executable_graph()[aggregate].id();
+        let mut scheduler = NodeScheduler::new(executable_graph);
+
+        // The GroupByKey stage is gated at the global window end.
+        assert_eq!(
+            scheduler.watermarks().stage_kind(&aggregate_id),
+            Some(StageKind::WatermarkGated)
+        );
+
+        // Only the source is ready; the aggregation waits for the watermark.
+        let ready = scheduler.next_nodes();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].0, source);
+
+        // Completing the source reports +inf, which is what satisfies the gate.
+        scheduler.mark_complete(source);
+        let ready = scheduler.next_nodes();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].0, aggregate);
     }
 }

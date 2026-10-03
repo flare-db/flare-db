@@ -7,7 +7,7 @@ use beam_model_rs::v1::{
     beam_fn_control_server::BeamFnControl, instruction_request,
 };
 use dashmap::DashMap;
-use log::{info, warn};
+use log::{debug, info, warn};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Response, Status};
@@ -336,7 +336,7 @@ impl ControlChannel {
         bundle_id: &str,
         response_rx: oneshot::Receiver<InstructionResponse>,
     ) -> Result<ControlResponse> {
-        info!("Polling for process bundle response");
+        debug!("Polling for process bundle response");
         let response = response_rx.await.map_err(|_| {
             anyhow!(
                 "control dispatcher reset or worker disconnected while awaiting instruction {}",
@@ -395,7 +395,7 @@ impl ControlChannel {
                 match response {
                     Ok(Some(response)) => {
                         let instruction_id = response.instruction_id.clone();
-                        info!(
+                        debug!(
                             "control response received: instruction_id={} error={}",
                             instruction_id, response.error
                         );

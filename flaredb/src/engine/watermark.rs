@@ -2,7 +2,7 @@
 //! [`ExecutableGraph`].
 //!
 //! This is the single owner of per-stage state: watermarks, holds, and the
-//! pending/in-flight bookkeeping that decides when a stage may run a bundle.
+//! pending/in-flight state that decides when a stage may run a bundle.
 //! There is deliberately no second copy of this state elsewhere (for example in
 //! [`crate::engine::scheduler`]). It owns no I/O, no transform execution and no
 //! proto types; a later milestone wires external watermark reports into it.
@@ -53,10 +53,15 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use anyhow::{Result, anyhow, bail};
+use beam_model_rs::v1::Components;
 use petgraph::Direction;
+use petgraph::graph::NodeIndex;
 
-use crate::coders::primitives::{BEAM_MAX_TIMESTAMP_MILLIS, BEAM_MIN_TIMESTAMP_MILLIS};
-use crate::fusion::pipeline::{ExecutableGraph, ExecutableNode};
+use crate::coders::primitives::{
+    BEAM_MAX_TIMESTAMP_MILLIS, BEAM_MIN_TIMESTAMP_MILLIS, GLOBAL_WINDOW_MAX_TIMESTAMP_MILLIS,
+};
+use crate::fusion::pipeline::{ConsumerMetaData, ExecutableGraph, ExecutableNode};
+use crate::jobservice::urns::beam_urns;
 
 /// A watermark timestamp in milliseconds since the Unix epoch.
 pub type Timestamp = i64;
@@ -66,6 +71,18 @@ pub const MIN_TIMESTAMP: Timestamp = BEAM_MIN_TIMESTAMP_MILLIS;
 
 /// Beam's maximum timestamp, used as "+∞" for a finished bounded source.
 pub const MAX_TIMESTAMP: Timestamp = BEAM_MAX_TIMESTAMP_MILLIS;
+
+/// Render a watermark for logs: the sentinels become `-inf`/`+inf`, everything
+/// else is millis since the Unix epoch.
+pub fn format_timestamp(timestamp: Timestamp) -> String {
+    if timestamp <= MIN_TIMESTAMP {
+        "-inf".to_string()
+    } else if timestamp >= MAX_TIMESTAMP {
+        "+inf".to_string()
+    } else {
+        timestamp.to_string()
+    }
+}
 
 /// Partition key used by [`WatermarkManager::report_source_watermark`] for
 /// sources that do not report per-partition watermarks.
@@ -124,16 +141,19 @@ impl SourceState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StageKind {
     /// Ready as soon as every main input has been produced. This is the bounded
-    /// case and matches the previous predecessor-complete scheduler.
+    /// data-driven case; it does not consult the watermark.
     #[default]
     Ordinary,
-    /// Additionally waits for the input watermark to advance past the value
-    /// observed at the previous bundle. This is Prism's aggregate/stateful
-    /// readiness: such a stage must not run again until time moves.
+    /// Additionally requires the input watermark to reach
+    /// [`required_watermark`](WatermarkManager::required_watermark). This is
+    /// Prism's aggregate/stateful readiness: such a stage must not run until
+    /// time has moved past what its work needs. A finished bounded source's
+    /// output is [`MAX_TIMESTAMP`], so a bounded aggregation still runs exactly
+    /// when its upstream completes.
     WatermarkGated,
 }
 
-/// Per-stage watermark, hold and eligibility bookkeeping.
+/// Per-stage watermark, hold and pending/in-flight state.
 #[derive(Debug, Clone)]
 struct StageState {
     main_inputs: Vec<PCollectionId>,
@@ -155,9 +175,9 @@ struct StageState {
     /// The stage has completed a bundle. A bounded stage runs exactly once.
     completed: bool,
     kind: StageKind,
-    /// Input watermark observed when the last bundle started; the gate for
-    /// [`StageKind::WatermarkGated`].
-    last_bundle_input: Timestamp,
+    /// Input watermark the stage's work needs before it may run; only consulted
+    /// for [`StageKind::WatermarkGated`]. [`MIN_TIMESTAMP`] means no gate.
+    required_watermark: Timestamp,
 }
 
 impl StageState {
@@ -178,7 +198,7 @@ impl StageState {
         }
         match self.kind {
             StageKind::Ordinary => true,
-            StageKind::WatermarkGated => self.input > self.last_bundle_input,
+            StageKind::WatermarkGated => self.input >= self.required_watermark,
         }
     }
 }
@@ -208,8 +228,8 @@ impl WatermarkManager {
     /// Main inputs come from incoming graph edges, side inputs from the stage's
     /// side-input refs, and outputs from the node's output PCollections. Roots
     /// (nodes with no incoming edges) become sources.
-    pub fn from_executable_graph(graph: &ExecutableGraph) -> Self {
-        let graph = graph.get_executable_graph();
+    pub fn from_executable_graph(executable: &ExecutableGraph) -> Self {
+        let graph = executable.get_executable_graph();
         let mut manager = Self::new();
 
         for index in graph.node_indices() {
@@ -242,6 +262,14 @@ impl WatermarkManager {
             outputs.dedup();
 
             manager.add_stage(node.id(), main_inputs, side_inputs, outputs);
+
+            if let Some(required) =
+                aggregation_required_watermark(node, graph, index, &executable.components)
+            {
+                let id = node.id();
+                manager.set_stage_kind(&id, StageKind::WatermarkGated).ok();
+                manager.set_required_watermark(&id, required).ok();
+            }
         }
 
         manager
@@ -291,7 +319,7 @@ impl WatermarkManager {
                 in_flight: false,
                 completed: false,
                 kind: StageKind::default(),
-                last_bundle_input: MIN_TIMESTAMP,
+                required_watermark: MIN_TIMESTAMP,
             },
         );
     }
@@ -406,6 +434,41 @@ impl WatermarkManager {
         Ok(())
     }
 
+    /// The input watermark a [`StageKind::WatermarkGated`] stage must reach.
+    pub fn required_watermark(&self, stage: &str) -> Option<Timestamp> {
+        self.stages.get(stage).map(|stage| stage.required_watermark)
+    }
+
+    /// Set the input watermark a gated stage must reach.
+    pub fn set_required_watermark(&mut self, stage: &str, watermark: Timestamp) -> Result<()> {
+        self.stage_mut(stage)?.required_watermark = watermark;
+        Ok(())
+    }
+
+    /// Whether a stage is a source (it has no main inputs).
+    pub fn is_source(&self, stage: &str) -> bool {
+        self.stages
+            .get(stage)
+            .map(StageState::is_source)
+            .unwrap_or(false)
+    }
+
+    /// Whether a stage has completed a bundle.
+    pub fn is_stage_completed(&self, stage: &str) -> bool {
+        self.stages
+            .get(stage)
+            .map(|stage| stage.completed)
+            .unwrap_or(false)
+    }
+
+    /// Whether a stage has a bundle in flight.
+    pub fn is_stage_in_flight(&self, stage: &str) -> bool {
+        self.stages
+            .get(stage)
+            .map(|stage| stage.in_flight)
+            .unwrap_or(false)
+    }
+
     /// Stages that may run a bundle now, sorted by id.
     ///
     /// A stage is ready when every main input has been produced, it has no
@@ -449,7 +512,7 @@ impl WatermarkManager {
     /// the returned vector lists the consumers that became ready as a result,
     /// sorted and deduplicated.
     pub fn complete_bundle(&mut self, stage: &str) -> Result<Vec<StageId>> {
-        let (outputs, input) = {
+        let outputs = {
             let stage_state = self
                 .stages
                 .get(stage)
@@ -457,14 +520,13 @@ impl WatermarkManager {
             if !stage_state.in_flight {
                 bail!("stage '{stage}' has no bundle in flight");
             }
-            (stage_state.outputs.clone(), stage_state.input)
+            stage_state.outputs.clone()
         };
 
         {
             let stage_state = self.stages.get_mut(stage).expect("checked above");
             stage_state.in_flight = false;
             stage_state.completed = true;
-            stage_state.last_bundle_input = input;
         }
 
         let mut newly_ready = Vec::new();
@@ -587,6 +649,58 @@ impl WatermarkManager {
             .as_mut()
             .expect("source stage has source state"))
     }
+}
+
+/// The earliest watermark at which a global window is complete, given the
+/// windowing strategy's allowed lateness: `GLOBAL_WINDOW_MAX_TIMESTAMP_MILLIS +
+/// allowed_lateness`.
+///
+/// [`MAX_TIMESTAMP`] is [`BEAM_MAX_TIMESTAMP_MILLIS`], which is above
+/// [`GLOBAL_WINDOW_MAX_TIMESTAMP_MILLIS`], so a finished bounded source's output
+/// always clears this gate: a global-window aggregation becomes ready exactly
+/// when its upstream bounded input completes.
+pub fn global_window_completion_watermark(allowed_lateness: Timestamp) -> Timestamp {
+    GLOBAL_WINDOW_MAX_TIMESTAMP_MILLIS.saturating_add(allowed_lateness)
+}
+
+/// The watermark an aggregation runner stage must reach before it may run, or
+/// `None` for stages that do not aggregate.
+///
+/// For a `GroupByKey` this is its input window's end plus the windowing
+/// strategy's allowed lateness. M2.6 resolves the global-window case (what
+/// bounded pipelines use); M5 generalizes this per window.
+fn aggregation_required_watermark(
+    node: &ExecutableNode,
+    graph: &petgraph::Graph<ExecutableNode, ConsumerMetaData>,
+    index: NodeIndex,
+    components: &Components,
+) -> Option<Timestamp> {
+    let is_aggregation = matches!(
+        node,
+        ExecutableNode::Runner(transform)
+            if transform.transfrom_spec().values().any(|pt| pt
+                .spec
+                .as_ref()
+                .is_some_and(|spec| spec.urn == beam_urns::GROUP_BY_KEY_TRANSFORM))
+    );
+    if !is_aggregation {
+        return None;
+    }
+
+    let allowed_lateness = graph
+        .edges_directed(index, Direction::Incoming)
+        .find_map(|edge| {
+            let pcol = components
+                .pcollections
+                .get(&edge.weight().produced_pcol_id)?;
+            let strategy = components
+                .windowing_strategies
+                .get(&pcol.windowing_strategy_id)?;
+            Some(strategy.allowed_lateness)
+        })
+        .unwrap_or(0);
+
+    Some(global_window_completion_watermark(allowed_lateness))
 }
 
 #[cfg(test)]
@@ -834,24 +948,131 @@ mod tests {
     }
 
     #[test]
-    fn watermark_gated_stage_waits_for_an_advance() {
+    fn gated_stage_waits_until_its_watermark_gate_is_reached() {
         let mut manager = manager(&[("A", &[], &[], &["p"]), ("S", &["p"], &[], &["q"])]);
         manager
             .set_stage_kind("S", StageKind::WatermarkGated)
             .unwrap();
+        manager.set_required_watermark("S", 100).unwrap();
         assert_eq!(manager.stage_kind("S"), Some(StageKind::WatermarkGated));
+        assert_eq!(manager.required_watermark("S"), Some(100));
 
         manager.start_bundle("A").unwrap();
-        // No watermark reported yet, so S's input is still MIN and the gate holds.
-        assert!(manager.complete_bundle("A").unwrap().is_empty());
+        manager.complete_bundle("A").unwrap();
+
+        // Input is available, but the watermark is below the gate: not runnable.
+        manager.report_source_watermark("A", 50).unwrap();
+        manager.refresh();
         assert!(
             manager.ready_stages().is_empty(),
-            "gated stage must wait for a watermark advance"
+            "50 is below the required 100"
         );
 
+        // Crossing the gate makes it runnable.
         manager.report_source_watermark("A", 100).unwrap();
         manager.refresh();
         assert_eq!(manager.ready_stages(), vec!["S".to_string()]);
+
+        // Outputs advance monotonically as the watermark keeps moving.
+        manager.start_bundle("S").unwrap();
+        manager.complete_bundle("S").unwrap();
+        assert_eq!(manager.output_watermark("S"), Some(100));
+
+        manager.report_source_watermark("A", 250).unwrap();
+        manager.refresh();
+        assert_eq!(manager.output_watermark("S"), Some(250));
+    }
+
+    #[test]
+    fn global_window_aggregation_becomes_ready_when_the_bounded_source_finishes() {
+        let gate = global_window_completion_watermark(0);
+
+        // The constant relationship the gate relies on: a finished source's
+        // output (MAX_TIMESTAMP) clears any global window plus lateness.
+        assert!(GLOBAL_WINDOW_MAX_TIMESTAMP_MILLIS < BEAM_MAX_TIMESTAMP_MILLIS);
+        assert!(gate >= GLOBAL_WINDOW_MAX_TIMESTAMP_MILLIS);
+        assert!(MAX_TIMESTAMP >= gate);
+        assert!(
+            global_window_completion_watermark(1_000) > gate,
+            "allowed lateness pushes the gate later"
+        );
+
+        let mut manager = manager(&[("A", &[], &[], &["p"]), ("G", &["p"], &[], &["q"])]);
+        manager
+            .set_stage_kind("G", StageKind::WatermarkGated)
+            .unwrap();
+        manager.set_required_watermark("G", gate).unwrap();
+
+        manager.start_bundle("A").unwrap();
+        manager.complete_bundle("A").unwrap();
+        assert!(
+            manager.ready_stages().iter().all(|stage| stage != "G"),
+            "aggregation must not run before its watermark reaches the window end"
+        );
+
+        manager.report_source_finished("A").unwrap();
+        manager.refresh();
+        assert_eq!(manager.input_watermark("G"), Some(MAX_TIMESTAMP));
+        assert_eq!(manager.ready_stages(), vec!["G".to_string()]);
+    }
+
+    #[test]
+    fn gated_stage_considers_the_side_input_watermark() {
+        let mut manager = manager(&[
+            ("A", &[], &[], &["p"]),
+            ("Side", &[], &[], &["s"]),
+            ("C", &["p"], &["s"], &["r"]),
+        ]);
+        manager
+            .set_stage_kind("C", StageKind::WatermarkGated)
+            .unwrap();
+        manager.set_required_watermark("C", 100).unwrap();
+
+        manager.start_bundle("A").unwrap();
+        manager.start_bundle("Side").unwrap();
+        manager.complete_bundle("A").unwrap();
+        manager.complete_bundle("Side").unwrap();
+
+        manager.report_source_watermark("A", 200).unwrap();
+        manager.report_source_watermark("Side", 40).unwrap();
+        manager.refresh();
+        // Main input passes the gate, but the side input holds the input
+        // watermark below it; the output watermark still advances with the main
+        // input only.
+        assert!(manager.ready_stages().is_empty());
+        assert_eq!(manager.input_watermark("C"), Some(40));
+        assert_eq!(manager.output_watermark("C"), Some(200));
+
+        manager.report_source_watermark("Side", 150).unwrap();
+        manager.refresh();
+        assert_eq!(manager.input_watermark("C"), Some(150));
+        assert_eq!(manager.ready_stages(), vec!["C".to_string()]);
+    }
+
+    #[test]
+    fn fan_in_gated_stage_waits_for_all_upstreams_and_the_watermark() {
+        let mut manager = manager(&[
+            ("A", &[], &[], &["p"]),
+            ("B", &[], &[], &["q"]),
+            ("G", &["p", "q"], &[], &["r"]),
+        ]);
+        manager
+            .set_stage_kind("G", StageKind::WatermarkGated)
+            .unwrap();
+        manager.set_required_watermark("G", 100).unwrap();
+
+        manager.start_bundle("A").unwrap();
+        manager.start_bundle("B").unwrap();
+        manager.complete_bundle("A").unwrap();
+        manager.report_source_watermark("A", 200).unwrap();
+        manager.report_source_watermark("B", 200).unwrap();
+        manager.refresh();
+        // The watermark passes, but B's PCollection is not produced yet.
+        assert!(manager.ready_stages().iter().all(|stage| stage != "G"));
+
+        manager.complete_bundle("B").unwrap();
+        manager.refresh();
+        assert_eq!(manager.ready_stages(), vec!["G".to_string()]);
     }
 
     #[test]
@@ -927,5 +1148,30 @@ mod tests {
         assert_eq!(manager.output_watermark(&a_id), Some(100));
         assert_eq!(manager.input_watermark(&b_id), Some(100));
         assert_eq!(manager.pcollection_watermark("p"), Some(100));
+    }
+
+    #[test]
+    fn group_by_key_stage_is_gated_at_the_global_window_end() {
+        let gbk = ExecutableNode::Runner(from_urn(
+            beam_urns::GROUP_BY_KEY_TRANSFORM,
+            "gbk".to_string(),
+            HashMap::new(),
+            HashMap::new(),
+        ));
+
+        let mut graph = Graph::new();
+        let a = graph.add_node(runner_node("A", &["p"]));
+        let g = graph.add_node(gbk);
+        graph.add_edge(a, g, metadata("p"));
+
+        let executable = ExecutableGraph::from_graph_for_test(graph, metadata("p"));
+        let manager = WatermarkManager::from_executable_graph(&executable);
+        let g_id = executable.get_executable_graph()[g].id();
+
+        assert_eq!(manager.stage_kind(&g_id), Some(StageKind::WatermarkGated));
+        assert_eq!(
+            manager.required_watermark(&g_id),
+            Some(global_window_completion_watermark(0))
+        );
     }
 }
