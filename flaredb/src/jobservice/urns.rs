@@ -31,6 +31,7 @@ pub mod beam_urns {
     pub const GLOBAL_WINDOW_CODER: &str = "beam:coder:global_window:v1";
     pub const INTERVAL_WINDOW_CODER: &str = "beam:coder:interval_window:v1";
     pub const WINDOWED_VALUE_CODER: &str = "beam:coder:windowed_value:v1";
+    pub const TIMER_CODER: &str = "beam:coder:timer:v1";
     pub const ROW_CODER: &str = "beam:coder:row:v1";
     pub const JAVA_SDK_CODER: &str = "beam:coders:javasdk:0.1";
     pub const PYTHON_PICKLE_CODER: &str = "beam:coder:pickled_python:v1";
