@@ -228,23 +228,17 @@ pub mod backend {
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
 
-    use anyhow::{Result, anyhow};
-    use arrow_array::{Array, BinaryArray, Int8Array, RecordBatch};
-    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
-    use paimon::spec::{
-        DataType as PaimonDataType, RowKind, Schema as PaimonSchema, VALUE_KIND_FIELD_NAME,
-        VarBinaryType,
-    };
+    use anyhow::Result;
     use tokio::sync::Mutex;
 
-    use crate::store::element_store::FlareElementStore;
+    use crate::{
+        engine::kv::{KvStore, PaimonKvStore},
+        store::element_store::FlareElementStore,
+    };
 
     /// Paimon table name backing the Beam Fn user-state API.
     const STATE_TABLE: &str = "__flare_state";
-
-    /// Column names for the user-state table.
     const STATE_KEY_COLUMN: &str = "state_key";
-    const STATE_VALUE_COLUMN: &str = "value";
 
     /// Number of dirty cells that triggers an automatic flush. A durable Paimon
     /// commit costs tens of milliseconds, so committing once per write would make
@@ -312,20 +306,32 @@ pub mod backend {
         }
     }
 
-    /// Opaque key/value storage for Beam user state, sharing the element store's
-    /// catalog and database.
+    /// Opaque key/value storage for Beam user state.
+    ///
+    /// The physical store is pluggable via [`KvStore`]: a Paimon primary-key
+    /// table or an embedded SlateDB LSM.
     #[derive(Clone)]
     pub struct StateBackend {
-        store: Arc<FlareElementStore>,
+        store: Arc<dyn KvStore>,
         /// Write-back cache plus the lock that serializes all state operations on
         /// it. A single lock is enough because requests are handled one at a time;
-        /// it makes each read-modify-write atomic without a Paimon transaction.
+        /// it makes each read-modify-write atomic without a backing-store
+        /// transaction.
         cache: Arc<Mutex<StateCache>>,
     }
 
     impl StateBackend {
-        /// Wrap an element store, reusing its catalog and database for the state table.
+        /// Back state with the element store's Paimon catalog (default).
         pub fn new(store: Arc<FlareElementStore>) -> Self {
+            Self::with_store(Arc::new(PaimonKvStore::new(
+                store,
+                STATE_TABLE,
+                STATE_KEY_COLUMN,
+            )))
+        }
+
+        /// Back state with an explicit physical [`KvStore`].
+        pub fn with_store(store: Arc<dyn KvStore>) -> Self {
             Self {
                 store,
                 cache: Arc::new(Mutex::new(StateCache {
@@ -358,38 +364,9 @@ pub mod backend {
             Ok(value)
         }
 
-        /// Read the value stored for `state_key` directly from Paimon.
-        ///
-        /// Uses a predicate targeted at the primary key rather than scanning the
-        /// whole state table; the returned row is still verified byte-for-byte
-        /// because Paimon filter pushdown is planner-level.
+        /// Read the value stored for `state_key` directly from the backing store.
         async fn read_from_store(&self, state_key: &[u8]) -> Result<Option<Vec<u8>>> {
-            for batch in self
-                .store
-                .read_table_batches_by_binary_key(STATE_TABLE, STATE_KEY_COLUMN, state_key)
-                .await?
-            {
-                let keys = batch
-                    .column_by_name(STATE_KEY_COLUMN)
-                    .and_then(|c| c.as_any().downcast_ref::<BinaryArray>())
-                    .ok_or_else(|| {
-                        anyhow!("state table {} column is not Binary", STATE_KEY_COLUMN)
-                    })?;
-                let values = batch
-                    .column_by_name(STATE_VALUE_COLUMN)
-                    .and_then(|c| c.as_any().downcast_ref::<BinaryArray>())
-                    .ok_or_else(|| {
-                        anyhow!("state table {} column is not Binary", STATE_VALUE_COLUMN)
-                    })?;
-
-                for row in 0..batch.num_rows() {
-                    if keys.value(row) == state_key {
-                        return Ok(Some(values.value(row).to_vec()));
-                    }
-                }
-            }
-
-            Ok(None)
+            self.store.get(state_key).await
         }
 
         /// Upsert `value` for `state_key` (last-write-wins).
@@ -454,83 +431,15 @@ pub mod backend {
                 return Ok(());
             }
 
-            let mut keys = Vec::with_capacity(cache.dirty.len());
-            let mut values = Vec::with_capacity(cache.dirty.len());
-            let mut kinds = Vec::with_capacity(cache.dirty.len());
-            for key in &cache.dirty {
-                keys.push(key.clone());
-                match cache.values.get(key).cloned().flatten() {
-                    Some(value) => {
-                        values.push(value);
-                        kinds.push(RowKind::Insert.to_value());
-                    }
-                    None => {
-                        values.push(Vec::new());
-                        kinds.push(RowKind::Delete.to_value());
-                    }
-                }
-            }
-
-            let table = self
-                .store
-                .get_or_create_table(STATE_TABLE, state_paimon_schema()?)
-                .await?;
-            let batch = build_state_record_batch_many(&keys, &values, &kinds)?;
-            self.store.write_table_batch(&table, &batch).await?;
+            let writes: Vec<(Vec<u8>, Option<Vec<u8>>)> = cache
+                .dirty
+                .iter()
+                .map(|key| (key.clone(), cache.values.get(key).cloned().flatten()))
+                .collect();
+            self.store.apply(&writes).await?;
             cache.dirty.clear();
             Ok(())
         }
-    }
-
-    /// Paimon schema for the primary-key user-state table.
-    fn state_paimon_schema() -> Result<PaimonSchema> {
-        let schema = PaimonSchema::builder()
-            .column(
-                STATE_KEY_COLUMN,
-                PaimonDataType::VarBinary(VarBinaryType::try_new(
-                    false,
-                    VarBinaryType::MAX_LENGTH,
-                )?),
-            )
-            .column(
-                STATE_VALUE_COLUMN,
-                PaimonDataType::VarBinary(VarBinaryType::try_new(
-                    false,
-                    VarBinaryType::MAX_LENGTH,
-                )?),
-            )
-            .primary_key([STATE_KEY_COLUMN])
-            .option("bucket", "1")
-            .build()?;
-        Ok(schema)
-    }
-
-    /// Build a multi-row [`RecordBatch`] for the state table, carrying the
-    /// `_VALUE_KIND` changelog column so inserts and deletes share one path and
-    /// many cells commit in a single durable write.
-    fn build_state_record_batch_many(
-        keys: &[Vec<u8>],
-        values: &[Vec<u8>],
-        kinds: &[i8],
-    ) -> Result<RecordBatch> {
-        let schema = ArrowSchema::new(vec![
-            ArrowField::new(STATE_KEY_COLUMN, DataType::Binary, false),
-            ArrowField::new(STATE_VALUE_COLUMN, DataType::Binary, false),
-            ArrowField::new(VALUE_KIND_FIELD_NAME, DataType::Int8, false),
-        ]);
-        let key_array = BinaryArray::from_iter_values(keys.iter().map(|key| key.as_slice()));
-        let value_array =
-            BinaryArray::from_iter_values(values.iter().map(|value| value.as_slice()));
-        let kind_array = Int8Array::from_iter_values(kinds.iter().copied());
-
-        Ok(RecordBatch::try_new(
-            Arc::new(schema),
-            vec![
-                Arc::new(key_array),
-                Arc::new(value_array),
-                Arc::new(kind_array),
-            ],
-        )?)
     }
 
     #[cfg(test)]
@@ -538,22 +447,24 @@ pub mod backend {
         use super::*;
         use tempfile::tempdir;
 
-        async fn make_backend() -> (tempfile::TempDir, StateBackend) {
+        async fn make_backend() -> (tempfile::TempDir, Arc<FlareElementStore>, StateBackend) {
             let dir = tempdir().expect("failed to create tempdir warehouse");
             let warehouse = dir
                 .path()
                 .to_str()
                 .expect("tempdir path is not valid utf8")
                 .to_string();
-            let store = FlareElementStore::new(warehouse, "testdb".to_string(), None)
-                .await
-                .expect("failed to construct FlareElementStore");
-            (dir, StateBackend::new(Arc::new(store)))
+            let store = Arc::new(
+                FlareElementStore::new(warehouse, "testdb".to_string(), None)
+                    .await
+                    .expect("failed to construct FlareElementStore"),
+            );
+            (dir, store.clone(), StateBackend::new(store))
         }
 
         #[tokio::test]
         async fn put_get_delete_roundtrip() {
-            let (_dir, backend) = make_backend().await;
+            let (_dir, _store, backend) = make_backend().await;
 
             // Missing key reads back None.
             assert!(backend.get(b"key").await.unwrap().is_none());
@@ -579,7 +490,7 @@ pub mod backend {
 
         #[tokio::test]
         async fn put_is_isolated_between_keys() {
-            let (_dir, backend) = make_backend().await;
+            let (_dir, _store, backend) = make_backend().await;
 
             backend.put(b"k1", b"one").await.unwrap();
             backend.put(b"k2", b"two").await.unwrap();
@@ -604,7 +515,7 @@ pub mod backend {
 
         #[tokio::test]
         async fn keyed_get_returns_the_matching_key_among_many() {
-            let (_dir, backend) = make_backend().await;
+            let (_dir, _store, backend) = make_backend().await;
 
             for i in 0..32u8 {
                 backend.put(&[i], &[i, i]).await.unwrap();
@@ -619,7 +530,7 @@ pub mod backend {
 
         #[tokio::test]
         async fn read_modify_write_does_not_lose_concurrent_updates() {
-            let (_dir, backend) = make_backend().await;
+            let (_dir, _store, backend) = make_backend().await;
             let tasks = 16;
 
             let mut handles = Vec::new();
@@ -645,7 +556,7 @@ pub mod backend {
 
         #[tokio::test]
         async fn flush_persists_the_write_back_cache_to_a_fresh_backend() {
-            let (_dir, backend) = make_backend().await;
+            let (_dir, store, backend) = make_backend().await;
             backend.put(b"k", b"v1").await.unwrap();
             backend
                 .read_modify_write(b"k", |mut current| {
@@ -657,13 +568,13 @@ pub mod backend {
 
             // Writes live in the in-memory cache until flushed, so a backend that
             // has not been flushed sees nothing.
-            let fresh = StateBackend::new(backend.store.clone());
+            let fresh = StateBackend::new(store.clone());
             assert!(fresh.get(b"k").await.unwrap().is_none());
 
             backend.flush().await.unwrap();
 
             // After a flush the value is durable for a backend sharing the store.
-            let reloaded = StateBackend::new(backend.store.clone());
+            let reloaded = StateBackend::new(store.clone());
             assert_eq!(
                 reloaded.get(b"k").await.unwrap().as_deref(),
                 Some(&b"v1+v2"[..])
@@ -672,14 +583,14 @@ pub mod backend {
 
         #[tokio::test]
         async fn dirty_writes_commit_automatically_past_the_threshold() {
-            let (_dir, backend) = make_backend().await;
+            let (_dir, store, backend) = make_backend().await;
 
             for i in 0..=STATE_FLUSH_THRESHOLD as u32 {
                 backend.put(&i.to_be_bytes(), b"v").await.unwrap();
             }
 
             // Crossing the threshold flushed without an explicit `flush` call.
-            let reloaded = StateBackend::new(backend.store.clone());
+            let reloaded = StateBackend::new(store.clone());
             assert_eq!(
                 reloaded.get(&0u32.to_be_bytes()).await.unwrap().as_deref(),
                 Some(&b"v"[..])
@@ -688,15 +599,41 @@ pub mod backend {
 
         #[tokio::test]
         async fn flush_commits_deletes_as_well_as_inserts() {
-            let (_dir, backend) = make_backend().await;
+            let (_dir, store, backend) = make_backend().await;
             backend.put(b"gone", b"value").await.unwrap();
             backend.flush().await.unwrap();
 
             backend.delete(b"gone").await.unwrap();
             backend.flush().await.unwrap();
 
-            let reloaded = StateBackend::new(backend.store.clone());
+            let reloaded = StateBackend::new(store.clone());
             assert!(reloaded.get(b"gone").await.unwrap().is_none());
+        }
+
+        #[tokio::test]
+        async fn slate_state_store_roundtrips_and_batches() {
+            let dir = tempdir().expect("failed to create tempdir");
+            let store = crate::engine::kv::SlateKvStore::open(dir.path(), "state")
+                .await
+                .expect("failed to open SlateDB state store");
+
+            assert!(store.get(b"missing").await.unwrap().is_none());
+
+            // One batched write for several cells.
+            store
+                .apply(&[
+                    (b"k1".to_vec(), Some(b"v1".to_vec())),
+                    (b"k2".to_vec(), Some(b"v2".to_vec())),
+                ])
+                .await
+                .unwrap();
+            assert_eq!(store.get(b"k1").await.unwrap().as_deref(), Some(&b"v1"[..]));
+            assert_eq!(store.get(b"k2").await.unwrap().as_deref(), Some(&b"v2"[..]));
+
+            // A delete in the batch removes only its own key.
+            store.apply(&[(b"k1".to_vec(), None)]).await.unwrap();
+            assert!(store.get(b"k1").await.unwrap().is_none());
+            assert_eq!(store.get(b"k2").await.unwrap().as_deref(), Some(&b"v2"[..]));
         }
 
         #[test]

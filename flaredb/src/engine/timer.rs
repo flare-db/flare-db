@@ -25,19 +25,16 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::engine::watermark::Timestamp;
-use anyhow::{Result, anyhow};
-use arrow_array::{Array, BinaryArray, Int8Array, RecordBatch};
-use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+use anyhow::Result;
 use log::warn;
-use paimon::spec::{
-    DataType as PaimonDataType, RowKind, Schema as PaimonSchema, VALUE_KIND_FIELD_NAME,
-    VarBinaryType,
-};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, mpsc};
 use tokio::time::Instant;
 
-use crate::store::element_store::FlareElementStore;
+use crate::{
+    engine::kv::{KvStore, PaimonKvStore, SlateKvStore},
+    store::element_store::FlareElementStore,
+};
 
 /// Durable timers plus the processing-time clock.
 pub struct TimerService {
@@ -161,8 +158,12 @@ impl TimerService {
     /// at-most-once: a crash after deletion loses the timer.
     pub async fn take_due_processing_time(&self, now: Timestamp) -> Result<Vec<TimerEntry>> {
         let due = self.due_processing_time(now).await?;
-        for entry in &due {
-            self.store.delete(&entry.key.storage_key()).await?;
+        if !due.is_empty() {
+            let pending: HashMap<Vec<u8>, Option<TimerEntry>> = due
+                .iter()
+                .map(|entry| (entry.key.storage_key(), None))
+                .collect();
+            self.store.apply(&pending).await?;
         }
         Ok(due)
     }
@@ -188,12 +189,17 @@ impl TimerService {
     /// Used when an event-time timer is delivered, so it fires at most once per
     /// delivery. A timer the fired callback re-sets is a distinct new entry.
     pub async fn delete_all(&self, entries: &[TimerEntry]) -> Result<()> {
-        for entry in entries {
-            self.store.delete(&entry.key.storage_key()).await?;
+        if entries.is_empty() {
+            return Ok(());
         }
-        if !entries.is_empty() {
-            self.notify.notify_waiters();
-        }
+        // Batch the deletes into one durable commit: firing thousands of event-time
+        // timers otherwise commits once per timer (~40ms each, the N13 tail).
+        let pending: HashMap<Vec<u8>, Option<TimerEntry>> = entries
+            .iter()
+            .map(|entry| (entry.key.storage_key(), None))
+            .collect();
+        self.store.apply(&pending).await?;
+        self.notify.notify_waiters();
         Ok(())
     }
 
@@ -451,7 +457,6 @@ mod tests {
 /// Paimon table backing the Beam user-timer store.
 const TIMER_TABLE: &str = "__flare_timer";
 const TIMER_KEY_COLUMN: &str = "timer_key";
-const TIMER_VALUE_COLUMN: &str = "value";
 
 /// Beam's timer time domain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -522,25 +527,35 @@ impl TimerEntry {
 /// Durable keyed storage for Beam user timers.
 #[derive(Clone)]
 pub struct TimerStore {
-    store: Arc<FlareElementStore>,
+    kv: Arc<dyn KvStore>,
 }
 
 impl TimerStore {
-    /// Wrap an element store, reusing its catalog and database for the timer table.
+    /// Back timers with the element store's Paimon catalog (default).
     pub fn new(store: Arc<FlareElementStore>) -> Self {
-        Self { store }
+        Self::with_store(Arc::new(PaimonKvStore::new(
+            store,
+            TIMER_TABLE,
+            TIMER_KEY_COLUMN,
+        )))
+    }
+
+    /// Back timers with an explicit physical [`KvStore`].
+    pub fn with_store(kv: Arc<dyn KvStore>) -> Self {
+        Self { kv }
     }
 
     /// Insert or replace the timer (last-write-wins on the composite key).
     pub async fn upsert(&self, entry: &TimerEntry) -> Result<()> {
         let value = serde_json::to_vec(entry)?;
-        self.write_row(&entry.key.storage_key(), &value, RowKind::Insert)
+        self.kv
+            .apply(&[(entry.key.storage_key(), Some(value))])
             .await
     }
 
     /// Delete the timer at `storage_key` (no-op when absent).
     pub async fn delete(&self, storage_key: &[u8]) -> Result<()> {
-        self.write_row(storage_key, &[], RowKind::Delete).await
+        self.kv.apply(&[(storage_key.to_vec(), None)]).await
     }
 
     /// Apply many timer writes in a single durable commit.
@@ -553,134 +568,45 @@ impl TimerStore {
         if pending.is_empty() {
             return Ok(());
         }
-        let mut keys = Vec::with_capacity(pending.len());
-        let mut values = Vec::with_capacity(pending.len());
-        let mut kinds = Vec::with_capacity(pending.len());
-        for (key, value) in pending {
-            keys.push(key.clone());
-            match value {
-                Some(entry) => {
-                    values.push(serde_json::to_vec(entry)?);
-                    kinds.push(RowKind::Insert.to_value());
-                }
-                None => {
-                    values.push(Vec::new());
-                    kinds.push(RowKind::Delete.to_value());
-                }
-            }
+        let mut writes = Vec::with_capacity(pending.len());
+        for (key, entry) in pending {
+            let value = match entry {
+                Some(entry) => Some(serde_json::to_vec(entry)?),
+                None => None,
+            };
+            writes.push((key.clone(), value));
         }
-        let table = self
-            .store
-            .get_or_create_table(TIMER_TABLE, timer_paimon_schema()?)
-            .await?;
-        let batch = build_timer_record_batch_many(&keys, &values, &kinds)?;
-        self.store.write_table_batch(&table, &batch).await
+        self.kv.apply(&writes).await
     }
 
     /// Read a single timer, or `None` when absent.
     pub async fn get(&self, storage_key: &[u8]) -> Result<Option<TimerEntry>> {
-        let batches = self
-            .store
-            .read_table_batches_by_binary_key(TIMER_TABLE, TIMER_KEY_COLUMN, storage_key)
-            .await?;
-        for batch in batches {
-            let keys = batch
-                .column_by_name(TIMER_KEY_COLUMN)
-                .and_then(|c| c.as_any().downcast_ref::<BinaryArray>())
-                .ok_or_else(|| anyhow!("timer table {} column is not Binary", TIMER_KEY_COLUMN))?;
-            let values = batch
-                .column_by_name(TIMER_VALUE_COLUMN)
-                .and_then(|c| c.as_any().downcast_ref::<BinaryArray>())
-                .ok_or_else(|| {
-                    anyhow!("timer table {} column is not Binary", TIMER_VALUE_COLUMN)
-                })?;
-            for row in 0..batch.num_rows() {
-                if keys.value(row) == storage_key {
-                    return Ok(Some(serde_json::from_slice(values.value(row))?));
-                }
-            }
+        match self.kv.get(storage_key).await? {
+            Some(value) => Ok(Some(serde_json::from_slice(&value)?)),
+            None => Ok(None),
         }
-        Ok(None)
     }
 
     /// All persisted timers.
     pub async fn entries(&self) -> Result<Vec<TimerEntry>> {
         let mut out = Vec::new();
-        for batch in self.store.read_table_batches(TIMER_TABLE).await? {
-            let values = batch
-                .column_by_name(TIMER_VALUE_COLUMN)
-                .and_then(|c| c.as_any().downcast_ref::<BinaryArray>())
-                .ok_or_else(|| {
-                    anyhow!("timer table {} column is not Binary", TIMER_VALUE_COLUMN)
-                })?;
-            for row in 0..batch.num_rows() {
-                out.push(serde_json::from_slice(values.value(row))?);
-            }
+        for (_, value) in self.kv.scan().await? {
+            out.push(serde_json::from_slice(&value)?);
         }
         Ok(out)
     }
+}
 
-    async fn write_row(&self, key: &[u8], value: &[u8], kind: RowKind) -> Result<()> {
-        let table = self
-            .store
-            .get_or_create_table(TIMER_TABLE, timer_paimon_schema()?)
-            .await?;
-        let batch = build_timer_record_batch(key, value, kind)?;
-        self.store.write_table_batch(&table, &batch).await
+/// Construct a job's timer store, honoring the shared backend selection
+/// (SlateDB by default, Paimon via `FLAREDB_STATE_BACKEND=paimon`).
+pub async fn build_timer_store(store: Arc<FlareElementStore>) -> Result<TimerStore> {
+    if crate::engine::kv::use_slatedb() {
+        let dir = crate::store::element_store::slate_state_dir(&store);
+        let kv = SlateKvStore::open(&dir, "timers").await?;
+        Ok(TimerStore::with_store(Arc::new(kv)))
+    } else {
+        Ok(TimerStore::new(store))
     }
-}
-
-/// Paimon schema for the primary-key timer table.
-fn timer_paimon_schema() -> Result<PaimonSchema> {
-    let schema = PaimonSchema::builder()
-        .column(
-            TIMER_KEY_COLUMN,
-            PaimonDataType::VarBinary(VarBinaryType::try_new(false, VarBinaryType::MAX_LENGTH)?),
-        )
-        .column(
-            TIMER_VALUE_COLUMN,
-            PaimonDataType::VarBinary(VarBinaryType::try_new(false, VarBinaryType::MAX_LENGTH)?),
-        )
-        .primary_key([TIMER_KEY_COLUMN])
-        .option("bucket", "1")
-        .build()?;
-    Ok(schema)
-}
-
-/// Build a single-row batch carrying the `_VALUE_KIND` changelog column so
-/// inserts and deletes share one write path.
-fn build_timer_record_batch(key: &[u8], value: &[u8], kind: RowKind) -> Result<RecordBatch> {
-    build_timer_record_batch_many(
-        std::slice::from_ref(&key.to_vec()),
-        std::slice::from_ref(&value.to_vec()),
-        std::slice::from_ref(&kind.to_value()),
-    )
-}
-
-/// Build a multi-row batch carrying the `_VALUE_KIND` changelog column, so many
-/// timer sets/clears commit in one durable write.
-fn build_timer_record_batch_many(
-    keys: &[Vec<u8>],
-    values: &[Vec<u8>],
-    kinds: &[i8],
-) -> Result<RecordBatch> {
-    let schema = ArrowSchema::new(vec![
-        ArrowField::new(TIMER_KEY_COLUMN, DataType::Binary, false),
-        ArrowField::new(TIMER_VALUE_COLUMN, DataType::Binary, false),
-        ArrowField::new(VALUE_KIND_FIELD_NAME, DataType::Int8, false),
-    ]);
-    let key_array = BinaryArray::from_iter_values(keys.iter().map(|key| key.as_slice()));
-    let value_array = BinaryArray::from_iter_values(values.iter().map(|value| value.as_slice()));
-    let kind_array = Int8Array::from_iter_values(kinds.iter().copied());
-
-    Ok(RecordBatch::try_new(
-        Arc::new(schema),
-        vec![
-            Arc::new(key_array),
-            Arc::new(value_array),
-            Arc::new(kind_array),
-        ],
-    )?)
 }
 
 #[cfg(test)]

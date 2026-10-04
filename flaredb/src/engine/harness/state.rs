@@ -5,7 +5,7 @@ use beam_model_rs::v1::{
     StateAppendResponse, StateClearResponse, StateGetResponse, StateRequest, StateResponse,
     beam_fn_state_server::BeamFnState, state_key, state_request, state_response,
 };
-use log::{info, warn};
+use log::{error, info, warn};
 use tokio::sync::{
     Mutex,
     mpsc::{self},
@@ -14,8 +14,11 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Response, Status};
 
 use crate::{
-    engine::state::{StateBackend, UserStateAddress, UserStateKind, UserStateStore},
-    store::element_store::FlareElementStore,
+    engine::{
+        kv::{SlateKvStore, use_slatedb},
+        state::{StateBackend, UserStateAddress, UserStateKind, UserStateStore},
+    },
+    store::element_store::{FlareElementStore, slate_state_dir},
 };
 
 pub struct StateInner {
@@ -174,10 +177,12 @@ impl StateChannel {
     pub fn stream_requests(&self, store: Arc<FlareElementStore>) {
         let channel = self.clone();
         let task_slot = self.stream_task.clone();
-        let backend = StateBackend::new(store);
 
         let join_handle = tokio::spawn(async move {
-            channel.drive_state_requests(backend).await;
+            match build_state_backend(store).await {
+                Ok(backend) => channel.drive_state_requests(backend).await,
+                Err(e) => error!("failed to construct state backend: {e}"),
+            }
         });
 
         *task_slot.lock().unwrap() = Some(join_handle);
@@ -237,6 +242,22 @@ impl StateChannel {
         }
         info!("state request driver stopped");
     }
+}
+
+/// Select and construct the physical state backend for a job.
+///
+/// Defaults to an embedded SlateDB LSM under the job's warehouse. Set
+/// `FLAREDB_STATE_BACKEND=paimon` to use the legacy Paimon state table instead.
+async fn build_state_backend(store: Arc<FlareElementStore>) -> Result<StateBackend> {
+    if !use_slatedb() {
+        info!("using Paimon state backend");
+        return Ok(StateBackend::new(store));
+    }
+
+    let dir = slate_state_dir(&store);
+    let kv = SlateKvStore::open(&dir, "state").await?;
+    info!("using SlateDB state backend at {}", dir.display());
+    Ok(StateBackend::with_store(Arc::new(kv)))
 }
 
 /// Human-readable summary of a [`StateRequest`] for logging.

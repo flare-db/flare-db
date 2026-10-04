@@ -832,6 +832,17 @@ pub async fn create_catalog(warehouse: String, db_name: String) -> Result<FileSy
         .await?;
     Ok(catalog)
 }
+
+/// Local directory SlateDB uses for a job's user state.
+///
+/// Derived from the store's warehouse and database so each job gets an isolated
+/// embedded state database, alongside the Paimon tables.
+pub fn slate_state_dir(store: &FlareElementStore) -> std::path::PathBuf {
+    std::path::Path::new(store.catalog.warehouse())
+        .join(".slate_state")
+        .join(&store.db_name)
+}
+
 /// Convert an Arrow [`Schema`](ArrowSchema) into a Paimon [`Schema`](PaimonSchema).
 ///
 /// The resulting schema preserves Arrow field names and converted data types,
