@@ -191,6 +191,48 @@ impl StandardBeamCoders {
         matches!(self, StandardBeamCoders::Void(_))
     }
 
+    /// Whether decoding this coder always yields a [`BeamRecord::PRIMITIVE`].
+    ///
+    /// A KV/GBK key may be any coder. Primitive keys are stored in their typed
+    /// [`PrimitiveValue`] slot; composite keys (KV, GBK, iterable, tuple, or a
+    /// nullable wrapping one) cannot be, so the runner keeps their nested encoding
+    /// as opaque [`PrimitiveValue::Bytes`] — enough for structural grouping and a
+    /// faithful round-trip, which is all the runner needs of a key.
+    fn is_primitive(&self) -> bool {
+        match self {
+            StandardBeamCoders::Nullable(coder) => coder.inner().is_primitive(),
+            StandardBeamCoders::Iterable(_)
+            | StandardBeamCoders::Tuple(_)
+            | StandardBeamCoders::Kv(_, _)
+            | StandardBeamCoders::Gbk(_, _) => false,
+            _ => true,
+        }
+    }
+
+    /// Decode a KV/GBK **key** (Beam encodes it in nested, self-delimiting context).
+    fn decode_key(&self, buf: &mut impl Buf) -> Result<PrimitiveValue, CodersError> {
+        if self.is_primitive() {
+            return self.decode_primitive(buf);
+        }
+        // Composite key: consume it and retain its nested encoding as opaque bytes.
+        let record = self.decode_nested(buf)?;
+        let mut raw = bytes::BytesMut::new();
+        self.encode(record, &mut raw);
+        Ok(PrimitiveValue::Bytes(raw.to_vec()))
+    }
+
+    /// Encode a KV/GBK **key**; the inverse of [`Self::decode_key`].
+    fn encode_key(&self, key: &PrimitiveValue, buf: &mut impl BufMut) {
+        if self.is_primitive() {
+            self.encode_primitive(key.clone(), buf);
+            return;
+        }
+        match key {
+            PrimitiveValue::Bytes(raw) => buf.put_slice(raw),
+            other => panic!("composite key coder requires opaque bytes, got {other:?}"),
+        }
+    }
+
     fn decode_primitive(&self, buf: &mut impl Buf) -> Result<PrimitiveValue, CodersError> {
         self.decode_nested(buf)?
             .get_primitive()
@@ -216,12 +258,12 @@ impl StandardBeamCoders {
             }
 
             (StandardBeamCoders::Kv(key_coder, value_coder), BeamRecord::KV(kv)) => {
-                key_coder.encode_primitive(kv.key, buf);
+                key_coder.encode_key(&kv.key, buf);
                 value_coder.encode(*kv.value, buf);
             }
 
             (StandardBeamCoders::Gbk(key_coder, value_coder), BeamRecord::GBK(kv)) => {
-                key_coder.encode_primitive(kv.key, buf);
+                key_coder.encode_key(&kv.key, buf);
                 value_coder.encode(kv.value.list, buf);
             }
 
@@ -297,11 +339,11 @@ impl StandardBeamCoders {
                 Ok(BeamRecord::PRIMITIVE(PrimitiveValue::Bytes(bytes.to_vec())))
             }
             StandardBeamCoders::Kv(key_coder, value_coder) => Ok(BeamRecord::KV(BeamKV {
-                key: key_coder.decode_primitive(buf)?,
+                key: key_coder.decode_key(buf)?,
                 value: Box::new(value_coder.decode_element(buf)?),
             })),
             StandardBeamCoders::Gbk(key_coder, value_coder) => Ok(BeamRecord::GBK(BeamGbk {
-                key: key_coder.decode_primitive(buf)?,
+                key: key_coder.decode_key(buf)?,
                 value: IterableValue {
                     list: value_coder.decode(buf)?,
                 },
@@ -347,11 +389,11 @@ impl StandardBeamCoders {
             })),
             StandardBeamCoders::Nullable(coder) => coder.decode(buf),
             StandardBeamCoders::Kv(key_coder, value_coder) => Ok(BeamRecord::KV(BeamKV {
-                key: key_coder.decode_primitive(buf)?,
+                key: key_coder.decode_key(buf)?,
                 value: Box::new(value_coder.decode_nested(buf)?),
             })),
             StandardBeamCoders::Gbk(key_coder, value_coder) => Ok(BeamRecord::GBK(BeamGbk {
-                key: key_coder.decode_primitive(buf)?,
+                key: key_coder.decode_key(buf)?,
                 value: IterableValue {
                     list: value_coder.decode(buf)?,
                 },
@@ -570,6 +612,61 @@ mod tests {
             other => panic!("expected KV, got {other:?}"),
         }
         assert_eq!(nested.remaining(), 0);
+    }
+
+    #[test]
+    fn kv_with_composite_key_roundtrips() {
+        // Outer KV<KvCoder<bytes,bytes>, varint> — the key is itself a KV, as in
+        // Beam's Combine.perKeyWithFanout(AddNonce) output (the Q7 failure).
+        let mut coders = HashMap::new();
+        coders.insert("b".to_string(), coder(beam_urns::BYTES_CODER, &[]));
+        coders.insert("v".to_string(), coder(beam_urns::VARINT_CODER, &[]));
+        coders.insert("kv".to_string(), coder(beam_urns::KV_CODER, &["b", "b"]));
+        coders.insert(
+            "outer".to_string(),
+            coder(beam_urns::KV_CODER, &["kv", "v"]),
+        );
+        let outer = StandardBeamCoders::from_urn("outer", None, Some(&coders));
+
+        // Nested encoding of the composite key KV<bytes,bytes>("a", "b").
+        let composite_key = vec![0x01, b'a', 0x01, b'b'];
+        let element = BeamRecord::KV(BeamKV {
+            key: PrimitiveValue::Bytes(composite_key.clone()),
+            value: Box::new(BeamRecord::PRIMITIVE(PrimitiveValue::Int64(7))),
+        });
+
+        let mut encoded = Vec::new();
+        outer.encode(element, &mut encoded);
+        // The composite key is written verbatim (it already is its nested encoding),
+        // then the varint value — no extra length prefix around the key.
+        assert_eq!(encoded, vec![0x01, b'a', 0x01, b'b', 0x07]);
+
+        let mut buf: &[u8] = &encoded;
+        let decoded = outer.decode_nested(&mut buf).unwrap();
+        assert_eq!(buf.remaining(), 0);
+        match decoded {
+            BeamRecord::KV(kv) => {
+                assert_eq!(kv.key, PrimitiveValue::Bytes(composite_key));
+                assert_eq!(*kv.value, BeamRecord::PRIMITIVE(PrimitiveValue::Int64(7)));
+            }
+            other => panic!("expected KV, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn is_primitive_classifies_key_coders() {
+        let primitive = StandardBeamCoders::StringUtf8(StringUtf8Coder);
+        assert!(primitive.is_primitive());
+
+        let composite = StandardBeamCoders::Kv(
+            Box::new(StandardBeamCoders::StringUtf8(StringUtf8Coder)),
+            Box::new(StandardBeamCoders::VarInt(VarIntCoder)),
+        );
+        assert!(!composite.is_primitive());
+
+        // Nullable is primitive iff its inner coder is.
+        assert!(StandardBeamCoders::Nullable(NullableCoder::new(primitive)).is_primitive());
+        assert!(!StandardBeamCoders::Nullable(NullableCoder::new(composite)).is_primitive());
     }
 
     #[test]

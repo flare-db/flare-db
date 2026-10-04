@@ -281,6 +281,12 @@ impl NullableCoder {
             value_coder: Box::new(value_coder),
         }
     }
+
+    /// The wrapped coder, for classifying the coder (e.g. whether it decodes to a
+    /// primitive).
+    pub fn inner(&self) -> &StandardBeamCoders {
+        &self.value_coder
+    }
 }
 
 const NULLABLE_ENCODE_NULL: u8 = 0;
