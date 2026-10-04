@@ -808,6 +808,24 @@ fn append_window_metadata(batch: RecordBatch, metadata: &[WindowMetadata]) -> Re
 pub async fn create_catalog(warehouse: String, db_name: String) -> Result<FileSystemCatalog> {
     let mut options = Options::new();
     options.set(CatalogOptions::WAREHOUSE, warehouse.as_str());
+
+    // Cache immutable table metadata and index blocks on local disk. Every scan
+    // plan and commit re-reads the latest schema, snapshot, and manifests; a
+    // stateful bundle issues enough of those that re-reading them from storage
+    // adds up on the hot path (N3). The cache is fail-open, so storage remains
+    // the source of truth. It lives under the warehouse, which is a local path
+    // for this single-node runner.
+    let cache_dir = std::path::Path::new(&warehouse).join(".paimon-cache");
+    if let Some(cache_dir) = cache_dir.to_str() {
+        options.set(CatalogOptions::LOCAL_CACHE_ENABLED, "true");
+        options.set(CatalogOptions::LOCAL_CACHE_DIR, cache_dir);
+        options.set(CatalogOptions::LOCAL_CACHE_MAX_SIZE, "1 GiB");
+        options.set(
+            CatalogOptions::LOCAL_CACHE_WHITELIST,
+            "meta,global-index,bucket-index",
+        );
+    }
+
     let catalog = FileSystemCatalog::new(options)?;
     catalog
         .create_database(&db_name, true, HashMap::new())

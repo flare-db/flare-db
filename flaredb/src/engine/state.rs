@@ -225,12 +225,12 @@ pub mod backend {
     //! [`super::bag`]. The core table read/write operations are delegated to
     //! [`FlareElementStore`].
 
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
 
     use anyhow::{Result, anyhow};
     use arrow_array::{Array, BinaryArray, Int8Array, RecordBatch};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
-    use dashmap::DashMap;
     use paimon::spec::{
         DataType as PaimonDataType, RowKind, Schema as PaimonSchema, VALUE_KIND_FIELD_NAME,
         VarBinaryType,
@@ -246,18 +246,36 @@ pub mod backend {
     const STATE_KEY_COLUMN: &str = "state_key";
     const STATE_VALUE_COLUMN: &str = "value";
 
+    /// Number of dirty cells that triggers an automatic flush. A durable Paimon
+    /// commit costs tens of milliseconds, so committing once per write would make
+    /// a stateful bundle miss its deadline (N3); batching many cells into one
+    /// commit amortizes that cost.
+    const STATE_FLUSH_THRESHOLD: usize = 512;
+
+    /// In-memory write-back cache over the Paimon user-state table.
+    ///
+    /// The Fn State protocol is request/response lockstep: the SDK sends one state
+    /// request and waits for its response before sending the next. Serving each op
+    /// from Paimon therefore costs a scan plus a full durable commit (~40ms),
+    /// which dominates bundle time for a stateful DoFn (N3). Every cell touched
+    /// during a job is instead held here, and dirty cells are committed together.
+    struct StateCache {
+        /// Authoritative value per touched cell. `None` means the cell is empty
+        /// (absent in Paimon, deleted, or cleared).
+        values: HashMap<Vec<u8>, Option<Vec<u8>>>,
+        /// Cells whose `values` entry has not yet been committed to Paimon.
+        dirty: HashSet<Vec<u8>>,
+    }
+
     /// Opaque key/value storage for Beam user state, sharing the element store's
     /// catalog and database.
     #[derive(Clone)]
     pub struct StateBackend {
         store: Arc<FlareElementStore>,
-        /// Per-key locks serializing read-modify-write of a state cell. A cell is
-        /// addressed by its composite `(transform, state id, window, key)` bytes,
-        /// so unrelated cells can be updated concurrently.
-        ///
-        /// Entries are retained for the process lifetime; window-expiry cleanup
-        /// (a later milestone) is expected to evict them alongside the state rows.
-        key_locks: Arc<DashMap<Vec<u8>, Arc<Mutex<()>>>>,
+        /// Write-back cache plus the lock that serializes all state operations on
+        /// it. A single lock is enough because requests are handled one at a time;
+        /// it makes each read-modify-write atomic without a Paimon transaction.
+        cache: Arc<Mutex<StateCache>>,
     }
 
     impl StateBackend {
@@ -265,16 +283,41 @@ pub mod backend {
         pub fn new(store: Arc<FlareElementStore>) -> Self {
             Self {
                 store,
-                key_locks: Arc::new(DashMap::new()),
+                cache: Arc::new(Mutex::new(StateCache {
+                    values: HashMap::new(),
+                    dirty: HashSet::new(),
+                })),
             }
         }
 
         /// Read the value stored for `state_key`, or `None` when absent.
         ///
+        /// Served from the write-back cache when the cell has been touched during
+        /// the job; otherwise read from Paimon and cached (first touch only).
+        pub async fn get(&self, state_key: &[u8]) -> Result<Option<Vec<u8>>> {
+            let mut cache = self.cache.lock().await;
+            self.get_locked(&mut cache, state_key).await
+        }
+
+        async fn get_locked(
+            &self,
+            cache: &mut StateCache,
+            state_key: &[u8],
+        ) -> Result<Option<Vec<u8>>> {
+            if let Some(value) = cache.values.get(state_key) {
+                return Ok(value.clone());
+            }
+            let value = self.read_from_store(state_key).await?;
+            cache.values.insert(state_key.to_vec(), value.clone());
+            Ok(value)
+        }
+
+        /// Read the value stored for `state_key` directly from Paimon.
+        ///
         /// Uses a predicate targeted at the primary key rather than scanning the
         /// whole state table; the returned row is still verified byte-for-byte
         /// because Paimon filter pushdown is planner-level.
-        pub async fn get(&self, state_key: &[u8]) -> Result<Option<Vec<u8>>> {
+        async fn read_from_store(&self, state_key: &[u8]) -> Result<Option<Vec<u8>>> {
             for batch in self
                 .store
                 .read_table_batches_by_binary_key(STATE_TABLE, STATE_KEY_COLUMN, state_key)
@@ -305,44 +348,88 @@ pub mod backend {
 
         /// Upsert `value` for `state_key` (last-write-wins).
         pub async fn put(&self, state_key: &[u8], value: &[u8]) -> Result<()> {
-            self.write_row(state_key, value, RowKind::Insert).await
+            let mut cache = self.cache.lock().await;
+            cache
+                .values
+                .insert(state_key.to_vec(), Some(value.to_vec()));
+            cache.dirty.insert(state_key.to_vec());
+            self.maybe_flush(&mut cache).await
         }
 
         /// Delete the row for `state_key` (no-op when absent).
         pub async fn delete(&self, state_key: &[u8]) -> Result<()> {
-            self.write_row(state_key, &[], RowKind::Delete).await
+            let mut cache = self.cache.lock().await;
+            cache.values.insert(state_key.to_vec(), None);
+            cache.dirty.insert(state_key.to_vec());
+            self.maybe_flush(&mut cache).await
         }
 
         /// Atomically apply `update` to the value stored at `state_key`.
         ///
-        /// Serialized per key so a concurrent read-modify-write cannot lose an
-        /// update. Paimon offers no cross-operation transaction here, so atomicity
-        /// comes from the per-key lock plus a single-row commit; `update` must be
-        /// pure.
+        /// Serialized by the cache lock so a concurrent read-modify-write cannot
+        /// lose an update; `update` must be pure.
         pub async fn read_modify_write<F>(&self, state_key: &[u8], update: F) -> Result<()>
         where
             F: FnOnce(Vec<u8>) -> Vec<u8>,
         {
-            let lock = self
-                .key_locks
-                .entry(state_key.to_vec())
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone();
-            let _guard = lock.lock().await;
-
-            let current = self.get(state_key).await?.unwrap_or_default();
+            let mut cache = self.cache.lock().await;
+            let current = self
+                .get_locked(&mut cache, state_key)
+                .await?
+                .unwrap_or_default();
             let next = update(current);
-            self.put(state_key, &next).await
+            cache.values.insert(state_key.to_vec(), Some(next));
+            cache.dirty.insert(state_key.to_vec());
+            self.maybe_flush(&mut cache).await
         }
 
-        /// Write a single insert/delete row and commit it to the user-state table.
-        async fn write_row(&self, state_key: &[u8], value: &[u8], kind: RowKind) -> Result<()> {
+        /// Flush once the pending set grows past [`STATE_FLUSH_THRESHOLD`].
+        async fn maybe_flush(&self, cache: &mut StateCache) -> Result<()> {
+            if cache.dirty.len() >= STATE_FLUSH_THRESHOLD {
+                self.flush_locked(cache).await?;
+            }
+            Ok(())
+        }
+
+        /// Commit every dirty cell to Paimon in a single durable batch.
+        ///
+        /// Called when the pending set grows and when the job's state stream ends,
+        /// so state outlives the in-memory cache without paying a commit per op.
+        pub async fn flush(&self) -> Result<()> {
+            let mut cache = self.cache.lock().await;
+            self.flush_locked(&mut cache).await
+        }
+
+        async fn flush_locked(&self, cache: &mut StateCache) -> Result<()> {
+            if cache.dirty.is_empty() {
+                return Ok(());
+            }
+
+            let mut keys = Vec::with_capacity(cache.dirty.len());
+            let mut values = Vec::with_capacity(cache.dirty.len());
+            let mut kinds = Vec::with_capacity(cache.dirty.len());
+            for key in &cache.dirty {
+                keys.push(key.clone());
+                match cache.values.get(key).cloned().flatten() {
+                    Some(value) => {
+                        values.push(value);
+                        kinds.push(RowKind::Insert.to_value());
+                    }
+                    None => {
+                        values.push(Vec::new());
+                        kinds.push(RowKind::Delete.to_value());
+                    }
+                }
+            }
+
             let table = self
                 .store
                 .get_or_create_table(STATE_TABLE, state_paimon_schema()?)
                 .await?;
-            let batch = build_state_record_batch(state_key, value, kind)?;
-            self.store.write_table_batch(&table, &batch).await
+            let batch = build_state_record_batch_many(&keys, &values, &kinds)?;
+            self.store.write_table_batch(&table, &batch).await?;
+            cache.dirty.clear();
+            Ok(())
         }
     }
 
@@ -369,21 +456,23 @@ pub mod backend {
         Ok(schema)
     }
 
-    /// Build a single-row [`RecordBatch`] for the state table, carrying the
-    /// `_VALUE_KIND` changelog column so inserts and deletes share one path.
-    fn build_state_record_batch(
-        state_key: &[u8],
-        value: &[u8],
-        kind: RowKind,
+    /// Build a multi-row [`RecordBatch`] for the state table, carrying the
+    /// `_VALUE_KIND` changelog column so inserts and deletes share one path and
+    /// many cells commit in a single durable write.
+    fn build_state_record_batch_many(
+        keys: &[Vec<u8>],
+        values: &[Vec<u8>],
+        kinds: &[i8],
     ) -> Result<RecordBatch> {
         let schema = ArrowSchema::new(vec![
             ArrowField::new(STATE_KEY_COLUMN, DataType::Binary, false),
             ArrowField::new(STATE_VALUE_COLUMN, DataType::Binary, false),
             ArrowField::new(VALUE_KIND_FIELD_NAME, DataType::Int8, false),
         ]);
-        let key_array = BinaryArray::from_iter_values([state_key]);
-        let value_array = BinaryArray::from_iter_values([value]);
-        let kind_array = Int8Array::from_iter_values([kind.to_value()]);
+        let key_array = BinaryArray::from_iter_values(keys.iter().map(|key| key.as_slice()));
+        let value_array =
+            BinaryArray::from_iter_values(values.iter().map(|value| value.as_slice()));
+        let kind_array = Int8Array::from_iter_values(kinds.iter().copied());
 
         Ok(RecordBatch::try_new(
             Arc::new(schema),
@@ -503,6 +592,62 @@ pub mod backend {
 
             let value = backend.get(b"counter").await.unwrap().unwrap();
             assert_eq!(value.len(), tasks, "every concurrent append must survive");
+        }
+
+        #[tokio::test]
+        async fn flush_persists_the_write_back_cache_to_a_fresh_backend() {
+            let (_dir, backend) = make_backend().await;
+            backend.put(b"k", b"v1").await.unwrap();
+            backend
+                .read_modify_write(b"k", |mut current| {
+                    current.extend_from_slice(b"+v2");
+                    current
+                })
+                .await
+                .unwrap();
+
+            // Writes live in the in-memory cache until flushed, so a backend that
+            // has not been flushed sees nothing.
+            let fresh = StateBackend::new(backend.store.clone());
+            assert!(fresh.get(b"k").await.unwrap().is_none());
+
+            backend.flush().await.unwrap();
+
+            // After a flush the value is durable for a backend sharing the store.
+            let reloaded = StateBackend::new(backend.store.clone());
+            assert_eq!(
+                reloaded.get(b"k").await.unwrap().as_deref(),
+                Some(&b"v1+v2"[..])
+            );
+        }
+
+        #[tokio::test]
+        async fn dirty_writes_commit_automatically_past_the_threshold() {
+            let (_dir, backend) = make_backend().await;
+
+            for i in 0..=STATE_FLUSH_THRESHOLD as u32 {
+                backend.put(&i.to_be_bytes(), b"v").await.unwrap();
+            }
+
+            // Crossing the threshold flushed without an explicit `flush` call.
+            let reloaded = StateBackend::new(backend.store.clone());
+            assert_eq!(
+                reloaded.get(&0u32.to_be_bytes()).await.unwrap().as_deref(),
+                Some(&b"v"[..])
+            );
+        }
+
+        #[tokio::test]
+        async fn flush_commits_deletes_as_well_as_inserts() {
+            let (_dir, backend) = make_backend().await;
+            backend.put(b"gone", b"value").await.unwrap();
+            backend.flush().await.unwrap();
+
+            backend.delete(b"gone").await.unwrap();
+            backend.flush().await.unwrap();
+
+            let reloaded = StateBackend::new(backend.store.clone());
+            assert!(reloaded.get(b"gone").await.unwrap().is_none());
         }
     }
 }

@@ -189,8 +189,19 @@ impl StateChannel {
             match self.recv_request().await {
                 Ok(request) => {
                     let summary = describe_request(&request);
-                    //info!("state request received: {}", summary);
+                    let started = std::time::Instant::now();
                     let response = handle_state_request(&backend, request).await;
+                    // A stateful DoFn drives many state ops per bundle; if each is
+                    // slow the bundle misses its deadline (N3), so surface the slow
+                    // ones with the request summary.
+                    let elapsed = started.elapsed();
+                    if elapsed.as_millis() >= 20 {
+                        warn!(
+                            "slow state request ({}ms): {}",
+                            elapsed.as_millis(),
+                            summary
+                        );
+                    }
                     match response {
                         Ok(response) => {
                             //info!("state response sent: id={}", response.id);
@@ -218,6 +229,11 @@ impl StateChannel {
                     break;
                 }
             }
+        }
+        // The in-memory write-back cache holds the job's state; commit it once on
+        // exit so it survives without paying a durable commit per operation.
+        if let Err(e) = backend.flush().await {
+            warn!("failed to flush user state on driver exit: {}", e);
         }
         info!("state request driver stopped");
     }

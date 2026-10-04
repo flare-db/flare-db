@@ -687,7 +687,13 @@ async fn drain_timer_elements(
     timer_service: &TimerService,
     receiver: Arc<Mutex<UnboundedReceiver<ElementStreamPayload>>>,
 ) -> usize {
+    // A stateful bundle can set thousands of timers. Persisting each with its own
+    // durable commit makes the bundle miss its deadline (N3: 1135 timers ≈ 43s), so
+    // accumulate the chunk's last write per key and commit the batch together.
+    const FLUSH_EVERY: usize = 512;
+    let mut pending: HashMap<Vec<u8>, Option<TimerEntry>> = HashMap::new();
     let mut total = 0usize;
+
     loop {
         let payload = {
             let mut guard = receiver.lock().await;
@@ -703,17 +709,15 @@ async fn drain_timer_elements(
                     chunk.timers.timers.len()
                 );
                 let mut buf: &[u8] = &chunk.timers.timers;
-                let mut decoded = 0usize;
                 while !buf.is_empty() {
                     match coder.decode(&mut buf) {
                         Ok(timer) => {
-                            decoded += 1;
+                            total += 1;
                             let entry = timer_entry(transform_id, timer_family_id, &timer, domain);
+                            let key = entry.key.storage_key();
                             if timer.clear {
-                                debug!(
-                                    "timer clear: key={:?}, window={}",
-                                    entry.key.user_key, entry.key.window
-                                );
+                                debug!("timer clear: key={:?}", entry.key.user_key);
+                                pending.insert(key, None);
                             } else {
                                 debug!(
                                     "timer set: key={:?}, window={}, fire_timestamp={}, hold_timestamp={}",
@@ -722,14 +726,7 @@ async fn drain_timer_elements(
                                     entry.fire_timestamp,
                                     entry.hold_timestamp
                                 );
-                            }
-                            let result = if timer.clear {
-                                timer_service.clear(&entry.key).await
-                            } else {
-                                timer_service.set(entry).await
-                            };
-                            if let Err(e) = result {
-                                log::warn!("failed to persist timer: {e}");
+                                pending.insert(key, Some(entry));
                             }
                         }
                         Err(e) => {
@@ -740,18 +737,47 @@ async fn drain_timer_elements(
                         }
                     }
                 }
-                total += decoded;
-                if decoded > 0 {
-                    info!("persisted {decoded} timer(s) for {transform_id}/{timer_family_id}");
+                let is_last = chunk.timers.is_last;
+                if is_last || pending.len() >= FLUSH_EVERY {
+                    flush_timers(timer_service, &mut pending, transform_id, timer_family_id).await;
                 }
-                if chunk.timers.is_last {
+                if is_last {
                     return total;
                 }
             }
             Some(ElementStreamPayload::Data(_)) => {}
-            None => return total,
+            None => {
+                flush_timers(timer_service, &mut pending, transform_id, timer_family_id).await;
+                return total;
+            }
         }
     }
+}
+
+/// Commit the accumulated timer writes for one endpoint in a single durable batch.
+async fn flush_timers(
+    timer_service: &TimerService,
+    pending: &mut HashMap<Vec<u8>, Option<TimerEntry>>,
+    transform_id: &str,
+    timer_family_id: &str,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    let count = pending.len();
+    let started = std::time::Instant::now();
+    match timer_service.apply(pending).await {
+        Ok(()) => info!(
+            "persisted {count} timer(s) for {transform_id}/{timer_family_id} in {}ms",
+            started.elapsed().as_millis()
+        ),
+        Err(e) => {
+            log::warn!(
+                "failed to persist {count} timer(s) for {transform_id}/{timer_family_id}: {e}"
+            )
+        }
+    }
+    pending.clear();
 }
 
 /// Build a storage [`TimerEntry`] from a decoded wire timer.

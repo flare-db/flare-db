@@ -19,6 +19,7 @@
 //! and firing deletes it before delivering, so it can never fire twice. Storage
 //! is [`TimerStore`] over a `__flare_timer` Paimon table.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -110,6 +111,18 @@ impl TimerService {
     /// Clear (delete) a timer.
     pub async fn clear(&self, key: &TimerKey) -> Result<()> {
         self.store.delete(&key.storage_key()).await?;
+        self.notify.notify_waiters();
+        Ok(())
+    }
+
+    /// Apply many timer sets/clears in one durable commit.
+    ///
+    /// `pending` maps a timer's storage key to `Some(entry)` to set/replace it or
+    /// `None` to delete it. A batch is a single Paimon commit instead of one per
+    /// timer, which is what makes a stateful bundle that sets thousands of timers
+    /// finish in time (see N3).
+    pub async fn apply(&self, pending: &HashMap<Vec<u8>, Option<TimerEntry>>) -> Result<()> {
+        self.store.apply(pending).await?;
         self.notify.notify_waiters();
         Ok(())
     }
@@ -530,6 +543,40 @@ impl TimerStore {
         self.write_row(storage_key, &[], RowKind::Delete).await
     }
 
+    /// Apply many timer writes in a single durable commit.
+    ///
+    /// `pending` maps a timer's storage key to `Some(entry)` to insert/replace or
+    /// `None` to delete; because it is a map, multiple writes to the same key in a
+    /// batch already resolve last-write-wins. Committing the whole batch once is
+    /// the difference between ~38ms per timer and ~one commit for thousands.
+    pub async fn apply(&self, pending: &HashMap<Vec<u8>, Option<TimerEntry>>) -> Result<()> {
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let mut keys = Vec::with_capacity(pending.len());
+        let mut values = Vec::with_capacity(pending.len());
+        let mut kinds = Vec::with_capacity(pending.len());
+        for (key, value) in pending {
+            keys.push(key.clone());
+            match value {
+                Some(entry) => {
+                    values.push(serde_json::to_vec(entry)?);
+                    kinds.push(RowKind::Insert.to_value());
+                }
+                None => {
+                    values.push(Vec::new());
+                    kinds.push(RowKind::Delete.to_value());
+                }
+            }
+        }
+        let table = self
+            .store
+            .get_or_create_table(TIMER_TABLE, timer_paimon_schema()?)
+            .await?;
+        let batch = build_timer_record_batch_many(&keys, &values, &kinds)?;
+        self.store.write_table_batch(&table, &batch).await
+    }
+
     /// Read a single timer, or `None` when absent.
     pub async fn get(&self, storage_key: &[u8]) -> Result<Option<TimerEntry>> {
         let batches = self
@@ -603,14 +650,28 @@ fn timer_paimon_schema() -> Result<PaimonSchema> {
 /// Build a single-row batch carrying the `_VALUE_KIND` changelog column so
 /// inserts and deletes share one write path.
 fn build_timer_record_batch(key: &[u8], value: &[u8], kind: RowKind) -> Result<RecordBatch> {
+    build_timer_record_batch_many(
+        std::slice::from_ref(&key.to_vec()),
+        std::slice::from_ref(&value.to_vec()),
+        std::slice::from_ref(&kind.to_value()),
+    )
+}
+
+/// Build a multi-row batch carrying the `_VALUE_KIND` changelog column, so many
+/// timer sets/clears commit in one durable write.
+fn build_timer_record_batch_many(
+    keys: &[Vec<u8>],
+    values: &[Vec<u8>],
+    kinds: &[i8],
+) -> Result<RecordBatch> {
     let schema = ArrowSchema::new(vec![
         ArrowField::new(TIMER_KEY_COLUMN, DataType::Binary, false),
         ArrowField::new(TIMER_VALUE_COLUMN, DataType::Binary, false),
         ArrowField::new(VALUE_KIND_FIELD_NAME, DataType::Int8, false),
     ]);
-    let key_array = BinaryArray::from_iter_values([key]);
-    let value_array = BinaryArray::from_iter_values([value]);
-    let kind_array = Int8Array::from_iter_values([kind.to_value()]);
+    let key_array = BinaryArray::from_iter_values(keys.iter().map(|key| key.as_slice()));
+    let value_array = BinaryArray::from_iter_values(values.iter().map(|value| value.as_slice()));
+    let kind_array = Int8Array::from_iter_values(kinds.iter().copied());
 
     Ok(RecordBatch::try_new(
         Arc::new(schema),
@@ -693,6 +754,39 @@ mod timer_store_tests {
         assert_eq!(timers.get(&a.key.storage_key()).await.unwrap(), Some(a));
         assert_eq!(timers.get(&b.key.storage_key()).await.unwrap(), Some(b));
         assert_eq!(timers.entries().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn apply_batch_sets_and_deletes_in_one_commit() {
+        let (_dir, store) = make_store().await;
+        let timers = TimerStore::new(store);
+
+        // Seed a timer to replace and one to delete.
+        let keep = entry(b"keep", TimeDomain::EventTime, 100, 100);
+        let drop = entry(b"drop", TimeDomain::EventTime, 200, 200);
+        timers.upsert(&keep).await.unwrap();
+        timers.upsert(&drop).await.unwrap();
+
+        // One batch: replace `keep`, delete `drop`, and insert `new`.
+        let new = entry(b"new", TimeDomain::EventTime, 300, 300);
+        let replaced = entry(b"keep", TimeDomain::EventTime, 150, 150);
+        let mut pending: HashMap<Vec<u8>, Option<TimerEntry>> = HashMap::new();
+        pending.insert(keep.key.storage_key(), Some(replaced));
+        pending.insert(drop.key.storage_key(), None);
+        pending.insert(new.key.storage_key(), Some(new.clone()));
+        timers.apply(&pending).await.unwrap();
+
+        assert_eq!(
+            timers
+                .get(&keep.key.storage_key())
+                .await
+                .unwrap()
+                .unwrap()
+                .fire_timestamp,
+            150
+        );
+        assert_eq!(timers.get(&drop.key.storage_key()).await.unwrap(), None);
+        assert_eq!(timers.get(&new.key.storage_key()).await.unwrap(), Some(new));
     }
 
     #[tokio::test]
