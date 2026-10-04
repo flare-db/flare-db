@@ -250,21 +250,41 @@ impl ExecutorDispatcher {
         Ok(())
     }
 
-    /// Replace the watermark manager's holds with one hold per pending event-time
-    /// timer, at that timer's `hold_timestamp`, on its owning stage.
+    /// Rebuild every stage's watermark holds from the durable event-time
+    /// timers, before the scheduler picks the next work to run. Iit helps decide
+    /// whether downstream stages are allowed to consider this stage's event-time work complete.
     ///
-    /// The durable timer store is the source of truth, so the whole map is
-    /// rebuilt each time (timers set and cleared during bundles both take
-    /// effect). Timers whose transform maps to no stage are ignored.
+    /// FlareDB executes the graph stage-by-stage in the scheduling
+    /// loop (`run_pipeline`). As a stage's bundle executes, the SDK may persist
+    /// event-time timers — set, clear, or re-arm — so the set of pending timers
+    /// changes as the run progresses.
+    ///
+    /// A pending event-time timer represents future work (e.g. a window's closing
+    /// pane). Until it fires, the owning stage's **output watermark** is held at
+    /// the timer's `hold_timestamp`. Downstream stages use watermarks to determine
+    /// when earlier event-time work is complete (which windows are ready and which
+    /// timers are due), without the hold, downstream stages could advance past
+    /// this stage's pending work and finalize too early.
+    ///
+    /// The durable timer store is the source of truth, so the holds map is rebuilt
+    /// from it on each scheduling iteration. This ensures timers set, cleared, or
+    /// re-armed during a bundle are reflected before the next scheduling decision.
+    /// Holds clamp output only and never block a stage's own readiness. Timers whose
+    /// transform maps to no stage are ignored.
+    ///
     async fn sync_event_time_holds(&self, scheduler: &mut NodeScheduler) -> anyhow::Result<()> {
-        let mut holds: HashMap<String, Vec<Timestamp>> = HashMap::new();
+        let mut watermark_holds: HashMap<String, Vec<Timestamp>> = HashMap::new();
         for timer in self.timer_service.all_event_time_timers().await? {
             if let Some(stage) = scheduler.stage_for_transform(&timer.key.transform_id) {
-                holds.entry(stage).or_default().push(timer.hold_timestamp);
+                watermark_holds
+                    .entry(stage)
+                    .or_default()
+                    .push(timer.hold_timestamp);
             }
         }
-        scheduler.watermarks_mut().set_event_time_holds(&holds);
-        scheduler.watermarks_mut().refresh();
+        scheduler
+            .watermarks_mut()
+            .set_event_time_holds(&watermark_holds);
         Ok(())
     }
 

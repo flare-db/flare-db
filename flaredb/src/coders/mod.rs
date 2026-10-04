@@ -377,9 +377,9 @@ fn length_prefixed_coder_id(id: &str) -> String {
 /// `pickled_python` URN — `PickleCoder` (varint length + pickled bytes),
 /// `FastPrimitivesCoder` (a type-marker byte followed by a nested value) and
 /// `PaneInfoCoder` — and the runner cannot tell them apart from the URN alone.
-/// Guessing wrong desynchronizes the enclosing coder stream. Following the
-/// Prism runner, we instead ask the SDK to length-prefix these leaves so their
-/// bytes become self-delimiting and can be stored opaquely.
+/// Guessing wrong desynchronizes the enclosing coder stream. Instead, we ask the
+/// SDK to length-prefix these leaves so their bytes become self-delimiting and can
+/// be stored opaquely.
 ///
 /// This is idempotent: an already-wrapped leaf resolves to a
 /// `beam:coder:length_prefix:v1` coder, which is not wrapped again.

@@ -306,11 +306,16 @@ impl NodeScheduler {
         by_stage.into_iter().collect()
     }
 
-    /// The stage that owns `transform_id`, if any.
+    /// Look up the executable stage that contains `transform_id`, if any.
     ///
-    /// Used to route a persisted event-time timer's output hold to its owning
-    /// stage's output watermark (the timer store persists the timer, not the
-    /// hold).
+    /// A plain lookup in the `transform_to_stage` map: several transforms are fused
+    /// into one executable stage, so a transform id (e.g. one that set a timer) is
+    /// resolved back to the stage that runs it. Used to route a persisted
+    /// event-time timer's output hold to that stage's output watermark (the timer
+    /// store persists the timer, not the hold).
+    ///
+    /// Returns the containing stage's id, or `None` when `transform_id` maps to no
+    /// stage (an unknown transform, or one not part of the executable graph).
     pub fn stage_for_transform(&self, transform_id: &str) -> Option<String> {
         self.transform_to_stage.get(transform_id).cloned()
     }

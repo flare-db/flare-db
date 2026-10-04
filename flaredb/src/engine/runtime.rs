@@ -158,7 +158,7 @@ impl BundleRuntime {
         let mut components = stage.components();
         // The Python SDK emits several distinguishable coders under the single
         // `pickled_python` URN. Ask the SDK to length-prefix those leaves so the
-        // runner can store their bytes opaquely (mirrors Prism's runner).
+        // runner can store their bytes opaquely.
         length_prefix_pickled_leaves(&mut components.coders);
         add_stage_data_boundary_coders(
             stage,

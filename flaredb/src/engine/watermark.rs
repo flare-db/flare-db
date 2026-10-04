@@ -24,9 +24,9 @@
 //! ```
 //!
 //! Side inputs gate the *input* watermark — they hold back execution — but they
-//! do not advance the *output* watermark; only main inputs do. This matches the
-//! portable runners (Prism's `bundleReady`/`updateWatermarks` split and the
-//! Python `WatermarkManager.StageNode`).
+//! do not advance the *output* watermark; only main inputs do. This matches how
+//! portable runners treat side inputs: they hold back a stage's input watermark
+//! without advancing its output watermark.
 //!
 //! A *source* (a stage with no main inputs) reports its own watermark. Sources
 //! may have partitions; idle partitions are excluded from the minimum, and a
@@ -35,6 +35,19 @@
 //! [`MAX_TIMESTAMP`], which is how the end of a bounded input propagates.
 //!
 //! All watermarks are monotonic and start at [`MIN_TIMESTAMP`].
+//!
+//! # Watermark holds
+//!
+//! A *watermark hold* is a promise not to let a stage's **output** watermark
+//! advance past a timestamp, because something still owes work at that time.
+//! Concretely: a stage with a pending **event-time timer** must not look
+//! "complete" to its consumers until that timer fires, so its output watermark is
+//! held at the timer's `hold_timestamp` (the Beam timer field of the same name).
+//! Holds are a multiset per stage — the same timestamp can be held more than once
+//! and must be released as many times — and `compute_output` takes the earliest
+//! one: `output = MIN(MAIN upstream outputs, earliest hold)`. They clamp output
+//! only; readiness uses the unclamped input, so a hold never blocks the holding
+//! stage itself. This is the same notion as Dataflow's `WatermarkHold`.
 //!
 //! # Eligibility
 //!
@@ -167,10 +180,10 @@ pub enum StageKind {
     Ordinary,
     /// Additionally requires the input watermark to reach
     /// [`required_watermark`](WatermarkManager::required_watermark). This is
-    /// Prism's aggregate/stateful readiness: such a stage must not run until
-    /// time has moved past what its work needs. A finished bounded source's
-    /// output is [`MAX_TIMESTAMP`], so a bounded aggregation still runs exactly
-    /// when its upstream completes.
+    /// aggregate/stateful readiness: such a stage must not run until time has
+    /// moved past what its work needs. A finished bounded source's output is
+    /// [`MAX_TIMESTAMP`], so a bounded aggregation still runs exactly when its
+    /// upstream completes.
     WatermarkGated,
 }
 
@@ -184,8 +197,9 @@ struct StageState {
     source: Option<SourceState>,
     input: Timestamp,
     output: Timestamp,
-    /// Multiset of watermark holds, keyed by hold timestamp.
-    holds: BTreeMap<Timestamp, usize>,
+    /// Watermark holds: a multiset keyed by hold timestamp (counted, so the same
+    /// timestamp can be held more than once). See the module docs on holds.
+    watermark_holds: BTreeMap<Timestamp, usize>,
 
     /// Main inputs not yet produced by their producer *for the first time*; empty
     /// means every input is available. This is the fan-in barrier and never
@@ -201,8 +215,9 @@ struct StageState {
     /// is pending. Set on push-wake from the producer's committed minimum and
     /// cleared when a bundle consumes the pending inputs. This is the input
     /// watermark clamp: the watermark must not advance past data not yet consumed.
-    /// The readiness gate deliberately uses the *unclamped* `input`, mirroring
-    /// Prism's split between its trigger watermark (`upstreamW`) and `ss.input`.
+    /// The readiness gate deliberately uses the *unclamped* `input` (the
+    /// triggering watermark), while the clamp is only for decisions that must not
+    /// run ahead of unconsumed input.
     pending_min: Timestamp,
     /// A bundle for this stage is currently executing.
     in_flight: bool,
@@ -226,9 +241,9 @@ impl StageState {
         self.source.is_some()
     }
 
-    /// The earliest outstanding hold, or `None` when none are held.
+    /// The earliest watermark hold, or `None` when none are held.
     fn min_hold(&self) -> Option<Timestamp> {
-        self.holds.keys().next().copied()
+        self.watermark_holds.keys().next().copied()
     }
 
     /// Whether this stage may run a bundle now, given its current input
@@ -379,7 +394,7 @@ impl WatermarkManager {
                 source,
                 input,
                 output: MIN_TIMESTAMP,
-                holds: BTreeMap::new(),
+                watermark_holds: BTreeMap::new(),
                 unproduced,
                 pending: BTreeSet::new(),
                 pending_min: MAX_TIMESTAMP,
@@ -471,39 +486,39 @@ impl WatermarkManager {
     /// must be released as many times.
     pub fn add_hold(&mut self, stage: &str, timestamp: Timestamp) -> Result<()> {
         let stage = self.stage_mut(stage)?;
-        *stage.holds.entry(timestamp).or_insert(0) += 1;
+        *stage.watermark_holds.entry(timestamp).or_insert(0) += 1;
         Ok(())
     }
 
-    /// Replace every stage's watermark holds with `holds`.
+    /// Replace every stage's watermark holds with `watermark_holds`.
     ///
     /// The durable timer store is the source of truth for event-time holds: a
     /// pending event-time timer holds its owning stage's output watermark at the
     /// timer's `hold_timestamp` until it fires. Because that set changes as
     /// timers are set and cleared, the caller reconciles the whole map rather
-    /// than incrementally adding/releasing. Stages absent from `holds` are
-    /// cleared. Call [`Self::refresh`] afterwards to propagate the clamp.
+    /// than incrementally adding/releasing. Stages absent from `watermark_holds`
+    /// are cleared. Call [`Self::refresh`] afterwards to propagate the clamp.
     ///
     /// Holds only ever *clamp* output watermarks (which are monotonic), so
     /// releasing one lets the watermark advance again but never regresses it.
-    pub fn set_event_time_holds(&mut self, holds: &HashMap<StageId, Vec<Timestamp>>) {
+    pub fn set_event_time_holds(&mut self, watermark_holds: &HashMap<StageId, Vec<Timestamp>>) {
         for (id, stage) in self.stages.iter_mut() {
-            stage.holds.clear();
-            if let Some(timestamps) = holds.get(id) {
+            stage.watermark_holds.clear();
+            if let Some(timestamps) = watermark_holds.get(id) {
                 for timestamp in timestamps {
-                    *stage.holds.entry(*timestamp).or_insert(0) += 1;
+                    *stage.watermark_holds.entry(*timestamp).or_insert(0) += 1;
                 }
             }
         }
     }
 
-    /// Release one hold at `timestamp` for `stage`.
+    /// Release one watermark hold at `timestamp` for `stage`.
     pub fn release_hold(&mut self, stage: &str, timestamp: Timestamp) -> Result<()> {
         let stage = self.stage_mut(stage)?;
-        if let Some(count) = stage.holds.get_mut(&timestamp) {
+        if let Some(count) = stage.watermark_holds.get_mut(&timestamp) {
             *count -= 1;
             if *count == 0 {
-                stage.holds.remove(&timestamp);
+                stage.watermark_holds.remove(&timestamp);
             }
         }
         Ok(())
@@ -529,10 +544,9 @@ impl WatermarkManager {
     /// The stage's input watermark clamped by the minimum event-time of its
     /// pending (unconsumed) input, or `None` if the stage is unknown.
     ///
-    /// Prism's `In' = MAX(In, MIN(minPendingTimestamp, upstream))`, minus the
-    /// `MAX` because our watermarks are already monotonic: while unconsumed input
-    /// exists, the watermark cannot advance past its oldest element. When nothing
-    /// is pending this equals [`input_watermark`](Self::input_watermark).
+    /// While unconsumed input exists, the watermark cannot advance past its oldest
+    /// element. When nothing is pending this equals
+    /// [`input_watermark`](Self::input_watermark).
     pub fn effective_input_watermark(&self, stage: &str) -> Option<Timestamp> {
         self.stages
             .get(stage)
@@ -788,7 +802,7 @@ impl WatermarkManager {
     }
 
     /// `MIN` over the upstream output watermarks of the stage's MAIN inputs and
-    /// its earliest hold; the source's own report for a source.
+    /// its earliest watermark hold; the source's own report for a source.
     fn compute_output(&self, stage: &StageState) -> Timestamp {
         if let Some(source) = &stage.source {
             return source.output();
@@ -797,8 +811,8 @@ impl WatermarkManager {
         for input in &stage.main_inputs {
             watermark = watermark.min(self.upstream(input));
         }
-        if let Some(hold) = stage.min_hold() {
-            watermark = watermark.min(hold);
+        if let Some(watermark_hold) = stage.min_hold() {
+            watermark = watermark.min(watermark_hold);
         }
         watermark
     }
