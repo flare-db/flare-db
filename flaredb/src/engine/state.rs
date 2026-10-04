@@ -252,19 +252,64 @@ pub mod backend {
     /// commit amortizes that cost.
     const STATE_FLUSH_THRESHOLD: usize = 512;
 
+    /// Upper bound on the number of cells retained in the write-back cache.
+    ///
+    /// The cache must be bounded: a stateful job can touch millions of distinct
+    /// cells, and retaining every one exhausts memory (observed as a multi-GB
+    /// `flaredb` RSS with swap exhausted on a 1M-event Q3 run). Clean cells are
+    /// always safe to drop — they can be re-read from Paimon — so only dirty
+    /// (uncommitted) cells are guaranteed to stay. Dirty growth is itself bounded
+    /// by [`STATE_FLUSH_THRESHOLD`], so eviction always makes progress.
+    const STATE_CACHE_MAX_ENTRIES: usize = 100_000;
+
+    /// Level the cache is trimmed down to once it exceeds
+    /// [`STATE_CACHE_MAX_ENTRIES`]. Bulk-evicting amortizes the O(n) scan over
+    /// many inserts.
+    const STATE_CACHE_EVICT_TARGET: usize = STATE_CACHE_MAX_ENTRIES / 4 * 3;
+
     /// In-memory write-back cache over the Paimon user-state table.
     ///
     /// The Fn State protocol is request/response lockstep: the SDK sends one state
     /// request and waits for its response before sending the next. Serving each op
     /// from Paimon therefore costs a scan plus a full durable commit (~40ms),
-    /// which dominates bundle time for a stateful DoFn (N3). Every cell touched
-    /// during a job is instead held here, and dirty cells are committed together.
+    /// which dominates bundle time for a stateful DoFn (N3). Cells touched during
+    /// a job are held here, dirty cells are committed together, and clean cells
+    /// are evicted under memory pressure.
     struct StateCache {
         /// Authoritative value per touched cell. `None` means the cell is empty
         /// (absent in Paimon, deleted, or cleared).
         values: HashMap<Vec<u8>, Option<Vec<u8>>>,
         /// Cells whose `values` entry has not yet been committed to Paimon.
         dirty: HashSet<Vec<u8>>,
+    }
+
+    impl StateCache {
+        /// Evict clean cells after an insert once the cache exceeds its bound.
+        fn evict_if_needed(&mut self) {
+            if self.values.len() > STATE_CACHE_MAX_ENTRIES {
+                self.evict_clean_to_fit(STATE_CACHE_EVICT_TARGET);
+            }
+        }
+
+        /// Drop clean cells until at most `target` remain. Dirty cells are never
+        /// evicted: their value is the client-visible state and must survive until
+        /// it is committed. If everything is dirty the cache stays over `target`,
+        /// but the flush threshold keeps the dirty set small.
+        fn evict_clean_to_fit(&mut self, target: usize) {
+            if self.values.len() <= target {
+                return;
+            }
+            let StateCache { values, dirty } = self;
+            let mut excess = values.len() - target;
+            values.retain(|key, _| {
+                if excess > 0 && !dirty.contains(key) {
+                    excess -= 1;
+                    false
+                } else {
+                    true
+                }
+            });
+        }
     }
 
     /// Opaque key/value storage for Beam user state, sharing the element store's
@@ -309,6 +354,7 @@ pub mod backend {
             }
             let value = self.read_from_store(state_key).await?;
             cache.values.insert(state_key.to_vec(), value.clone());
+            cache.evict_if_needed();
             Ok(value)
         }
 
@@ -353,6 +399,7 @@ pub mod backend {
                 .values
                 .insert(state_key.to_vec(), Some(value.to_vec()));
             cache.dirty.insert(state_key.to_vec());
+            cache.evict_if_needed();
             self.maybe_flush(&mut cache).await
         }
 
@@ -361,6 +408,7 @@ pub mod backend {
             let mut cache = self.cache.lock().await;
             cache.values.insert(state_key.to_vec(), None);
             cache.dirty.insert(state_key.to_vec());
+            cache.evict_if_needed();
             self.maybe_flush(&mut cache).await
         }
 
@@ -380,6 +428,7 @@ pub mod backend {
             let next = update(current);
             cache.values.insert(state_key.to_vec(), Some(next));
             cache.dirty.insert(state_key.to_vec());
+            cache.evict_if_needed();
             self.maybe_flush(&mut cache).await
         }
 
@@ -648,6 +697,42 @@ pub mod backend {
 
             let reloaded = StateBackend::new(backend.store.clone());
             assert!(reloaded.get(b"gone").await.unwrap().is_none());
+        }
+
+        #[test]
+        fn eviction_drops_clean_cells_and_keeps_dirty_ones() {
+            let mut cache = StateCache {
+                values: HashMap::new(),
+                dirty: HashSet::new(),
+            };
+            for i in 0..1_000u32 {
+                cache
+                    .values
+                    .insert(i.to_be_bytes().to_vec(), Some(vec![1, 2, 3]));
+            }
+            let dirty_key = 7u32.to_be_bytes().to_vec();
+            cache.dirty.insert(dirty_key.clone());
+
+            cache.evict_clean_to_fit(100);
+
+            assert_eq!(cache.values.len(), 100, "cache is trimmed to the target");
+            assert!(
+                cache.values.contains_key(&dirty_key),
+                "dirty cell must survive eviction"
+            );
+        }
+
+        #[test]
+        fn evict_if_needed_leaves_a_small_cache_untouched() {
+            let mut cache = StateCache {
+                values: HashMap::new(),
+                dirty: HashSet::new(),
+            };
+            cache.values.insert(b"k".to_vec(), Some(b"v".to_vec()));
+
+            cache.evict_if_needed();
+
+            assert_eq!(cache.values.len(), 1);
         }
     }
 }
