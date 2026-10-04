@@ -39,7 +39,7 @@ use crate::{
         element_store::FlareElementStore,
         record::{BeamRecord, PrimitiveValue},
     },
-    transforms::FlareRunnerTransform,
+    transforms::{FlareRunnerTransform, SourceProgress},
     utils::batch_size_estimator::{BatchConfig, BatchSizeEstimator},
 };
 
@@ -51,6 +51,7 @@ pub struct BundleRuntime {
     pipeline_coders: Arc<HashMap<String, Coder>>,
     pipeline_components: Arc<Components>,
     timer_service: Arc<TimerService>,
+    source_reports: tokio::sync::mpsc::UnboundedSender<SourceProgress>,
 }
 
 impl BundleRuntime {
@@ -61,6 +62,7 @@ impl BundleRuntime {
         pipeline_coders: Arc<HashMap<String, Coder>>,
         pipeline_components: Arc<Components>,
         timer_service: Arc<TimerService>,
+        source_reports: tokio::sync::mpsc::UnboundedSender<SourceProgress>,
     ) -> Self {
         Self {
             control,
@@ -69,7 +71,13 @@ impl BundleRuntime {
             pipeline_coders,
             pipeline_components,
             timer_service,
+            source_reports,
         }
+    }
+
+    /// Sender for runner-source progress reports (used by `TestStream`).
+    pub fn source_reports(&self) -> &tokio::sync::mpsc::UnboundedSender<SourceProgress> {
+        &self.source_reports
     }
 
     pub fn timer_service(&self) -> &Arc<TimerService> {

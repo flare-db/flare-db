@@ -434,6 +434,8 @@ mod tests {
                 windowing_strategy: None,
                 processing_time: 0,
                 input_watermark,
+                output_coder: None,
+                source_reports: None,
             })
             .await
             .expect("GroupByKey execute failed");
@@ -459,6 +461,8 @@ mod tests {
                 windowing_strategy: strategy,
                 processing_time: 0,
                 input_watermark,
+                output_coder: None,
+                source_reports: None,
             })
             .await
             .expect("GroupByKey execute failed");

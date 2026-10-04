@@ -13,6 +13,7 @@ use crate::{
     jobservice::urns::beam_urns,
     store::element_store::FlareElementStore,
     transforms::{flatten::Flatten, gbk::GroupByKey, impluse::Impulse},
+    utils::teststream::TestStream,
 };
 
 pub mod flatten;
@@ -52,6 +53,24 @@ pub trait FlareTransform {
     fn transfrom_spec(&self) -> HashMap<String, PTransform>;
 
     fn pcollections(&self, components: &Components) -> HashMap<String, PCollection>;
+
+    /// Whether this transform synthesizes its output from encoded element bytes
+    /// and therefore needs the output PCollection's element coder to decode them.
+    /// Only runner *sources* that replay pre-encoded elements (e.g. `TestStream`)
+    /// return `true`.
+    fn needs_output_coder(&self) -> bool {
+        false
+    }
+
+    /// Whether completing this stage's bundle marks it a finished source.
+    ///
+    /// A bounded source (e.g. `Impulse`) emits everything in one bundle, so its
+    /// completion is its end. A runner source that drives an event stream
+    /// (`TestStream`) returns `false` here and reports completion explicitly, so it
+    /// can run again for the next scripted event.
+    fn source_auto_finishes(&self) -> bool {
+        true
+    }
 
     // TODO: add methods needed to build the ProcessBundleDescriptor object.
 }
@@ -98,14 +117,68 @@ pub struct ExecutionContext {
     /// input watermark reaches its end, i.e.
     /// `window.max_timestamp_millis() <= input_watermark`.
     pub input_watermark: i64,
+    /// The primary output PCollection's element coder, when the transform asked
+    /// for it (see [`FlareTransform::needs_output_coder`]). A runner source decodes
+    /// its pre-encoded elements with it.
+    pub output_coder: Option<crate::coders::StandardBeamCoders>,
+    /// Sink for source progress reports (watermark / processing time / finish).
+    pub source_reports: Option<SourceReportSink>,
 }
 pub type FlareRunnerTransform = Arc<dyn FlareTransform + Send + Sync>;
+
+/// A progress report from a runner source that drives time itself.
+///
+/// A bounded source (`Impulse`) finishes implicitly when its single bundle
+/// completes. A `TestStream`, by contrast, plays one scripted event per bundle and
+/// must tell the dispatcher two things: how far event time / processing time moved
+/// (so watermarks and the clock advance), and whether it still has events left (so
+/// the dispatcher re-arms it instead of treating it as finished).
+#[derive(Debug, Clone)]
+pub struct SourceProgress {
+    /// The reporting stage (the transform instance id).
+    pub stage_id: String,
+    /// New source watermark to report, if this event advanced the watermark.
+    pub watermark: Option<i64>,
+    /// New processing time (epoch millis) to set, if this event advanced the
+    /// processing-time clock.
+    pub processing_time: Option<i64>,
+    /// The source has emitted all of its events and is finished.
+    pub done: bool,
+}
+
+/// Sink handed to a runner source through [`ExecutionContext`] so it can report
+/// [`SourceProgress`] back to the dispatcher loop.
+#[derive(Clone)]
+pub struct SourceReportSink(pub(crate) tokio::sync::mpsc::UnboundedSender<SourceProgress>);
+
+impl SourceReportSink {
+    /// Send a progress report; a closed receiver means the job is shutting down, in
+    /// which case the report is dropped.
+    pub fn report(&self, progress: SourceProgress) {
+        let _ = self.0.send(progress);
+    }
+}
 
 pub fn from_urn(
     urn: &str,
     name: String,
     inputs: HashMap<String, String>,
     outputs: HashMap<String, String>,
+) -> FlareRunnerTransform {
+    from_urn_with_payload(urn, name, inputs, outputs, &[])
+}
+
+/// Like [`from_urn`], but forwards a runner transform's `FunctionSpec` payload.
+///
+/// Runner transforms that are configured by their payload — today only
+/// `TestStream`, whose serialized [`TestStreamPayload`] carries the scripted
+/// events — read it here. Most transforms ignore it.
+pub fn from_urn_with_payload(
+    urn: &str,
+    name: String,
+    inputs: HashMap<String, String>,
+    outputs: HashMap<String, String>,
+    payload: &[u8],
 ) -> FlareRunnerTransform {
     let transform: FlareRunnerTransform = match urn {
         beam_urns::IMPULSE_TRANSFORM => Arc::new(Impulse::with(
@@ -126,6 +199,11 @@ pub fn from_urn(
             outputs,
             name,
         )),
+        beam_urns::TEST_STREAM_TRANSFORM => {
+            let stream = TestStream::with(Uuid::new_v4().to_string(), inputs, outputs, name);
+            stream.set_script(payload);
+            Arc::new(stream)
+        }
         _ => panic!("Unknown URN {}", urn),
     };
     transform

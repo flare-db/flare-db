@@ -6,6 +6,7 @@ use beam_model_rs::v1::{ApiServiceDescriptor, ProcessBundleDescriptor};
 use log::{error, info, warn};
 
 use crate::{
+    coders::StandardBeamCoders,
     engine::timer::TimerEntry,
     engine::{
         harness::{
@@ -18,7 +19,7 @@ use crate::{
         },
     },
     fusion::pipeline::{ConsumerMetaData, ExecutableNode},
-    transforms::ExecutionContext,
+    transforms::{ExecutionContext, SourceReportSink},
 };
 
 /// Executor for worker and runner stage nodes.
@@ -387,15 +388,38 @@ impl StageExecutor {
                                         .cloned()
                                 });
 
+                            // A runner source that replays pre-encoded elements
+                            // (TestStream) needs the output PCollection's element
+                            // coder to decode them.
+                            let output_coder = if runner_transform.needs_output_coder() {
+                                components
+                                    .pcollections
+                                    .get(&output_pcollection_id)
+                                    .map(|pcol| pcol.coder_id.clone())
+                                    .map(|coder_id| {
+                                        StandardBeamCoders::from_urn(
+                                            &coder_id,
+                                            None,
+                                            Some(self.runtime.pipeline_coders().as_ref()),
+                                        )
+                                    })
+                            } else {
+                                None
+                            };
+
                             let ctx = ExecutionContext {
                                 store: self.runtime.store().clone(),
                                 input_pcollection_ids,
-                                output_pcollection_id,
+                                output_pcollection_id: output_pcollection_id.clone(),
                                 consumer_transfrom_id,
                                 stage_id: runner_transform.id(),
                                 windowing_strategy,
                                 processing_time: self.runtime.timer_service().now(),
                                 input_watermark,
+                                output_coder: output_coder.clone(),
+                                source_reports: Some(SourceReportSink(
+                                    self.runtime.source_reports().clone(),
+                                )),
                             };
 
                             runner_transform.execute(ctx).await?;

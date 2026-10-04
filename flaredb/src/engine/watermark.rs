@@ -104,10 +104,27 @@ struct PartitionWatermark {
 }
 
 /// External watermark reports for a source stage.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct SourceState {
     partitions: BTreeMap<String, PartitionWatermark>,
     finished: bool,
+    /// Whether completing one bundle finishes this source.
+    ///
+    /// A bounded source (`Impulse`) emits everything in one bundle, so completion
+    /// is its end. A runner source that drives an event stream (`TestStream`) is
+    /// set to `false` and reports completion itself, so it may run again for the
+    /// next scripted event.
+    auto_finish: bool,
+}
+
+impl Default for SourceState {
+    fn default() -> Self {
+        Self {
+            partitions: BTreeMap::new(),
+            finished: false,
+            auto_finish: true,
+        }
+    }
 }
 
 impl SourceState {
@@ -301,6 +318,14 @@ impl WatermarkManager {
 
             manager.add_stage(node.id(), main_inputs, side_inputs, outputs);
 
+            // A runner source that replays an event stream (TestStream) is not
+            // finished by completing a bundle; it reports completion explicitly.
+            if let ExecutableNode::Runner(transform) = node {
+                if !transform.source_auto_finishes() {
+                    manager.set_source_auto_finish(&node.id(), false).ok();
+                }
+            }
+
             if let Some(required) =
                 aggregation_required_watermark(node, graph, index, &executable.components)
             {
@@ -418,6 +443,24 @@ impl WatermarkManager {
     pub fn report_source_finished(&mut self, stage: &str) -> Result<()> {
         self.source_mut(stage)?.finished = true;
         Ok(())
+    }
+
+    /// Set whether completing a bundle marks this source finished.
+    ///
+    /// Default `true` (bounded sources). A runner source that drives an event
+    /// stream sets `false` so the dispatcher can re-run it for the next event.
+    pub fn set_source_auto_finish(&mut self, stage: &str, auto_finish: bool) -> Result<()> {
+        self.source_mut(stage)?.auto_finish = auto_finish;
+        Ok(())
+    }
+
+    /// Whether completing a bundle marks this source finished (default `true`).
+    pub fn source_auto_finishes(&self, stage: &str) -> bool {
+        self.stages
+            .get(stage)
+            .and_then(|stage| stage.source.as_ref())
+            .map(|source| source.auto_finish)
+            .unwrap_or(true)
     }
 
     /// Add a watermark hold at `timestamp` for `stage`.

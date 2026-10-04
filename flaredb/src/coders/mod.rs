@@ -274,6 +274,44 @@ impl StandardBeamCoders {
         self.decode_nested(buf)
     }
 
+    /// Decode one element in the **non-nested** (top-level element) context.
+    ///
+    /// Beam's standard coders distinguish nested from non-nested encoding (see
+    /// `standard_coders.yaml`): a length-prefixed `string_utf8`/`bytes` is nested,
+    /// raw is non-nested; a `KvCoder` always length-prefixes its key but encodes its
+    /// value in the *same* nesting as the KV. PCollection elements inside a
+    /// `WindowedValue` are nested (what [`Self::decode`] handles); a `TestStream`
+    /// payload encodes each element in the non-nested context, where the value is
+    /// the last field and runs to the end of the buffer.
+    pub fn decode_element(&self, buf: &mut impl Buf) -> Result<BeamRecord, CodersError> {
+        match self {
+            StandardBeamCoders::StringUtf8(_) => {
+                let bytes = buf.copy_to_bytes(buf.remaining());
+                let value = String::from_utf8(bytes.to_vec()).map_err(|err| {
+                    CodersError::WhileDecoding(format!("invalid utf8 element: {err}"))
+                })?;
+                Ok(BeamRecord::PRIMITIVE(PrimitiveValue::String(value)))
+            }
+            StandardBeamCoders::Bytes(_) => {
+                let bytes = buf.copy_to_bytes(buf.remaining());
+                Ok(BeamRecord::PRIMITIVE(PrimitiveValue::Bytes(bytes.to_vec())))
+            }
+            StandardBeamCoders::Kv(key_coder, value_coder) => Ok(BeamRecord::KV(BeamKV {
+                key: key_coder.decode_primitive(buf)?,
+                value: Box::new(value_coder.decode_element(buf)?),
+            })),
+            StandardBeamCoders::Gbk(key_coder, value_coder) => Ok(BeamRecord::GBK(BeamGbk {
+                key: key_coder.decode_primitive(buf)?,
+                value: IterableValue {
+                    list: value_coder.decode(buf)?,
+                },
+            })),
+            // Self-delimiting (varint/bool/double) and nested composites (iterable,
+            // tuple, nullable, length_prefix, pickle) encode identically non-nested.
+            _ => self.decode_nested(buf),
+        }
+    }
+
     fn decode_nested(&self, buf: &mut impl Buf) -> Result<BeamRecord, CodersError> {
         match self {
             StandardBeamCoders::StringUtf8(coder) => Ok(BeamRecord::PRIMITIVE(
@@ -493,6 +531,45 @@ mod tests {
             coders["fast_lp"].component_coder_ids,
             vec!["fast".to_string()]
         );
+    }
+
+    #[test]
+    fn kv_element_decodes_the_value_non_nested() {
+        // From standard_coders.yaml, `beam:coder:kv:v1` (bytes, bytes):
+        //   nested: false -> "\x03abcdef"   (key length-prefixed, value raw)
+        //   nested: true  -> "\x03abc\x03def" (both length-prefixed)
+        // TestStream elements use the non-nested form; WindowedValue payloads use
+        // the nested one.
+        let mut coders = HashMap::new();
+        coders.insert("b".to_string(), coder(beam_urns::BYTES_CODER, &[]));
+        coders.insert("kv".to_string(), coder(beam_urns::KV_CODER, &["b", "b"]));
+        let kv = StandardBeamCoders::from_urn("kv", None, Some(&coders));
+
+        let mut buf: &[u8] = b"\x03abcdef";
+        match kv.decode_element(&mut buf).unwrap() {
+            BeamRecord::KV(v) => {
+                assert_eq!(v.key, PrimitiveValue::Bytes(b"abc".to_vec()));
+                assert_eq!(
+                    *v.value,
+                    BeamRecord::PRIMITIVE(PrimitiveValue::Bytes(b"def".to_vec()))
+                );
+            }
+            other => panic!("expected KV, got {other:?}"),
+        }
+        assert_eq!(buf.remaining(), 0);
+
+        let mut nested: &[u8] = b"\x03abc\x03def";
+        match kv.decode(&mut nested).unwrap() {
+            BeamRecord::KV(v) => {
+                assert_eq!(v.key, PrimitiveValue::Bytes(b"abc".to_vec()));
+                assert_eq!(
+                    *v.value,
+                    BeamRecord::PRIMITIVE(PrimitiveValue::Bytes(b"def".to_vec()))
+                );
+            }
+            other => panic!("expected KV, got {other:?}"),
+        }
+        assert_eq!(nested.remaining(), 0);
     }
 
     #[test]

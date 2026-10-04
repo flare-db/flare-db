@@ -203,6 +203,8 @@ mod tests {
                 windowing_strategy: None,
                 processing_time: 0,
                 input_watermark: i64::MAX,
+                output_coder: None,
+                source_reports: None,
             })
             .await
             .expect("flatten failed");

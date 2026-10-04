@@ -13,6 +13,7 @@ def javaModules = [
     'fixed-window'   : 'example/fixed-window',
     'sliding-window' : 'example/sliding-window',
     'timers-example' : 'example/timers-example',
+    'test-stream'    : 'testing/test-stream',
     'nexmark'        : 'benchmarks/nexmark',
 ]
 

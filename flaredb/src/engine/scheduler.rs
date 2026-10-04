@@ -144,7 +144,7 @@ impl NodeScheduler {
     /// pending input until that input is consumed.
     pub fn mark_complete_with_min(&mut self, idx: NodeIndex, output_min_ts: Option<Timestamp>) {
         let stage = self.graph.get_executable_graph()[idx].id();
-        if self.watermarks.is_source(&stage) {
+        if self.watermarks.is_source(&stage) && self.watermarks.source_auto_finishes(&stage) {
             let _ = self.watermarks.report_source_finished(&stage);
             info!(
                 "scheduler: source '{stage}' finished; output watermark = {}",
@@ -378,7 +378,7 @@ mod tests {
     use crate::engine::timer::{TimeDomain, TimerEntry, TimerKey};
     use crate::fusion::pipeline::{ConsumerMetaData, ExecutableGraph, ExecutableNode};
     use crate::jobservice::urns::beam_urns;
-    use crate::transforms::from_urn;
+    use crate::transforms::{from_urn, from_urn_with_payload};
 
     fn runner_node(name: &str) -> ExecutableNode {
         ExecutableNode::Runner(from_urn(
@@ -458,6 +458,18 @@ mod tests {
             name.to_string(),
             HashMap::new(),
             HashMap::new(),
+        ))
+    }
+
+    /// A runner source that drives an event stream (no payload, so an empty
+    /// script).
+    fn test_stream_node(name: &str) -> ExecutableNode {
+        ExecutableNode::Runner(from_urn_with_payload(
+            beam_urns::TEST_STREAM_TRANSFORM,
+            name.to_string(),
+            HashMap::new(),
+            HashMap::new(),
+            &[],
         ))
     }
 
@@ -589,6 +601,59 @@ mod tests {
         let ready = scheduler.next_nodes();
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].0, aggregate);
+    }
+
+    #[test]
+    fn test_stream_source_does_not_finish_when_a_bundle_completes() {
+        use crate::engine::watermark::MAX_TIMESTAMP;
+
+        let mut graph = Graph::<ExecutableNode, ConsumerMetaData>::new();
+        let stream = graph.add_node(test_stream_node("stream"));
+        let consumer = graph.add_node(runner_node("consumer"));
+        graph.add_edge(stream, consumer, dummy_metadata("sc"));
+
+        let executable_graph = graph_for_test(graph, dummy_metadata("root"));
+        let stream_id = executable_graph.get_executable_graph()[stream].id();
+        let mut scheduler = NodeScheduler::new(executable_graph);
+
+        assert!(scheduler.watermarks().is_source(&stream_id));
+        assert!(!scheduler.watermarks().source_auto_finishes(&stream_id));
+
+        // First bundle: the source reports its first scripted event, not completion.
+        let ready = scheduler.next_nodes();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].0, stream);
+        scheduler.mark_complete(stream);
+
+        // Completing the bundle must not report `+inf` — the script may have more
+        // events — so the source's output watermark stays put...
+        assert_ne!(
+            scheduler.watermarks().output_watermark(&stream_id),
+            Some(MAX_TIMESTAMP)
+        );
+        // ...but the append still push-wakes the consumer.
+        let ready = scheduler.next_nodes();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].0, consumer);
+        scheduler.mark_complete(consumer);
+
+        // The source can be re-armed to play its next event.
+        scheduler.watermarks_mut().mark_rerun(&stream_id).unwrap();
+        let ready = scheduler.next_nodes();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].0, stream);
+        scheduler.mark_complete(stream);
+
+        // Only an explicit finish reaches `+inf`.
+        scheduler
+            .watermarks_mut()
+            .report_source_finished(&stream_id)
+            .unwrap();
+        scheduler.watermarks_mut().refresh();
+        assert_eq!(
+            scheduler.watermarks().output_watermark(&stream_id),
+            Some(MAX_TIMESTAMP)
+        );
     }
 
     /// Build `source -> stateful(SDK)`, returning the scheduler, the graph node
@@ -808,6 +873,8 @@ mod tests {
                         windowing_strategy: None,
                         processing_time: 0,
                         input_watermark: i64::MAX,
+                        output_coder: None,
+                        source_reports: None,
                     })
                     .await
                     .expect("runner execute");

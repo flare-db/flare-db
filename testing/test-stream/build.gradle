@@ -1,0 +1,33 @@
+// TestStream determinism / streaming-semantics regression check.
+//
+// Build the pipeline:  ./gradlew :test-stream:shadowJar
+// Run it:              ./gradlew :test-stream:run
+//
+// Requires a running FlareDB instance (started with `./flareup-dev.sh --debug`).
+
+plugins {
+    id 'java'
+    id 'application'
+    alias(libs.plugins.shadow)
+}
+
+application {
+    mainClass = 'com.flaredb.testing.TestStreamExample'
+}
+
+dependencies {
+    implementation project(':flaredb-runner')
+    implementation libs.beam.core
+    runtimeOnly libs.slf4j.simple
+}
+
+shadowJar {
+    mergeServiceFiles()
+    zip64 = true
+}
+
+run {
+    // The FlareRunner stages the shadow (uber) JAR to the FlareDB workers, so it must exist
+    // before the example starts.
+    dependsOn tasks.named('shadowJar')
+}

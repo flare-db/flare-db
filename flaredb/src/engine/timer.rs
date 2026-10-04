@@ -20,6 +20,7 @@
 //! is [`TimerStore`] over a `__flare_timer` Paimon table.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::engine::watermark::Timestamp;
@@ -45,6 +46,10 @@ pub struct TimerService {
     /// epoch-domain processing-time clock that paused-time tests can advance.
     origin_epoch_millis: Timestamp,
     origin: Instant,
+    /// A paused, deterministic processing-time clock, used when a `TestStream`
+    /// advances processing time explicitly. `i64::MIN` means "unset" (use the wall
+    /// clock); any other value is the processing time the runner should report.
+    manual_now: AtomicI64,
 }
 
 impl TimerService {
@@ -59,6 +64,7 @@ impl TimerService {
             notify: Arc::new(Notify::new()),
             origin_epoch_millis,
             origin: Instant::now(),
+            manual_now: AtomicI64::new(i64::MIN),
         }
     }
 
@@ -68,8 +74,30 @@ impl TimerService {
     }
 
     /// Current processing time in epoch millis.
+    ///
+    /// Returns the wall-clock time unless a `TestStream` has set a deterministic
+    /// processing time via [`set_processing_time`](Self::set_processing_time).
     pub fn now(&self) -> Timestamp {
+        let manual = self.manual_now.load(Ordering::Relaxed);
+        if manual != i64::MIN {
+            return manual;
+        }
         self.origin_epoch_millis + self.origin.elapsed().as_millis() as i64
+    }
+
+    /// Whether the processing-time clock is paused at a deterministic time.
+    pub fn is_manual(&self) -> bool {
+        self.manual_now.load(Ordering::Relaxed) != i64::MIN
+    }
+
+    /// Pause the processing-time clock at `timestamp` (epoch millis).
+    ///
+    /// Called by the dispatcher when a `TestStream` advances processing time, so
+    /// trigger evaluation and timer due-ness become deterministic. Wakes waiters so
+    /// a sleeping firing loop re-checks its deadline.
+    pub fn set_processing_time(&self, timestamp: Timestamp) {
+        self.manual_now.store(timestamp, Ordering::Relaxed);
+        self.notify.notify_waiters();
     }
 
     /// Set (replace) a timer.

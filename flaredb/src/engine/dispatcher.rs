@@ -1,4 +1,5 @@
 use crate::engine::sdf::SplittableStageExecutor;
+use crate::transforms::SourceProgress;
 use crate::{
     engine::timer::{TimerEntry, TimerStore},
     engine::{
@@ -7,7 +8,7 @@ use crate::{
         runtime::BundleRuntime,
         scheduler::NodeScheduler,
         timer::TimerService,
-        watermark::{MIN_TIMESTAMP, Timestamp},
+        watermark::{MIN_TIMESTAMP, Timestamp, format_timestamp},
     },
     fusion::pipeline::{ExecutableGraph, ExecutableNode},
     store::element_store::FlareElementStore,
@@ -15,6 +16,7 @@ use crate::{
 use anyhow::anyhow;
 use beam_model_rs::v1::{Coder, Components};
 use std::{collections::HashMap, sync::Arc, time::Duration};
+use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
 /// Owns the harness channels and per-job state needed to prepare a pipeline for
@@ -25,6 +27,9 @@ pub struct ExecutorDispatcher {
     pipeline_coders: Arc<HashMap<String, Coder>>,
     pipeline_components: Arc<Components>,
     timer_service: Arc<TimerService>,
+    /// Runner-source progress reports (TestStream) sent from bundle execution.
+    source_reports_tx: mpsc::UnboundedSender<SourceProgress>,
+    source_reports_rx: mpsc::UnboundedReceiver<SourceProgress>,
 }
 
 impl ExecutorDispatcher {
@@ -34,12 +39,15 @@ impl ExecutorDispatcher {
         let store =
             Arc::new(FlareElementStore::new(store_base, "pcollection".to_string(), None).await?);
         let timer_service = Arc::new(TimerService::new(TimerStore::new(store.clone())));
+        let (source_reports_tx, source_reports_rx) = mpsc::unbounded_channel();
         Ok(Self {
             channels,
             store,
             pipeline_coders: Arc::new(HashMap::new()),
             pipeline_components: Arc::new(Components::default()),
             timer_service,
+            source_reports_tx,
+            source_reports_rx,
         })
     }
 
@@ -99,10 +107,12 @@ impl ExecutorDispatcher {
     /// timers (whose owning stage's input watermark has advanced past them), then
     /// waits for the next processing-time timer, fires it, and re-arms the owning
     /// stage so its `@OnTimer` runs.
-    pub async fn run_pipeline(&self, scheduler: &mut NodeScheduler) -> anyhow::Result<()> {
+    pub async fn run_pipeline(&mut self, scheduler: &mut NodeScheduler) -> anyhow::Result<()> {
         let mut in_flight = JoinSet::new();
         // Timers to deliver the next time each re-armed stage runs.
         let mut pending_timers: HashMap<String, Vec<TimerEntry>> = HashMap::new();
+        // Drop any stale reports left by a previous job over the same dispatcher.
+        while self.source_reports_rx.try_recv().is_ok() {}
 
         loop {
             // Reconcile output-watermark holds with the durable event-time timers
@@ -148,17 +158,45 @@ impl ExecutorDispatcher {
             }
 
             if in_flight.is_empty() {
-                // Watermarks may have advanced since the last round (a bundle
-                // completed, or a source reported). Fire any event-time timers
-                // whose owning stage's input watermark has now reached them; this
-                // also drains timers re-armed from inside `@OnTimer` once the
-                // source has reported `+inf`.
-                if self
+                // (1) Runner-source progress (TestStream): one event per run. Apply
+                // the reported watermark / processing time, and either re-arm the
+                // source for its next event or mark it finished.
+                let source_progress = self.apply_source_progress(scheduler).await?;
+
+                // (2) Fire event-time timers the (possibly advanced) watermark
+                // reached; this also drains timers re-armed from inside `@OnTimer`
+                // once the source has reported `+inf`.
+                let promoted_et = self
                     .promote_due_event_time_timers(scheduler, &mut pending_timers)
-                    .await?
-                    > 0
-                {
+                    .await?;
+
+                // (3) Fire any processing-time timers already due at `now`. With the
+                // wall clock this is usually empty and the wait below handles the
+                // deadline; with a TestStream's paused clock it is how an
+                // `advanceProcessingTime` event fires timers.
+                let fired_pt = self
+                    .fire_due_processing_time(scheduler, &mut pending_timers)
+                    .await?;
+
+                // Any applied source progress can change scheduling: a re-arm makes a
+                // source runnable, and a watermark advance can make a gated
+                // aggregation ready again (e.g. its window expiring at `+inf`). Re-loop
+                // so `next_nodes` re-evaluates readiness before concluding deadlock.
+                if source_progress > 0 || promoted_et > 0 || fired_pt > 0 {
                     continue;
+                }
+
+                // Nothing is due now. A paused (TestStream) clock never advances on
+                // its own, so if the graph is not complete it is deadlocked.
+                if self.timer_service.is_manual() {
+                    if scheduler.is_complete() {
+                        self.warn_stranded_event_time_timers().await;
+                        break;
+                    }
+                    return Err(anyhow!(
+                        "executable graph deadlocked: processing time is paused at {} with no due timers",
+                        self.timer_service.now()
+                    ));
                 }
 
                 match self.timer_service.next_processing_deadline().await? {
@@ -168,11 +206,11 @@ impl ExecutorDispatcher {
                             tokio::time::sleep(Duration::from_millis((deadline - now) as u64))
                                 .await;
                         }
-                        let due = self
-                            .timer_service
-                            .take_due_processing_time(self.timer_service.now())
-                            .await?;
-                        if due.is_empty() {
+                        if self
+                            .fire_due_processing_time(scheduler, &mut pending_timers)
+                            .await?
+                            == 0
+                        {
                             if scheduler.is_complete() {
                                 break;
                             }
@@ -180,25 +218,11 @@ impl ExecutorDispatcher {
                                 "executable graph deadlocked: timer deadline passed but nothing was due"
                             ));
                         }
-                        log::info!(
-                            "firing {} due processing-time timer(s): [{}]",
-                            due.len(),
-                            summarize_due_timers(&due)
-                        );
-                        for (stage, timers) in scheduler.promote_due_timers(&due) {
-                            pending_timers.entry(stage).or_default().extend(timers);
-                        }
                         continue;
                     }
                     None => {
                         if scheduler.is_complete() {
-                            let stranded = self.timer_service.all_event_time_timers().await?;
-                            if !stranded.is_empty() {
-                                log::warn!(
-                                    "finishing with {} event-time timer(s) never reached by a watermark; they will not fire",
-                                    stranded.len()
-                                );
-                            }
+                            self.warn_stranded_event_time_timers().await;
                             break;
                         }
                         return Err(anyhow!(
@@ -279,7 +303,94 @@ impl ExecutorDispatcher {
             self.pipeline_coders.clone(),
             self.pipeline_components.clone(),
             self.timer_service.clone(),
+            self.source_reports_tx.clone(),
         )
+    }
+
+    /// Apply runner-source progress reports (TestStream).
+    ///
+    /// For each report: advance the source's watermark and/or the processing-time
+    /// clock, then either mark the source finished (its last event) or re-arm it so
+    /// it runs again for the next scripted event. Returns the number of reports
+    /// applied, so the caller re-evaluates scheduling after the watermark moved (a
+    /// gated aggregation may have become ready).
+    async fn apply_source_progress(
+        &mut self,
+        scheduler: &mut NodeScheduler,
+    ) -> anyhow::Result<usize> {
+        let mut applied = 0usize;
+        while let Ok(progress) = self.source_reports_rx.try_recv() {
+            applied += 1;
+            if let Some(watermark) = progress.watermark {
+                scheduler
+                    .watermarks_mut()
+                    .report_source_watermark(&progress.stage_id, watermark)?;
+                log::info!(
+                    "source '{}' advanced watermark to {}",
+                    progress.stage_id,
+                    format_timestamp(watermark)
+                );
+            }
+            if let Some(processing_time) = progress.processing_time {
+                self.timer_service.set_processing_time(processing_time);
+                log::info!(
+                    "source '{}' advanced processing time to {}",
+                    progress.stage_id,
+                    processing_time
+                );
+            }
+            if progress.done {
+                scheduler
+                    .watermarks_mut()
+                    .report_source_finished(&progress.stage_id)?;
+                log::info!("source '{}' finished", progress.stage_id);
+            } else {
+                scheduler.watermarks_mut().mark_rerun(&progress.stage_id)?;
+            }
+        }
+        if applied > 0 {
+            scheduler.watermarks_mut().refresh();
+        }
+        Ok(applied)
+    }
+
+    /// Fire every processing-time timer already due at [`TimerService::now`].
+    ///
+    /// Returns the number of timers promoted. Used both for a paused TestStream
+    /// clock and to fire timers due immediately at the wall-clock time.
+    async fn fire_due_processing_time(
+        &self,
+        scheduler: &mut NodeScheduler,
+        pending_timers: &mut HashMap<String, Vec<TimerEntry>>,
+    ) -> anyhow::Result<usize> {
+        let due = self
+            .timer_service
+            .take_due_processing_time(self.timer_service.now())
+            .await?;
+        if due.is_empty() {
+            return Ok(0);
+        }
+        log::info!(
+            "firing {} due processing-time timer(s): [{}]",
+            due.len(),
+            summarize_due_timers(&due)
+        );
+        for (stage, timers) in scheduler.promote_due_timers(&due) {
+            pending_timers.entry(stage).or_default().extend(timers);
+        }
+        Ok(due.len())
+    }
+
+    /// Warn about event-time timers that will never fire because no watermark
+    /// reached them before the run ended.
+    async fn warn_stranded_event_time_timers(&self) {
+        match self.timer_service.all_event_time_timers().await {
+            Ok(stranded) if !stranded.is_empty() => log::warn!(
+                "finishing with {} event-time timer(s) never reached by a watermark; they will not fire",
+                stranded.len()
+            ),
+            _ => {}
+        }
     }
 }
 
