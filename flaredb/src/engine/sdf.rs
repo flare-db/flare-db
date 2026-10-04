@@ -202,36 +202,37 @@ impl SplittableStageExecutor {
         let response_future =
             control.recv_process_bundle_response(&instruction_id, bundle_response_rx);
 
-        let control_response = tokio::time::timeout(Duration::from_secs(60), async {
-            tokio::pin!(response_future);
-            tokio::select! {
-                bundle_response = &mut response_future => {
-                    match bundle_response {
-                        Ok(response) => {
-                            let bytes = collect_task.await.map_err(|err| {
-                                anyhow!("initialization collect task failed: {}", err)
-                            })?;
-                            Ok((response, bytes))
-                        }
-                        Err(err) => {
-                            collect_task.abort();
-                            Err(err)
+        let control_response = crate::engine::liveness::idle_guard(
+            async {
+                tokio::pin!(response_future);
+                tokio::select! {
+                    bundle_response = &mut response_future => {
+                        match bundle_response {
+                            Ok(response) => {
+                                let bytes = collect_task.await.map_err(|err| {
+                                    anyhow!("initialization collect task failed: {}", err)
+                                })?;
+                                Ok((response, bytes))
+                            }
+                            Err(err) => {
+                                collect_task.abort();
+                                Err(err)
+                            }
                         }
                     }
+                    collect_result = &mut collect_task => {
+                        let bytes = collect_result.map_err(|err| {
+                            anyhow!("initialization collect task failed: {}", err)
+                        })?;
+                        let response = response_future.await?;
+                        Ok((response, bytes))
+                    }
                 }
-                collect_result = &mut collect_task => {
-                    let bytes = collect_result.map_err(|err| {
-                        anyhow!("initialization collect task failed: {}", err)
-                    })?;
-                    let response = response_future.await?;
-                    Ok((response, bytes))
-                }
-            }
-        })
-        .await
-        .map_err(|_| {
-            anyhow!("timed out waiting for SDF initialization stage control response/data")
-        })??;
+            },
+            Duration::from_secs(60),
+            "waiting for SDF initialization stage control response/data",
+        )
+        .await?;
 
         match control_response {
             (ControlResponse::ProcessBundleSuccess(_), bytes) => Ok(bytes),
@@ -306,48 +307,50 @@ impl SplittableStageExecutor {
             });
 
             let timeout_id = instruction_id.clone();
-            tokio::time::timeout(Duration::from_secs(60), async {
-                tokio::pin!(response_future);
-                tokio::select! {
-                    bundle_response = &mut response_future => {
-                        match bundle_response {
-                            Ok(response) => {
-                                decode_task.await.map_err(|err| {
-                                    anyhow!("output decode task failed: {}", err)
-                                })??;
-                                Ok(response)
-                            }
-                            Err(err) => {
-                                decode_task.abort();
-                                Err(err)
+            crate::engine::liveness::idle_guard(
+                async {
+                    tokio::pin!(response_future);
+                    tokio::select! {
+                        bundle_response = &mut response_future => {
+                            match bundle_response {
+                                Ok(response) => {
+                                    decode_task.await.map_err(|err| {
+                                        anyhow!("output decode task failed: {}", err)
+                                    })??;
+                                    Ok(response)
+                                }
+                                Err(err) => {
+                                    decode_task.abort();
+                                    Err(err)
+                                }
                             }
                         }
+                        decode_result = &mut decode_task => {
+                            decode_result.map_err(|err| {
+                                anyhow!("output decode task failed: {}", err)
+                            })??;
+                            response_future.await
+                        }
                     }
-                    decode_result = &mut decode_task => {
-                        decode_result.map_err(|err| {
-                            anyhow!("output decode task failed: {}", err)
-                        })??;
-                        response_future.await
-                    }
-                }
-            })
-            .await
-            .map_err(|_| {
-                anyhow!(
-                    "timed out waiting for SDF process bundle {} output data and control response",
+                },
+                Duration::from_secs(60),
+                &format!(
+                    "waiting for SDF process bundle {} output data and control response",
                     timeout_id
-                )
-            })??
+                ),
+            )
+            .await?
         } else {
             let timeout_id = instruction_id.clone();
-            tokio::time::timeout(Duration::from_secs(60), response_future)
-                .await
-                .map_err(|_| {
-                    anyhow!(
-                        "timed out waiting for SDF process bundle {} control response",
-                        timeout_id
-                    )
-                })??
+            crate::engine::liveness::idle_guard(
+                response_future,
+                Duration::from_secs(60),
+                &format!(
+                    "waiting for SDF process bundle {} control response",
+                    timeout_id
+                ),
+            )
+            .await?
         };
 
         match control_response {

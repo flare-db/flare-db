@@ -394,6 +394,7 @@ impl ControlChannel {
 
                 match response {
                     Ok(Some(response)) => {
+                        crate::engine::liveness::touch();
                         let instruction_id = response.instruction_id.clone();
                         debug!(
                             "control response received: instruction_id={} error={}",

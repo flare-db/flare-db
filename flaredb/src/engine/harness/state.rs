@@ -193,6 +193,7 @@ impl StateChannel {
         loop {
             match self.recv_request().await {
                 Ok(request) => {
+                    crate::engine::liveness::touch();
                     let summary = describe_request(&request);
                     let started = std::time::Instant::now();
                     let response = handle_state_request(&backend, request).await;
