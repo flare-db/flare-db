@@ -272,10 +272,10 @@ impl NodeScheduler {
     /// `fire_timestamp <= input_watermark`). Processing-time timers are ignored
     /// here; they are driven by [`Self::promote_due_timers`] off the clock.
     ///
-    /// A timer whose stage currently has a bundle in flight is deliberately left
-    /// un-promoted: re-arming it now would be cleared when that bundle completes
-    /// (`complete_bundle` resets `rerun_pending`), and the caller may have already
-    /// deleted it from the store. It will be promoted after the bundle finishes.
+    /// A timer whose stage currently has a bundle in flight is still promoted: the
+    /// re-arm it sets survives bundle completion (`complete_bundle` no longer
+    /// clears `rerun_pending`) and is consumed when the stage next runs. This lets
+    /// timers fire without waiting for a concurrent wave to drain.
     pub fn promote_due_event_time_timers(
         &mut self,
         timers: &[TimerEntry],
@@ -292,9 +292,6 @@ impl NodeScheduler {
             else {
                 continue;
             };
-            if self.watermarks.is_stage_in_flight(&stage) {
-                continue;
-            }
             // Clamp by pending input: an event-time timer must not fire while
             // older input for the owning stage is still unconsumed.
             let watermark = self
@@ -321,6 +318,11 @@ impl NodeScheduler {
     /// stage (an unknown transform, or one not part of the executable graph).
     pub fn stage_for_transform(&self, transform_id: &str) -> Option<String> {
         self.transform_to_stage.get(transform_id).cloned()
+    }
+
+    /// The stage id of the executable node at `idx`.
+    pub fn stage_id(&self, idx: NodeIndex) -> String {
+        self.graph.get_executable_graph()[idx].id()
     }
 
     /// The shared per-stage watermark and eligibility state.
@@ -743,10 +745,10 @@ mod tests {
         assert!(scheduler.promote_due_event_time_timers(&[timer]).is_empty());
     }
 
-    /// A timer whose stage already has a bundle in flight is not promoted (the
-    /// re-arm would be lost when that bundle completes).
+    /// A timer whose stage already has a bundle in flight is still promoted, and
+    /// the re-arm survives that bundle's completion, so the timer is not lost.
     #[test]
-    fn event_time_timer_for_an_in_flight_stage_is_not_promoted() {
+    fn event_time_timer_for_an_in_flight_stage_is_promoted_and_survives_completion() {
         let (mut scheduler, source, stateful, _source_id, _stateful_id) = source_and_stateful();
         let timer = event_timer("stateful", 100);
 
@@ -758,16 +760,18 @@ mod tests {
         // Start the stateful stage's bundle: it is now in flight.
         let ready = scheduler.next_nodes();
         assert!(ready.iter().any(|(idx, _)| *idx == stateful));
-        assert!(
-            scheduler
-                .promote_due_event_time_timers(&[timer.clone()])
-                .is_empty()
-        );
 
-        // Once it completes, the timer is promoted.
-        scheduler.mark_complete(stateful);
+        // The timer is promoted even though the stage has a bundle in flight.
         let promoted = scheduler.promote_due_event_time_timers(&[timer]);
         assert_eq!(promoted.len(), 1);
+
+        // Completion does not discard the re-arm: the stage runs again.
+        scheduler.mark_complete(stateful);
+        assert!(!scheduler.is_complete());
+        let ready = scheduler.next_nodes();
+        assert!(ready.iter().any(|(idx, _)| *idx == stateful));
+        scheduler.mark_complete(stateful);
+        assert!(scheduler.is_complete());
     }
 
     /// After a bounded source reports +inf, a timer re-armed by the fired

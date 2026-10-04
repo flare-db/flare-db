@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use anyhow::anyhow;
-use beam_model_rs::v1::{DelayedBundleApplication, ProcessBundleResponse};
+use beam_model_rs::v1::{BundleApplication, DelayedBundleApplication, ProcessBundleResponse};
 use log::{error, info};
 
 use crate::{
@@ -23,30 +23,29 @@ use crate::{
     },
 };
 
-/// Per-splittable-stage execution state carried across scheduling turns.
+/// One deferred bundle's worth of SDF work.
 ///
-/// A splittable (SDF) stage does not finish in a single bundle: the SDK returns
-/// the unprocessed remainder of each element as a *residual*, which the runner
-/// must feed back later. FlareDB carries the residual element bytes here between
-/// turns and re-arms the stage until no residuals remain. While residuals are
-/// outstanding the stage's output watermark is held at their reported
-/// `output_watermarks`, so consumers do not treat earlier event-time work as done.
-#[derive(Default)]
-pub struct SdfStageState {
-    /// The initialization bundle has produced and delivered its seed elements.
-    initialized: bool,
-    /// The initialization and process bundles are registered with the worker.
-    /// Registration persists on the harness connection, so it happens once.
-    registered: bool,
-    /// Encoded residual elements from the last process bundle, to re-feed next.
-    residuals: Vec<Vec<u8>>,
+/// `seed` is the encoded element bytes to feed the process stage for this bundle
+/// (a residual's `element`, or the initialization seed for the first bundle).
+/// `holds` is the output-watermark clamp the deferred work imposes: while the item
+/// is queued or in flight, the stage's output watermark must not advance past it.
+#[derive(Clone, Debug, Default)]
+pub struct SdfWorkItem {
+    pub seed: Vec<u8>,
+    pub holds: Vec<Timestamp>,
 }
 
-impl SdfStageState {
-    /// Whether the stage still owes deferred (residual) work.
-    pub fn has_pending_work(&self) -> bool {
-        !self.residuals.is_empty()
-    }
+/// What one executed SDF bundle reports back to the dispatcher.
+#[derive(Debug, Default)]
+pub struct SdfBundleOutcome {
+    /// The initialization bundle has run (carried forward across bundles).
+    pub initialized: bool,
+    /// The descriptors are registered with the worker (carried forward).
+    pub registered: bool,
+    /// Output-watermark holds of the work item this bundle consumed (to release).
+    pub consumed_holds: Vec<Timestamp>,
+    /// Residual work items this bundle produced, to be scheduled later.
+    pub items: Vec<SdfWorkItem>,
 }
 
 /// Executor for a `SplittableStage` node
@@ -59,43 +58,57 @@ impl SplittableStageExecutor {
         Self { runtime }
     }
 
-    /// Run one scheduling turn of a splittable (SDF) stage.
+    /// Execute exactly one bundle of a splittable (SDF) stage.
     ///
-    /// On the first turn this runs the initialization bundle to obtain the seed
-    /// elements, then runs exactly one process bundle. On later turns it re-feeds
-    /// the residual elements returned by the previous process bundle. The caller
-    /// re-arms the stage while [`SdfStageState::has_pending_work`] holds, and
-    /// applies the returned residual `output_watermarks` as output holds until
-    /// then.
-    pub async fn execute_turn(
+    /// `seed` is the work item to process, or `None` for the first
+    /// (initialization) bundle. `initialized`/`registered` are the stage's flags
+    /// from prior bundles; the outcome carries them forward along with the residual
+    /// work items this bundle produced and the holds of the item it consumed. The
+    /// caller schedules one bundle per work item and applies the item holds as
+    /// output-watermark clamps until the item completes.
+    pub async fn execute_bundle(
         &mut self,
         stage: &SplittableStage,
         output_edge_metadata: Option<ConsumerMetaData>,
-        state: &mut SdfStageState,
-    ) -> anyhow::Result<(ProcessBundleResponse, Vec<Timestamp>)> {
+        seed: Option<SdfWorkItem>,
+        initialized: bool,
+        registered: bool,
+    ) -> anyhow::Result<(ProcessBundleResponse, SdfBundleOutcome)> {
         let plan = stage.plan();
 
-        // Seed: freshly captured initialization bytes on the first turn,
-        // otherwise the residual elements from the previous process bundle.
-        let seed = if state.initialized {
-            std::mem::take(&mut state.residuals).concat()
-        } else {
-            let seed = self
-                .run_initialization_stage(&plan.initialization_stage)
-                .await?;
-            state.initialized = true;
-            seed
+        let (seed_bytes, consumed_holds) = match seed {
+            Some(item) => (Some(item.seed), item.holds),
+            None => (None, Vec::new()),
         };
 
-        let register = !state.registered;
-        let response = self
-            .run_process_stage(&plan.process_stage, output_edge_metadata, seed, register)
-            .await?;
-        state.registered = true;
+        // The first bundle runs the initialization stage to capture its seed;
+        // later bundles are seeded by their work item.
+        let bytes = if initialized {
+            seed_bytes.unwrap_or_default()
+        } else {
+            self.run_initialization_stage(&plan.initialization_stage)
+                .await?
+        };
 
-        state.residuals = residual_elements(&response.residual_roots);
-        let holds = residual_output_holds(stage, &response.residual_roots);
-        Ok((response, holds))
+        let response = self
+            .run_process_stage(
+                &plan.process_stage,
+                output_edge_metadata,
+                bytes,
+                !registered,
+            )
+            .await?;
+
+        let items = residual_items(stage, &response.residual_roots);
+        Ok((
+            response,
+            SdfBundleOutcome {
+                initialized: true,
+                registered: true,
+                consumed_holds,
+                items,
+            },
+        ))
     }
 
     /// Run the SDF initialization stage and return its captured seed bytes.
@@ -411,26 +424,14 @@ impl SplittableStageExecutor {
     }
 }
 
-/// Encoded element bytes for each residual application, to re-feed next turn.
-fn residual_elements(residuals: &[DelayedBundleApplication]) -> Vec<Vec<u8>> {
-    residuals
-        .iter()
-        .filter_map(|residual| residual.application.as_ref())
-        .map(|application| application.element.clone())
-        .collect()
-}
-
-/// The output-watermark holds a stage must carry while its residuals are pending.
+/// The residual work items a process bundle produced.
 ///
-/// A residual's `output_watermarks` is a lower bound on the timestamps of elements
-/// the owning PTransform will still produce when the residual runs. Only entries
-/// naming an output PCollection that *leaves* the stage are considered — internal
-/// PCollections are not tracked by the runner — and a `MIN_TIMESTAMP` or absent
-/// entry imposes no hold (a hold at `MIN_TIMESTAMP` would stall the stage forever).
-fn residual_output_holds(
+/// One item per residual application: the encoded element bytes to re-feed, plus
+/// the output-watermark holds that deferred work imposes.
+fn residual_items(
     stage: &SplittableStage,
     residuals: &[DelayedBundleApplication],
-) -> Vec<Timestamp> {
+) -> Vec<SdfWorkItem> {
     if residuals.is_empty() {
         return Vec::new();
     }
@@ -444,28 +445,46 @@ fn residual_output_holds(
         .map(|transform| (transform.id().clone(), transform.node().outputs.clone()))
         .collect();
 
+    residuals
+        .iter()
+        .filter_map(|residual| residual.application.as_ref())
+        .map(|application| SdfWorkItem {
+            seed: application.element.clone(),
+            holds: residual_item_holds(application, &outputs_by_transform, &boundary),
+        })
+        .collect()
+}
+
+/// The output-watermark holds a single residual imposes on its stage's output.
+///
+/// A residual's `output_watermarks` is a lower bound on the timestamps of elements
+/// the owning PTransform will still produce when the residual runs. Only entries
+/// naming an output PCollection that *leaves* the stage are considered — internal
+/// PCollections are not tracked by the runner — and a `MIN_TIMESTAMP` or absent
+/// entry imposes no hold (a hold at `MIN_TIMESTAMP` would stall the stage forever).
+fn residual_item_holds(
+    application: &BundleApplication,
+    outputs_by_transform: &HashMap<String, HashMap<String, String>>,
+    boundary: &HashSet<&str>,
+) -> Vec<Timestamp> {
+    let Some(outputs) = outputs_by_transform.get(&application.transform_id) else {
+        return Vec::new();
+    };
+
     let mut holds = Vec::new();
-    for residual in residuals {
-        let Some(application) = &residual.application else {
+    for (local_name, watermark) in &application.output_watermarks {
+        let Some(pcollection) = outputs.get(local_name) else {
             continue;
         };
-        let Some(outputs) = outputs_by_transform.get(&application.transform_id) else {
+        if !boundary.contains(pcollection.as_str()) {
             continue;
-        };
-        for (local_name, watermark) in &application.output_watermarks {
-            let Some(pcollection) = outputs.get(local_name) else {
-                continue;
-            };
-            if !boundary.contains(pcollection.as_str()) {
-                continue;
-            }
-            let hold = watermark
-                .seconds
-                .saturating_mul(1_000)
-                .saturating_add(i64::from(watermark.nanos) / 1_000_000);
-            if hold > MIN_TIMESTAMP {
-                holds.push(hold);
-            }
+        }
+        let hold = watermark
+            .seconds
+            .saturating_mul(1_000)
+            .saturating_add(i64::from(watermark.nanos) / 1_000_000);
+        if hold > MIN_TIMESTAMP {
+            holds.push(hold);
         }
     }
     holds
@@ -558,60 +577,57 @@ mod tests {
     }
 
     #[test]
-    fn residual_holds_only_boundary_output_watermarks() {
+    fn residual_items_only_hold_boundary_output_watermarks() {
         let stage = splittable_stage(
             &["pcol-out"],
             "process",
             &[("out", "pcol-out"), ("internal", "pcol-internal")],
         );
 
-        // A boundary output reported at 5000ms becomes a single hold at 5000.
-        assert_eq!(
-            residual_output_holds(&stage, &[residual("process", "out", 5_000)]),
-            vec![5_000]
-        );
+        // A boundary output reported at 5000ms becomes a hold at 5000.
+        let items = residual_items(&stage, &[residual("process", "out", 5_000)]);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].holds, vec![5_000]);
 
-        // An internal output is not tracked by the runner: no hold.
+        // An internal output is not tracked by the runner: the item still exists,
+        // but imposes no hold.
+        let items = residual_items(&stage, &[residual("process", "internal", 5_000)]);
+        assert_eq!(items.len(), 1);
+        assert!(items[0].holds.is_empty());
+
+        // A local output name not declared on the transform, or a transform not in
+        // the process stage, impose no hold.
         assert!(
-            residual_output_holds(&stage, &[residual("process", "internal", 5_000)]).is_empty()
+            residual_items(&stage, &[residual("process", "missing", 5_000)])[0]
+                .holds
+                .is_empty()
+        );
+        assert!(
+            residual_items(&stage, &[residual("elsewhere", "out", 5_000)])[0]
+                .holds
+                .is_empty()
         );
 
-        // A local output name that is not declared on the transform: no hold.
-        assert!(residual_output_holds(&stage, &[residual("process", "missing", 5_000)]).is_empty());
-
-        // A transform not present in the process stage: no hold.
-        assert!(residual_output_holds(&stage, &[residual("elsewhere", "out", 5_000)]).is_empty());
-
-        // No residuals: no hold.
-        assert!(residual_output_holds(&stage, &[]).is_empty());
+        // No residuals: no items.
+        assert!(residual_items(&stage, &[]).is_empty());
     }
 
     #[test]
-    fn residual_holds_accumulate_across_residuals() {
+    fn residual_items_carry_seed_and_holds_per_residual() {
         let stage = splittable_stage(&["pcol-out"], "process", &[("out", "pcol-out")]);
 
-        // Each residual contributes its own multiset entry; the manager takes the
-        // minimum, so a lower bound from any residual holds the stage.
-        let holds = residual_output_holds(
-            &stage,
-            &[
-                residual("process", "out", 5_000),
-                residual("process", "out", 2_000),
-            ],
-        );
-        assert_eq!(holds, vec![5_000, 2_000]);
-    }
-
-    #[test]
-    fn residual_elements_collect_each_application_body() {
         let mut first = residual("process", "out", 5_000);
         first.application.as_mut().unwrap().element = b"first".to_vec();
-        let mut second = residual("process", "out", 5_000);
+        let mut second = residual("process", "out", 2_000);
         second.application.as_mut().unwrap().element = b"second".to_vec();
         // A residual with no application is skipped rather than panicking.
         let empty = DelayedBundleApplication::default();
 
-        let elements = residual_elements(&[first, empty, second]);
-        assert_eq!(elements, vec![b"first".to_vec(), b"second".to_vec()]);
+        let items = residual_items(&stage, &[first, empty, second]);
+        assert_eq!(items.len(), 2, "one item per residual application");
+        assert_eq!(items[0].seed, b"first".to_vec());
+        assert_eq!(items[0].holds, vec![5_000]);
+        assert_eq!(items[1].seed, b"second".to_vec());
+        assert_eq!(items[1].holds, vec![2_000]);
     }
 }

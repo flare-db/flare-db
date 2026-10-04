@@ -20,7 +20,9 @@
 //! ```text
 //! input  = MIN(upstream output watermarks of main inputs,
 //!              upstream output watermarks of side inputs)
-//! output = MIN(upstream output watermarks of MAIN inputs, min watermark hold)
+//! output = MIN(upstream output watermarks of MAIN inputs,
+//!              min timestamp of unconsumed input,
+//!              earliest watermark hold)
 //! ```
 //!
 //! Side inputs gate the *input* watermark — they hold back execution — but they
@@ -226,11 +228,12 @@ struct StageState {
     pending: BTreeSet<PCollectionId>,
     /// Minimum event-time among the pending inputs; [`MAX_TIMESTAMP`] when nothing
     /// is pending. Set on push-wake from the producer's committed minimum and
-    /// cleared when a bundle consumes the pending inputs. This is the input
-    /// watermark clamp: the watermark must not advance past data not yet consumed.
-    /// The readiness gate deliberately uses the *unclamped* `input` (the
-    /// triggering watermark), while the clamp is only for decisions that must not
-    /// run ahead of unconsumed input.
+    /// cleared when a bundle consumes the pending inputs. It clamps two things: the
+    /// [`effective_input_watermark`](WatermarkManager::effective_input_watermark)
+    /// (decisions that must not run ahead of unconsumed input) and the stage's
+    /// **output** watermark — a stage that has not consumed input at `t` cannot have
+    /// produced output past `t`. The readiness gate deliberately uses the
+    /// *unclamped* `input` (the triggering watermark).
     pending_min: Timestamp,
     /// Number of bundles for this stage currently executing. Zero when idle. Up
     /// to [`max_in_flight`](Self::max_in_flight) may run concurrently.
@@ -804,11 +807,10 @@ impl WatermarkManager {
             let stage_state = self.stages.get_mut(stage).expect("checked above");
             stage_state.in_flight -= 1;
             stage_state.completed = true;
-            // A completion does not clear a re-arm that another concurrently
-            // in-flight bundle's timer may have set; `start_bundle` consumes it.
-            if stage_state.in_flight == 0 {
-                stage_state.rerun_pending = false;
-            }
+            // Do not clear `rerun_pending` here: a timer promoted while a bundle
+            // was in flight (or during a concurrent bundle) must survive this
+            // completion. `start_bundle` consumes the re-arm when the stage next
+            // runs, so a stale one is harmless.
         }
 
         let mut newly_ready = Vec::new();
@@ -910,9 +912,16 @@ impl WatermarkManager {
         watermark
     }
 
-    /// `MIN` over the upstream output watermarks of the stage's MAIN inputs and
-    /// its earliest watermark hold (event-time timer or deferred work); the
-    /// source's own report for a source.
+    /// `MIN` over the upstream output watermarks of the stage's MAIN inputs, the
+    /// minimum timestamp of its **unconsumed** input (`pending_min`), and its
+    /// earliest watermark hold (event-time timer or deferred work); the source's own
+    /// report for a source.
+    ///
+    /// The `pending_min` term is what makes holds effective: a stage that has not yet
+    /// consumed input at timestamp `t` cannot have produced output past `t`, so its
+    /// output must not advance to a finished upstream's `+∞` before that input is
+    /// processed. Without it, a deferred-work hold (e.g. an SDF residual bound below
+    /// the input watermark) could never clamp a watermark that had already advanced.
     fn compute_output(&self, stage: &StageState) -> Timestamp {
         if let Some(source) = &stage.source {
             return source.output();
@@ -921,6 +930,7 @@ impl WatermarkManager {
         for input in &stage.main_inputs {
             watermark = watermark.min(self.upstream(input));
         }
+        watermark = watermark.min(stage.pending_min);
         if let Some(watermark_hold) = stage.min_hold() {
             watermark = watermark.min(watermark_hold);
         }
@@ -1638,6 +1648,67 @@ mod tests {
         assert_eq!(manager.max_in_flight("A"), 1);
     }
 
+    /// A multi-bundle producer (as an SDF stage is) clamps its gated consumer at
+    /// the earliest outstanding deferred-work hold, and the consumer only becomes
+    /// ready once the last overlapping hold releases.
+    #[test]
+    fn concurrent_producer_bundles_hold_a_gated_consumer_until_all_release() {
+        let mut manager = manager(&[
+            ("S", &[], &[], &["s"]),
+            ("P", &["s"], &[], &["p"]),
+            ("C", &["p"], &[], &["q"]),
+        ]);
+        manager
+            .set_stage_kind("C", StageKind::WatermarkGated)
+            .unwrap();
+        manager.set_required_watermark("C", 100).unwrap();
+
+        // The source runs and completes (bounded end = +inf) committing a minimum
+        // event-time of 50, which produces the producer's input and makes P
+        // runnable. P's output is clamped by that unconsumed input.
+        manager.start_bundle("S").unwrap();
+        manager.complete_bundle_with_min("S", Some(50)).unwrap();
+        manager.report_source_finished("S").unwrap();
+        manager.refresh();
+        assert_eq!(manager.output_watermark("P"), Some(50));
+
+        // P declares three concurrent residual bundles and starts them as a wave.
+        manager.set_max_in_flight("P", 3).unwrap();
+        manager.enqueue_bundles("P", 3).unwrap();
+        manager.start_bundle("P").unwrap();
+        manager.start_bundle("P").unwrap();
+        manager.start_bundle("P").unwrap();
+        assert_eq!(manager.in_flight_bundles("P"), 3);
+        assert_eq!(manager.queued_bundles("P"), 0);
+
+        // One bundle completes: this produces P's output (clears C's fan-in
+        // barrier) while two bundles remain in flight.
+        manager.complete_bundle("P").unwrap();
+        assert_eq!(manager.in_flight_bundles("P"), 2);
+
+        // The two outstanding residuals hold P's output at the earliest bound 50,
+        // so the gated consumer C (needs >= 100) is not ready.
+        manager.set_residual_holds(&HashMap::from([("P".to_string(), vec![50, 200])]));
+        manager.refresh();
+        assert_eq!(manager.output_watermark("P"), Some(50));
+        assert!(!manager.ready_stages().contains(&"C".to_string()));
+
+        // The bundle holding 50 completes and its hold releases; the remaining
+        // bound 200 clears the gate, so C becomes ready.
+        manager.complete_bundle("P").unwrap();
+        manager.set_residual_holds(&HashMap::from([("P".to_string(), vec![200])]));
+        manager.refresh();
+        assert_eq!(manager.output_watermark("P"), Some(200));
+        assert!(manager.ready_stages().contains(&"C".to_string()));
+
+        // The last bundle completes and releases; P reaches +inf.
+        manager.complete_bundle("P").unwrap();
+        manager.set_residual_holds(&HashMap::new());
+        manager.refresh();
+        assert_eq!(manager.in_flight_bundles("P"), 0);
+        assert_eq!(manager.output_watermark("P"), Some(MAX_TIMESTAMP));
+    }
+
     #[test]
     fn completing_a_producer_rearms_an_already_completed_consumer() {
         let mut manager = manager(&[("A", &[], &[], &["p"]), ("B", &["p"], &[], &["q"])]);
@@ -1684,7 +1755,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_min_clamps_only_the_effective_input_watermark() {
+    fn pending_min_clamps_output_and_effective_input() {
         let mut manager = manager(&[("A", &[], &[], &["p"]), ("B", &["p"], &[], &["q"])]);
 
         // A completes, committing a minimum event-time of 42 that B has not consumed.
@@ -1695,12 +1766,17 @@ mod tests {
 
         // The propagated watermark and the readiness gate stay unclamped...
         assert_eq!(manager.input_watermark("B"), Some(100));
-        // ...but the effective watermark cannot pass unconsumed input.
+        // ...but neither the effective watermark nor B's output may pass the
+        // oldest unconsumed input.
         assert_eq!(manager.effective_input_watermark("B"), Some(42));
+        assert_eq!(manager.output_watermark("B"), Some(42));
 
         // Consuming the pending input lifts the clamp.
         manager.start_bundle("B").unwrap();
         assert_eq!(manager.effective_input_watermark("B"), Some(100));
+        manager.complete_bundle("B").unwrap();
+        manager.refresh();
+        assert_eq!(manager.output_watermark("B"), Some(100));
     }
 
     #[test]

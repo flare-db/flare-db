@@ -1,4 +1,4 @@
-use crate::engine::sdf::{SdfStageState, SplittableStageExecutor};
+use crate::engine::sdf::{SdfBundleOutcome, SdfWorkItem, SplittableStageExecutor};
 use crate::transforms::SourceProgress;
 use crate::{
     engine::timer::{TimerEntry, TimerStore},
@@ -15,22 +15,54 @@ use crate::{
 };
 use anyhow::anyhow;
 use beam_model_rs::v1::{Coder, Components};
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, collections::VecDeque, sync::Arc, time::Duration};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
 /// Outcome of one dispatched stage bundle.
 ///
 /// Non-splittable stages carry no extra state; a splittable (SDF) stage returns
-/// its deferred-work state and the residual output-watermark holds it imposes so
-/// the dispatcher can re-arm it and clamp its output watermark.
+/// the residual work items it produced and the holds of the item it consumed, so
+/// the dispatcher can queue them and clamp the stage's output watermark.
 enum StageRun {
     Plain,
-    Sdf {
-        stage_id: String,
-        state: SdfStageState,
-        holds: Vec<Timestamp>,
-    },
+    Sdf { outcome: SdfBundleOutcome },
+}
+
+/// Pending bundle work for one splittable stage.
+#[derive(Default)]
+struct SdfQueue {
+    /// The initialization bundle has run (carried forward across bundles).
+    initialized: bool,
+    /// The descriptors are registered with the worker.
+    registered: bool,
+    /// Residual work items awaiting a bundle, oldest first.
+    items: VecDeque<SdfWorkItem>,
+}
+
+/// Add each hold in `holds` to `map[stage]` (a multiset).
+fn add_holds(map: &mut HashMap<String, Vec<Timestamp>>, stage: &str, holds: &[Timestamp]) {
+    if holds.is_empty() {
+        return;
+    }
+    map.entry(stage.to_string())
+        .or_default()
+        .extend_from_slice(holds);
+}
+
+/// Remove one occurrence of each hold in `holds` from `map[stage]`.
+fn remove_holds(map: &mut HashMap<String, Vec<Timestamp>>, stage: &str, holds: &[Timestamp]) {
+    let Some(list) = map.get_mut(stage) else {
+        return;
+    };
+    for hold in holds {
+        if let Some(pos) = list.iter().position(|candidate| candidate == hold) {
+            list.remove(pos);
+        }
+    }
+    if list.is_empty() {
+        map.remove(stage);
+    }
 }
 
 /// Owns the harness channels and per-job state needed to prepare a pipeline for
@@ -124,17 +156,19 @@ impl ExecutorDispatcher {
     /// ready (e.g. GBK's windows expiring at `+∞`) and a re-arm makes a source
     /// runnable — before concluding completion or deadlock.
     ///
-    /// A **splittable (SDF)** stage returns residual work one bundle at a time: the
-    /// loop re-arms it while residuals remain and holds its output watermark at the
-    /// residuals' reported `output_watermarks`, so consumers do not treat earlier
-    /// event-time work as complete until the deferred work drains.
+    /// A **splittable (SDF)** stage produces residual work items one bundle at a
+    /// time and may run several concurrently (up to its concurrency ceiling). The
+    /// loop queues those items, runs one bundle per item, and holds the stage's
+    /// output watermark at the minimum over all outstanding items' reported
+    /// `output_watermarks`, so consumers do not treat earlier event-time work as
+    /// complete until the deferred work drains.
     pub async fn run_pipeline(&mut self, scheduler: &mut NodeScheduler) -> anyhow::Result<()> {
         let mut in_flight = JoinSet::new();
         // Timers to deliver the next time each re-armed stage runs.
         let mut pending_timers: HashMap<String, Vec<TimerEntry>> = HashMap::new();
-        // Deferred SDF state (residual elements) and the residual output-watermark
-        // holds it imposes, keyed by stage id. Both are per-run and start empty.
-        let mut sdf_states: HashMap<String, SdfStageState> = HashMap::new();
+        // Pending residual work items per splittable stage, and the union of the
+        // output-watermark holds their deferred work imposes. Both per-run.
+        let mut sdf_queues: HashMap<String, SdfQueue> = HashMap::new();
         let mut residual_holds: HashMap<String, Vec<Timestamp>> = HashMap::new();
         // Drop any stale reports left by a previous job over the same dispatcher.
         while self.source_reports_rx.try_recv().is_ok() {}
@@ -164,28 +198,39 @@ impl ExecutorDispatcher {
                     .watermarks()
                     .input_watermark(&stage_id)
                     .unwrap_or(MIN_TIMESTAMP);
-                // A splittable stage is re-run until its residual work drains; its
-                // per-stage state is taken out here and returned by the task.
-                let sdf_state = sdf_states.remove(&stage_id).unwrap_or_default();
+
+                // A splittable stage runs one bundle per queued work item. Take
+                // the next item here (the initialization bundle has no item), so
+                // each started bundle gets distinct seed bytes.
+                let (sdf_seed, sdf_initialized, sdf_registered) = match &node {
+                    ExecutableNode::Splittable(_) => {
+                        let queue = sdf_queues.entry(stage_id.clone()).or_default();
+                        let seed = if queue.initialized {
+                            queue.items.pop_front()
+                        } else {
+                            None
+                        };
+                        (seed, queue.initialized, queue.registered)
+                    }
+                    _ => (None, false, false),
+                };
 
                 in_flight.spawn(async move {
                     if let ExecutableNode::Splittable(stage) = node {
                         let mut executor = SplittableStageExecutor::new(runtime);
-                        let mut sdf_state = sdf_state;
-                        let result = executor
-                            .execute_turn(&stage, output_metadata, &mut sdf_state)
+                        let run = match executor
+                            .execute_bundle(
+                                &stage,
+                                output_metadata,
+                                sdf_seed,
+                                sdf_initialized,
+                                sdf_registered,
+                            )
                             .await
-                            .map(|(response, holds)| {
-                                (ControlResponse::ProcessBundleSuccess(response), holds)
-                            });
-                        let run = match result {
-                            Ok((control, holds)) => (
-                                Ok(control),
-                                StageRun::Sdf {
-                                    stage_id,
-                                    state: sdf_state,
-                                    holds,
-                                },
+                        {
+                            Ok((response, outcome)) => (
+                                Ok(ControlResponse::ProcessBundleSuccess(response)),
+                                StageRun::Sdf { outcome },
                             ),
                             Err(err) => (Err(err), StageRun::Plain),
                         };
@@ -284,40 +329,52 @@ impl ExecutorDispatcher {
             if let Some(joined) = in_flight.join_next().await {
                 let (idx, result, run) = joined?;
                 result?;
-                // The minimum event-time this bundle committed to its primary
-                // output clamps each consumer's input watermark until consumed.
-                let output_min_ts = scheduler
-                    .output_edge_metadata(idx)
-                    .map(|meta| meta.produced_pcol_id)
-                    .and_then(|pcollection| self.store.take_commit_min_timestamp(&pcollection));
-                scheduler.mark_complete_with_min(idx, output_min_ts);
+                let stage_id = scheduler.stage_id(idx);
 
-                // A splittable stage that still has residual work is re-armed and
-                // its output watermark held at the residual `output_watermarks`, so
-                // consumers do not treat earlier event-time work as complete until
-                // the deferred work drains. Once drained the holds are released.
-                if let StageRun::Sdf {
-                    stage_id,
-                    state,
-                    holds,
-                } = run
-                {
-                    if holds.is_empty() {
-                        residual_holds.remove(&stage_id);
-                    } else {
-                        residual_holds.insert(stage_id.clone(), holds);
+                // Release the holds of the item this bundle consumed, publish the
+                // holds of the residuals it produced, queue those residuals, and
+                // declare them to the scheduler so the stage is not considered
+                // complete while any remain.
+                //
+                // This must happen BEFORE `mark_complete_with_min` refreshes: a hold
+                // can only clamp a watermark that has not advanced yet, and the
+                // refresh inside completion would otherwise let the producer's output
+                // run ahead of the deferred work.
+                if let StageRun::Sdf { outcome } = run {
+                    remove_holds(&mut residual_holds, &stage_id, &outcome.consumed_holds);
+                    let queue = sdf_queues.entry(stage_id.clone()).or_default();
+                    queue.initialized = outcome.initialized;
+                    queue.registered = outcome.registered;
+                    for item in &outcome.items {
+                        add_holds(&mut residual_holds, &stage_id, &item.holds);
                     }
-                    if state.has_pending_work() {
-                        sdf_states.insert(stage_id.clone(), state);
-                        // Declare one more bundle for this stage. The stage is not
-                        // complete (and the job does not terminate) until the queue
-                        // drains; a split/SDF executor that produces N independent
-                        // work items will enqueue N here instead of 1.
-                        scheduler.watermarks_mut().enqueue_bundles(&stage_id, 1)?;
-                    } else {
-                        sdf_states.remove(&stage_id);
+                    let count = outcome.items.len();
+                    queue.items.extend(outcome.items);
+                    scheduler
+                        .watermarks_mut()
+                        .set_residual_holds(&residual_holds);
+                    if count > 0 {
+                        scheduler
+                            .watermarks_mut()
+                            .enqueue_bundles(&stage_id, count)?;
                     }
                 }
+
+                // Take the committed minimum only on the producer's last in-flight
+                // bundle (the end of a wave). Concurrent producer bundles fold into
+                // one running min, so a per-bundle take could clear another bundle's
+                // contribution; taking at wave end yields the min over the whole
+                // wave. `in_flight_bundles` still counts this bundle.
+                let is_last_of_wave = scheduler.watermarks().in_flight_bundles(&stage_id) <= 1;
+                let output_min_ts = if is_last_of_wave {
+                    scheduler
+                        .output_edge_metadata(idx)
+                        .map(|meta| meta.produced_pcol_id)
+                        .and_then(|pcollection| self.store.take_commit_min_timestamp(&pcollection))
+                } else {
+                    None
+                };
+                scheduler.mark_complete_with_min(idx, output_min_ts);
             }
         }
 
@@ -509,5 +566,34 @@ fn summarize_due_timers(due: &[TimerEntry]) -> String {
         format!("{shown}, +{} more", due.len() - SHOWN)
     } else {
         shown
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn holds_are_a_multiset_union_across_bundles() {
+        let mut holds: HashMap<String, Vec<Timestamp>> = HashMap::new();
+        add_holds(&mut holds, "s", &[50, 200]);
+        add_holds(&mut holds, "s", &[50]);
+        // The same timestamp can be held more than once (one per bundle).
+        assert_eq!(holds["s"], vec![50, 200, 50]);
+
+        // Releasing a bundle removes one occurrence of each of its holds.
+        remove_holds(&mut holds, "s", &[50]);
+        assert_eq!(holds["s"], vec![200, 50]);
+
+        remove_holds(&mut holds, "s", &[50, 200]);
+        assert!(!holds.contains_key("s"), "all holds released");
+    }
+
+    #[test]
+    fn releasing_absent_holds_is_a_no_op() {
+        let mut holds: HashMap<String, Vec<Timestamp>> = HashMap::new();
+        remove_holds(&mut holds, "missing", &[1]);
+        add_holds(&mut holds, "s", &[]);
+        assert!(holds.is_empty());
     }
 }
