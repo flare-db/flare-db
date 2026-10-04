@@ -1,10 +1,10 @@
-use crate::engine::sdf::SplittableStageExecutor;
+use crate::engine::sdf::{SdfStageState, SplittableStageExecutor};
 use crate::transforms::SourceProgress;
 use crate::{
     engine::timer::{TimerEntry, TimerStore},
     engine::{
-        executor::{Executor, StageExecutor},
-        harness::Channels,
+        executor::StageExecutor,
+        harness::{Channels, control::ControlResponse},
         runtime::BundleRuntime,
         scheduler::NodeScheduler,
         timer::TimerService,
@@ -18,6 +18,20 @@ use beam_model_rs::v1::{Coder, Components};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
+
+/// Outcome of one dispatched stage bundle.
+///
+/// Non-splittable stages carry no extra state; a splittable (SDF) stage returns
+/// its deferred-work state and the residual output-watermark holds it imposes so
+/// the dispatcher can re-arm it and clamp its output watermark.
+enum StageRun {
+    Plain,
+    Sdf {
+        stage_id: String,
+        state: SdfStageState,
+        holds: Vec<Timestamp>,
+    },
+}
 
 /// Owns the harness channels and per-job state needed to prepare a pipeline for
 /// execution. A [`StageExecutor`] is built from this prepared state.
@@ -109,10 +123,19 @@ impl ExecutorDispatcher {
     /// it re-evaluates scheduling — a watermark advance can make a gated stage
     /// ready (e.g. GBK's windows expiring at `+∞`) and a re-arm makes a source
     /// runnable — before concluding completion or deadlock.
+    ///
+    /// A **splittable (SDF)** stage returns residual work one bundle at a time: the
+    /// loop re-arms it while residuals remain and holds its output watermark at the
+    /// residuals' reported `output_watermarks`, so consumers do not treat earlier
+    /// event-time work as complete until the deferred work drains.
     pub async fn run_pipeline(&mut self, scheduler: &mut NodeScheduler) -> anyhow::Result<()> {
         let mut in_flight = JoinSet::new();
         // Timers to deliver the next time each re-armed stage runs.
         let mut pending_timers: HashMap<String, Vec<TimerEntry>> = HashMap::new();
+        // Deferred SDF state (residual elements) and the residual output-watermark
+        // holds it imposes, keyed by stage id. Both are per-run and start empty.
+        let mut sdf_states: HashMap<String, SdfStageState> = HashMap::new();
+        let mut residual_holds: HashMap<String, Vec<Timestamp>> = HashMap::new();
         // Drop any stale reports left by a previous job over the same dispatcher.
         while self.source_reports_rx.try_recv().is_ok() {}
 
@@ -123,6 +146,11 @@ impl ExecutorDispatcher {
             // stage as complete before the timer fires. Holds clamp output only,
             // so this cannot deadlock a stage's own readiness.
             self.sync_event_time_holds(scheduler).await?;
+            // Deferred-work (SDF residual) holds live in a separate multiset, so a
+            // timer reconcile never erases them; apply them alongside the timers.
+            scheduler
+                .watermarks_mut()
+                .set_residual_holds(&residual_holds);
 
             for (idx, node) in scheduler.next_nodes() {
                 let runtime = self.new_bundle_runtime();
@@ -136,16 +164,35 @@ impl ExecutorDispatcher {
                     .watermarks()
                     .input_watermark(&stage_id)
                     .unwrap_or(MIN_TIMESTAMP);
+                // A splittable stage is re-run until its residual work drains; its
+                // per-stage state is taken out here and returned by the task.
+                let sdf_state = sdf_states.remove(&stage_id).unwrap_or_default();
 
                 in_flight.spawn(async move {
-                    let result = if matches!(node, ExecutableNode::Splittable(_)) {
+                    if let ExecutableNode::Splittable(stage) = node {
                         let mut executor = SplittableStageExecutor::new(runtime);
-                        executor
-                            .execute(node, input_metadata, output_metadata, input_watermark)
+                        let mut sdf_state = sdf_state;
+                        let result = executor
+                            .execute_turn(&stage, output_metadata, &mut sdf_state)
                             .await
+                            .map(|(response, holds)| {
+                                (ControlResponse::ProcessBundleSuccess(response), holds)
+                            });
+                        let run = match result {
+                            Ok((control, holds)) => (
+                                Ok(control),
+                                StageRun::Sdf {
+                                    stage_id,
+                                    state: sdf_state,
+                                    holds,
+                                },
+                            ),
+                            Err(err) => (Err(err), StageRun::Plain),
+                        };
+                        (idx, run.0, run.1)
                     } else {
                         let mut executor = StageExecutor::new(runtime);
-                        executor
+                        let result = executor
                             .execute_with_timers(
                                 node,
                                 input_metadata,
@@ -153,9 +200,9 @@ impl ExecutorDispatcher {
                                 timers,
                                 input_watermark,
                             )
-                            .await
-                    };
-                    (idx, result)
+                            .await;
+                        (idx, result, StageRun::Plain)
+                    }
                 });
             }
 
@@ -235,7 +282,7 @@ impl ExecutorDispatcher {
             }
 
             if let Some(joined) = in_flight.join_next().await {
-                let (idx, result) = joined?;
+                let (idx, result, run) = joined?;
                 result?;
                 // The minimum event-time this bundle committed to its primary
                 // output clamps each consumer's input watermark until consumed.
@@ -244,6 +291,29 @@ impl ExecutorDispatcher {
                     .map(|meta| meta.produced_pcol_id)
                     .and_then(|pcollection| self.store.take_commit_min_timestamp(&pcollection));
                 scheduler.mark_complete_with_min(idx, output_min_ts);
+
+                // A splittable stage that still has residual work is re-armed and
+                // its output watermark held at the residual `output_watermarks`, so
+                // consumers do not treat earlier event-time work as complete until
+                // the deferred work drains. Once drained the holds are released.
+                if let StageRun::Sdf {
+                    stage_id,
+                    state,
+                    holds,
+                } = run
+                {
+                    if holds.is_empty() {
+                        residual_holds.remove(&stage_id);
+                    } else {
+                        residual_holds.insert(stage_id.clone(), holds);
+                    }
+                    if state.has_pending_work() {
+                        sdf_states.insert(stage_id.clone(), state);
+                        scheduler.watermarks_mut().mark_rerun(&stage_id)?;
+                    } else {
+                        sdf_states.remove(&stage_id);
+                    }
+                }
             }
         }
 

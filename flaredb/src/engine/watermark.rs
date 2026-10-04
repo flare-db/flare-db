@@ -49,6 +49,13 @@
 //! only; readiness uses the unclamped input, so a hold never blocks the holding
 //! stage itself. This is the same notion as Dataflow's `WatermarkHold`.
 //!
+//! A stage can also hold its output watermark for **deferred work** — work the
+//! SDK has split off and will run later, such as an SDF residual. Those holds live
+//! in a separate multiset ([`WatermarkManager::set_residual_holds`]) because the
+//! event-time timer holds are rebuilt from the durable timer store on every tick
+//! and would otherwise erase them. `compute_output` takes the minimum over both
+//! multisets.
+//!
 //! # Eligibility
 //!
 //! A stage is ready for a bundle when it has no main input left unproduced, no
@@ -197,9 +204,15 @@ struct StageState {
     source: Option<SourceState>,
     input: Timestamp,
     output: Timestamp,
-    /// Watermark holds: a multiset keyed by hold timestamp (counted, so the same
-    /// timestamp can be held more than once). See the module docs on holds.
+    /// Watermark holds from pending event-time timers: a multiset keyed by hold
+    /// timestamp (counted, so the same timestamp can be held more than once). See
+    /// the module docs on holds. Rebuilt as a whole by [`set_event_time_holds`]
+    /// (WatermarkManager::set_event_time_holds) on every scheduling tick.
     watermark_holds: BTreeMap<Timestamp, usize>,
+    /// Watermark holds for deferred work (SDF residual output watermarks), kept
+    /// separate from [`watermark_holds`] because the event-time holds are rebuilt
+    /// as a whole each tick and would clobber this multiset.
+    residual_holds: BTreeMap<Timestamp, usize>,
 
     /// Main inputs not yet produced by their producer *for the first time*; empty
     /// means every input is available. This is the fan-in barrier and never
@@ -241,9 +254,18 @@ impl StageState {
         self.source.is_some()
     }
 
-    /// The earliest watermark hold, or `None` when none are held.
+    /// The earliest watermark hold across event-time and deferred-work holds, or
+    /// `None` when none are held.
     fn min_hold(&self) -> Option<Timestamp> {
-        self.watermark_holds.keys().next().copied()
+        match (
+            self.watermark_holds.keys().next(),
+            self.residual_holds.keys().next(),
+        ) {
+            (Some(timer), Some(residual)) => Some(*timer.min(residual)),
+            (Some(timer), None) => Some(*timer),
+            (None, Some(residual)) => Some(*residual),
+            (None, None) => None,
+        }
     }
 
     /// Whether this stage may run a bundle now, given its current input
@@ -395,6 +417,7 @@ impl WatermarkManager {
                 input,
                 output: MIN_TIMESTAMP,
                 watermark_holds: BTreeMap::new(),
+                residual_holds: BTreeMap::new(),
                 unproduced,
                 pending: BTreeSet::new(),
                 pending_min: MAX_TIMESTAMP,
@@ -507,6 +530,26 @@ impl WatermarkManager {
             if let Some(timestamps) = watermark_holds.get(id) {
                 for timestamp in timestamps {
                     *stage.watermark_holds.entry(*timestamp).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+
+    /// Replace every stage's deferred-work watermark holds with `residual_holds`.
+    ///
+    /// Unlike [`set_event_time_holds`](Self::set_event_time_holds) — which is
+    /// rebuilt from the durable timer store every tick — these holds describe work
+    /// the SDK has deferred (an SDF residual's `output_watermarks`: a lower bound
+    /// on the timestamps that deferred work will still produce). They live in a
+    /// separate multiset so a timer reconcile does not erase them. Stages absent
+    /// from `residual_holds` are cleared. Call [`Self::refresh`] afterwards to
+    /// propagate the clamp.
+    pub fn set_residual_holds(&mut self, residual_holds: &HashMap<StageId, Vec<Timestamp>>) {
+        for (id, stage) in self.stages.iter_mut() {
+            stage.residual_holds.clear();
+            if let Some(timestamps) = residual_holds.get(id) {
+                for timestamp in timestamps {
+                    *stage.residual_holds.entry(*timestamp).or_insert(0) += 1;
                 }
             }
         }
@@ -802,7 +845,8 @@ impl WatermarkManager {
     }
 
     /// `MIN` over the upstream output watermarks of the stage's MAIN inputs and
-    /// its earliest watermark hold; the source's own report for a source.
+    /// its earliest watermark hold (event-time timer or deferred work); the
+    /// source's own report for a source.
     fn compute_output(&self, stage: &StageState) -> Timestamp {
         if let Some(source) = &stage.source {
             return source.output();
@@ -1101,6 +1145,51 @@ mod tests {
         // All fire: no holds remain.
         manager.set_event_time_holds(&HashMap::new());
         assert_eq!(manager.min_hold("A"), None);
+    }
+
+    #[test]
+    fn residual_holds_clamp_output_and_release_when_cleared() {
+        let mut manager = manager(&[
+            ("A", &[], &[], &["p"]),
+            ("B", &["p"], &[], &["q"]),
+            ("C", &["q"], &[], &["r"]),
+        ]);
+
+        // Deferred (residual) work on B promises its remaining output is >= 30, so
+        // B's output is held there and C cannot advance past it.
+        manager.set_residual_holds(&HashMap::from([("B".to_string(), vec![30])]));
+        manager.report_source_watermark("A", 100).unwrap();
+        manager.refresh();
+
+        assert_eq!(manager.input_watermark("B"), Some(100));
+        assert_eq!(manager.output_watermark("B"), Some(30));
+        assert_eq!(manager.input_watermark("C"), Some(30));
+
+        // The deferred work completes: the hold is dropped and B catches up.
+        manager.set_residual_holds(&HashMap::new());
+        manager.refresh();
+        assert_eq!(manager.output_watermark("B"), Some(100));
+        assert_eq!(manager.input_watermark("C"), Some(100));
+    }
+
+    #[test]
+    fn residual_holds_are_independent_of_event_time_holds() {
+        let mut manager = manager(&[("A", &[], &[], &["p"])]);
+
+        manager.set_residual_holds(&HashMap::from([("A".to_string(), vec![30])]));
+        assert_eq!(manager.min_hold("A"), Some(30));
+
+        // Rebuilding the event-time holds must not erase the deferred-work hold.
+        manager.set_event_time_holds(&HashMap::new());
+        assert_eq!(manager.min_hold("A"), Some(30));
+
+        // Two kinds of hold: the earliest wins.
+        manager.set_event_time_holds(&HashMap::from([("A".to_string(), vec![10])]));
+        assert_eq!(manager.min_hold("A"), Some(10));
+
+        // Clearing the deferred hold leaves only the event-time hold.
+        manager.set_residual_holds(&HashMap::new());
+        assert_eq!(manager.min_hold("A"), Some(10));
     }
 
     #[test]

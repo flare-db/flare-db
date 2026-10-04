@@ -2225,6 +2225,7 @@ dependencies = [
  "paimon-datafusion",
  "petgraph",
  "prost 0.14.4",
+ "prost-types",
  "rand 0.10.2",
  "serde",
  "serde_json",
