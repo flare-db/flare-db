@@ -119,10 +119,13 @@ impl NodeScheduler {
             let Some(&index) = self.index_of.get(&stage) else {
                 continue;
             };
-            if self.watermarks.start_bundle(&stage).is_err() {
-                continue;
+            let node = self.graph.get_executable_graph()[index].clone();
+            // Start one bundle, and keep going while the stage still has declared
+            // work (e.g. SDF residuals) and is under its concurrency ceiling. For
+            // the common `max_in_flight == 1` case this starts exactly one bundle.
+            while self.watermarks.start_bundle(&stage).is_ok() {
+                next.push((index, node.clone()));
             }
-            next.push((index, self.graph.get_executable_graph()[index].clone()));
         }
 
         next
@@ -924,5 +927,40 @@ mod tests {
         // 2, not 3: exactly one new element was appended, so B re-read only new
         // rows rather than re-emitting the whole input.
         assert_eq!(output_len(&store).await, 2);
+    }
+
+    /// A stage with more declared bundle work than its concurrency ceiling (as an
+    /// SDF producer would have) is handed out as multiple entries by `next_nodes`,
+    /// and the pipeline is not complete until every one of them finishes.
+    #[test]
+    fn next_nodes_starts_queued_bundles_up_to_the_concurrency_ceiling() {
+        let (mut scheduler, _source, stateful, _source_id, stateful_id) = source_and_stateful();
+
+        // Run the source so the stateful stage's input is produced.
+        let first = scheduler.next_nodes();
+        assert_eq!(first.len(), 1);
+        scheduler.mark_complete(first[0].0);
+
+        scheduler
+            .watermarks_mut()
+            .set_max_in_flight(&stateful_id, 3)
+            .unwrap();
+        scheduler
+            .watermarks_mut()
+            .enqueue_bundles(&stateful_id, 3)
+            .unwrap();
+
+        let batch = scheduler.next_nodes();
+        assert_eq!(batch.len(), 3, "one entry per started bundle");
+        assert!(batch.iter().all(|(idx, _)| *idx == stateful));
+        assert_eq!(scheduler.watermarks().in_flight_bundles(&stateful_id), 3);
+        assert_eq!(scheduler.watermarks().queued_bundles(&stateful_id), 0);
+
+        // Finishing them one at a time drains the stage; the last one completes it.
+        for (idx, _) in batch {
+            scheduler.mark_complete(idx);
+        }
+        assert_eq!(scheduler.watermarks().in_flight_bundles(&stateful_id), 0);
+        assert!(scheduler.is_complete());
     }
 }

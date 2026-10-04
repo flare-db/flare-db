@@ -309,7 +309,11 @@ impl ExecutorDispatcher {
                     }
                     if state.has_pending_work() {
                         sdf_states.insert(stage_id.clone(), state);
-                        scheduler.watermarks_mut().mark_rerun(&stage_id)?;
+                        // Declare one more bundle for this stage. The stage is not
+                        // complete (and the job does not terminate) until the queue
+                        // drains; a split/SDF executor that produces N independent
+                        // work items will enqueue N here instead of 1.
+                        scheduler.watermarks_mut().enqueue_bundles(&stage_id, 1)?;
                     } else {
                         sdf_states.remove(&stage_id);
                     }

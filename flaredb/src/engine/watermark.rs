@@ -232,8 +232,17 @@ struct StageState {
     /// triggering watermark), while the clamp is only for decisions that must not
     /// run ahead of unconsumed input.
     pending_min: Timestamp,
-    /// A bundle for this stage is currently executing.
-    in_flight: bool,
+    /// Number of bundles for this stage currently executing. Zero when idle. Up
+    /// to [`max_in_flight`](Self::max_in_flight) may run concurrently.
+    in_flight: usize,
+    /// Bundle work items the executor has declared but not started yet (for
+    /// example SDF residuals). The stage is not complete while this is non-zero;
+    /// each [`start_bundle`](WatermarkManager::start_bundle) consumes one.
+    queued: usize,
+    /// Ceiling on concurrent bundles for this stage. Runner-native and ordinary
+    /// SDK stages keep `1`; a splittable stage may raise it to run residual work
+    /// in parallel (see the multi-bundle execution docs).
+    max_in_flight: usize,
     /// The stage has completed at least one bundle.
     completed: bool,
     /// The stage has been re-armed to run another bundle (for example by a
@@ -271,16 +280,18 @@ impl StageState {
     /// Whether this stage may run a bundle now, given its current input
     /// watermark.
     fn is_ready(&self) -> bool {
-        if self.in_flight || !self.unproduced.is_empty() {
+        if self.in_flight >= self.max_in_flight || !self.unproduced.is_empty() {
             return false;
         }
         // A stage that has never run starts once its inputs are produced; a
         // stage that has already run runs again when it is re-armed (a fired
-        // timer), has unconsumed upstream output (push-wake), or — for a
-        // watermark-gated stage — when its input watermark has advanced past the
-        // watermark at its last run.
+        // timer), has declared bundle work (queued, e.g. SDF residuals), has
+        // unconsumed upstream output (push-wake), or — for a watermark-gated
+        // stage — when its input watermark has advanced past the watermark at its
+        // last run.
         let has_work = if self.completed {
             self.rerun_pending
+                || self.queued > 0
                 || !self.pending.is_empty()
                 || (self.kind == StageKind::WatermarkGated
                     && self.input > self.watermark_at_last_run)
@@ -421,7 +432,9 @@ impl WatermarkManager {
                 unproduced,
                 pending: BTreeSet::new(),
                 pending_min: MAX_TIMESTAMP,
-                in_flight: false,
+                in_flight: 0,
+                queued: 0,
+                max_in_flight: 1,
                 completed: false,
                 rerun_pending: false,
                 kind: StageKind::default(),
@@ -649,16 +662,53 @@ impl WatermarkManager {
     pub fn is_stage_in_flight(&self, stage: &str) -> bool {
         self.stages
             .get(stage)
-            .map(|stage| stage.in_flight)
+            .map(|stage| stage.in_flight > 0)
             .unwrap_or(false)
+    }
+
+    /// The number of bundles currently executing for `stage`.
+    pub fn in_flight_bundles(&self, stage: &str) -> usize {
+        self.stages.get(stage).map(|s| s.in_flight).unwrap_or(0)
+    }
+
+    /// The number of declared-but-not-started bundles for `stage` (e.g. SDF
+    /// residuals). The stage is not complete while this is non-zero.
+    pub fn queued_bundles(&self, stage: &str) -> usize {
+        self.stages.get(stage).map(|s| s.queued).unwrap_or(0)
+    }
+
+    /// The concurrency ceiling for `stage` (default `1`).
+    pub fn max_in_flight(&self, stage: &str) -> usize {
+        self.stages.get(stage).map(|s| s.max_in_flight).unwrap_or(1)
+    }
+
+    /// Set how many bundles of `stage` may run concurrently. Callers must only
+    /// raise this for stages whose executor can actually produce independent
+    /// work items (splittable stages); stateful runner-native stages must stay at
+    /// `1`.
+    pub fn set_max_in_flight(&mut self, stage: &str, max_in_flight: usize) -> Result<()> {
+        let stage_state = self.stage_mut(stage)?;
+        stage_state.max_in_flight = max_in_flight.max(1);
+        Ok(())
+    }
+
+    /// Declare `count` additional bundle work items for `stage` (e.g. SDF
+    /// residuals or splits). Each is consumed by one
+    /// [`start_bundle`](Self::start_bundle); the stage does not complete until
+    /// every queued item has run.
+    pub fn enqueue_bundles(&mut self, stage: &str, count: usize) -> Result<()> {
+        let stage_state = self.stage_mut(stage)?;
+        stage_state.queued += count;
+        Ok(())
     }
 
     /// Stages that may run a bundle now, sorted by id.
     ///
-    /// A stage is ready when every main input has been produced, it has no
-    /// bundle in flight, it has not completed, and its [`StageKind`] gate is
-    /// satisfied. This does not reserve the stages; call [`Self::start_bundle`]
-    /// before executing each one.
+    /// A stage is ready when every main input has been produced, it has fewer
+    /// bundles in flight than its concurrency ceiling, it has work to do (a first
+    /// run, a re-arm, queued work, pending input, or a gated watermark advance),
+    /// and its [`StageKind`] gate is satisfied. This does not reserve the stages;
+    /// call [`Self::start_bundle`] before executing each one.
     pub fn ready_stages(&self) -> Vec<StageId> {
         let mut ready: Vec<StageId> = self
             .stages
@@ -671,18 +721,25 @@ impl WatermarkManager {
     }
 
     /// Mark that a bundle for `stage` has started.
+    ///
+    /// A stage may have several bundles in flight up to its
+    /// [`max_in_flight`](Self::max_in_flight); each call consumes one queued work
+    /// item (if any) and increments the in-flight count. The first bundle of a
+    /// wave consumes the `pending` input; the rest are independent work items
+    /// (SDF residuals).
     pub fn start_bundle(&mut self, stage: &str) -> Result<()> {
         let stage_state = self
             .stages
             .get_mut(stage)
             .ok_or_else(|| anyhow!("unknown stage '{stage}'"))?;
-        if stage_state.in_flight {
-            bail!("stage '{stage}' already has a bundle in flight");
+        if stage_state.in_flight >= stage_state.max_in_flight {
+            bail!("stage '{stage}' already has its maximum number of bundles in flight");
         }
         let watermark_rerun = stage_state.kind == StageKind::WatermarkGated
             && stage_state.input > stage_state.watermark_at_last_run;
         if stage_state.completed
             && !stage_state.rerun_pending
+            && stage_state.queued == 0
             && !watermark_rerun
             && stage_state.pending.is_empty()
         {
@@ -691,16 +748,19 @@ impl WatermarkManager {
         if !stage_state.unproduced.is_empty() {
             bail!("stage '{stage}' still has unproduced main inputs");
         }
-        stage_state.in_flight = true;
+        stage_state.in_flight += 1;
+        stage_state.queued = stage_state.queued.saturating_sub(1);
         stage_state.rerun_pending = false;
-        // This bundle consumes every input currently pending. Anything a producer
-        // appends while this bundle is in flight re-populates `pending` and
-        // re-arms the stage for another run.
-        stage_state.pending.clear();
-        stage_state.pending_min = MAX_TIMESTAMP;
-        // Remember the watermark this bundle ran at, so a later advance re-arms
-        // a watermark-gated stage.
-        stage_state.watermark_at_last_run = stage_state.input;
+        // The first bundle of a wave consumes every input currently pending.
+        // Anything a producer appends while a bundle is in flight re-populates
+        // `pending` and re-arms the stage for another run.
+        if stage_state.in_flight == 1 {
+            stage_state.pending.clear();
+            stage_state.pending_min = MAX_TIMESTAMP;
+            // Remember the watermark this wave ran at, so a later advance re-arms
+            // a watermark-gated stage.
+            stage_state.watermark_at_last_run = stage_state.input;
+        }
         Ok(())
     }
 
@@ -734,7 +794,7 @@ impl WatermarkManager {
                 .stages
                 .get(stage)
                 .ok_or_else(|| anyhow!("unknown stage '{stage}'"))?;
-            if !stage_state.in_flight {
+            if stage_state.in_flight == 0 {
                 bail!("stage '{stage}' has no bundle in flight");
             }
             stage_state.outputs.clone()
@@ -742,9 +802,13 @@ impl WatermarkManager {
 
         {
             let stage_state = self.stages.get_mut(stage).expect("checked above");
-            stage_state.in_flight = false;
+            stage_state.in_flight -= 1;
             stage_state.completed = true;
-            stage_state.rerun_pending = false;
+            // A completion does not clear a re-arm that another concurrently
+            // in-flight bundle's timer may have set; `start_bundle` consumes it.
+            if stage_state.in_flight == 0 {
+                stage_state.rerun_pending = false;
+            }
         }
 
         let mut newly_ready = Vec::new();
@@ -781,6 +845,8 @@ impl WatermarkManager {
             stage.completed
                 && stage.pending.is_empty()
                 && !stage.rerun_pending
+                && stage.queued == 0
+                && stage.in_flight == 0
                 && !(stage.kind == StageKind::WatermarkGated
                     && stage.input > stage.watermark_at_last_run)
         })
@@ -1512,6 +1578,64 @@ mod tests {
         assert!(!manager.ready_stages().contains(&"B".to_string()));
         manager.complete_bundle("B").unwrap();
         assert!(manager.is_complete());
+    }
+
+    #[test]
+    fn queued_bundles_keep_a_stage_incomplete_until_drained() {
+        let mut manager = manager(&[("A", &[], &[], &["p"]), ("B", &["p"], &[], &["q"])]);
+        manager.start_bundle("A").unwrap();
+        manager.complete_bundle("A").unwrap();
+
+        // B declares two residual bundles; neither starts until scheduled.
+        manager.enqueue_bundles("B", 2).unwrap();
+        assert_eq!(manager.queued_bundles("B"), 2);
+
+        manager.start_bundle("B").unwrap();
+        assert_eq!(manager.queued_bundles("B"), 1);
+        manager.complete_bundle("B").unwrap();
+        assert!(
+            !manager.is_complete(),
+            "one queued residual bundle still owes work"
+        );
+
+        manager.start_bundle("B").unwrap();
+        assert_eq!(manager.queued_bundles("B"), 0);
+        manager.complete_bundle("B").unwrap();
+        assert!(manager.is_complete(), "all queued bundles drained");
+    }
+
+    #[test]
+    fn max_in_flight_bounds_concurrent_queued_bundles() {
+        let mut manager = manager(&[("A", &[], &[], &["p"]), ("B", &["p"], &[], &["q"])]);
+        manager.start_bundle("A").unwrap();
+        manager.complete_bundle("A").unwrap();
+
+        manager.set_max_in_flight("B", 3).unwrap();
+        manager.enqueue_bundles("B", 3).unwrap();
+
+        manager.start_bundle("B").unwrap();
+        manager.start_bundle("B").unwrap();
+        manager.start_bundle("B").unwrap();
+        assert_eq!(manager.in_flight_bundles("B"), 3);
+        assert_eq!(manager.queued_bundles("B"), 0);
+        // At the concurrency ceiling: no fourth bundle.
+        manager.start_bundle("B").unwrap_err();
+
+        manager.complete_bundle("B").unwrap();
+        assert_eq!(manager.in_flight_bundles("B"), 2);
+        manager.complete_bundle("B").unwrap();
+        manager.complete_bundle("B").unwrap();
+        assert!(manager.is_complete());
+    }
+
+    #[test]
+    fn enqueue_on_an_unknown_stage_errors() {
+        let mut manager = manager(&[("A", &[], &[], &["p"])]);
+        manager.enqueue_bundles("nope", 1).unwrap_err();
+        manager.set_max_in_flight("nope", 2).unwrap_err();
+        // A ceiling below one is clamped up so a stage can always run.
+        manager.set_max_in_flight("A", 0).unwrap();
+        assert_eq!(manager.max_in_flight("A"), 1);
     }
 
     #[test]
