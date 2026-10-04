@@ -189,11 +189,11 @@ impl StateChannel {
             match self.recv_request().await {
                 Ok(request) => {
                     let summary = describe_request(&request);
-                    info!("state request received: {}", summary);
+                    //info!("state request received: {}", summary);
                     let response = handle_state_request(&backend, request).await;
                     match response {
                         Ok(response) => {
-                            info!("state response sent: id={}", response.id);
+                            //info!("state response sent: id={}", response.id);
                             if let Err(e) = self.send_response(response).await {
                                 warn!("failed to send state response (worker gone?): {}", e);
                                 break;

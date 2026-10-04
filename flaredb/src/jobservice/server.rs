@@ -252,7 +252,12 @@ impl JobService for FlareJobService {
                 .await
                 .set_job_store(&preparation_id)
                 .await
-                .map_err(|e| Status::internal(format!("failed to set job store: {}", e)))?;
+                .map_err(|e| {
+                    Status::internal(truncate_grpc_error(format!(
+                        "failed to set job store: {}",
+                        e
+                    )))
+                })?;
 
             let connect_timeout_secs = self.worker_manager.config().connect_timeout_secs;
             timeout(Duration::from_secs(connect_timeout_secs), async {
@@ -267,10 +272,10 @@ impl JobService for FlareJobService {
                 ))
             })?
             .map_err(|e| {
-                Status::internal(format!(
+                Status::internal(truncate_grpc_error(format!(
                     "failed waiting for harness connection for job {}: {}",
                     preparation_id, e
-                ))
+                )))
             })?;
 
             let mut dispatcher = self.dispatcher.lock().await;
@@ -278,10 +283,10 @@ impl JobService for FlareJobService {
 
             let mut scheduler = NodeScheduler::new((*job_graph).clone());
             dispatcher.run_pipeline(&mut scheduler).await.map_err(|e| {
-                Status::internal(format!(
+                Status::internal(truncate_grpc_error(format!(
                     "failed to execute pipeline for job {}: {}",
                     preparation_id, e
-                ))
+                )))
             })?;
 
             // stop worker, next job will get a fresh one.
@@ -594,4 +599,52 @@ impl JobService for FlareJobService {
 
     #[doc = " Server streaming response type for the GetMessageStream method."]
     type GetMessageStreamStream = ReceiverStream<Result<JobMessagesResponse, tonic::Status>>;
+}
+
+/// Bound the length of an error string carried back to the client.
+///
+/// gRPC errors travel in the HTTP/2 `grpc-message` trailer, and the JVM runner's
+/// gRPC client defaults to an 8 KiB inbound-metadata limit. A long message (for
+/// example a chained coder or panic error) exceeds it, and the *real* failure is
+/// replaced by a `HeaderListSizeException`, hiding the cause. Truncate on a UTF-8
+/// char boundary so the trailer stays small and the useful prefix survives.
+fn truncate_grpc_error(message: String) -> String {
+    const MAX_BYTES: usize = 2_048;
+    if message.len() <= MAX_BYTES {
+        return message;
+    }
+    let mut end = MAX_BYTES;
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}… [truncated, {} bytes total]",
+        &message[..end],
+        message.len()
+    )
+}
+
+#[cfg(test)]
+mod truncate_tests {
+    use super::truncate_grpc_error;
+
+    #[test]
+    fn keeps_short_messages_intact() {
+        assert_eq!(truncate_grpc_error("boom".to_string()), "boom");
+    }
+
+    #[test]
+    fn truncates_long_messages() {
+        let truncated = truncate_grpc_error("a".repeat(10_000));
+        assert!(truncated.len() < 3_000);
+        assert!(truncated.starts_with('a'));
+        assert!(truncated.contains("truncated"));
+    }
+
+    #[test]
+    fn truncation_is_utf8_safe() {
+        // 'é' is two bytes; cutting mid-codepoint would panic without the boundary check.
+        let truncated = truncate_grpc_error("é".repeat(5_000));
+        assert!(truncated.contains("truncated"));
+    }
 }
