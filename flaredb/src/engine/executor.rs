@@ -6,6 +6,7 @@ use beam_model_rs::v1::{ApiServiceDescriptor, ProcessBundleDescriptor};
 use log::{error, info, warn};
 
 use crate::{
+    engine::timer::TimerEntry,
     engine::{
         harness::{
             control::ControlResponse,
@@ -17,7 +18,6 @@ use crate::{
         },
     },
     fusion::pipeline::{ConsumerMetaData, ExecutableNode},
-    state::timer::TimerEntry,
     transforms::ExecutionContext,
 };
 

@@ -10,7 +10,7 @@ use crate::engine::watermark::{
     MAX_TIMESTAMP, MIN_TIMESTAMP, StageKind, Timestamp, WatermarkManager, format_timestamp,
 };
 use crate::fusion::pipeline::{ConsumerMetaData, ExecutableGraph, ExecutableNode};
-use crate::state::timer::{TimeDomain, TimerEntry};
+use crate::engine::timer::{TimeDomain, TimerEntry};
 
 /// Scheduler that manages execution state for an `ExecutableGraph`.
 ///
@@ -377,7 +377,7 @@ mod tests {
     use crate::engine::scheduler::NodeScheduler;
     use crate::fusion::pipeline::{ConsumerMetaData, ExecutableGraph, ExecutableNode};
     use crate::jobservice::urns::beam_urns;
-    use crate::state::timer::{TimeDomain, TimerEntry, TimerKey};
+    use crate::engine::timer::{TimeDomain, TimerEntry, TimerKey};
     use crate::transforms::from_urn;
 
     fn runner_node(name: &str) -> ExecutableNode {

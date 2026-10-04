@@ -14,7 +14,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Response, Status};
 
 use crate::{
-    state::{StateBackend, UserStateAddress, UserStateKind, UserStateStore},
+    engine::state::{StateBackend, UserStateAddress, UserStateKind, UserStateStore},
     store::element_store::FlareElementStore,
 };
 

@@ -18,6 +18,7 @@ use paimon_datafusion::PaimonTableProvider;
 
 use crate::{
     coders::primitives::{BeamWindow, PaneInfo, WindowedValue},
+    engine::trigger::{TriggerContext, TriggerRunner, TriggerSpec},
     jobservice::urns::beam_urns,
     store::{
         KEY_COLUMN, VALUE_COLUMN,
@@ -27,10 +28,7 @@ use crate::{
             primitive_value_from_array_row,
         },
     },
-    transforms::{
-        ExecutionContext, FlareTransform,
-        trigger::{TriggerContext, TriggerRunner, TriggerSpec},
-    },
+    transforms::{ExecutionContext, FlareTransform},
 };
 
 /// Runner-native implementation of Beam's `GroupByKey`.

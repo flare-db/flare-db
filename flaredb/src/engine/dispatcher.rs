@@ -1,5 +1,6 @@
 use crate::engine::sdf::SplittableStageExecutor;
 use crate::{
+    engine::timer::{TimerEntry, TimerStore},
     engine::{
         executor::{Executor, StageExecutor},
         harness::Channels,
@@ -9,7 +10,6 @@ use crate::{
         watermark::{MIN_TIMESTAMP, Timestamp},
     },
     fusion::pipeline::{ExecutableGraph, ExecutableNode},
-    state::timer::{TimerEntry, TimerStore},
     store::element_store::FlareElementStore,
 };
 use anyhow::anyhow;

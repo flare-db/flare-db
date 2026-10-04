@@ -18,7 +18,6 @@ use crate::{
 pub mod flatten;
 pub mod gbk;
 pub mod impluse;
-pub mod trigger;
 
 #[async_trait]
 pub trait FlareTransform {

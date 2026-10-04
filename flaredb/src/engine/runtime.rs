@@ -25,6 +25,7 @@ use crate::{
         },
         resolve_length_prefixed_coder_id,
     },
+    engine::timer::{TimeDomain, TimerEntry, TimerKey},
     engine::{
         harness::{
             control::{ControlChannel, ControlResponse},
@@ -34,7 +35,6 @@ use crate::{
     },
     fusion::{pipeline::ConsumerMetaData, stage::ExecutableStage},
     jobservice::urns::beam_urns,
-    state::timer::{TimeDomain, TimerEntry, TimerKey},
     store::{
         element_store::FlareElementStore,
         record::{BeamRecord, PrimitiveValue},
@@ -1035,7 +1035,7 @@ mod timer_tests {
     use super::*;
     use crate::coders::primitives::StringUtf8Coder;
     use crate::engine::harness::data::{TimerChunk, TimersKey};
-    use crate::state::timer::TimerStore;
+    use crate::engine::timer::TimerStore;
     use crate::store::element_store::FlareElementStore;
     use beam_model_rs::v1::TimerFamilySpec;
     use prost::Message;

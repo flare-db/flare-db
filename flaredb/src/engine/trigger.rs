@@ -1,22 +1,32 @@
-//! Beam trigger semantics: when a window fires, and how each firing is described.
+//! Beam trigger semantics: **when** a window fires, and **how** that firing is
+//! described.
 //!
-//! A [`Trigger`] is parsed from the portable `WindowingStrategy.trigger` proto and
-//! run by a [`TriggerRunner`], a small state machine mirroring Beam's
-//! `TriggerStateMachine`: it consumes elements (`on_element`), is asked whether it
-//! is ready to fire (`should_fire`) given the current watermark/processing time,
-//! and is told when it fired (`on_fire`) so once-triggers latch and repeating
-//! triggers reset.
+//! A window does not emit just because it has data — a *trigger* decides when a
+//! window's accumulated contents are released. This module parses triggers from
+//! the windowing strategy and runs them.
 //!
-//! This is the "ungrouping" half of the streams-and-tables model: grouping turns a
-//! stream into a table, and the trigger drives table → stream conversion. The
-//! windowing strategy also carries the [`AccumulationMode`] (does a new pane
-//! replace or extend the prior one) and `allowed_lateness` (how long a window
-//! remains open after its end).
+//! # Pieces
+//! - [`Trigger`] — a parsed trigger, from `WindowingStrategy.trigger`.
+//! - [`TriggerRunner`] — runs one trigger for one window: feed it elements
+//!   (`on_element`), ask if it can fire (`should_fire`), record the firing
+//!   (`on_fire`). Once-triggers latch; repeating ones reset.
+//! - [`TriggerSpec`] — the trigger plus the strategy's [`AccumulationMode`] and
+//!   `allowed_lateness`.
+//! - [`pane_info`] / [`pane_timing`] — describes a firing (early / on-time / late).
 //!
-//! Supported trigger specifications are the standard Beam set: `Default`
-//! (`AfterWatermark.pastEndOfWindow`), `AfterWatermark` with early/late firings,
-//! `AfterProcessingTime`, `ElementCount`, `Always`, `Never`, `AfterAll`,
-//! `AfterAny`, `AfterEach`, `Repeat`, and `OrFinally`.
+//! # Triggers, and when each is used
+//! - **Watermark** — [`Trigger::Default`] fires once the watermark passes the
+//!   window end; [`Trigger::AfterWatermark`] adds early firings (before the end)
+//!   and late firings (after the on-time firing).
+//! - **Processing time** — [`Trigger::AfterProcessingTime`] fires a set delay after
+//!   the window's first element arrives.
+//! - **Data** — [`Trigger::ElementCount`] fires once N elements have arrived.
+//! - **Composite** — [`Trigger::AfterAll`] (all ready), [`Trigger::AfterAny`] (any
+//!   ready), [`Trigger::AfterEach`] (in sequence), [`Trigger::Repeat`] (re-arm after
+//!   each firing), [`Trigger::OrFinally`] (main, or finally exactly once).
+//! - **Special** — [`Trigger::Always`] (fires always), [`Trigger::Never`] (only at
+//!   window expiration), [`Trigger::AfterSynchronizedProcessingTime`] (treated as
+//!   always).
 
 use beam_model_rs::v1::{
     Trigger as TriggerProto, WindowingStrategy, accumulation_mode, timestamp_transform,
