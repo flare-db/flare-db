@@ -6,11 +6,11 @@ use petgraph::visit::EdgeRef;
 
 use log::{debug, info};
 
+use crate::engine::timer::{TimeDomain, TimerEntry};
 use crate::engine::watermark::{
     MAX_TIMESTAMP, MIN_TIMESTAMP, StageKind, Timestamp, WatermarkManager, format_timestamp,
 };
 use crate::fusion::pipeline::{ConsumerMetaData, ExecutableGraph, ExecutableNode};
-use crate::engine::timer::{TimeDomain, TimerEntry};
 
 /// Scheduler that manages execution state for an `ExecutableGraph`.
 ///
@@ -375,9 +375,9 @@ mod tests {
     use petgraph::Graph;
 
     use crate::engine::scheduler::NodeScheduler;
+    use crate::engine::timer::{TimeDomain, TimerEntry, TimerKey};
     use crate::fusion::pipeline::{ConsumerMetaData, ExecutableGraph, ExecutableNode};
     use crate::jobservice::urns::beam_urns;
-    use crate::engine::timer::{TimeDomain, TimerEntry, TimerKey};
     use crate::transforms::from_urn;
 
     fn runner_node(name: &str) -> ExecutableNode {
@@ -806,6 +806,7 @@ mod tests {
                         consumer_transfrom_id: "test".to_string(),
                         stage_id: transform.id(),
                         windowing_strategy: None,
+                        processing_time: 0,
                         input_watermark: i64::MAX,
                     })
                     .await

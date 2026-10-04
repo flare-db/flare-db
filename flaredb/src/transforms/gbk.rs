@@ -9,50 +9,84 @@ use beam_model_rs::v1::{
     Coder, Components, Environment, FunctionSpec, PCollection, PTransform, WindowingStrategy,
 };
 use datafusion::{
-    common::TableReference,
     functions_aggregate::expr_fn::array_agg,
-    prelude::{SessionContext, col, lit},
+    prelude::{SessionContext, col},
 };
 use log::info;
-use paimon_datafusion::PaimonTableProvider;
 
 use crate::{
-    coders::primitives::{BeamWindow, PaneInfo, WindowedValue},
-    engine::trigger::{TriggerContext, TriggerRunner, TriggerSpec},
+    coders::primitives::{BeamWindow, WindowedValue},
+    engine::trigger::{
+        AccumulationMode, TriggerContext, TriggerRunner, TriggerSpec, pane_info, pane_timing,
+    },
     jobservice::urns::beam_urns,
     store::{
         KEY_COLUMN, VALUE_COLUMN,
         element_store::WINDOW_KEY_COLUMN,
         record::{
-            BeamGbk, BeamRecord, PrimitiveValue, iterable_value_from_array_row,
+            BeamGbk, BeamRecord, IterableValue, PrimitiveValue, iterable_value_from_array_row,
             primitive_value_from_array_row,
         },
     },
     transforms::{ExecutionContext, FlareTransform},
 };
 
+/// Accumulated state for one `(key, window)` group, carried across runs.
+///
+/// Holds the values seen so far, the trigger state machine for this group, and
+/// the pane bookkeeping needed to describe the next firing.
+struct WindowState {
+    key: PrimitiveValue,
+    window: BeamWindow,
+    values: Vec<BeamRecord>,
+    trigger: TriggerRunner,
+    pane_index: i64,
+    /// A firing has happened for this window.
+    fired: bool,
+    /// The closing pane has been emitted; no further firings.
+    closed: bool,
+}
+
+impl WindowState {
+    fn new(key: PrimitiveValue, window: BeamWindow, trigger: TriggerRunner) -> Self {
+        Self {
+            key,
+            window,
+            values: Vec::new(),
+            trigger,
+            pane_index: 0,
+            fired: false,
+            closed: false,
+        }
+    }
+}
+
+/// Identity of a `(key, window)` group, used to key the state map.
+fn group_identity(key: &PrimitiveValue, window: &BeamWindow) -> String {
+    format!("{key:?}\u{1}{}", window.canonical_key())
+}
+
 /// Runner-native implementation of Beam's `GroupByKey`.
 ///
-/// Groups input `KV<K, V>` elements by `(key, window)` and emits one
-/// `KV<K, Iterable<V>>` per group, but only for windows the owning stage's input
-/// watermark has reached (Beam's default trigger, `AfterWatermark.pastEndOfWindow`:
-/// `window.max_timestamp_millis() <= input_watermark`). Output metadata is derived
-/// from the group's window (max timestamp, single window, on-time pane).
+/// Groups input `KV<K, V>` elements by `(key, window)` and emits
+/// `KV<K, Iterable<V>>` whenever the window's trigger fires — Beam's
+/// "ungrouping" step. The trigger comes from the input's windowing strategy, so a
+/// single window can emit an early pane, an on-time pane, and late panes, subject
+/// to its accumulation mode.
 ///
-/// Emission is pruned by window: the aggregation is filtered to the ready window
-/// keys (`__flare_window_key IN (...)`), so a run only scans/aggregates rows of
-/// the windows it is about to emit rather than the whole table. Windows already
-/// emitted are remembered across runs, so re-running as the watermark advances
-/// never re-emits a window.
+/// It consumes its input incrementally: each run reads only the rows appended
+/// since its last run (via this stage's read cursor) and folds them into
+/// per-group state. DataFusion does the per-batch `(key, window)` grouping; the
+/// accumulated state (values, trigger, pane) is kept here across runs.
 #[derive(Clone)]
 pub struct GroupByKey {
     name: String,
     id: String,
     inputs: HashMap<String, String>,
     outputs: HashMap<String, String>,
-    /// Canonical window keys already emitted. The shared `Arc` survives re-runs of
-    /// this stage (the node holds one instance), so later runs skip them.
-    emitted_windows: Arc<Mutex<HashSet<String>>>,
+    /// Per-`(key, window)` state. The shared `Arc` survives re-runs (the node
+    /// holds one instance).
+    states: Arc<Mutex<HashMap<String, WindowState>>>,
 }
 
 #[async_trait]
@@ -75,7 +109,7 @@ impl FlareTransform for GroupByKey {
             inputs,
             outputs,
             name,
-            emitted_windows: Arc::new(Mutex::new(HashSet::new())),
+            states: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -87,163 +121,66 @@ impl FlareTransform for GroupByKey {
             .cloned()
             .expect("GroupByKey expects exactly one input PCollection");
 
-        // Zero committed elements means no schema and no table: empty output.
-        if ctx.store.registry.get(&input_pcollection_id).is_none() {
-            info!(
-                "GroupByKey: input PCollection '{}' has no elements, producing empty output",
-                input_pcollection_id
-            );
-            return Ok(());
-        }
-        let Some(table) = ctx.store.get_existing_table(&input_pcollection_id).await? else {
-            info!(
-                "GroupByKey: input PCollection '{}' has no elements, producing empty output",
-                input_pcollection_id
-            );
-            return Ok(());
-        };
-
-        let session = SessionContext::new();
-        let provider = PaimonTableProvider::try_new(table)?;
-        session.register_table(TableReference::bare("gbk"), Arc::new(provider))?;
-
-        // The owning windowing strategy's trigger decides which present windows
-        // fire now — Beam's table -> stream "ungrouping". `emitted_windows`
-        // survives re-runs so a pinned `OnceTrigger`-style firing is not repeated.
-        //
-        // The whole window is re-read each run, so the trigger is evaluated
-        // against the accumulated pane rather than element by element. That is
-        // exact for the default (`AfterWatermark.pastEndOfWindow`, one on-time
-        // firing) and for `Never`/`Always`; early/late and accumulated panes need
-        // element-level trigger state and a processing-time scheduling seam.
         let spec = TriggerSpec::from_windowing_strategy(ctx.windowing_strategy.as_ref());
-        let present = discover_window_keys(&session).await?;
-        let ready: Vec<String> = {
-            let emitted = self
-                .emitted_windows
-                .lock()
-                .expect("emitted windows lock not poisoned");
-            present
-                .into_iter()
-                .filter(|key| {
-                    if emitted.contains(key) {
-                        return false;
-                    }
-                    let Some(window) = BeamWindow::from_canonical_key(key) else {
-                        return false;
-                    };
-                    let end = window.max_timestamp_millis();
-                    let end_of_window = end <= ctx.input_watermark;
-                    let expired = spec.earliest_completion(end) <= ctx.input_watermark;
-                    // The on-time pane always fires once the watermark passes the
-                    // window end (the closing pane), plus any later trigger-driven
-                    // firing. This keeps bounded output identical to the default
-                    // trigger even when the strategy names a non-watermark trigger.
-                    end_of_window
-                        || TriggerRunner::new(spec.trigger.clone()).should_fire(TriggerContext {
-                            end_of_window,
-                            expired,
-                            processing_time: 0,
-                        })
-                })
-                .collect()
+
+        // Read only the input appended since this stage's last run. The cursor is
+        // this stage's position in the input PCollection's changelog.
+        let cursor = ctx
+            .store
+            .cursor(&ctx.stage_id, &input_pcollection_id)
+            .await?;
+        let (batches, latest) = ctx
+            .store
+            .read_incremental_batches(&input_pcollection_id, cursor)
+            .await?;
+
+        // Group the new rows by `(key, window)` with DataFusion, then fold them
+        // into per-group state and evaluate the trigger. Everything touching the
+        // state map holds one lock, so a re-run stays consistent.
+        let grouped = if batches.is_empty() {
+            Vec::new()
+        } else {
+            group_batches(batches).await?
         };
 
-        if ready.is_empty() {
+        let output = {
+            let mut states = self.states.lock().expect("gbk state lock not poisoned");
+            for (key, window, values) in grouped {
+                let identity = group_identity(&key, &window);
+                let state = states.entry(identity).or_insert_with(|| {
+                    WindowState::new(key, window, TriggerRunner::new(spec.trigger.clone()))
+                });
+                for _ in 0..values.len() {
+                    state.trigger.on_element(ctx.processing_time);
+                }
+                state.values.extend(values);
+            }
+            fire_windows(&mut states, &spec, ctx.input_watermark, ctx.processing_time)?
+        };
+
+        if let Some(latest) = latest {
+            ctx.store
+                .set_cursor(&ctx.stage_id, &input_pcollection_id, latest)
+                .await?;
+        }
+
+        if output.is_empty() {
             info!(
-                "GroupByKey: no window ready at input watermark {} (all present windows are either not yet complete or already emitted)",
+                "GroupByKey: no window fired at input watermark {}",
                 ctx.input_watermark
             );
             return Ok(());
         }
 
-        // Prune by window key: one scan, limited to the ready windows, then
-        // `array_agg` per `(key, window)` group.
-        let ready_exprs: Vec<_> = ready.iter().map(|key| lit(key.clone())).collect();
-        let df = session.table("gbk").await?;
-        let df = df.unnest_columns(&[WINDOW_KEY_COLUMN])?;
-        let df = df.filter(col(WINDOW_KEY_COLUMN).in_list(ready_exprs, false))?;
-        let df = df.aggregate(
-            vec![col(KEY_COLUMN), col(WINDOW_KEY_COLUMN)],
-            vec![array_agg(col(VALUE_COLUMN)).alias(VALUE_COLUMN)],
-        )?;
-        let batches = df.collect().await?;
-
-        // Rebuild each group as a WindowedValue, deriving metadata from its window.
-        let mut output: Vec<WindowedValue> = Vec::new();
-        let mut emitted_now: HashSet<String> = HashSet::new();
-        for batch in batches {
-            let key_column = batch
-                .column_by_name(KEY_COLUMN)
-                .ok_or_else(|| anyhow!("GroupByKey result is missing the '{KEY_COLUMN}' column"))?;
-            let window_column = batch.column_by_name(WINDOW_KEY_COLUMN).ok_or_else(|| {
-                anyhow!("GroupByKey result is missing the '{WINDOW_KEY_COLUMN}' column")
-            })?;
-            let value_column = batch.column_by_name(VALUE_COLUMN).ok_or_else(|| {
-                anyhow!("GroupByKey result is missing the '{VALUE_COLUMN}' column")
-            })?;
-
-            for row in 0..batch.num_rows() {
-                let key = primitive_value_from_array_row(
-                    key_column.as_ref(),
-                    key_column.data_type(),
-                    row,
-                )?;
-                let window_key = match primitive_value_from_array_row(
-                    window_column.as_ref(),
-                    window_column.data_type(),
-                    row,
-                )? {
-                    PrimitiveValue::String(s) => s,
-                    other => {
-                        return Err(anyhow!(
-                            "GroupByKey window key must be a string, got {other:?}"
-                        ));
-                    }
-                };
-                let window = BeamWindow::from_canonical_key(&window_key).ok_or_else(|| {
-                    anyhow!("GroupByKey encountered a malformed window key '{window_key}'")
-                })?;
-                let value = iterable_value_from_array_row(
-                    value_column.as_ref(),
-                    value_column.data_type(),
-                    row,
-                )?;
-
-                emitted_now.insert(window_key);
-                output.push(WindowedValue {
-                    value: BeamRecord::GBK(BeamGbk { key, value }),
-                    timestamp_millis: window.max_timestamp_millis(),
-                    windows: vec![window],
-                    pane: PaneInfo::on_time_firing(),
-                });
-            }
-        }
-
-        if output.is_empty() {
-            info!(
-                "GroupByKey: {} ready window(s) produced no output groups",
-                ready.len()
-            );
-            return Ok(());
-        }
-
         info!(
-            "Executed GroupByKey: {} output groups across {} ready window(s)",
+            "Executed GroupByKey: {} pane(s) fired at input watermark {}",
             output.len(),
-            emitted_now.len()
+            ctx.input_watermark
         );
 
         ctx.store
             .write_windowed_value_batch(&ctx.output_pcollection_id, output)
             .await?;
-
-        // Remember these windows so a later run does not re-emit them.
-        let mut emitted = self
-            .emitted_windows
-            .lock()
-            .expect("emitted windows lock not poisoned");
-        emitted.extend(emitted_now);
 
         Ok(())
     }
@@ -308,38 +245,126 @@ impl FlareTransform for GroupByKey {
     }
 }
 
-/// The distinct canonical window keys present in the registered `gbk` input table.
+/// Group incremental input batches by `(key, window)` with DataFusion.
 ///
-/// Projected to the single `__flare_window_key` column and un-nested, so it does
-/// not read the element values.
-async fn discover_window_keys(session: &SessionContext) -> Result<Vec<String>, Error> {
-    let df = session.table("gbk").await?;
-    let df = df.select(vec![col(WINDOW_KEY_COLUMN)])?;
+/// Returns one `(key, window, values)` per group, where `values` are the `V`s
+/// appended for that group since the last run. This is the per-batch half of the
+/// aggregation; the accumulated state across batches lives in [`GroupByKey`].
+async fn group_batches(
+    batches: Vec<arrow_array::RecordBatch>,
+) -> Result<Vec<(PrimitiveValue, BeamWindow, Vec<BeamRecord>)>, Error> {
+    let session = SessionContext::new();
+    let df = session.read_batches(batches)?;
     let df = df.unnest_columns(&[WINDOW_KEY_COLUMN])?;
-    let df = df.select(vec![col(WINDOW_KEY_COLUMN)])?;
-    let df = df.distinct()?;
+    let df = df.aggregate(
+        vec![col(KEY_COLUMN), col(WINDOW_KEY_COLUMN)],
+        vec![array_agg(col(VALUE_COLUMN)).alias(VALUE_COLUMN)],
+    )?;
     let batches = df.collect().await?;
 
-    let mut keys = Vec::new();
+    let mut groups = Vec::new();
     for batch in batches {
-        let column = batch.column_by_name(WINDOW_KEY_COLUMN).ok_or_else(|| {
-            anyhow!("GroupByKey window discovery is missing the '{WINDOW_KEY_COLUMN}' column")
+        let key_column = batch
+            .column_by_name(KEY_COLUMN)
+            .ok_or_else(|| anyhow!("GroupByKey result is missing the '{KEY_COLUMN}' column"))?;
+        let window_column = batch.column_by_name(WINDOW_KEY_COLUMN).ok_or_else(|| {
+            anyhow!("GroupByKey result is missing the '{WINDOW_KEY_COLUMN}' column")
         })?;
+        let value_column = batch
+            .column_by_name(VALUE_COLUMN)
+            .ok_or_else(|| anyhow!("GroupByKey result is missing the '{VALUE_COLUMN}' column"))?;
+
         for row in 0..batch.num_rows() {
-            if let PrimitiveValue::String(key) =
-                primitive_value_from_array_row(column.as_ref(), column.data_type(), row)?
-            {
-                keys.push(key);
-            }
+            let key =
+                primitive_value_from_array_row(key_column.as_ref(), key_column.data_type(), row)?;
+            let window_key = match primitive_value_from_array_row(
+                window_column.as_ref(),
+                window_column.data_type(),
+                row,
+            )? {
+                PrimitiveValue::String(s) => s,
+                other => {
+                    return Err(anyhow!(
+                        "GroupByKey window key must be a string, got {other:?}"
+                    ));
+                }
+            };
+            let window = BeamWindow::from_canonical_key(&window_key).ok_or_else(|| {
+                anyhow!("GroupByKey encountered a malformed window key '{window_key}'")
+            })?;
+            let iterable = iterable_value_from_array_row(
+                value_column.as_ref(),
+                value_column.data_type(),
+                row,
+            )?;
+            groups.push((key, window, iterable.list));
         }
     }
-    Ok(keys)
+    Ok(groups)
+}
+
+/// Evaluate every group's trigger and build the output pane for each firing.
+///
+/// A window fires whenever its trigger says so. In addition, once a window's
+/// expiration has passed it always gets a closing pane (Beam's closing behavior),
+/// even if its trigger would not fire on its own. `is_last` is set on the closing
+/// pane; for the default trigger (no lateness) the on-time pane is also the
+/// closing one.
+fn fire_windows(
+    states: &mut HashMap<String, WindowState>,
+    spec: &TriggerSpec,
+    input_watermark: i64,
+    processing_time: i64,
+) -> Result<Vec<WindowedValue>, Error> {
+    let mut output = Vec::new();
+    for state in states.values_mut() {
+        let end = state.window.max_timestamp_millis();
+        let end_of_window = end <= input_watermark;
+        let expired = spec.earliest_completion(end) <= input_watermark;
+        let trigger_ctx = TriggerContext {
+            end_of_window,
+            expired,
+            processing_time,
+        };
+
+        let closing = expired && !state.closed;
+        if !(state.trigger.should_fire(trigger_ctx) || closing) {
+            continue;
+        }
+
+        let is_first = !state.fired;
+        let timing = pane_timing(end_of_window, is_first);
+        let pane = pane_info(timing, state.pane_index, is_first, expired);
+
+        let values = match spec.accumulation {
+            AccumulationMode::Discarding => std::mem::take(&mut state.values),
+            AccumulationMode::Accumulating | AccumulationMode::Retracting => state.values.clone(),
+        };
+
+        output.push(WindowedValue {
+            value: BeamRecord::GBK(BeamGbk {
+                key: state.key.clone(),
+                value: IterableValue::from_records(values),
+            }),
+            timestamp_millis: end,
+            windows: vec![state.window.clone()],
+            pane,
+        });
+
+        state.trigger.on_fire(trigger_ctx);
+        state.pane_index += 1;
+        state.fired = true;
+        if expired {
+            state.closed = true;
+        }
+    }
+    Ok(output)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::coders::primitives::PaneTiming;
+    use crate::coders::primitives::{PaneInfo, PaneTiming};
     use crate::store::element_store::{FlareElementStore, ScanCollectionRequest};
     use crate::store::record::BeamKV;
     use std::sync::Arc;
@@ -407,6 +432,32 @@ mod tests {
                 consumer_transfrom_id: "consumer".to_string(),
                 stage_id: "gbk-test".to_string(),
                 windowing_strategy: None,
+                processing_time: 0,
+                input_watermark,
+            })
+            .await
+            .expect("GroupByKey execute failed");
+    }
+
+    /// Run with an explicit windowing strategy (trigger/accumulation/lateness), so
+    /// a test can exercise non-default triggers.
+    async fn run_gbk_with_strategy(
+        transform: &GroupByKey,
+        store: &Arc<FlareElementStore>,
+        input: &str,
+        output: &str,
+        strategy: Option<WindowingStrategy>,
+        input_watermark: i64,
+    ) {
+        transform
+            .execute(ExecutionContext {
+                store: store.clone(),
+                input_pcollection_ids: vec![input.to_string()],
+                output_pcollection_id: output.to_string(),
+                consumer_transfrom_id: "consumer".to_string(),
+                stage_id: "gbk-with-strategy".to_string(),
+                windowing_strategy: strategy,
+                processing_time: 0,
                 input_watermark,
             })
             .await
@@ -688,5 +739,91 @@ mod tests {
             2,
             "a re-run at the same watermark must not re-emit"
         );
+    }
+
+    /// A non-default trigger emits multiple panes for one window: an on-time pane
+    /// when the watermark passes the window end, then a late pane when a late
+    /// element arrives and the late trigger is satisfied.
+    #[tokio::test]
+    async fn a_late_element_fires_a_second_late_pane() {
+        use beam_model_rs::v1::{
+            Trigger as TriggerProto, accumulation_mode, trigger as trigger_proto,
+        };
+
+        let (_dir, store) = make_store().await;
+        let input = "gbk-in-late";
+        let output = "gbk-out-late";
+
+        let transform = GroupByKey::with(
+            "gbk-late".to_string(),
+            HashMap::from([("in".to_string(), input.to_string())]),
+            HashMap::from([("out".to_string(), output.to_string())]),
+            "GroupByKey".to_string(),
+        );
+
+        // AfterEndOfWindow { late: AfterPane.elementCount(1) }, with lateness so the
+        // window stays open for the late element.
+        let late = TriggerProto {
+            trigger: Some(trigger_proto::Trigger::ElementCount(
+                trigger_proto::ElementCount { element_count: 1 },
+            )),
+        };
+        let strategy = WindowingStrategy {
+            trigger: Some(TriggerProto {
+                trigger: Some(trigger_proto::Trigger::AfterEndOfWindow(Box::new(
+                    trigger_proto::AfterEndOfWindow {
+                        early_firings: None,
+                        late_firings: Some(Box::new(late)),
+                    },
+                ))),
+            }),
+            accumulation_mode: accumulation_mode::Enum::Discarding as i32,
+            allowed_lateness: 1_000,
+            ..WindowingStrategy::default()
+        };
+
+        store
+            .write_windowed_value_batch(
+                input,
+                vec![kv_windowed("a", 1, vec![interval(0, 100)], 10)],
+            )
+            .await
+            .unwrap();
+
+        // Watermark reaches the window end: one on-time pane with the first value.
+        run_gbk_with_strategy(
+            &transform,
+            &store,
+            input,
+            output,
+            Some(strategy.clone()),
+            99,
+        )
+        .await;
+        let panes = scan_output(&store, output).await;
+        assert_eq!(panes.len(), 1, "expected one on-time pane");
+        assert_eq!(panes[0].pane.timing, PaneTiming::OnTime);
+        assert_eq!(
+            collect_groups(&panes).get(&("a".to_string(), 0, 100)),
+            Some(&vec![1])
+        );
+
+        // A late element arrives for the same window; the late trigger fires again.
+        store
+            .write_windowed_value_batch(
+                input,
+                vec![kv_windowed("a", 2, vec![interval(0, 100)], 20)],
+            )
+            .await
+            .unwrap();
+        run_gbk_with_strategy(&transform, &store, input, output, Some(strategy), 99).await;
+
+        let panes = scan_output(&store, output).await;
+        assert_eq!(
+            panes.len(),
+            2,
+            "a late element must fire a second (late) pane"
+        );
+        assert_eq!(panes[1].pane.timing, PaneTiming::Late);
     }
 }

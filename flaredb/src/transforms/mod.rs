@@ -88,6 +88,9 @@ pub struct ExecutionContext {
     /// resolve it. Runner-native transforms read its trigger, accumulation mode,
     /// and allowed lateness (see [`trigger::TriggerSpec`]).
     pub windowing_strategy: Option<WindowingStrategy>,
+    /// Current processing time in epoch milliseconds, for triggers that fire on
+    /// the wall clock (`AfterProcessingTime`).
+    pub processing_time: i64,
     /// The owning stage's input watermark at the start of this bundle.
     ///
     /// A windowed aggregation uses this to decide which windows are ready: Beam's

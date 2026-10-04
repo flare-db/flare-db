@@ -394,6 +394,7 @@ impl StageExecutor {
                                 consumer_transfrom_id,
                                 stage_id: runner_transform.id(),
                                 windowing_strategy,
+                                processing_time: self.runtime.timer_service().now(),
                                 input_watermark,
                             };
 
