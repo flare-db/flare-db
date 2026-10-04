@@ -5,7 +5,8 @@
 //! pending/in-flight state that decides when a stage may run a bundle.
 //! There is deliberately no second copy of this state elsewhere (for example in
 //! [`crate::engine::scheduler`]). It owns no I/O, no transform execution and no
-//! proto types; a later milestone wires external watermark reports into it.
+//! proto types; runner sources report into it via `report_source_*`, and the
+//! dispatcher drives scheduling from it.
 //!
 //! # Model
 //!
@@ -45,12 +46,13 @@
 //! See [`WatermarkManager::ready_stages`], [`WatermarkManager::start_bundle`] and
 //! [`WatermarkManager::complete_bundle`].
 //!
-//! # Subscription
+//! # Refresh
 //!
 //! [`WatermarkManager::refresh`] advances the graph to a fixpoint and returns the
-//! stages whose input or output watermark moved, in deterministic order. A later
-//! milestone uses that return value as the push notification that drives
-//! scheduling; this module only computes it.
+//! stages whose input or output watermark moved, in deterministic order. The
+//! dispatcher calls it after any watermark or hold change and then re-evaluates
+//! readiness from the updated state (a watermark advance can make a gated stage
+//! ready again).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 

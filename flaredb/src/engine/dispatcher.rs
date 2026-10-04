@@ -102,11 +102,13 @@ impl ExecutorDispatcher {
 
     /// Run the executable graph to completion.
     ///
-    /// The loop is `refresh -> ready` (via [`NodeScheduler::next_nodes`]) then
-    /// run. When no data work is ready it first fires any due **event-time**
-    /// timers (whose owning stage's input watermark has advanced past them), then
-    /// waits for the next processing-time timer, fires it, and re-arms the owning
-    /// stage so its `@OnTimer` runs.
+    /// The loop is `refresh -> ready` (via [`NodeScheduler::next_nodes`]) then run.
+    /// When no data work is ready it applies any runner-source progress
+    /// (`TestStream` watermarks / re-arms), fires due **event-time** timers, and
+    /// fires **processing-time** timers already due. If any of those made progress
+    /// it re-evaluates scheduling — a watermark advance can make a gated stage
+    /// ready (e.g. GBK's windows expiring at `+∞`) and a re-arm makes a source
+    /// runnable — before concluding completion or deadlock.
     pub async fn run_pipeline(&mut self, scheduler: &mut NodeScheduler) -> anyhow::Result<()> {
         let mut in_flight = JoinSet::new();
         // Timers to deliver the next time each re-armed stage runs.

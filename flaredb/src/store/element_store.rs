@@ -66,8 +66,11 @@ pub struct FlareElementStore {
     pub(crate) db_name: String,
     /// Per-reader incremental read cursor: the id of the last Paimon snapshot a
     /// reader has consumed from a PCollection. Keyed by
-    /// `(reader_id, pcollection_id)`. In-memory for M6a; durable cursors are a
-    /// later milestone. See [`FlareElementStore::scan_windowed_values_since`].
+    /// `(reader_id, pcollection_id)` and cached here for the process; the
+    /// authoritative value is the durable `__flare_cursor` Paimon table
+    /// (write-through in [`FlareElementStore::set_cursor`], read-through in
+    /// [`FlareElementStore::cursor`]). See
+    /// [`FlareElementStore::scan_windowed_values_since`].
     cursors: Arc<DashMap<String, i64>>,
     /// Running minimum event-time among rows committed to a PCollection since the
     /// producer last reported. Read and cleared by the driver after each producer
