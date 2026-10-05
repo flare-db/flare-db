@@ -3,7 +3,7 @@ use crate::fusion::stage::{
     ExecutableStage, SplittableExecutionPlan, SplittableProcessKind, SplittableStage,
 };
 use crate::jobservice::urns;
-use crate::transforms::{FlareRunnerTransform, from_urn};
+use crate::transforms::{FlareRunnerTransform, from_urn_with_payload};
 use crate::utils::errors::*;
 use beam_model_rs::v1::executable_stage_payload::{SideInputId, TimerId, UserStateId};
 use beam_model_rs::v1::{Components, Environment, PCollection, PTransform, ParDoPayload};
@@ -83,11 +83,12 @@ impl ExecutableGraph {
 
         for stage in runner_stages.iter() {
             if let Some(spec) = stage.node().spec.as_ref() {
-                let runner_node = ExecutableNode::Runner(from_urn(
+                let runner_node = ExecutableNode::Runner(from_urn_with_payload(
                     &spec.urn,
                     stage.node().unique_name.clone(),
                     stage.node().inputs.clone(),
                     stage.node().outputs.clone(),
+                    &spec.payload,
                 ));
 
                 for input_id in stage.node().inputs.values() {
@@ -123,11 +124,12 @@ impl ExecutableGraph {
             let urn = &spec.urn;
             info!("Root node urn: {}", urn);
             info!("root outputs: {:?}", root.transform.outputs.clone());
-            let root_node = ExecutableNode::Runner(from_urn(
+            let root_node = ExecutableNode::Runner(from_urn_with_payload(
                 urn,
                 root.node().unique_name.clone(),
                 root.transform.inputs.clone(),
                 root.transform.outputs.clone(),
+                &spec.payload,
             ));
 
             let runner_index = self.ensure_node_exists(&root_node);
@@ -844,11 +846,19 @@ impl QueryablePipeline {
     }*/
 
     pub fn get_environment(&self, transform: &PTransform) -> Option<Environment> {
-        return self
-            .components
+        // A runner-owned primitive executes in FlareDB, not an SDK harness, even
+        // when the SDK attaches an environment to it. Without this,
+        // it would be fused into an SDK stage and having no runner root the
+        // executable graph would come out empty at runtime.
+        if let Some(spec) = transform.spec.as_ref() {
+            if urns::beam_urns::FLARE.contains(&spec.urn.as_str()) {
+                return None;
+            }
+        }
+        self.components
             .environments
             .get(&transform.environment_id)
-            .cloned();
+            .cloned()
     }
 
     pub fn get_side_inputs(

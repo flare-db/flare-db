@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     io::Cursor,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::Arc,
@@ -8,31 +8,38 @@ use std::{
 
 use anyhow::anyhow;
 use beam_model_rs::v1::{
-    ApiServiceDescriptor, Coder, Components, Elements, FunctionSpec, PTransform,
+    ApiServiceDescriptor, Coder, Components, Elements, FunctionSpec, PTransform, ParDoPayload,
     ProcessBundleDescriptor, RemoteGrpcPort, elements,
 };
 use bytes::{Buf, BytesMut};
-use log::info;
+use log::{debug, info};
 use prost::Message;
 use tokio::sync::{Mutex, mpsc::UnboundedReceiver};
 
 use crate::{
     coders::{
         BeamCoder, StandardBeamCoders, length_prefix_pickled_leaves,
-        primitives::{WindowCoder, WindowedValue, WindowedValueCoder},
+        primitives::{
+            BeamWindow, PaneInfo, Timer as WireTimer, TimerCoder, WindowCoder, WindowedValue,
+            WindowedValueCoder,
+        },
         resolve_length_prefixed_coder_id,
     },
-    engine::harness::{
-        control::{ControlChannel, ControlResponse},
-        data::{DataChannel, DataKey, ElementStreamPayload},
+    engine::timer::{TimeDomain, TimerEntry, TimerKey},
+    engine::{
+        harness::{
+            control::{ControlChannel, ControlResponse},
+            data::{DataChannel, DataKey, ElementStreamPayload},
+        },
+        timer::TimerService,
     },
     fusion::{pipeline::ConsumerMetaData, stage::ExecutableStage},
     jobservice::urns::beam_urns,
     store::{
-        element_store::{FlareElementStore, ScanCollectionRequest},
+        element_store::{FlareElementStore, PCollectionWriter},
         record::{BeamRecord, PrimitiveValue},
     },
-    transforms::FlareRunnerTransform,
+    transforms::{FlareRunnerTransform, SourceProgress},
     utils::batch_size_estimator::{BatchConfig, BatchSizeEstimator},
 };
 
@@ -43,6 +50,8 @@ pub struct BundleRuntime {
     store: Arc<FlareElementStore>,
     pipeline_coders: Arc<HashMap<String, Coder>>,
     pipeline_components: Arc<Components>,
+    timer_service: Arc<TimerService>,
+    source_reports: tokio::sync::mpsc::UnboundedSender<SourceProgress>,
 }
 
 impl BundleRuntime {
@@ -52,6 +61,8 @@ impl BundleRuntime {
         store: Arc<FlareElementStore>,
         pipeline_coders: Arc<HashMap<String, Coder>>,
         pipeline_components: Arc<Components>,
+        timer_service: Arc<TimerService>,
+        source_reports: tokio::sync::mpsc::UnboundedSender<SourceProgress>,
     ) -> Self {
         Self {
             control,
@@ -59,7 +70,18 @@ impl BundleRuntime {
             store,
             pipeline_coders,
             pipeline_components,
+            timer_service,
+            source_reports,
         }
+    }
+
+    /// Sender for runner-source progress reports (used by `TestStream`).
+    pub fn source_reports(&self) -> &tokio::sync::mpsc::UnboundedSender<SourceProgress> {
+        &self.source_reports
+    }
+
+    pub fn timer_service(&self) -> &Arc<TimerService> {
+        &self.timer_service
     }
 
     pub fn control(&mut self) -> &mut ControlChannel {
@@ -136,7 +158,7 @@ impl BundleRuntime {
         let mut components = stage.components();
         // The Python SDK emits several distinguishable coders under the single
         // `pickled_python` URN. Ask the SDK to length-prefix those leaves so the
-        // runner can store their bytes opaquely (mirrors Prism's runner).
+        // runner can store their bytes opaquely.
         length_prefix_pickled_leaves(&mut components.coders);
         add_stage_data_boundary_coders(
             stage,
@@ -178,8 +200,8 @@ impl BundleRuntime {
         });
         let mut target_batch_size = batch_size_estimator.next_batch_size();
 
-        info!("Spawned task to process stage's output elements");
-        info!(
+        debug!("Spawned task to process stage's output elements");
+        debug!(
             "Decoding with coder_id={}, component_coders={:?}",
             edge_metadata.coder_id, edge_metadata.component_coder
         );
@@ -204,13 +226,18 @@ impl BundleRuntime {
         let mut stream_ended = false;
         let mut total_decoded: usize = 0;
 
+        // One Paimon writer/committer per bundle: every decoded batch is
+        // appended to a single table writer and committed exactly once, instead
+        // of opening a writer and committing per batch. This keeps Paimon
+        // snapshots/data files proportional to *bundles* rather than *batches*
+        // and makes the bundle's output atomic (a failed bundle writes nothing).
+        let mut writer = PCollectionWriter::new(store.clone(), pcollection_id.clone());
+
         while !stream_ended {
             let payload = {
                 let mut receiver_lock = receiver.lock().await;
                 receiver_lock.recv().await
             };
-            // ToDo: create per bundle schema instred of deriving schema for eveyry record batch.
-            // create paimon writer and commitor per bundle
             match payload {
                 Some(ElementStreamPayload::Data(data_chunk)) => {
                     stream_buffer.extend_from_slice(&data_chunk.data.data);
@@ -271,12 +298,7 @@ impl BundleRuntime {
                                 if batch.len() >= target_batch_size {
                                     let batch_size = batch.len();
                                     let start = Instant::now();
-                                    store
-                                        .write_windowed_value_batch(
-                                            &pcollection_id,
-                                            std::mem::take(&mut batch),
-                                        )
-                                        .await?;
+                                    writer.write(std::mem::take(&mut batch)).await?;
                                     batch_size_estimator.record(batch_size, start.elapsed());
                                     target_batch_size = batch_size_estimator.next_batch_size();
                                 }
@@ -300,11 +322,11 @@ impl BundleRuntime {
 
                 Some(ElementStreamPayload::Timers(_timer_chunk)) => {
                     //todo!()
-                    info!("Timers chunk");
+                    debug!("Timers chunk");
                 }
 
                 None => {
-                    info!("Receiver channel closed");
+                    debug!("Receiver channel closed");
                     stream_ended = true;
                 }
             }
@@ -319,15 +341,14 @@ impl BundleRuntime {
             ));
         }
 
-        // Flush any remaining elements in the batch.
+        // Flush any remaining elements in the batch, then commit the bundle.
         if !batch.is_empty() {
             let batch_size = batch.len();
             let start = Instant::now();
-            store
-                .write_windowed_value_batch(&pcollection_id, batch)
-                .await?;
+            writer.write(batch).await?;
             batch_size_estimator.record(batch_size, start.elapsed());
         }
+        writer.commit().await?;
 
         info!(
             "Finished decoding output elements: {} total elements",
@@ -350,6 +371,12 @@ impl BundleRuntime {
     /// [`stage_timer_endpoints`]); each is terminated with an empty
     /// `Elements.Timers { is_last = true }` so the harness's `awaitCompletion`
     /// (which waits for data *and* timer endpoints) can return.
+    ///
+    /// Input is read *incrementally*: the first bundle for a stage delivers the
+    /// whole input PCollection, and a later (re-run) bundle delivers only the
+    /// rows the upstream stage appended since. `consumer_transform_id` (the
+    /// stage's `.../source` id) is the reader identity for that cursor, so a
+    /// re-run never re-delivers elements the stage already saw.
     pub async fn process_input_elements(
         &self,
         input_instruction_id: String,
@@ -359,18 +386,13 @@ impl BundleRuntime {
         input_component_coder_ids: Option<Vec<String>>,
         timer_endpoints: Vec<(String, String)>,
     ) -> anyhow::Result<()> {
-        info!("Spawned task to send stage's input elements to worker");
-        info!(
+        debug!("Spawned task to send stage's input elements to worker");
+        debug!(
             "Sending input elements: instruction_id={}, transform_id={}",
             input_instruction_id, consumer_transform_id,
         );
 
-        let request = ScanCollectionRequest {
-            pcollection_id: input_pcollection_id.clone(),
-        };
-
-        let elements = self.store.scan_windowed_values(request).await?;
-        info!("Input element coder: {}", input_coder_id);
+        debug!("Input element coder: {}", input_coder_id);
 
         let element_coder = StandardBeamCoders::from_urn(
             input_coder_id.as_str(),
@@ -382,42 +404,100 @@ impl BundleRuntime {
         let window_coder = self.window_coder_for_pcollection(&input_pcollection_id);
         let windowed_value_coder =
             WindowedValueCoder::with_window_coder(element_coder, window_coder);
-        let mut encoded = BytesMut::new();
 
         if opaque_void {
-            info!(
-                "VoidCoder pcollection {}: forwarding {} opaque element(s) unchanged",
-                input_pcollection_id,
-                elements.len()
+            debug!(
+                "VoidCoder pcollection {}: forwarding opaque element(s) unchanged",
+                input_pcollection_id
             );
-            for element in elements {
-                match element.value {
-                    BeamRecord::PRIMITIVE(PrimitiveValue::Bytes(raw)) => {
-                        encoded.extend_from_slice(&raw);
+        }
+
+        // Stream the PCollection's windowed values batch-by-batch (one Arrow batch
+        // at a time) so a large input is never fully decoded into memory before
+        // encoding begins. Each decoded batch is then encoded and sent out in
+        // dynamically-sized chunks via the batch-size estimator — mirroring
+        // `process_output_elements` — rather than as one giant `Elements` message.
+        let mut input = self
+            .store
+            .stream_windowed_values_since(
+                consumer_transform_id.clone(),
+                input_pcollection_id.clone(),
+            )
+            .await?;
+
+        let mut batch_size_estimator = BatchSizeEstimator::new(BatchConfig {
+            min_batch_size: 2,
+            ..BatchConfig::default()
+        });
+        let mut target_batch_size = batch_size_estimator.next_batch_size();
+        let mut encoded = BytesMut::new();
+        let mut batch_len = 0usize;
+
+        while let Some(values) = input.next_batch().await? {
+            for element in values {
+                if opaque_void {
+                    match element.value {
+                        BeamRecord::PRIMITIVE(PrimitiveValue::Bytes(raw)) => {
+                            encoded.extend_from_slice(&raw);
+                        }
+                        other => {
+                            return Err(anyhow!(
+                                "expected opaque bytes for VoidCoder pcollection {}, found {:?}",
+                                input_pcollection_id,
+                                other
+                            ));
+                        }
                     }
-                    other => {
-                        return Err(anyhow!(
-                            "expected opaque bytes for VoidCoder pcollection {}, found {:?}",
-                            input_pcollection_id,
-                            other
-                        ));
-                    }
+                } else {
+                    windowed_value_coder.encode(element, &mut encoded);
                 }
-            }
-        } else {
-            for element in elements {
-                windowed_value_coder.encode(element, &mut encoded);
+                batch_len += 1;
+
+                if batch_len >= target_batch_size {
+                    let data = std::mem::take(&mut encoded).freeze().to_vec();
+                    let start = Instant::now();
+                    self.data
+                        .send_elements(Elements {
+                            data: vec![elements::Data {
+                                instruction_id: input_instruction_id.clone(),
+                                transform_id: consumer_transform_id.clone(),
+                                data,
+                                is_last: false,
+                            }],
+                            timers: Vec::new(),
+                        })
+                        .await?;
+                    batch_size_estimator.record(batch_len, start.elapsed());
+                    target_batch_size = batch_size_estimator.next_batch_size();
+                    batch_len = 0;
+                }
             }
         }
 
-        let payload = encoded.freeze();
+        // Flush any trailing elements, then terminate the stream.
+        if batch_len > 0 {
+            let data = std::mem::take(&mut encoded).freeze().to_vec();
+            let start = Instant::now();
+            self.data
+                .send_elements(Elements {
+                    data: vec![elements::Data {
+                        instruction_id: input_instruction_id.clone(),
+                        transform_id: consumer_transform_id.clone(),
+                        data,
+                        is_last: false,
+                    }],
+                    timers: Vec::new(),
+                })
+                .await?;
+            batch_size_estimator.record(batch_len, start.elapsed());
+        }
 
-        // Terminate the stage's inbound timer endpoints before sending the data
+        // Terminate the stage's inbound timer endpoints before the data
         // terminator, so the harness's awaited completion covers both.
         let timers: Vec<elements::Timers> = timer_endpoints
             .into_iter()
             .map(|(transform_id, timer_family_id)| {
-                info!(
+                debug!(
                     "Terminating inbound timer endpoint: instruction_id={}, transform_id={}, timer_family_id={}",
                     input_instruction_id, transform_id, timer_family_id
                 );
@@ -439,28 +519,347 @@ impl BundleRuntime {
         // Sending the elements separately with `is_last = false` followed by an empty
         // `is_last = true` terminator is the portable-safe framing, and the only one
         // the Python harness accepts.
-        let mut data: Vec<elements::Data> = Vec::new();
-        if !payload.is_empty() {
-            data.push(elements::Data {
-                instruction_id: input_instruction_id.clone(),
-                transform_id: consumer_transform_id.clone(),
-                data: payload.to_vec(),
-                is_last: false,
-            });
-        }
-        data.push(elements::Data {
+        let data = vec![elements::Data {
             instruction_id: input_instruction_id,
             transform_id: consumer_transform_id,
             data: Vec::new(),
             is_last: true,
-        });
+        }];
 
-        let elements = Elements { data, timers };
-
-        self.data.send_elements(elements).await?;
-        info!("Finished sending input elements to worker");
+        self.data.send_elements(Elements { data, timers }).await?;
+        debug!("Finished sending input elements to worker");
         Ok(())
     }
+
+    /// Terminate a bundle's input endpoints without sending any data.
+    ///
+    /// Used for a timer-only bundle: the stage must run just its `@OnTimer`, so
+    /// its PCollection input must not be re-delivered.
+    pub async fn terminate_bundle_input(
+        &self,
+        instruction_id: String,
+        consumer_transform_id: String,
+        timer_endpoints: Vec<(String, String)>,
+    ) -> anyhow::Result<()> {
+        let timers: Vec<elements::Timers> = timer_endpoints
+            .into_iter()
+            .map(|(transform_id, timer_family_id)| elements::Timers {
+                instruction_id: instruction_id.clone(),
+                transform_id,
+                timer_family_id,
+                timers: Vec::new(),
+                is_last: true,
+            })
+            .collect();
+        let data = vec![elements::Data {
+            instruction_id,
+            transform_id: consumer_transform_id,
+            data: Vec::new(),
+            is_last: true,
+        }];
+        self.data.send_elements(Elements { data, timers }).await
+    }
+
+    /// Consume a stage's inbound `Elements.Timers` chunks, persisting each timer
+    /// (set replaces, clear deletes) until that family's stream ends.
+    pub async fn process_timer_elements(
+        &self,
+        transform_id: String,
+        timer_family_id: String,
+        receiver: Arc<Mutex<UnboundedReceiver<ElementStreamPayload>>>,
+    ) -> anyhow::Result<()> {
+        let Some((coder, domain)) = resolve_timer_family(
+            &self.pipeline_components,
+            &self.pipeline_coders,
+            &transform_id,
+            &timer_family_id,
+        ) else {
+            log::warn!(
+                "no timer coder resolved for {transform_id}/{timer_family_id}; timers dropped"
+            );
+            return Ok(());
+        };
+
+        info!(
+            "timer receive: transform_id={transform_id}, timer_family_id={timer_family_id}, domain={domain:?}"
+        );
+
+        drain_timer_elements(
+            &coder,
+            domain,
+            &transform_id,
+            &timer_family_id,
+            &self.timer_service,
+            receiver,
+        )
+        .await;
+        Ok(())
+    }
+
+    /// Send fired timers to the worker as `Elements.Timers`, grouped by
+    /// `(transform, family)`.
+    ///
+    /// Call this before the input terminator (sent by
+    /// [`Self::process_input_elements`]) so the harness observes the timers
+    /// before the endpoint closes.
+    pub async fn send_fired_timers(
+        &self,
+        instruction_id: &str,
+        timers: &[TimerEntry],
+    ) -> anyhow::Result<()> {
+        if timers.is_empty() {
+            return Ok(());
+        }
+
+        let mut groups: BTreeMap<(String, String), Vec<&TimerEntry>> = BTreeMap::new();
+        for entry in timers {
+            groups
+                .entry((
+                    entry.key.transform_id.clone(),
+                    entry.key.timer_family_id.clone(),
+                ))
+                .or_default()
+                .push(entry);
+        }
+
+        let mut messages = Vec::new();
+        for ((transform_id, timer_family_id), entries) in groups {
+            let Some((coder, _)) = resolve_timer_family(
+                &self.pipeline_components,
+                &self.pipeline_coders,
+                &transform_id,
+                &timer_family_id,
+            ) else {
+                log::warn!(
+                    "no timer coder for {transform_id}/{timer_family_id}; fired timers dropped"
+                );
+                continue;
+            };
+            let mut bytes = Vec::new();
+            for entry in entries {
+                if let Some(wire) = timer_to_wire(entry) {
+                    coder.encode_into(&wire, &mut bytes);
+                }
+            }
+            messages.push(elements::Timers {
+                instruction_id: instruction_id.to_string(),
+                transform_id,
+                timer_family_id,
+                timers: bytes,
+                is_last: false,
+            });
+        }
+
+        if !messages.is_empty() {
+            self.data
+                .send_elements(Elements {
+                    data: Vec::new(),
+                    timers: messages,
+                })
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+/// Resolve a timer family's key/window coders and time domain from its
+/// transform's `ParDoPayload.timer_family_specs`.
+///
+/// Free function (rather than a [`BundleRuntime`] method) so the resolution can
+/// be unit-tested against a hand-built `Components`/coder map, without harness
+/// channels. Returns `None` when the transform, family, coder or domain is
+/// unknown, in which case the caller drops the timers.
+fn resolve_timer_family(
+    components: &Components,
+    coders: &HashMap<String, Coder>,
+    transform_id: &str,
+    timer_family_id: &str,
+) -> Option<(TimerCoder, TimeDomain)> {
+    let transform = components.transforms.get(transform_id)?;
+    let payload = transform
+        .spec
+        .as_ref()
+        .and_then(|spec| ParDoPayload::decode(spec.payload.as_slice()).ok())?;
+    let family = payload.timer_family_specs.get(timer_family_id)?;
+    let domain = match family.time_domain {
+        1 => TimeDomain::EventTime,
+        2 => TimeDomain::ProcessingTime,
+        _ => return None,
+    };
+
+    let coder = coders.get(&family.timer_family_coder_id)?;
+    let spec = coder.spec.as_ref()?;
+    if spec.urn == beam_urns::TIMER_CODER {
+        // `beam:coder:timer:v1` components are [key coder, window coder].
+        let key_id = coder.component_coder_ids.first()?;
+        let window_id = coder.component_coder_ids.get(1)?;
+        let key_coder = StandardBeamCoders::from_urn(key_id, None, Some(coders));
+        let window_urn = coders
+            .get(window_id)
+            .and_then(|c| c.spec.as_ref())
+            .map(|s| s.urn.as_str())?;
+        Some((
+            TimerCoder::new(key_coder, WindowCoder::from_urn(window_urn)),
+            domain,
+        ))
+    } else {
+        // Some SDKs register the key coder directly; assume a global window.
+        let key_coder = StandardBeamCoders::from_urn(
+            &family.timer_family_coder_id,
+            Some(coder.component_coder_ids.clone()),
+            Some(coders),
+        );
+        Some((TimerCoder::new(key_coder, WindowCoder::Global), domain))
+    }
+}
+
+/// Decode a stage's inbound timer stream and persist each timer into the
+/// [`TimerService`] (a set replaces, a clear deletes), until the family's stream
+/// ends (`is_last`) or the channel closes.
+///
+/// Split out of [`BundleRuntime::process_timer_elements`] so the decode →
+/// persist path can be tested against a real `TimerService` and receiver,
+/// without constructing harness channels. Returns the number of timers decoded
+/// (sets plus clears).
+async fn drain_timer_elements(
+    coder: &TimerCoder,
+    domain: TimeDomain,
+    transform_id: &str,
+    timer_family_id: &str,
+    timer_service: &TimerService,
+    receiver: Arc<Mutex<UnboundedReceiver<ElementStreamPayload>>>,
+) -> usize {
+    // A stateful bundle can set thousands of timers. Persisting each with its own
+    // durable commit makes the bundle miss its deadline (N3: 1135 timers ≈ 43s), so
+    // accumulate the chunk's last write per key and commit the batch together.
+    const FLUSH_EVERY: usize = 512;
+    let mut pending: HashMap<Vec<u8>, Option<TimerEntry>> = HashMap::new();
+    let mut total = 0usize;
+
+    loop {
+        let payload = {
+            let mut guard = receiver.lock().await;
+            guard.recv().await
+        };
+        match payload {
+            Some(ElementStreamPayload::Timers(chunk)) => {
+                debug!(
+                    "timer chunk received: transform_id={}, timer_family_id={}, is_last={}, bytes={}",
+                    chunk.timers.transform_id,
+                    chunk.timers.timer_family_id,
+                    chunk.timers.is_last,
+                    chunk.timers.timers.len()
+                );
+                let mut buf: &[u8] = &chunk.timers.timers;
+                while !buf.is_empty() {
+                    match coder.decode(&mut buf) {
+                        Ok(timer) => {
+                            total += 1;
+                            let entry = timer_entry(transform_id, timer_family_id, &timer, domain);
+                            let key = entry.key.storage_key();
+                            if timer.clear {
+                                debug!("timer clear: key={:?}", entry.key.user_key);
+                                pending.insert(key, None);
+                            } else {
+                                debug!(
+                                    "timer set: key={:?}, window={}, fire_timestamp={}, hold_timestamp={}",
+                                    entry.key.user_key,
+                                    entry.key.window,
+                                    entry.fire_timestamp,
+                                    entry.hold_timestamp
+                                );
+                                pending.insert(key, Some(entry));
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "failed to decode timer for {transform_id}/{timer_family_id}: {e}"
+                            );
+                            break;
+                        }
+                    }
+                }
+                let is_last = chunk.timers.is_last;
+                if is_last || pending.len() >= FLUSH_EVERY {
+                    flush_timers(timer_service, &mut pending, transform_id, timer_family_id).await;
+                }
+                if is_last {
+                    return total;
+                }
+            }
+            Some(ElementStreamPayload::Data(_)) => {}
+            None => {
+                flush_timers(timer_service, &mut pending, transform_id, timer_family_id).await;
+                return total;
+            }
+        }
+    }
+}
+
+/// Commit the accumulated timer writes for one endpoint in a single durable batch.
+async fn flush_timers(
+    timer_service: &TimerService,
+    pending: &mut HashMap<Vec<u8>, Option<TimerEntry>>,
+    transform_id: &str,
+    timer_family_id: &str,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    let count = pending.len();
+    let started = std::time::Instant::now();
+    match timer_service.apply(pending).await {
+        Ok(()) => info!(
+            "persisted {count} timer(s) for {transform_id}/{timer_family_id} in {}ms",
+            started.elapsed().as_millis()
+        ),
+        Err(e) => {
+            log::warn!(
+                "failed to persist {count} timer(s) for {transform_id}/{timer_family_id}: {e}"
+            )
+        }
+    }
+    pending.clear();
+}
+
+/// Build a storage [`TimerEntry`] from a decoded wire timer.
+fn timer_entry(
+    transform_id: &str,
+    timer_family_id: &str,
+    timer: &WireTimer,
+    domain: TimeDomain,
+) -> TimerEntry {
+    let window = timer
+        .windows
+        .first()
+        .map(|window| window.canonical_key())
+        .unwrap_or_else(|| "global".to_string());
+    TimerEntry {
+        key: TimerKey {
+            transform_id: transform_id.to_string(),
+            timer_family_id: timer_family_id.to_string(),
+            tag: timer.tag.clone(),
+            window,
+            user_key: timer.user_key.clone(),
+        },
+        domain,
+        fire_timestamp: timer.fire_timestamp,
+        hold_timestamp: timer.hold_timestamp,
+    }
+}
+
+/// Rebuild the wire timer for a fired [`TimerEntry`].
+fn timer_to_wire(entry: &TimerEntry) -> Option<WireTimer> {
+    let window = BeamWindow::from_canonical_key(&entry.key.window)?;
+    Some(WireTimer {
+        user_key: entry.key.user_key.clone(),
+        tag: entry.key.tag.clone(),
+        windows: vec![window],
+        clear: false,
+        fire_timestamp: entry.fire_timestamp,
+        hold_timestamp: entry.hold_timestamp,
+        pane: PaneInfo::no_firing(),
+    })
 }
 
 pub fn metadata_pcollection_id(metadata: Option<&ConsumerMetaData>) -> String {
@@ -573,7 +972,7 @@ fn stage_window_coder_id(
                 })
         });
     let resolved = window_coder_id.unwrap_or_else(|| format!("{}/global_window", stage.id()));
-    info!(
+    debug!(
         "Resolved boundary window coder: stage={}, pcollection={}, strategy={}, window_coder_id={}",
         stage.id(),
         pcollection_id,
@@ -626,7 +1025,7 @@ pub fn stage_transforms_with_data_boundaries(
     let source_id = stage_source_transform_id(stage);
     let input_element_coder_id = input_pcol.node().coder_id.clone();
     let input_wire_coder_id = windowed_value_coder_id(stage, input_pcol.id());
-    info!(
+    debug!(
         "Adding SDK stage source transform: id={}, output_pcollection={}, element_coder_id={}, wire_coder_id={}",
         source_id,
         input_pcol.id(),
@@ -648,7 +1047,7 @@ pub fn stage_transforms_with_data_boundaries(
     );
 
     if stage.output_pcols().is_empty() {
-        info!(
+        debug!(
             "Stage {} has no boundary output PCollections: every output is consumed inside the stage (fused downstream) or is terminal, so no sink transform is registered",
             stage.id()
         );
@@ -658,7 +1057,7 @@ pub fn stage_transforms_with_data_boundaries(
         let sink_id = stage_sink_transform_id(stage, output_pcol.id());
         let output_element_coder_id = output_pcol.node().coder_id.clone();
         let output_wire_coder_id = windowed_value_coder_id(stage, output_pcol.id());
-        info!(
+        debug!(
             "Adding SDK stage sink transform: id={}, input_pcollection={}, element_coder_id={}, wire_coder_id={}",
             sink_id,
             output_pcol.id(),
@@ -705,4 +1104,274 @@ pub fn stage_timer_endpoints(stage: &ExecutableStage) -> Vec<(String, String)> {
             )
         })
         .collect()
+}
+
+#[cfg(test)]
+mod timer_tests {
+    use super::*;
+    use crate::coders::primitives::StringUtf8Coder;
+    use crate::engine::harness::data::{TimerChunk, TimersKey};
+    use crate::engine::timer::TimerStore;
+    use crate::store::element_store::FlareElementStore;
+    use beam_model_rs::v1::TimerFamilySpec;
+    use prost::Message;
+    use tempfile::tempdir;
+
+    fn coder_for_string_key() -> TimerCoder {
+        TimerCoder::new(
+            StandardBeamCoders::StringUtf8(StringUtf8Coder),
+            WindowCoder::Global,
+        )
+    }
+
+    /// The nested-encoded bytes a timer coder stores as a timer's `user_key`.
+    fn encoded_string_key(s: &str) -> Vec<u8> {
+        let mut buf = Vec::new();
+        StandardBeamCoders::StringUtf8(StringUtf8Coder).encode(
+            BeamRecord::PRIMITIVE(PrimitiveValue::String(s.to_string())),
+            &mut buf,
+        );
+        buf
+    }
+
+    fn wire_timer(user_key: Vec<u8>, clear: bool, fire: i64, hold: i64) -> WireTimer {
+        WireTimer {
+            user_key,
+            tag: String::new(),
+            windows: vec![BeamWindow::Global],
+            clear,
+            fire_timestamp: fire,
+            hold_timestamp: hold,
+            pane: PaneInfo::no_firing(),
+        }
+    }
+
+    fn timers_payload(
+        transform_id: &str,
+        timer_family_id: &str,
+        bytes: Vec<u8>,
+        is_last: bool,
+    ) -> ElementStreamPayload {
+        ElementStreamPayload::Timers(TimerChunk {
+            key: TimersKey {
+                instruction_id: "instr".to_string(),
+                transform_id: transform_id.to_string(),
+                timer_family_id: timer_family_id.to_string(),
+            },
+            timers: elements::Timers {
+                instruction_id: "instr".to_string(),
+                transform_id: transform_id.to_string(),
+                timer_family_id: timer_family_id.to_string(),
+                timers: bytes,
+                is_last,
+            },
+        })
+    }
+
+    async fn make_timer_service() -> (tempfile::TempDir, Arc<TimerService>) {
+        let dir = tempdir().expect("failed to create tempdir warehouse");
+        let warehouse = dir
+            .path()
+            .to_str()
+            .expect("tempdir path is not valid utf8")
+            .to_string();
+        let store = FlareElementStore::new(warehouse, "timers-test".to_string(), None)
+            .await
+            .expect("failed to construct FlareElementStore");
+        let service = Arc::new(TimerService::new(TimerStore::new(Arc::new(store))));
+        (dir, service)
+    }
+
+    /// A coder id helper for the resolver test.
+    fn coder(urn: &str, component_ids: Vec<&str>) -> Coder {
+        Coder {
+            spec: Some(FunctionSpec {
+                urn: urn.to_string(),
+                payload: Vec::new(),
+            }),
+            component_coder_ids: component_ids.into_iter().map(str::to_string).collect(),
+        }
+    }
+
+    #[test]
+    fn resolve_timer_family_reads_key_window_coders_and_domain() {
+        let mut components = Components::default();
+
+        let mut payload = ParDoPayload::default();
+        payload.timer_family_specs.insert(
+            "ts-flush".to_string(),
+            TimerFamilySpec {
+                time_domain: 2, // PROCESSING_TIME
+                timer_family_coder_id: "timer_coder".to_string(),
+            },
+        );
+        payload.timer_family_specs.insert(
+            "ts-event".to_string(),
+            TimerFamilySpec {
+                time_domain: 1, // EVENT_TIME
+                timer_family_coder_id: "timer_coder".to_string(),
+            },
+        );
+        components.transforms.insert(
+            "BufferAndFireOnTimer".to_string(),
+            PTransform {
+                unique_name: "BufferAndFireOnTimer".to_string(),
+                spec: Some(FunctionSpec {
+                    urn: beam_urns::PAR_DO_TRANSFORM.to_string(),
+                    payload: payload.encode_to_vec(),
+                }),
+                ..Default::default()
+            },
+        );
+
+        let mut coders: HashMap<String, Coder> = HashMap::new();
+        coders.insert(
+            "key_coder".to_string(),
+            coder(beam_urns::STRING_UTF8_CODER, vec![]),
+        );
+        coders.insert(
+            "window_coder".to_string(),
+            coder(beam_urns::GLOBAL_WINDOW_CODER, vec![]),
+        );
+        coders.insert(
+            "timer_coder".to_string(),
+            coder(beam_urns::TIMER_CODER, vec!["key_coder", "window_coder"]),
+        );
+
+        let (coder, domain) =
+            resolve_timer_family(&components, &coders, "BufferAndFireOnTimer", "ts-flush")
+                .expect("timer family resolves");
+        assert_eq!(domain, TimeDomain::ProcessingTime);
+
+        // The resolved coder is a timer coder with a StringUtf8 key and the global
+        // window: a wire timer round-trips through it.
+        let key = encoded_string_key("alice");
+        let mut bytes = Vec::new();
+        coder.encode_into(&wire_timer(key.clone(), false, 1000, 999), &mut bytes);
+        let mut buf: &[u8] = &bytes;
+        let decoded = coder.decode(&mut buf).expect("decode with resolved coder");
+        assert_eq!(decoded.user_key, key);
+        assert_eq!(decoded.fire_timestamp, 1000);
+
+        // The event-time family maps to the event-time domain.
+        let (_, event_domain) =
+            resolve_timer_family(&components, &coders, "BufferAndFireOnTimer", "ts-event")
+                .expect("event-time family resolves");
+        assert_eq!(event_domain, TimeDomain::EventTime);
+
+        // Unknown transform or family is a miss (callers drop, not panic).
+        assert!(resolve_timer_family(&components, &coders, "nope", "ts-flush").is_none());
+        assert!(
+            resolve_timer_family(&components, &coders, "BufferAndFireOnTimer", "nope").is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_persists_a_set_timer() {
+        let (_dir, service) = make_timer_service().await;
+        let coder = coder_for_string_key();
+        let key = encoded_string_key("alice");
+
+        let mut set_bytes = Vec::new();
+        coder.encode_into(&wire_timer(key.clone(), false, 1000, 999), &mut set_bytes);
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(timers_payload("t", "f", set_bytes, true)).unwrap();
+        drop(tx);
+
+        let decoded = drain_timer_elements(
+            &coder,
+            TimeDomain::ProcessingTime,
+            "t",
+            "f",
+            service.as_ref(),
+            Arc::new(Mutex::new(rx)),
+        )
+        .await;
+        assert_eq!(decoded, 1);
+
+        let entries = service.store().entries().await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].key.transform_id, "t");
+        assert_eq!(entries[0].key.timer_family_id, "f");
+        assert_eq!(entries[0].key.window, "global");
+        assert_eq!(entries[0].key.user_key, key);
+        assert_eq!(entries[0].domain, TimeDomain::ProcessingTime);
+        assert_eq!(entries[0].fire_timestamp, 1000);
+        assert_eq!(entries[0].hold_timestamp, 999);
+    }
+
+    #[tokio::test]
+    async fn drain_clear_deletes_the_set_timer() {
+        let (_dir, service) = make_timer_service().await;
+        let coder = coder_for_string_key();
+        let key = encoded_string_key("alice");
+
+        let mut set_bytes = Vec::new();
+        coder.encode_into(&wire_timer(key.clone(), false, 1000, 999), &mut set_bytes);
+        let mut clear_bytes = Vec::new();
+        coder.encode_into(&wire_timer(key.clone(), true, 0, 0), &mut clear_bytes);
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(timers_payload("t", "f", set_bytes, false)).unwrap();
+        tx.send(timers_payload("t", "f", clear_bytes, true))
+            .unwrap();
+        drop(tx);
+
+        let decoded = drain_timer_elements(
+            &coder,
+            TimeDomain::ProcessingTime,
+            "t",
+            "f",
+            service.as_ref(),
+            Arc::new(Mutex::new(rx)),
+        )
+        .await;
+        assert_eq!(decoded, 2);
+        assert!(
+            service.store().entries().await.unwrap().is_empty(),
+            "a cleared timer must not remain in the store"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_decodes_concatenated_timers_in_one_chunk() {
+        let (_dir, service) = make_timer_service().await;
+        let coder = coder_for_string_key();
+
+        // Two set timers for different keys, concatenated into one chunk, exactly
+        // as the SDK frames a batch of set timers.
+        let mut bytes = Vec::new();
+        coder.encode_into(
+            &wire_timer(encoded_string_key("alice"), false, 10, 10),
+            &mut bytes,
+        );
+        coder.encode_into(
+            &wire_timer(encoded_string_key("bob"), false, 20, 20),
+            &mut bytes,
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(timers_payload("t", "f", bytes, true)).unwrap();
+        drop(tx);
+
+        let decoded = drain_timer_elements(
+            &coder,
+            TimeDomain::ProcessingTime,
+            "t",
+            "f",
+            service.as_ref(),
+            Arc::new(Mutex::new(rx)),
+        )
+        .await;
+        assert_eq!(decoded, 2);
+
+        let mut entries = service.store().entries().await.unwrap();
+        entries.sort_by_key(|entry| entry.fire_timestamp);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].key.user_key, encoded_string_key("alice"));
+        assert_eq!(entries[0].fire_timestamp, 10);
+        assert_eq!(entries[1].key.user_key, encoded_string_key("bob"));
+        assert_eq!(entries[1].fire_timestamp, 20);
+    }
 }

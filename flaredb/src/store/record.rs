@@ -2077,6 +2077,28 @@ mod tests {
     }
 
     #[test]
+    fn roundtrip_kv_with_opaque_composite_key() {
+        // A composite KV/GBK key is carried as its opaque nested encoding (see the
+        // coder fix for Q7); it must survive the schema/batch round-trip as bytes.
+        let key = bytes(&[0x01, b'a', 0x01, b'b']);
+        let records = vec![
+            BeamRecord::KV(BeamKV {
+                key: key.clone(),
+                value: Box::new(BeamRecord::PRIMITIVE(i(1))),
+            }),
+            BeamRecord::KV(BeamKV {
+                key: key.clone(),
+                value: Box::new(BeamRecord::PRIMITIVE(i(2))),
+            }),
+        ];
+        let schema = derive_table_schema("pc", &records).unwrap();
+        let batch = beamrecords_to_record_batch(&records, &schema).unwrap();
+        let back = record_batch_to_beamrecords(&batch, &schema).unwrap();
+        assert_kv(&back[0], &key, &i(1));
+        assert_kv(&back[1], &key, &i(2));
+    }
+
+    #[test]
     fn roundtrip_iterable() {
         let records = vec![
             BeamRecord::ITERABLE(IterableValue::new(vec![i(1), i(2)])),

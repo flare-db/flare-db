@@ -1070,7 +1070,9 @@ fn unique_id(prefix: &str, exists: impl Fn(&str) -> bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fusion::pipeline::{PCollectionNode, PTransformNode, QueryablePipeline};
+    use crate::fusion::pipeline::{
+        ExecutableGraph, PCollectionNode, PTransformNode, QueryablePipeline,
+    };
     use crate::fusion::stage::{CollectionConsumers, ExecutableStage};
     use crate::jobservice::urns::beam_urns;
     use beam_model_rs::v1::{
@@ -1400,6 +1402,90 @@ mod tests {
         );
     }
 
+    /// A runner-owned primitive must stay a runner transform even when the SDK
+    /// attaches an environment to it (the Java SDK tags `TestStream` with the
+    /// pipeline's default environment). If it were fused into an SDK stage, the
+    /// executable graph — which is seeded from runner roots — would come out empty
+    /// at runtime and the job would "succeed" having done nothing.
+    #[test]
+    fn test_stream_with_an_environment_stays_a_runner_stage() {
+        let env = make_env("env1");
+        let clean = clean_pardo_payload();
+        // TestStream (environment attached!) -> ParDo (same env) -> GroupByKey.
+        let test_stream = make_transform(
+            "TestStream",
+            beam_urns::TEST_STREAM_TRANSFORM,
+            &[],
+            &[("out", "p0")],
+            "env1",
+        );
+        let pardo = make_pardo_transform(
+            "AssignWindows",
+            beam_urns::PAR_DO_TRANSFORM,
+            &[("in", "p0")],
+            &[("out", "p1")],
+            "env1",
+            &clean,
+        );
+        let gbk = make_transform(
+            "GroupByKey",
+            beam_urns::GROUP_BY_KEY_TRANSFORM,
+            &[("in", "p1")],
+            &[("out", "p2")],
+            "",
+        );
+        let pcols = vec![make_pcol("p0"), make_pcol("p1"), make_pcol("p2")];
+        let mut envs = HashMap::new();
+        envs.insert("env1".to_string(), env);
+
+        let pipeline = build_pipeline(vec![test_stream, pardo, gbk], pcols, envs);
+        let fuser = GreedyPipelineFuser::with(pipeline);
+        // Mirror `jobservice::job::fuse_pipeline`: seed env-less roots as runner
+        // transforms, then add each root's unfusible descendants.
+        let mut unfused = HashSet::new();
+        let mut consumers = BTreeSet::new();
+        for root in fuser.pipeline.get_root_transforms() {
+            if fuser.pipeline.get_environment(&root.transform).is_none() {
+                unfused.insert(root.clone());
+            }
+            let desc = fuser.get_root_consumers(root.clone());
+            unfused.extend(desc.get_unfusible().iter().cloned());
+            consumers.extend(desc.get_fusible().iter().cloned());
+        }
+        let fused = fuser.fuse_pipeline(unfused, consumers).unwrap();
+
+        let runner_ids: HashSet<&str> = fused
+            .runner_stages()
+            .iter()
+            .map(|t| t.id.as_str())
+            .collect();
+        assert!(
+            runner_ids.contains("TestStream"),
+            "TestStream must be a runner stage despite its environment; runner={runner_ids:?}"
+        );
+        assert!(runner_ids.contains("GroupByKey"));
+
+        for stage in fused.sdk_stages() {
+            for transform in stage.transforms() {
+                assert_ne!(
+                    transform.id, "TestStream",
+                    "TestStream must not be fused into an SDK stage"
+                );
+            }
+        }
+
+        // The executable graph (seeded from runner roots) must be non-empty.
+        let graph = ExecutableGraph::from(
+            fused.sdk_stages().clone(),
+            fused.runner_stages().clone(),
+            fused.components().clone(),
+        );
+        assert!(
+            graph.get_executable_graph().node_count() > 0,
+            "executable graph must not be empty when TestStream is the root"
+        );
+    }
+
     /// Two ParDos with different environment_ids should produce two separate ExecutableStages.
     #[test]
     fn different_environments_split_into_separate_stages() {
@@ -1683,8 +1769,19 @@ mod tests {
             .fuse_pipeline(initial_unfused, initial_consumers)
             .unwrap();
 
-        let _timer_stage =
+        let timer_stage =
             find_stage_with(&fused.sdk_stages(), "timer_pardo").expect("timer_pardo not found");
+        // The stage must carry the ParDo's timer family so the runner can register
+        // its timer endpoints and route set/cleared timers back to it.
+        let timer_names: Vec<String> = timer_stage
+            .timers()
+            .iter()
+            .map(|timer| timer.local_name().to_string())
+            .collect();
+        assert!(
+            timer_names.contains(&"my_timer".to_string()),
+            "stage must retain the ParDo timer family, found {timer_names:?}"
+        );
         let downstream_stage =
             find_stage_with(&fused.sdk_stages(), "downstream").expect("downstream not found");
 

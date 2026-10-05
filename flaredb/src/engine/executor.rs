@@ -3,18 +3,23 @@ use std::time::Duration;
 use anyhow::anyhow;
 use async_trait::async_trait;
 use beam_model_rs::v1::{ApiServiceDescriptor, ProcessBundleDescriptor};
-use log::{error, info};
+use log::{error, info, warn};
 
 use crate::{
+    coders::StandardBeamCoders,
+    engine::timer::TimerEntry,
     engine::{
-        harness::{control::ControlResponse, data::DataKey},
+        harness::{
+            control::ControlResponse,
+            data::{DataKey, TimersKey},
+        },
         runtime::{
             BundleRuntime, runner_consumer_transform_id, runner_output_pcollection_id,
             stage_sink_transform_id, stage_source_transform_id, stage_timer_endpoints,
         },
     },
     fusion::pipeline::{ConsumerMetaData, ExecutableNode},
-    transforms::ExecutionContext,
+    transforms::{ExecutionContext, SourceReportSink},
 };
 
 /// Executor for worker and runner stage nodes.
@@ -41,6 +46,7 @@ pub trait Executor {
         node: ExecutableNode,
         input_edge_metadata: Vec<ConsumerMetaData>,
         output_edge_metadata: Option<ConsumerMetaData>,
+        input_watermark: i64,
     ) -> anyhow::Result<ControlResponse>;
 }
 
@@ -51,13 +57,61 @@ impl Executor for StageExecutor {
         node: ExecutableNode,
         input_edge_metadata: Vec<ConsumerMetaData>,
         output_edge_metadata: Option<ConsumerMetaData>,
+        input_watermark: i64,
     ) -> anyhow::Result<ControlResponse> {
-        self.execute_node(node, input_edge_metadata, output_edge_metadata, None)
-            .await
+        self.execute_node(
+            node,
+            input_edge_metadata,
+            output_edge_metadata,
+            None,
+            Vec::new(),
+            input_watermark,
+        )
+        .await
     }
 }
 
 impl StageExecutor {
+    /// Execute a node, delivering `timers` to its `@OnTimer` if it is an SDK stage.
+    pub async fn execute_with_timers(
+        &mut self,
+        node: ExecutableNode,
+        input_edge_metadata: Vec<ConsumerMetaData>,
+        output_edge_metadata: Option<ConsumerMetaData>,
+        timers: Vec<TimerEntry>,
+        input_watermark: i64,
+    ) -> anyhow::Result<ControlResponse> {
+        self.execute_node(
+            node,
+            input_edge_metadata,
+            output_edge_metadata,
+            None,
+            timers,
+            input_watermark,
+        )
+        .await
+    }
+}
+
+impl StageExecutor {
+    /// Wait for a stage's timer-output tasks to finish, bounded so a stage that
+    /// never closes its timer endpoints cannot hang the bundle forever.
+    async fn finish_bundle(
+        &self,
+        response: ControlResponse,
+        timer_handles: Vec<tokio::task::JoinHandle<()>>,
+    ) -> ControlResponse {
+        for handle in timer_handles {
+            if tokio::time::timeout(Duration::from_secs(30), handle)
+                .await
+                .is_err()
+            {
+                warn!("timed out waiting for timer output; some timers may be lost");
+            }
+        }
+        response
+    }
+
     /// Execute a worker or runner stage node.
     ///
     /// `input_edge_metadata` carries one entry per incoming PCollection: a
@@ -69,6 +123,8 @@ impl StageExecutor {
         input_edge_metadata: Vec<ConsumerMetaData>,
         output_edge_metadata: Option<ConsumerMetaData>,
         _instruction_id: Option<String>,
+        timers: Vec<TimerEntry>,
+        input_watermark: i64,
     ) -> anyhow::Result<ControlResponse> {
         match node {
             ExecutableNode::Worker(executable_stage) => {
@@ -114,20 +170,71 @@ impl StageExecutor {
                                 stage_source_transform_id(&executable_stage);
                             let input_timer_endpoints = stage_timer_endpoints(&executable_stage);
 
+                            let timer_only = !timers.is_empty();
+                            if timer_only || !input_timer_endpoints.is_empty() {
+                                info!(
+                                    "stage timer endpoints: {:?}; delivering {} fired timer(s) (timer_only={})",
+                                    input_timer_endpoints,
+                                    timers.len(),
+                                    timer_only
+                                );
+                            }
+                            // Deliver any fired timers first, then start the input
+                            // pump (whose terminators close the endpoints), then
+                            // consume the stage's own timer output.
+                            self.runtime
+                                .send_fired_timers(&instruction_id, &timers)
+                                .await?;
+                            let mut timer_handles = Vec::new();
+                            for (transform_id, timer_family_id) in
+                                input_timer_endpoints.iter().cloned()
+                            {
+                                let receiver = self.runtime.data().get_timer_receiver(TimersKey {
+                                    instruction_id: instruction_id.clone(),
+                                    transform_id: transform_id.clone(),
+                                    timer_family_id: timer_family_id.clone(),
+                                });
+                                let timer_runtime = self.runtime.clone();
+                                timer_handles.push(tokio::spawn(async move {
+                                    if let Err(err) = timer_runtime
+                                        .process_timer_elements(
+                                            transform_id,
+                                            timer_family_id,
+                                            receiver,
+                                        )
+                                        .await
+                                    {
+                                        warn!("timer processing failed: {}", err);
+                                    }
+                                }));
+                            }
+
                             tokio::spawn(async move {
-                                if let Err(err) = input_runtime
-                                    .process_input_elements(
-                                        input_instruction_id,
-                                        input_consumer_transform_id,
-                                        input_pcollection_id,
-                                        input_coder_id,
-                                        None,
-                                        input_timer_endpoints,
-                                    )
-                                    .await
-                                {
+                                let result = if timer_only {
+                                    // A timer-only bundle must not re-deliver the
+                                    // stage's input data.
+                                    input_runtime
+                                        .terminate_bundle_input(
+                                            input_instruction_id,
+                                            input_consumer_transform_id,
+                                            input_timer_endpoints,
+                                        )
+                                        .await
+                                } else {
+                                    input_runtime
+                                        .process_input_elements(
+                                            input_instruction_id,
+                                            input_consumer_transform_id,
+                                            input_pcollection_id,
+                                            input_coder_id,
+                                            None,
+                                            input_timer_endpoints,
+                                        )
+                                        .await
+                                };
+                                if let Err(err) = result {
                                     error!(
-                                        "Failed to send input elements for instruction {}: {}",
+                                        "Failed to send input for instruction {}: {}",
                                         instruction_id_log, err
                                     );
                                 }
@@ -158,8 +265,7 @@ impl StageExecutor {
                                 });
 
                                 let timeout_id = instruction_id.clone();
-                                let proces_bundle_response = tokio::time::timeout(
-                                    Duration::from_secs(60),
+                                let proces_bundle_response = crate::engine::liveness::idle_guard(
                                     async {
                                         tokio::pin!(bundle_response_future);
                                         tokio::select! {
@@ -185,31 +291,29 @@ impl StageExecutor {
                                             }
                                         }
                                     },
-                                )
-                                .await
-                                .map_err(|_| {
-                                    anyhow!(
-                                        "timed out waiting for SDK bundle {} output data and control response",
+                                    Duration::from_secs(60),
+                                    &format!(
+                                        "waiting for SDK bundle {} output data and control response",
                                         timeout_id
-                                    )
-                                })??;
+                                    ),
+                                )
+                                .await?;
 
-                                return Ok(proces_bundle_response);
+                                return Ok(self
+                                    .finish_bundle(proces_bundle_response, timer_handles)
+                                    .await);
                             }
 
                             let timeout_id = instruction_id.clone();
-                            let proces_bundle_response = tokio::time::timeout(
-                                Duration::from_secs(60),
+                            let proces_bundle_response = crate::engine::liveness::idle_guard(
                                 bundle_response_future,
+                                Duration::from_secs(60),
+                                &format!("waiting for SDK bundle {} control response", timeout_id),
                             )
-                            .await
-                            .map_err(|_| {
-                                anyhow!(
-                                    "timed out waiting for SDK bundle {} control response",
-                                    timeout_id
-                                )
-                            })??;
-                            return Ok(proces_bundle_response);
+                            .await?;
+                            return Ok(self
+                                .finish_bundle(proces_bundle_response, timer_handles)
+                                .await);
                         } else {
                             Ok(ControlResponse::ProcessBundleError(
                                 "Error wile registring bundle".to_string(),
@@ -264,11 +368,51 @@ impl StageExecutor {
                     Ok(response) => {
                         if matches!(response, ControlResponse::BundleRegistered) {
                             info!("Runer bundle registred at worker");
+                            // Resolve the primary input's windowing strategy so a
+                            // runner-native transform can read its trigger.
+                            let components = self.runtime.pipeline_components();
+                            let windowing_strategy = input_pcollection_ids
+                                .first()
+                                .and_then(|id| components.pcollections.get(id))
+                                .and_then(|pcol| {
+                                    components
+                                        .windowing_strategies
+                                        .get(&pcol.windowing_strategy_id)
+                                        .cloned()
+                                });
+
+                            // A runner source that replays pre-encoded elements
+                            // (TestStream) needs the output PCollection's element
+                            // coder to decode them.
+                            let output_coder = if runner_transform.needs_output_coder() {
+                                components
+                                    .pcollections
+                                    .get(&output_pcollection_id)
+                                    .map(|pcol| pcol.coder_id.clone())
+                                    .map(|coder_id| {
+                                        StandardBeamCoders::from_urn(
+                                            &coder_id,
+                                            None,
+                                            Some(self.runtime.pipeline_coders().as_ref()),
+                                        )
+                                    })
+                            } else {
+                                None
+                            };
+
                             let ctx = ExecutionContext {
                                 store: self.runtime.store().clone(),
                                 input_pcollection_ids,
-                                output_pcollection_id,
+                                output_pcollection_id: output_pcollection_id.clone(),
                                 consumer_transfrom_id,
+                                stage_id: runner_transform.id(),
+                                windowing_strategy,
+                                processing_time: self.runtime.timer_service().now(),
+                                input_watermark,
+                                output_coder: output_coder.clone(),
+                                source_reports: Some(SourceReportSink(
+                                    self.runtime.source_reports().clone(),
+                                )),
                             };
 
                             runner_transform.execute(ctx).await?;

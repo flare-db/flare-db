@@ -9,7 +9,6 @@ use std::collections::{HashMap, HashSet};
 use crate::{
     coders::primitives::WindowedValue,
     jobservice::urns::beam_urns,
-    store::element_store::ScanCollectionRequest,
     transforms::{ExecutionContext, FlareTransform},
 };
 
@@ -50,15 +49,15 @@ impl FlareTransform for Flatten {
 
     async fn execute(&self, ctx: ExecutionContext) -> Result<(), Error> {
         // Pure union: read every input as WindowedValues and re-emit unchanged,
-        // preserving each element's window metadata.
+        // preserving each element's window metadata. Inputs are read
+        // incrementally from this stage's cursor, so a re-run emits only the rows
+        // appended by its upstream since the previous run.
         let mut merged: Vec<WindowedValue> = Vec::new();
 
         for input_id in &ctx.input_pcollection_ids {
             let values = ctx
                 .store
-                .scan_windowed_values(ScanCollectionRequest {
-                    pcollection_id: input_id.clone(),
-                })
+                .scan_windowed_values_since(&ctx.stage_id, input_id)
                 .await?;
             merged.extend(values);
         }
@@ -145,7 +144,7 @@ impl FlareTransform for Flatten {
 mod tests {
     use super::*;
     use crate::coders::primitives::{BeamWindow, PaneInfo};
-    use crate::store::element_store::FlareElementStore;
+    use crate::store::element_store::{FlareElementStore, ScanCollectionRequest};
     use crate::store::record::{BeamKV, BeamRecord, PrimitiveValue};
     use std::sync::Arc;
     use tempfile::tempdir;
@@ -200,6 +199,12 @@ mod tests {
                 input_pcollection_ids: vec!["in-0".to_string(), "in-1".to_string()],
                 output_pcollection_id: "out".to_string(),
                 consumer_transfrom_id: "consumer".to_string(),
+                stage_id: "flatten-test".to_string(),
+                windowing_strategy: None,
+                processing_time: 0,
+                input_watermark: i64::MAX,
+                output_coder: None,
+                source_reports: None,
             })
             .await
             .expect("flatten failed");

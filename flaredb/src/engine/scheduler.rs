@@ -1,64 +1,338 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap};
 
-use petgraph::{Direction, graph::NodeIndex};
+use petgraph::Direction;
+use petgraph::graph::NodeIndex;
+use petgraph::visit::EdgeRef;
 
+use log::{debug, info};
+
+use crate::engine::timer::{TimeDomain, TimerEntry};
+use crate::engine::watermark::{
+    MAX_TIMESTAMP, MIN_TIMESTAMP, StageKind, Timestamp, WatermarkManager, format_timestamp,
+};
 use crate::fusion::pipeline::{ConsumerMetaData, ExecutableGraph, ExecutableNode};
 
 /// Scheduler that manages execution state for an `ExecutableGraph`.
 ///
-/// Tracks executed and in-flight nodes and provides helpers to query ready
-/// nodes and edge metadata.
+/// Eligibility is delegated to [`WatermarkManager`], the single owner of
+/// per-stage pending/in-flight and watermark state. In the bounded case a node
+/// is ready once every main input PCollection has been produced by a completing
+/// predecessor; this replaces the previous all-predecessors-executed check,
+/// whose executed/in-flight tracking it duplicated.
 pub struct NodeScheduler {
     graph: ExecutableGraph,
-    executed: HashSet<NodeIndex>,
-    in_flight: HashSet<NodeIndex>,
+    /// Shared per-stage watermark, hold and pending/in-flight state.
+    watermarks: WatermarkManager,
+    /// Stage id to graph node index.
+    index_of: HashMap<String, NodeIndex>,
+    /// Owning stage id for each transform inside an SDK stage, used to route a
+    /// fired timer back to the stage that must run its `@OnTimer`.
+    transform_to_stage: HashMap<String, String>,
 }
 
 impl NodeScheduler {
     pub fn new(graph: ExecutableGraph) -> Self {
+        let watermarks = WatermarkManager::from_executable_graph(&graph);
+        let mut index_of = HashMap::new();
+        let mut transform_to_stage = HashMap::new();
+        for index in graph.get_executable_graph().node_indices() {
+            let node = &graph.get_executable_graph()[index];
+            index_of.insert(node.id(), index);
+            if let ExecutableNode::Worker(stage) = node {
+                for transform in stage.transforms() {
+                    transform_to_stage.insert(transform.id().clone(), stage.id());
+                }
+            }
+        }
+
+        // One-line plan summary so a job's scheduling shape is visible up front.
+        let stages = watermarks.stages();
+        let gated: Vec<String> = stages
+            .iter()
+            .filter(|stage| watermarks.stage_kind(stage) == Some(StageKind::WatermarkGated))
+            .map(|stage| {
+                format!(
+                    "{stage}@{}",
+                    format_timestamp(
+                        watermarks
+                            .required_watermark(stage)
+                            .unwrap_or(MIN_TIMESTAMP)
+                    )
+                )
+            })
+            .collect();
+        info!(
+            "scheduler: {} stages, {} watermark-gated [{}]",
+            stages.len(),
+            gated.len(),
+            gated.join(", ")
+        );
+
         Self {
             graph,
-            executed: HashSet::new(),
-            in_flight: HashSet::new(),
+            watermarks,
+            index_of,
+            transform_to_stage,
         }
     }
 
-    /// Returns the next ready nodes to execute.
+    /// Returns the next ready nodes to execute, ordered by stage id.
     ///
-    /// A node is considered ready when it is not in the `executed` or
-    /// `in_flight` sets and all of its predecessor nodes have been executed.
-    /// Nodes returned by this method are marked as in-flight.
+    /// Eligibility is `refresh() -> ready_stages()`: watermarks are propagated
+    /// first, then the shared pending/in-flight state decides. A node is ready
+    /// when all of its main input PCollections have been produced and its
+    /// watermark gate (if any) is satisfied. Nodes returned by this method are
+    /// marked in-flight.
     pub fn next_nodes(&mut self) -> Vec<(NodeIndex, ExecutableNode)> {
+        self.watermarks.refresh();
+        let ready = self.watermarks.ready_stages();
+
+        // Per-step eligibility trace. `debug!` keeps this off the default
+        // `info` firehose; enable with `RUST_LOG=flaredb::engine=debug`.
+        debug!(
+            "scheduler: ready [{}]",
+            ready
+                .iter()
+                .map(|stage| format!(
+                    "{stage}(in={}, out={})",
+                    format_timestamp(
+                        self.watermarks
+                            .input_watermark(stage)
+                            .unwrap_or(MIN_TIMESTAMP)
+                    ),
+                    format_timestamp(
+                        self.watermarks
+                            .output_watermark(stage)
+                            .unwrap_or(MIN_TIMESTAMP)
+                    ),
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+
+        #[cfg(debug_assertions)]
+        self.debug_assert_eligibility_matches_dependency_rule(&ready);
+
         let mut next = Vec::new();
 
-        for idx in self.graph.get_executable_graph().node_indices() {
-            if self.executed.contains(&idx) || self.in_flight.contains(&idx) {
+        for stage in ready {
+            let Some(&index) = self.index_of.get(&stage) else {
                 continue;
+            };
+            let node = self.graph.get_executable_graph()[index].clone();
+            // Start one bundle, and keep going while the stage still has declared
+            // work (e.g. SDF residuals) and is under its concurrency ceiling. For
+            // the common `max_in_flight == 1` case this starts exactly one bundle.
+            while self.watermarks.start_bundle(&stage).is_ok() {
+                next.push((index, node.clone()));
             }
-
-            let all_predecessors_executed = self
-                .graph
-                .get_executable_graph()
-                .neighbors_directed(idx, Direction::Incoming)
-                .all(|pred| self.executed.contains(&pred));
-
-            if all_predecessors_executed {
-                self.in_flight.insert(idx);
-                next.push((idx, self.graph.get_executable_graph()[idx].clone()));
-            }
-            // is
         }
 
         next
     }
 
-    /// Marks a node as completed.
+    /// Marks a node as completed, propagating its outputs.
     ///
-    /// Removes the node from the in-flight set and inserts it into the
-    /// executed set.
+    /// A bounded source reports `+∞` when it finishes, so a source's completion
+    /// is what satisfies the watermark permit of everything downstream. The
+    /// completion happens once per node, after all of that node's internal
+    /// bundles (including SDF residuals and splits) are done, so a stage's output
+    /// never advances after just the first bundle.
     pub fn mark_complete(&mut self, idx: NodeIndex) {
-        self.in_flight.remove(&idx);
-        self.executed.insert(idx);
+        self.mark_complete_with_min(idx, None)
+    }
+
+    /// Like [`Self::mark_complete`], but also records the minimum event-time the
+    /// bundle committed, so each consumer's input watermark is clamped by its
+    /// pending input until that input is consumed.
+    pub fn mark_complete_with_min(&mut self, idx: NodeIndex, output_min_ts: Option<Timestamp>) {
+        let stage = self.graph.get_executable_graph()[idx].id();
+        if self.watermarks.is_source(&stage) && self.watermarks.source_auto_finishes(&stage) {
+            let _ = self.watermarks.report_source_finished(&stage);
+            info!(
+                "scheduler: source '{stage}' finished; output watermark = {}",
+                format_timestamp(MAX_TIMESTAMP)
+            );
+        }
+        let newly_ready = self
+            .watermarks
+            .complete_bundle_with_min(&stage, output_min_ts)
+            .unwrap_or_default();
+        let advanced = self.watermarks.refresh();
+        debug!(
+            "scheduler: stage '{stage}' completed; newly ready [{}]; advanced [{}]",
+            newly_ready.join(", "),
+            advanced
+                .iter()
+                .map(|stage| format!(
+                    "{stage}(in={}, out={})",
+                    format_timestamp(
+                        self.watermarks
+                            .input_watermark(stage)
+                            .unwrap_or(MIN_TIMESTAMP)
+                    ),
+                    format_timestamp(
+                        self.watermarks
+                            .output_watermark(stage)
+                            .unwrap_or(MIN_TIMESTAMP)
+                    ),
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    /// Debug-only cross-check that the watermark-driven eligibility answer agrees
+    /// with the previous all-predecessors-complete rule on a bounded run.
+    ///
+    /// The watermark gate can only restrict, so the new answer must be a subset
+    /// of the dependency answer; for ungated (`Ordinary`) stages the two must be
+    /// equal.
+    #[cfg(debug_assertions)]
+    fn debug_assert_eligibility_matches_dependency_rule(&self, ready: &[String]) {
+        use std::collections::HashSet;
+
+        let graph = self.graph.get_executable_graph();
+        let new: HashSet<NodeIndex> = ready
+            .iter()
+            .filter_map(|stage| self.index_of.get(stage).copied())
+            .collect();
+
+        let mut legacy: HashSet<NodeIndex> = HashSet::new();
+        for index in graph.node_indices() {
+            let stage = graph[index].id();
+            if self.watermarks.is_stage_completed(&stage)
+                || self.watermarks.is_stage_in_flight(&stage)
+            {
+                continue;
+            }
+            let all_predecessors_done =
+                graph
+                    .edges_directed(index, Direction::Incoming)
+                    .all(|edge| {
+                        self.watermarks
+                            .is_stage_completed(&graph[edge.source()].id())
+                    });
+            if all_predecessors_done {
+                legacy.insert(index);
+            }
+        }
+
+        // A completed stage may be legitimately ready again after a timer fires;
+        // the dependency rule only models first-run eligibility. So the new
+        // answer must agree on stages that have not yet run, and every
+        // dependency-ready ordinary stage must be first-run ready.
+        for index in &new {
+            let stage = graph[*index].id();
+            if !self.watermarks.is_stage_completed(&stage) {
+                assert!(
+                    legacy.contains(index),
+                    "first-run stage '{stage}' is not dependency-ready"
+                );
+            }
+        }
+
+        for index in &legacy {
+            let stage = graph[*index].id();
+            if self.watermarks.stage_kind(&stage) == Some(StageKind::Ordinary) {
+                assert!(
+                    new.contains(index),
+                    "ordinary stage '{stage}' is dependency-ready but not watermark-ready"
+                );
+            }
+        }
+    }
+
+    /// Re-arm the stage that owns each due timer, and return the timers grouped
+    /// by owning stage so they can be delivered when that stage runs again.
+    ///
+    /// Timers whose transform maps to no stage are ignored (a warning is logged
+    /// by the caller).
+    pub fn promote_due_timers(&mut self, due: &[TimerEntry]) -> Vec<(String, Vec<TimerEntry>)> {
+        let mut by_stage: BTreeMap<String, Vec<TimerEntry>> = BTreeMap::new();
+        for entry in due {
+            let Some(stage) = self
+                .transform_to_stage
+                .get(&entry.key.transform_id)
+                .cloned()
+            else {
+                continue;
+            };
+            let _ = self.watermarks.mark_rerun(&stage);
+            by_stage.entry(stage).or_default().push(entry.clone());
+        }
+        by_stage.into_iter().collect()
+    }
+
+    /// Re-arm the stage that owns each due **event-time** timer and return the
+    /// timers grouped by owning stage.
+    ///
+    /// Beam fires an event-time timer once its owning stage's input watermark has
+    /// reached the timer's timestamp ([`TimerEntry::is_due_at_watermark`], i.e.
+    /// `fire_timestamp <= input_watermark`). Processing-time timers are ignored
+    /// here; they are driven by [`Self::promote_due_timers`] off the clock.
+    ///
+    /// A timer whose stage currently has a bundle in flight is still promoted: the
+    /// re-arm it sets survives bundle completion (`complete_bundle` no longer
+    /// clears `rerun_pending`) and is consumed when the stage next runs. This lets
+    /// timers fire without waiting for a concurrent wave to drain.
+    pub fn promote_due_event_time_timers(
+        &mut self,
+        timers: &[TimerEntry],
+    ) -> Vec<(String, Vec<TimerEntry>)> {
+        let mut by_stage: BTreeMap<String, Vec<TimerEntry>> = BTreeMap::new();
+        for entry in timers {
+            if entry.domain != TimeDomain::EventTime {
+                continue;
+            }
+            let Some(stage) = self
+                .transform_to_stage
+                .get(&entry.key.transform_id)
+                .cloned()
+            else {
+                continue;
+            };
+            // Clamp by pending input: an event-time timer must not fire while
+            // older input for the owning stage is still unconsumed.
+            let watermark = self
+                .watermarks
+                .effective_input_watermark(&stage)
+                .unwrap_or(MIN_TIMESTAMP);
+            if entry.is_due_at_watermark(watermark) {
+                let _ = self.watermarks.mark_rerun(&stage);
+                by_stage.entry(stage).or_default().push(entry.clone());
+            }
+        }
+        by_stage.into_iter().collect()
+    }
+
+    /// Look up the executable stage that contains `transform_id`, if any.
+    ///
+    /// A plain lookup in the `transform_to_stage` map: several transforms are fused
+    /// into one executable stage, so a transform id (e.g. one that set a timer) is
+    /// resolved back to the stage that runs it. Used to route a persisted
+    /// event-time timer's output hold to that stage's output watermark (the timer
+    /// store persists the timer, not the hold).
+    ///
+    /// Returns the containing stage's id, or `None` when `transform_id` maps to no
+    /// stage (an unknown transform, or one not part of the executable graph).
+    pub fn stage_for_transform(&self, transform_id: &str) -> Option<String> {
+        self.transform_to_stage.get(transform_id).cloned()
+    }
+
+    /// The stage id of the executable node at `idx`.
+    pub fn stage_id(&self, idx: NodeIndex) -> String {
+        self.graph.get_executable_graph()[idx].id()
+    }
+
+    /// The shared per-stage watermark and eligibility state.
+    pub fn watermarks(&self) -> &WatermarkManager {
+        &self.watermarks
+    }
+
+    /// Mutable access to the shared per-stage watermark and eligibility state.
+    pub fn watermarks_mut(&mut self) -> &mut WatermarkManager {
+        &mut self.watermarks
     }
 
     /// Returns metadata for every incoming edge to `idx`.
@@ -100,9 +374,8 @@ impl NodeScheduler {
 
     /// Returns `true` when every node in the graph has been executed.
     pub fn is_complete(&self) -> bool {
-        self.executed.len() == self.graph.get_executable_graph().node_count()
+        self.watermarks.is_complete()
     }
-    // set_job_store
 }
 
 #[cfg(test)]
@@ -112,9 +385,10 @@ mod tests {
     use petgraph::Graph;
 
     use crate::engine::scheduler::NodeScheduler;
+    use crate::engine::timer::{TimeDomain, TimerEntry, TimerKey};
     use crate::fusion::pipeline::{ConsumerMetaData, ExecutableGraph, ExecutableNode};
     use crate::jobservice::urns::beam_urns;
-    use crate::transforms::from_urn;
+    use crate::transforms::{from_urn, from_urn_with_payload};
 
     fn runner_node(name: &str) -> ExecutableNode {
         ExecutableNode::Runner(from_urn(
@@ -122,6 +396,90 @@ mod tests {
             name.to_string(),
             HashMap::new(),
             HashMap::new(),
+        ))
+    }
+
+    /// A minimal SDK (worker) stage with a single transform, so `NodeScheduler`
+    /// maps that transform id to this stage (required for timer routing).
+    fn worker_stage_node(transform_id: &str) -> ExecutableNode {
+        use beam_model_rs::v1::executable_stage_payload::WireCoderSetting;
+        use beam_model_rs::v1::{Components, Environment, PCollection, PTransform};
+        use indexmap::IndexSet;
+
+        use crate::fusion::pipeline::{PCollectionNode, PTransformNode};
+        use crate::fusion::stage::ExecutableStage;
+
+        let mut components = Components::default();
+        let transform = PTransform {
+            unique_name: transform_id.to_string(),
+            ..Default::default()
+        };
+        components
+            .transforms
+            .insert(transform_id.to_string(), transform.clone());
+
+        let mut transforms = IndexSet::new();
+        transforms.insert(PTransformNode {
+            id: transform_id.to_string(),
+            transform,
+        });
+
+        ExecutableNode::Worker(ExecutableStage::from(
+            components,
+            Environment {
+                urn: "test-env".to_string(),
+                ..Default::default()
+            },
+            HashSet::<WireCoderSetting>::new(),
+            PCollectionNode {
+                id: "stage-in".to_string(),
+                collection: PCollection {
+                    unique_name: "stage-in".to_string(),
+                    coder_id: "c".to_string(),
+                    ..Default::default()
+                },
+            },
+            IndexSet::new(),
+            IndexSet::new(),
+            IndexSet::new(),
+            IndexSet::new(),
+            transforms,
+        ))
+    }
+
+    fn event_timer(transform_id: &str, fire: i64) -> TimerEntry {
+        TimerEntry {
+            key: TimerKey {
+                transform_id: transform_id.to_string(),
+                timer_family_id: "f".to_string(),
+                tag: String::new(),
+                window: "global".to_string(),
+                user_key: b"k".to_vec(),
+            },
+            domain: TimeDomain::EventTime,
+            fire_timestamp: fire,
+            hold_timestamp: fire,
+        }
+    }
+
+    fn gbk_node(name: &str) -> ExecutableNode {
+        ExecutableNode::Runner(from_urn(
+            beam_urns::GROUP_BY_KEY_TRANSFORM,
+            name.to_string(),
+            HashMap::new(),
+            HashMap::new(),
+        ))
+    }
+
+    /// A runner source that drives an event stream (no payload, so an empty
+    /// script).
+    fn test_stream_node(name: &str) -> ExecutableNode {
+        ExecutableNode::Runner(from_urn_with_payload(
+            beam_urns::TEST_STREAM_TRANSFORM,
+            name.to_string(),
+            HashMap::new(),
+            HashMap::new(),
+            &[],
         ))
     }
 
@@ -222,5 +580,391 @@ mod tests {
         let ready = scheduler.next_nodes();
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].0, c);
+    }
+
+    #[test]
+    fn watermark_gated_aggregation_runs_only_after_the_source_completes() {
+        use crate::engine::watermark::StageKind;
+
+        let mut graph = Graph::<ExecutableNode, ConsumerMetaData>::new();
+        let source = graph.add_node(runner_node("source"));
+        let aggregate = graph.add_node(gbk_node("aggregate"));
+        graph.add_edge(source, aggregate, dummy_metadata("sa"));
+
+        let executable_graph = graph_for_test(graph, dummy_metadata("root"));
+        let aggregate_id = executable_graph.get_executable_graph()[aggregate].id();
+        let mut scheduler = NodeScheduler::new(executable_graph);
+
+        // The GroupByKey stage is gated at the global window end.
+        assert_eq!(
+            scheduler.watermarks().stage_kind(&aggregate_id),
+            Some(StageKind::WatermarkGated)
+        );
+
+        // Only the source is ready; the aggregation waits for the watermark.
+        let ready = scheduler.next_nodes();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].0, source);
+
+        // Completing the source reports +inf, which is what satisfies the gate.
+        scheduler.mark_complete(source);
+        let ready = scheduler.next_nodes();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].0, aggregate);
+    }
+
+    #[test]
+    fn test_stream_source_does_not_finish_when_a_bundle_completes() {
+        use crate::engine::watermark::MAX_TIMESTAMP;
+
+        let mut graph = Graph::<ExecutableNode, ConsumerMetaData>::new();
+        let stream = graph.add_node(test_stream_node("stream"));
+        let consumer = graph.add_node(runner_node("consumer"));
+        graph.add_edge(stream, consumer, dummy_metadata("sc"));
+
+        let executable_graph = graph_for_test(graph, dummy_metadata("root"));
+        let stream_id = executable_graph.get_executable_graph()[stream].id();
+        let mut scheduler = NodeScheduler::new(executable_graph);
+
+        assert!(scheduler.watermarks().is_source(&stream_id));
+        assert!(!scheduler.watermarks().source_auto_finishes(&stream_id));
+
+        // First bundle: the source reports its first scripted event, not completion.
+        let ready = scheduler.next_nodes();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].0, stream);
+        scheduler.mark_complete(stream);
+
+        // Completing the bundle must not report `+inf` — the script may have more
+        // events — so the source's output watermark stays put...
+        assert_ne!(
+            scheduler.watermarks().output_watermark(&stream_id),
+            Some(MAX_TIMESTAMP)
+        );
+        // ...but the append still push-wakes the consumer.
+        let ready = scheduler.next_nodes();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].0, consumer);
+        scheduler.mark_complete(consumer);
+
+        // The source can be re-armed to play its next event.
+        scheduler.watermarks_mut().mark_rerun(&stream_id).unwrap();
+        let ready = scheduler.next_nodes();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].0, stream);
+        scheduler.mark_complete(stream);
+
+        // Only an explicit finish reaches `+inf`.
+        scheduler
+            .watermarks_mut()
+            .report_source_finished(&stream_id)
+            .unwrap();
+        scheduler.watermarks_mut().refresh();
+        assert_eq!(
+            scheduler.watermarks().output_watermark(&stream_id),
+            Some(MAX_TIMESTAMP)
+        );
+    }
+
+    /// Build `source -> stateful(SDK)`, returning the scheduler, the graph node
+    /// indices and the two stage ids.
+    fn source_and_stateful() -> (
+        NodeScheduler,
+        petgraph::graph::NodeIndex,
+        petgraph::graph::NodeIndex,
+        String,
+        String,
+    ) {
+        let mut graph = Graph::<ExecutableNode, ConsumerMetaData>::new();
+        let source = graph.add_node(runner_node("source"));
+        let stateful = graph.add_node(worker_stage_node("stateful"));
+        graph.add_edge(source, stateful, dummy_metadata("ss"));
+
+        let executable_graph = graph_for_test(graph, dummy_metadata("root"));
+        let source_id = executable_graph.get_executable_graph()[source].id();
+        let stateful_id = executable_graph.get_executable_graph()[stateful].id();
+        (
+            NodeScheduler::new(executable_graph),
+            source,
+            stateful,
+            source_id,
+            stateful_id,
+        )
+    }
+
+    /// Beam fires an event-time timer only once the owning stage's input
+    /// watermark has reached the timer's timestamp (`fire_timestamp <= WM`).
+    #[test]
+    fn event_time_timer_fires_only_once_the_stage_watermark_reaches_it() {
+        let (mut scheduler, _source, _stateful, source_id, stateful_id) = source_and_stateful();
+        let timer = event_timer("stateful", 100);
+
+        // No watermark report yet: the source output is MIN, so nothing is due.
+        assert!(
+            scheduler
+                .promote_due_event_time_timers(&[timer.clone()])
+                .is_empty()
+        );
+
+        // WM = 99: still below the timer.
+        scheduler
+            .watermarks_mut()
+            .report_source_watermark(&source_id, 99)
+            .unwrap();
+        scheduler.watermarks_mut().refresh();
+        assert!(
+            scheduler
+                .promote_due_event_time_timers(&[timer.clone()])
+                .is_empty()
+        );
+
+        // WM = 100: the watermark has reached the timer, so it fires (equal timestamps fire).
+        scheduler
+            .watermarks_mut()
+            .report_source_watermark(&source_id, 100)
+            .unwrap();
+        scheduler.watermarks_mut().refresh();
+        let promoted = scheduler.promote_due_event_time_timers(&[timer]);
+        assert_eq!(promoted.len(), 1);
+        assert_eq!(promoted[0].0, stateful_id);
+        assert_eq!(promoted[0].1.len(), 1);
+    }
+
+    /// Processing-time timers are never promoted by the watermark path.
+    #[test]
+    fn processing_time_timer_is_not_promoted_by_the_watermark() {
+        let (mut scheduler, _source, _stateful, source_id, _stateful_id) = source_and_stateful();
+        scheduler
+            .watermarks_mut()
+            .report_source_watermark(&source_id, 1_000)
+            .unwrap();
+        scheduler.watermarks_mut().refresh();
+
+        let mut timer = event_timer("stateful", 100);
+        timer.domain = TimeDomain::ProcessingTime;
+        assert!(scheduler.promote_due_event_time_timers(&[timer]).is_empty());
+    }
+
+    /// A timer whose stage already has a bundle in flight is still promoted, and
+    /// the re-arm survives that bundle's completion, so the timer is not lost.
+    #[test]
+    fn event_time_timer_for_an_in_flight_stage_is_promoted_and_survives_completion() {
+        let (mut scheduler, source, stateful, _source_id, _stateful_id) = source_and_stateful();
+        let timer = event_timer("stateful", 100);
+
+        // Start and complete the source: +inf, which readies the stateful stage.
+        let ready = scheduler.next_nodes();
+        assert!(ready.iter().any(|(idx, _)| *idx == source));
+        scheduler.mark_complete(source);
+
+        // Start the stateful stage's bundle: it is now in flight.
+        let ready = scheduler.next_nodes();
+        assert!(ready.iter().any(|(idx, _)| *idx == stateful));
+
+        // The timer is promoted even though the stage has a bundle in flight.
+        let promoted = scheduler.promote_due_event_time_timers(&[timer]);
+        assert_eq!(promoted.len(), 1);
+
+        // Completion does not discard the re-arm: the stage runs again.
+        scheduler.mark_complete(stateful);
+        assert!(!scheduler.is_complete());
+        let ready = scheduler.next_nodes();
+        assert!(ready.iter().any(|(idx, _)| *idx == stateful));
+        scheduler.mark_complete(stateful);
+        assert!(scheduler.is_complete());
+    }
+
+    /// After a bounded source reports +inf, a timer re-armed by the fired
+    /// callback (a new event-time timer) is due again and must drain.
+    #[test]
+    fn event_time_timers_drain_after_a_finished_source() {
+        let (mut scheduler, source, stateful, _source_id, stateful_id) = source_and_stateful();
+
+        // Start and complete the source: bounded end reports +inf.
+        let ready = scheduler.next_nodes();
+        assert!(ready.iter().any(|(idx, _)| *idx == source));
+        scheduler.mark_complete(source);
+
+        // First timer fires at +inf.
+        let first = event_timer("stateful", 100);
+        let promoted = scheduler.promote_due_event_time_timers(&[first]);
+        assert_eq!(promoted.len(), 1);
+        assert_eq!(promoted[0].0, stateful_id);
+
+        // Run the timer-only bundle (this consumes the re-arm).
+        let ready = scheduler.next_nodes();
+        assert!(ready.iter().any(|(idx, _)| *idx == stateful));
+        scheduler.mark_complete(stateful);
+
+        // The callback re-armed: a brand-new event-time timer, also at/below +inf.
+        let rearmed = event_timer("stateful", 100);
+        let promoted = scheduler.promote_due_event_time_timers(&[rearmed]);
+        assert_eq!(
+            promoted.len(),
+            1,
+            "a timer re-armed after +inf must still be promoted, not stranded"
+        );
+        assert_eq!(promoted[0].0, stateful_id);
+    }
+
+    /// End-to-end for the M6a gap: a completed consumer re-runs when its upstream
+    /// appends again, and on that re-run it reads only the newly appended rows
+    /// (incremental cursor), not the whole input again.
+    #[tokio::test]
+    async fn a_completed_consumer_reruns_and_reads_only_newly_appended_rows() {
+        use crate::store::element_store::{FlareElementStore, ScanCollectionRequest};
+        use crate::transforms::ExecutionContext;
+        use std::sync::Arc;
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let warehouse = dir.path().to_str().expect("utf8").to_string();
+        let store = Arc::new(
+            FlareElementStore::new(warehouse, "testdb".to_string(), None)
+                .await
+                .expect("store"),
+        );
+
+        // A (source, Impulse) -> p; B (Flatten) consumes p and emits q.
+        let impulse = ExecutableNode::Runner(from_urn(
+            beam_urns::IMPULSE_TRANSFORM,
+            "A".to_string(),
+            HashMap::new(),
+            HashMap::from([("out".to_string(), "p".to_string())]),
+        ));
+        let flatten = ExecutableNode::Runner(from_urn(
+            beam_urns::FLATTEN_TRANSFORM,
+            "B".to_string(),
+            HashMap::from([("in".to_string(), "p".to_string())]),
+            HashMap::from([("out".to_string(), "q".to_string())]),
+        ));
+        let mut graph = Graph::new();
+        let a = graph.add_node(impulse);
+        let b = graph.add_node(flatten);
+        graph.add_edge(
+            a,
+            b,
+            ConsumerMetaData {
+                producer_transform_id: "A".to_string(),
+                produced_pcol_id: "p".to_string(),
+                coder_id: "c".to_string(),
+                component_coder: None,
+                consumer_transfrom_id: "B".to_string(),
+            },
+        );
+
+        let executable = graph_for_test(graph, dummy_metadata("root"));
+        let a_stage = executable.get_executable_graph()[a].id();
+        let mut scheduler = NodeScheduler::new(executable);
+
+        // One scheduling round: run every ready node once, then mark it complete.
+        // Runner transforms execute directly against the store (no SDK harness),
+        // mirroring `StageExecutor`'s runner branch.
+        async fn run_round(scheduler: &mut NodeScheduler, store: &Arc<FlareElementStore>) {
+            for (idx, node) in scheduler.next_nodes() {
+                let ExecutableNode::Runner(transform) = node else {
+                    panic!("test graph is runner-only");
+                };
+                let inputs = scheduler
+                    .input_edge_metadata(idx)
+                    .iter()
+                    .map(|meta| meta.produced_pcol_id.clone())
+                    .collect();
+                let output = scheduler
+                    .output_edge_metadata(idx)
+                    .map(|meta| meta.produced_pcol_id)
+                    .or_else(|| transform.output_pcol_ids().into_iter().next())
+                    .expect("runner output pcollection");
+                transform
+                    .execute(ExecutionContext {
+                        store: store.clone(),
+                        input_pcollection_ids: inputs,
+                        output_pcollection_id: output,
+                        consumer_transfrom_id: "test".to_string(),
+                        stage_id: transform.id(),
+                        windowing_strategy: None,
+                        processing_time: 0,
+                        input_watermark: i64::MAX,
+                        output_coder: None,
+                        source_reports: None,
+                    })
+                    .await
+                    .expect("runner execute");
+                scheduler.mark_complete(idx);
+            }
+        }
+
+        async fn output_len(store: &Arc<FlareElementStore>) -> usize {
+            store
+                .scan_windowed_values(ScanCollectionRequest {
+                    pcollection_id: "q".to_string(),
+                })
+                .await
+                .expect("scan q")
+                .len()
+        }
+
+        // First run to quiescence: A appends one element, B consumes it.
+        let mut rounds = 0;
+        while !scheduler.is_complete() {
+            run_round(&mut scheduler, &store).await;
+            rounds += 1;
+            assert!(rounds < 10, "first run did not quiesce");
+        }
+        assert_eq!(output_len(&store).await, 1);
+
+        // A re-runs (as a fired timer would): its append must re-wake the already
+        // completed B, and B's incremental read must deliver only the new element.
+        scheduler.watermarks_mut().mark_rerun(&a_stage).unwrap();
+        assert!(!scheduler.is_complete());
+
+        let mut rounds = 0;
+        while !scheduler.is_complete() {
+            run_round(&mut scheduler, &store).await;
+            rounds += 1;
+            assert!(
+                rounds < 10,
+                "re-run did not quiesce (consumer never woken?)"
+            );
+        }
+
+        // 2, not 3: exactly one new element was appended, so B re-read only new
+        // rows rather than re-emitting the whole input.
+        assert_eq!(output_len(&store).await, 2);
+    }
+
+    /// A stage with more declared bundle work than its concurrency ceiling (as an
+    /// SDF producer would have) is handed out as multiple entries by `next_nodes`,
+    /// and the pipeline is not complete until every one of them finishes.
+    #[test]
+    fn next_nodes_starts_queued_bundles_up_to_the_concurrency_ceiling() {
+        let (mut scheduler, _source, stateful, _source_id, stateful_id) = source_and_stateful();
+
+        // Run the source so the stateful stage's input is produced.
+        let first = scheduler.next_nodes();
+        assert_eq!(first.len(), 1);
+        scheduler.mark_complete(first[0].0);
+
+        scheduler
+            .watermarks_mut()
+            .set_max_in_flight(&stateful_id, 3)
+            .unwrap();
+        scheduler
+            .watermarks_mut()
+            .enqueue_bundles(&stateful_id, 3)
+            .unwrap();
+
+        let batch = scheduler.next_nodes();
+        assert_eq!(batch.len(), 3, "one entry per started bundle");
+        assert!(batch.iter().all(|(idx, _)| *idx == stateful));
+        assert_eq!(scheduler.watermarks().in_flight_bundles(&stateful_id), 3);
+        assert_eq!(scheduler.watermarks().queued_bundles(&stateful_id), 0);
+
+        // Finishing them one at a time drains the stage; the last one completes it.
+        for (idx, _) in batch {
+            scheduler.mark_complete(idx);
+        }
+        assert_eq!(scheduler.watermarks().in_flight_bundles(&stateful_id), 0);
+        assert!(scheduler.is_complete());
     }
 }

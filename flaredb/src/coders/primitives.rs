@@ -281,6 +281,12 @@ impl NullableCoder {
             value_coder: Box::new(value_coder),
         }
     }
+
+    /// The wrapped coder, for classifying the coder (e.g. whether it decodes to a
+    /// primitive).
+    pub fn inner(&self) -> &StandardBeamCoders {
+        &self.value_coder
+    }
 }
 
 const NULLABLE_ENCODE_NULL: u8 = 0;
@@ -580,6 +586,99 @@ impl BeamCoder<WindowedValue> for WindowedValueCoder {
             windows,
             pane,
         })
+    }
+}
+
+/// A decoded Beam user timer (`beam:coder:timer:v1`).
+///
+/// The key is kept as raw encoded bytes so it can be re-emitted verbatim when
+/// the timer fires; the windows are decoded so the runner can reason about
+/// event-time expiry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Timer {
+    pub user_key: Vec<u8>,
+    pub tag: String,
+    pub windows: Vec<BeamWindow>,
+    pub clear: bool,
+    pub fire_timestamp: i64,
+    pub hold_timestamp: i64,
+    pub pane: PaneInfo,
+}
+
+/// Encodes and decodes `beam:coder:timer:v1`.
+///
+/// Wire form: `key (key coder), tag (nested string), windows (window coder),
+/// clear bit (1 byte)`, then, when set, `fire timestamp, hold timestamp, pane`.
+/// `key_coder` is the timer family's key coder and `window_coder` its window
+/// coder, resolved from the pipeline's `TimerFamilySpec`.
+#[derive(Debug, Clone)]
+pub struct TimerCoder {
+    key_coder: StandardBeamCoders,
+    window_coder: WindowCoder,
+}
+
+impl TimerCoder {
+    pub fn new(key_coder: StandardBeamCoders, window_coder: WindowCoder) -> Self {
+        Self {
+            key_coder,
+            window_coder,
+        }
+    }
+
+    /// Decode one timer from `buf`, advancing it past the timer.
+    pub fn decode(&self, buf: &mut impl Buf) -> Result<Timer, CodersError> {
+        // Decode the key, then re-encode it in nested form: the timer's own
+        // framing stores the key bytes verbatim, so a fired timer can emit them
+        // without the decoder needing to track reader positions.
+        let key = self
+            .key_coder
+            .decode(buf)
+            .map_err(|e| CodersError::WhileDecoding(format!("timer key: {e}")))?;
+        let mut user_key = Vec::new();
+        self.key_coder.encode(key, &mut user_key);
+
+        let tag_len = decode_varint(buf) as usize;
+        let mut tag_bytes = vec![0u8; tag_len];
+        buf.copy_to_slice(&mut tag_bytes);
+        let tag = String::from_utf8(tag_bytes)
+            .map_err(|e| CodersError::WhileDecoding(format!("timer tag: {e}")))?;
+
+        let windows = decode_windows(buf, self.window_coder);
+        let clear = buf.get_u8() != 0;
+
+        let (fire_timestamp, hold_timestamp, pane) = if clear {
+            (0, 0, PaneInfo::no_firing())
+        } else {
+            (
+                decode_timestamp_millis(buf),
+                decode_timestamp_millis(buf),
+                decode_pane_info(buf),
+            )
+        };
+
+        Ok(Timer {
+            user_key,
+            tag,
+            windows,
+            clear,
+            fire_timestamp,
+            hold_timestamp,
+            pane,
+        })
+    }
+
+    /// Encode a timer in the `beam:coder:timer:v1` wire form.
+    pub fn encode_into(&self, timer: &Timer, buf: &mut impl BufMut) {
+        buf.put_slice(&timer.user_key);
+        encode_varint(timer.tag.len() as u64, buf);
+        buf.put_slice(timer.tag.as_bytes());
+        encode_windows(&timer.windows, self.window_coder, buf);
+        buf.put_u8(u8::from(timer.clear));
+        if !timer.clear {
+            encode_timestamp_millis(timer.fire_timestamp, buf);
+            encode_timestamp_millis(timer.hold_timestamp, buf);
+            encode_pane_info(&timer.pane, buf);
+        }
     }
 }
 
@@ -1603,5 +1702,67 @@ mod beam_wire_tests {
                 PrimitiveValue::Int64(1000),
             ])
         );
+    }
+}
+
+#[cfg(test)]
+mod timer_coder_tests {
+    use super::*;
+
+    fn coder() -> TimerCoder {
+        TimerCoder::new(
+            StandardBeamCoders::StringUtf8(StringUtf8Coder),
+            WindowCoder::Global,
+        )
+    }
+
+    /// The set-timer example from Beam's `standard_coders.yaml`.
+    fn set_timer_bytes() -> Vec<u8> {
+        vec![
+            3, b'k', b'e', b'y', 3, b't', b'a', b'g', 0, 0, 0, 1, 0, 0x80, 0, 0, 0, 0, 0, 0x04,
+            0xd2, 0x80, 0, 0, 0, 0, 0, 0x16, 0x2e, 0x0f,
+        ]
+    }
+
+    #[test]
+    fn decodes_a_set_timer() {
+        let bytes = set_timer_bytes();
+        let mut buf: &[u8] = &bytes;
+        let timer = coder().decode(&mut buf).unwrap();
+
+        assert!(!timer.clear);
+        assert_eq!(timer.tag, "tag");
+        assert_eq!(timer.user_key, vec![3, b'k', b'e', b'y']);
+        assert_eq!(timer.windows, vec![BeamWindow::Global]);
+        assert_eq!(timer.fire_timestamp, 1234);
+        assert_eq!(timer.hold_timestamp, 5678);
+        assert_eq!(timer.pane.timing, PaneTiming::Unknown);
+        assert!(timer.pane.is_first && timer.pane.is_last);
+        assert!(
+            buf.is_empty(),
+            "decoder must consume exactly the timer bytes"
+        );
+    }
+
+    #[test]
+    fn decodes_a_clear_timer() {
+        let bytes: Vec<u8> = vec![3, b'k', b'e', b'y', 3, b't', b'a', b'g', 0, 0, 0, 1, 1];
+        let mut buf: &[u8] = &bytes;
+        let timer = coder().decode(&mut buf).unwrap();
+
+        assert!(timer.clear);
+        assert_eq!(timer.tag, "tag");
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn encode_round_trips_the_wire_bytes() {
+        let bytes = set_timer_bytes();
+        let mut buf: &[u8] = &bytes;
+        let timer = coder().decode(&mut buf).unwrap();
+
+        let mut out = Vec::new();
+        coder().encode_into(&timer, &mut out);
+        assert_eq!(out, bytes);
     }
 }
