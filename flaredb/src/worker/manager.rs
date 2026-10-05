@@ -91,7 +91,9 @@ impl WorkerManager {
                     )));
                 }
 
-                let classpath = format!("{}:{}", worker_jar, staged_jar);
+                // Java uses ';' as the classpath separator on Windows and ':' elsewhere.
+                let classpath_sep = if cfg!(windows) { ";" } else { ":" };
+                let classpath = format!("{}{}{}", worker_jar, classpath_sep, staged_jar);
                 let mut cmd = Command::new("java");
 
                 cmd.arg("--add-opens=java.base/java.nio=org.apache.arrow.memory.core,ALL-UNNAMED") // arrow vector needs it
