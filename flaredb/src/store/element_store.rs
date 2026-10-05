@@ -11,8 +11,8 @@ use paimon::spec::{
     DataType as PaimonDataType, Datum, PredicateBuilder, Schema as PaimonSchema, VarBinaryType,
 };
 use paimon::{
-    Catalog, CatalogOptions, FileSystemCatalog, IncrementalScanMode, Options, Table,
-    catalog::Identifier,
+    Catalog, CatalogOptions, FileSystemCatalog, IncrementalScanMode, Options, Table, TableWrite,
+    catalog::Identifier, table::ArrowRecordBatchStream,
 };
 use tokio_stream::StreamExt;
 
@@ -158,6 +158,24 @@ impl FlareElementStore {
         if values.is_empty() {
             return Ok(());
         }
+        let (batch, schema) = self.build_windowed_batch(pcollection_id, &values)?;
+        let min_ts = values.iter().map(|value| value.timestamp_millis).min();
+        self.ingest_batch(pcollection_id, schema, batch).await?;
+        if let Some(min_ts) = min_ts {
+            self.record_commit_min_ts(pcollection_id, min_ts);
+        }
+        Ok(())
+    }
+
+    /// Build the Arrow batch (logical payload + window metadata) for a decoded
+    /// windowed-value batch, deriving and caching the PCollection schema on first
+    /// use. Shared by the one-shot [`Self::write_windowed_value_batch`] and the
+    /// per-bundle [`PCollectionWriter`].
+    fn build_windowed_batch(
+        &self,
+        pcollection_id: &str,
+        values: &[WindowedValue],
+    ) -> Result<(RecordBatch, Arc<RecordTableSchema>)> {
         let records: Vec<BeamRecord> = values.iter().map(|value| value.value.clone()).collect();
         let base_schema = match self.registry.get(pcollection_id) {
             Some(schema) if schema.has_windowed_metadata => RecordTableSchema {
@@ -186,12 +204,7 @@ impl FlareElementStore {
         });
         self.registry
             .register_if_absent(pcollection_id, schema.clone());
-        let min_ts = values.iter().map(|value| value.timestamp_millis).min();
-        self.ingest_batch(pcollection_id, schema, batch).await?;
-        if let Some(min_ts) = min_ts {
-            self.record_commit_min_ts(pcollection_id, min_ts);
-        }
-        Ok(())
+        Ok((batch, schema))
     }
 
     /// Persists a runner-built [`RecordBatch`] together with one [`WindowedValue`]
@@ -417,23 +430,50 @@ impl FlareElementStore {
         pcollection_id: &str,
         cursor: Option<i64>,
     ) -> Result<(Vec<RecordBatch>, Option<i64>)> {
+        let (mut stream, latest) = self.open_incremental_arrow(pcollection_id, cursor).await?;
+        let mut batches = Vec::new();
+        if let Some(stream) = stream.as_mut() {
+            while let Some(batch) = stream.next().await {
+                batches.push(batch?);
+            }
+        }
+        Ok((batches, latest))
+    }
+
+    /// Open a lazy incremental read of `pcollection_id` in the snapshot range
+    /// `(cursor, latest]`, returning the unconsumed Arrow batch stream and the
+    /// snapshot id to advance the reader's cursor to once the stream is drained.
+    ///
+    /// Returns `Ok((None, _))` when there is nothing to read (table absent, no
+    /// committed snapshot, or the cursor is already at/after `latest`): the
+    /// stream is `None` and the second element is the cursor value to record
+    /// (`None` when the table was never committed).
+    ///
+    /// Shared by [`Self::read_incremental_batches`] (which collects) and
+    /// [`Self::stream_windowed_values_since`] (which streams), so both follow
+    /// identical snapshot-range planning.
+    async fn open_incremental_arrow(
+        &self,
+        pcollection_id: &str,
+        cursor: Option<i64>,
+    ) -> Result<(Option<ArrowRecordBatchStream>, Option<i64>)> {
         let identifier = self.table_identifier(pcollection_id);
         let table = match self.catalog.get_table(&identifier).await {
             Ok(table) => table,
-            Err(paimon::Error::TableNotExist { .. }) => return Ok((Vec::new(), cursor)),
+            Err(paimon::Error::TableNotExist { .. }) => return Ok((None, cursor)),
             Err(err) => return Err(err.into()),
         };
 
         let manager = table.snapshot_manager();
         let Some(latest) = manager.get_latest_snapshot_id().await? else {
             // The table exists but nothing has been committed yet.
-            return Ok((Vec::new(), cursor));
+            return Ok((None, cursor));
         };
         let earliest = manager.earliest_snapshot_id().await?.unwrap_or(latest);
         let floor = earliest - 1;
         let start = cursor.map(|cursor| cursor.max(floor)).unwrap_or(floor);
         if start >= latest {
-            return Ok((Vec::new(), Some(latest)));
+            return Ok((None, Some(latest)));
         }
 
         let read_builder = table.new_read_builder();
@@ -442,12 +482,8 @@ impl FlareElementStore {
             .plan()
             .await?;
         let read = read_builder.new_read()?;
-        let mut stream = read.to_incremental_arrow(&plan)?;
-        let mut batches = Vec::new();
-        while let Some(batch) = stream.next().await {
-            batches.push(batch?);
-        }
-        Ok((batches, Some(latest)))
+        let stream = read.to_incremental_arrow(&plan)?;
+        Ok((Some(stream), Some(latest)))
     }
 
     /// Read the [`WindowedValue`]s appended to `pcollection_id` since `reader_id`
@@ -501,6 +537,45 @@ impl FlareElementStore {
             self.set_cursor(reader_id, pcollection_id, latest).await?;
         }
         Ok(records)
+    }
+
+    /// Stream the [`WindowedValue`]s appended to `pcollection_id` since
+    /// `reader_id` last read it, yielding values lazily (one Arrow batch at a
+    /// time) instead of materializing the whole PCollection into a single `Vec`.
+    ///
+    /// The reader's cursor advances to the latest snapshot once the stream is
+    /// exhausted (see [`WindowedValueStream::next_batch`]). Prefer this over
+    /// [`scan_windowed_values_since`](Self::scan_windowed_values_since) when the
+    /// caller processes values incrementally (e.g. encoding them out to a worker
+    /// harness), so a large PCollection never has to be fully decoded in memory.
+    pub async fn stream_windowed_values_since(
+        self: &Arc<Self>,
+        reader_id: String,
+        pcollection_id: String,
+    ) -> Result<WindowedValueStream> {
+        let table_schema = self.registry.get(&pcollection_id);
+        let Some(table_schema) = table_schema else {
+            return Ok(WindowedValueStream {
+                store: Arc::clone(self),
+                reader_id,
+                pcollection_id,
+                table_schema: None,
+                inner: None,
+                latest: None,
+                advanced: false,
+            });
+        };
+        let cursor = self.cursor(&reader_id, &pcollection_id).await?;
+        let (inner, latest) = self.open_incremental_arrow(&pcollection_id, cursor).await?;
+        Ok(WindowedValueStream {
+            store: Arc::clone(self),
+            reader_id,
+            pcollection_id,
+            table_schema: Some(table_schema),
+            inner,
+            latest,
+            advanced: false,
+        })
     }
 
     /// Ingest a pre-built [`RecordBatch`] with its known table schema.
@@ -718,6 +793,133 @@ impl FlareElementStore {
     }
 }
 
+/// A Paimon writer opened for a single bundle's output.
+///
+/// Many batches are appended to one table and committed once, instead of
+/// creating a writer + committing per batch. This keeps Paimon snapshots and
+/// data files proportional to *bundles* rather than *batches* (fewer commits =
+/// cheaper downstream incremental reads), and makes a bundle's output atomic:
+/// a failed bundle writes nothing.
+pub struct PCollectionWriter {
+    store: Arc<FlareElementStore>,
+    pcollection_id: String,
+    table: Option<Table>,
+    writer: Option<TableWrite>,
+    /// Running minimum event-time across all batches written so far.
+    min_ts: Option<i64>,
+}
+
+impl PCollectionWriter {
+    /// Begin writing `pcollection_id`'s output for one bundle.
+    pub fn new(store: Arc<FlareElementStore>, pcollection_id: String) -> Self {
+        Self {
+            store,
+            pcollection_id,
+            table: None,
+            writer: None,
+            min_ts: None,
+        }
+    }
+
+    /// Append one decoded windowed-value batch. The writer is opened lazily on
+    /// the first non-empty batch, once the PCollection schema is known.
+    pub async fn write(&mut self, values: Vec<WindowedValue>) -> Result<()> {
+        if values.is_empty() {
+            return Ok(());
+        }
+        let (batch, schema) = self
+            .store
+            .build_windowed_batch(&self.pcollection_id, &values)?;
+        if let Some(ts) = values.iter().map(|value| value.timestamp_millis).min() {
+            self.min_ts = Some(self.min_ts.map_or(ts, |current| current.min(ts)));
+        }
+
+        if self.writer.is_none() {
+            let table = self.store.get_table(&self.pcollection_id, &schema).await?;
+            let writer = table.new_write_builder().new_write()?;
+            self.table = Some(table);
+            self.writer = Some(writer);
+        }
+
+        let batch = materialize_void_columns(batch)?;
+        self.writer
+            .as_mut()
+            .expect("writer initialized above")
+            .write_arrow_batch(&batch)
+            .await?;
+        Ok(())
+    }
+
+    /// Commit all appended batches and fold the bundle's minimum event-time
+    /// into the store's running minimum.
+    pub async fn commit(mut self) -> Result<()> {
+        if let (Some(mut writer), Some(table)) = (self.writer.take(), self.table.take()) {
+            let messages = writer.prepare_commit().await?;
+            table
+                .new_write_builder()
+                .new_commit()
+                .commit(messages)
+                .await?;
+        }
+        if let Some(min_ts) = self.min_ts {
+            self.store
+                .record_commit_min_ts(&self.pcollection_id, min_ts);
+        }
+        Ok(())
+    }
+}
+
+/// A lazy, streaming read of a PCollection's appended windowed values.
+///
+/// Produced by [`FlareElementStore::stream_windowed_values_since`]. Values are
+/// yielded one Arrow batch at a time via [`Self::next_batch`] so the caller can
+/// process them incrementally (encode, send, drop) without materializing the
+/// whole PCollection in memory. The reader's cursor is advanced once, to the
+/// latest snapshot, when the stream is exhausted.
+pub struct WindowedValueStream {
+    store: Arc<FlareElementStore>,
+    reader_id: String,
+    pcollection_id: String,
+    table_schema: Option<Arc<RecordTableSchema>>,
+    inner: Option<ArrowRecordBatchStream>,
+    latest: Option<i64>,
+    advanced: bool,
+}
+
+impl WindowedValueStream {
+    /// The next batch of windowed values, or `None` when the stream is
+    /// exhausted. On exhaustion the reader's cursor is advanced once (to the
+    /// latest snapshot, when one is known); subsequent calls keep returning
+    /// `None` without re-advancing.
+    pub async fn next_batch(&mut self) -> Result<Option<Vec<WindowedValue>>> {
+        if let Some(inner) = self.inner.as_mut() {
+            match inner.next().await {
+                Some(Ok(batch)) => {
+                    let schema = self
+                        .table_schema
+                        .as_ref()
+                        .expect("schema is present whenever the stream has data");
+                    return Ok(Some(windowed_values_from_batch(&batch, schema)?));
+                }
+                Some(Err(err)) => return Err(err.into()),
+                None => self.inner = None,
+            }
+        }
+
+        // Either the stream never had data, or it just drained. Advance the
+        // cursor exactly once, then report exhaustion.
+        if !self.advanced {
+            if let Some(latest) = self.latest {
+                self.store
+                    .set_cursor(&self.reader_id, &self.pcollection_id, latest)
+                    .await?;
+            }
+            self.advanced = true;
+        }
+        Ok(None)
+    }
+}
+
 /// Reserved Paimon column holding a JSON-encoded [`WindowMetadata`] per row.
 ///
 /// The column is appended to every windowed PCollection's Arrow schema as a
@@ -832,6 +1034,17 @@ pub async fn create_catalog(warehouse: String, db_name: String) -> Result<FileSy
         .await?;
     Ok(catalog)
 }
+
+/// Local directory SlateDB uses for a job's user state.
+///
+/// Derived from the store's warehouse and database so each job gets an isolated
+/// embedded state database, alongside the Paimon tables.
+pub fn slate_state_dir(store: &FlareElementStore) -> std::path::PathBuf {
+    std::path::Path::new(store.catalog.warehouse())
+        .join(".slate_state")
+        .join(&store.db_name)
+}
+
 /// Convert an Arrow [`Schema`](ArrowSchema) into a Paimon [`Schema`](PaimonSchema).
 ///
 /// The resulting schema preserves Arrow field names and converted data types,
@@ -1173,6 +1386,104 @@ mod element_store_tests {
             windows: vec![crate::coders::primitives::BeamWindow::Global],
             pane: crate::coders::primitives::PaneInfo::no_firing(),
         }
+    }
+
+    #[tokio::test]
+    async fn pcollection_writer_commits_once_across_batches_and_folds_min_ts() {
+        let (_dir, store) = make_store().await;
+        let store = Arc::new(store);
+        let pc = "pc-bundled";
+
+        // One bundle writing three batches should append the same rows as three
+        // one-shot writes, but through a single Paimon commit.
+        let mut writer = PCollectionWriter::new(store.clone(), pc.to_string());
+        writer.write(vec![windowed_int(1, 30)]).await.unwrap();
+        writer.write(vec![windowed_int(2, 10)]).await.unwrap();
+        writer.write(vec![windowed_int(3, 20)]).await.unwrap();
+        writer.commit().await.unwrap();
+
+        let scanned = store
+            .scan_windowed_values(ScanCollectionRequest {
+                pcollection_id: pc.to_string(),
+            })
+            .await
+            .unwrap();
+        let mut ints: Vec<i64> = scanned
+            .iter()
+            .map(|v| match &v.value {
+                BeamRecord::PRIMITIVE(PrimitiveValue::Int64(n)) => *n,
+                other => panic!("expected int64 primitive, got {other:?}"),
+            })
+            .collect();
+        ints.sort_unstable();
+        assert_eq!(ints, vec![1, 2, 3]);
+
+        // The bundle's minimum event-time is folded across all its batches.
+        assert_eq!(store.take_commit_min_timestamp(pc), Some(10));
+
+        // An empty bundle is a no-op: no table created, no commit, no min-ts.
+        let mut empty = PCollectionWriter::new(store.clone(), "pc-never".to_string());
+        empty.write(Vec::new()).await.unwrap();
+        empty.commit().await.unwrap();
+        assert_eq!(store.take_commit_min_timestamp("pc-never"), None);
+        let never = store
+            .scan_windowed_values(ScanCollectionRequest {
+                pcollection_id: "pc-never".to_string(),
+            })
+            .await
+            .unwrap();
+        assert!(never.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stream_windowed_values_since_yields_all_rows_and_advances_cursor() {
+        let (_dir, store) = make_store().await;
+        let store = Arc::new(store);
+        let pc = "pc-stream";
+
+        store
+            .write_windowed_value_batch(
+                pc,
+                vec![
+                    windowed_int(1, 10),
+                    windowed_int(2, 20),
+                    windowed_int(3, 30),
+                ],
+            )
+            .await
+            .unwrap();
+
+        // The streaming read yields the same values as a full scan, and its
+        // cursor advances once the stream is exhausted.
+        let mut stream = store
+            .stream_windowed_values_since("reader-s".to_string(), pc.to_string())
+            .await
+            .unwrap();
+        let mut ints = Vec::new();
+        while let Some(values) = stream.next_batch().await.unwrap() {
+            for value in values {
+                match value.value {
+                    BeamRecord::PRIMITIVE(PrimitiveValue::Int64(n)) => ints.push(n),
+                    other => panic!("expected int64 primitive, got {other:?}"),
+                }
+            }
+        }
+        ints.sort_unstable();
+        assert_eq!(ints, vec![1, 2, 3]);
+
+        // Cursor advanced: a second stream over the same reader drains empty.
+        let mut second = store
+            .stream_windowed_values_since("reader-s".to_string(), pc.to_string())
+            .await
+            .unwrap();
+        assert!(second.next_batch().await.unwrap().is_none());
+
+        // A stream over a never-written PCollection drains empty without error.
+        let mut empty = store
+            .stream_windowed_values_since("reader-s".to_string(), "pc-never".to_string())
+            .await
+            .unwrap();
+        assert!(empty.next_batch().await.unwrap().is_none());
     }
 
     #[tokio::test]

@@ -265,8 +265,7 @@ impl StageExecutor {
                                 });
 
                                 let timeout_id = instruction_id.clone();
-                                let proces_bundle_response = tokio::time::timeout(
-                                    Duration::from_secs(60),
+                                let proces_bundle_response = crate::engine::liveness::idle_guard(
                                     async {
                                         tokio::pin!(bundle_response_future);
                                         tokio::select! {
@@ -292,14 +291,13 @@ impl StageExecutor {
                                             }
                                         }
                                     },
-                                )
-                                .await
-                                .map_err(|_| {
-                                    anyhow!(
-                                        "timed out waiting for SDK bundle {} output data and control response",
+                                    Duration::from_secs(60),
+                                    &format!(
+                                        "waiting for SDK bundle {} output data and control response",
                                         timeout_id
-                                    )
-                                })??;
+                                    ),
+                                )
+                                .await?;
 
                                 return Ok(self
                                     .finish_bundle(proces_bundle_response, timer_handles)
@@ -307,17 +305,12 @@ impl StageExecutor {
                             }
 
                             let timeout_id = instruction_id.clone();
-                            let proces_bundle_response = tokio::time::timeout(
-                                Duration::from_secs(60),
+                            let proces_bundle_response = crate::engine::liveness::idle_guard(
                                 bundle_response_future,
+                                Duration::from_secs(60),
+                                &format!("waiting for SDK bundle {} control response", timeout_id),
                             )
-                            .await
-                            .map_err(|_| {
-                                anyhow!(
-                                    "timed out waiting for SDK bundle {} control response",
-                                    timeout_id
-                                )
-                            })??;
+                            .await?;
                             return Ok(self
                                 .finish_bundle(proces_bundle_response, timer_handles)
                                 .await);

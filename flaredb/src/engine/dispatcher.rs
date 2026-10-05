@@ -1,7 +1,7 @@
 use crate::engine::sdf::{SdfBundleOutcome, SdfWorkItem, SplittableStageExecutor};
 use crate::transforms::SourceProgress;
 use crate::{
-    engine::timer::{TimerEntry, TimerStore},
+    engine::timer::{TimerEntry, build_timer_store},
     engine::{
         executor::StageExecutor,
         harness::{Channels, control::ControlResponse},
@@ -84,7 +84,7 @@ impl ExecutorDispatcher {
         let store_base = store_path.to_str().unwrap_or(".").to_string();
         let store =
             Arc::new(FlareElementStore::new(store_base, "pcollection".to_string(), None).await?);
-        let timer_service = Arc::new(TimerService::new(TimerStore::new(store.clone())));
+        let timer_service = Arc::new(TimerService::new(build_timer_store(store.clone()).await?));
         let (source_reports_tx, source_reports_rx) = mpsc::unbounded_channel();
         Ok(Self {
             channels,
@@ -113,7 +113,7 @@ impl ExecutorDispatcher {
         let store_path = crate::utils::path::warehouse_dir();
         let store_base = store_path.to_str().unwrap_or(".").to_string();
         let store = Arc::new(FlareElementStore::new(store_base, job_id.to_string(), None).await?);
-        self.timer_service = Arc::new(TimerService::new(TimerStore::new(store.clone())));
+        self.timer_service = Arc::new(TimerService::new(build_timer_store(store.clone()).await?));
         self.store = store;
         Ok(())
     }
