@@ -24,8 +24,8 @@ if ! command -v java >/dev/null 2>&1; then
     echo "java is required but was not found on PATH."
     exit 1
 fi
-if ! command -v wget >/dev/null 2>&1; then
-    echo "wget is required but was not found on PATH."
+if ! command -v curl >/dev/null 2>&1; then
+    echo "curl is required but was not found on PATH."
     exit 1
 fi
 
@@ -52,12 +52,12 @@ mkdir -p "${BIN_DIR}" "${INSTANCES_DIR}"
 
 WORKER_JAR_NAME="beam-sdks-java-harness-2.76.0-flare-bundled.jar"
 WORKER_JAR="${BIN_DIR}/${WORKER_JAR_NAME}"
-WORKER_JAR_URL="https://github.com/flare-db/flare-db/releases/download/beam-worker-java-2.72.0/${WORKER_JAR_NAME}"
+WORKER_JAR_URL="https://github.com/flare-db/flare-db/releases/download/beam-worker-2.76.0/${WORKER_JAR_NAME}"
 
 # Download worker jar if it doesn't exist (show progress bar)
 if [[ ! -f "${WORKER_JAR}" ]]; then
     echo "Downloading worker jar from ${WORKER_JAR_URL}..."
-    if ! wget --progress=bar:force -O "${WORKER_JAR}" "${WORKER_JAR_URL}"; then
+    if ! curl --fail --location --progress-bar --output "${WORKER_JAR}" "${WORKER_JAR_URL}"; then
         echo "Failed to download worker jar. Please check your internet connection and try again."
         exit 1
     fi

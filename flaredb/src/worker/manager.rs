@@ -92,8 +92,6 @@ impl WorkerManager {
                 }
 
                 // Java uses ';' as the classpath separator on Windows and ':' elsewhere.
-                // Hardcoding ':' breaks the harness launch on Windows: the JVM cannot
-                // resolve classes and exits before connecting back to FlareDB.
                 let classpath_sep = if cfg!(windows) { ";" } else { ":" };
                 let classpath = format!("{}{}{}", worker_jar, classpath_sep, staged_jar);
                 let mut cmd = Command::new("java");
