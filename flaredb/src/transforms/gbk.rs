@@ -10,9 +10,11 @@ use beam_model_rs::v1::{
 };
 use datafusion::{
     functions_aggregate::expr_fn::array_agg,
+    physical_plan::SendableRecordBatchStream,
     prelude::{SessionContext, col},
 };
 use log::info;
+use tokio_stream::StreamExt;
 
 use crate::{
     coders::primitives::{BeamWindow, WindowedValue},
@@ -134,27 +136,31 @@ impl FlareTransform for GroupByKey {
             .read_incremental_batches(&input_pcollection_id, cursor)
             .await?;
 
-        // Group the new rows by `(key, window)` with DataFusion, then fold them
-        // into per-group state and evaluate the trigger. Everything touching the
-        // state map holds one lock, so a re-run stays consistent.
-        let grouped = if batches.is_empty() {
-            Vec::new()
-        } else {
-            group_batches(batches).await?
-        };
+        // Group the new rows by `(key, window)` with DataFusion and stream the
+        // result, folding each batch's groups into per-group state as it arrives
+        // (bounded to one batch) instead of materializing the full aggregated
+        // result with `collect()`. The state-map lock is acquired per batch, never
+        // held across a stream await point.
+        if !batches.is_empty() {
+            let mut stream = group_batches_stream(batches).await?;
+            while let Some(batch) = stream.next().await {
+                let groups = decode_group_batch(&batch?)?;
+                let mut states = self.states.lock().expect("gbk state lock not poisoned");
+                for (key, window, values) in groups {
+                    let identity = group_identity(&key, &window);
+                    let state = states.entry(identity).or_insert_with(|| {
+                        WindowState::new(key, window, TriggerRunner::new(spec.trigger.clone()))
+                    });
+                    for _ in 0..values.len() {
+                        state.trigger.on_element(ctx.processing_time);
+                    }
+                    state.values.extend(values);
+                }
+            }
+        }
 
         let output = {
             let mut states = self.states.lock().expect("gbk state lock not poisoned");
-            for (key, window, values) in grouped {
-                let identity = group_identity(&key, &window);
-                let state = states.entry(identity).or_insert_with(|| {
-                    WindowState::new(key, window, TriggerRunner::new(spec.trigger.clone()))
-                });
-                for _ in 0..values.len() {
-                    state.trigger.on_element(ctx.processing_time);
-                }
-                state.values.extend(values);
-            }
             fire_windows(&mut states, &spec, ctx.input_watermark, ctx.processing_time)?
         };
 
@@ -245,14 +251,13 @@ impl FlareTransform for GroupByKey {
     }
 }
 
-/// Group incremental input batches by `(key, window)` with DataFusion.
-///
-/// Returns one `(key, window, values)` per group, where `values` are the `V`s
-/// appended for that group since the last run. This is the per-batch half of the
-/// aggregation; the accumulated state across batches lives in [`GroupByKey`].
-async fn group_batches(
+/// Build the DataFusion `(key, window) -> array_agg(value)` plan over the
+/// incremental input batches and return its lazy record stream, so the caller
+/// can fold groups into state one batch at a time instead of materializing the
+/// full aggregated result with `collect()`.
+async fn group_batches_stream(
     batches: Vec<arrow_array::RecordBatch>,
-) -> Result<Vec<(PrimitiveValue, BeamWindow, Vec<BeamRecord>)>, Error> {
+) -> Result<SendableRecordBatchStream, Error> {
     let session = SessionContext::new();
     let df = session.read_batches(batches)?;
     let df = df.unnest_columns(&[WINDOW_KEY_COLUMN])?;
@@ -260,45 +265,48 @@ async fn group_batches(
         vec![col(KEY_COLUMN), col(WINDOW_KEY_COLUMN)],
         vec![array_agg(col(VALUE_COLUMN)).alias(VALUE_COLUMN)],
     )?;
-    let batches = df.collect().await?;
+    Ok(df.execute_stream().await?)
+}
 
-    let mut groups = Vec::new();
-    for batch in batches {
-        let key_column = batch
-            .column_by_name(KEY_COLUMN)
-            .ok_or_else(|| anyhow!("GroupByKey result is missing the '{KEY_COLUMN}' column"))?;
-        let window_column = batch.column_by_name(WINDOW_KEY_COLUMN).ok_or_else(|| {
-            anyhow!("GroupByKey result is missing the '{WINDOW_KEY_COLUMN}' column")
+/// Decode one aggregated DataFusion batch into `(key, window, values)` groups.
+///
+/// Each output row is a complete `(key, window)` group (`array_agg` places every
+/// value for a group in a single row's list), so a group is never split across
+/// batches and can be folded into state as soon as its batch arrives.
+fn decode_group_batch(
+    batch: &arrow_array::RecordBatch,
+) -> Result<Vec<(PrimitiveValue, BeamWindow, Vec<BeamRecord>)>, Error> {
+    let key_column = batch
+        .column_by_name(KEY_COLUMN)
+        .ok_or_else(|| anyhow!("GroupByKey result is missing the '{KEY_COLUMN}' column"))?;
+    let window_column = batch
+        .column_by_name(WINDOW_KEY_COLUMN)
+        .ok_or_else(|| anyhow!("GroupByKey result is missing the '{WINDOW_KEY_COLUMN}' column"))?;
+    let value_column = batch
+        .column_by_name(VALUE_COLUMN)
+        .ok_or_else(|| anyhow!("GroupByKey result is missing the '{VALUE_COLUMN}' column"))?;
+
+    let mut groups = Vec::with_capacity(batch.num_rows());
+    for row in 0..batch.num_rows() {
+        let key = primitive_value_from_array_row(key_column.as_ref(), key_column.data_type(), row)?;
+        let window_key = match primitive_value_from_array_row(
+            window_column.as_ref(),
+            window_column.data_type(),
+            row,
+        )? {
+            PrimitiveValue::String(s) => s,
+            other => {
+                return Err(anyhow!(
+                    "GroupByKey window key must be a string, got {other:?}"
+                ));
+            }
+        };
+        let window = BeamWindow::from_canonical_key(&window_key).ok_or_else(|| {
+            anyhow!("GroupByKey encountered a malformed window key '{window_key}'")
         })?;
-        let value_column = batch
-            .column_by_name(VALUE_COLUMN)
-            .ok_or_else(|| anyhow!("GroupByKey result is missing the '{VALUE_COLUMN}' column"))?;
-
-        for row in 0..batch.num_rows() {
-            let key =
-                primitive_value_from_array_row(key_column.as_ref(), key_column.data_type(), row)?;
-            let window_key = match primitive_value_from_array_row(
-                window_column.as_ref(),
-                window_column.data_type(),
-                row,
-            )? {
-                PrimitiveValue::String(s) => s,
-                other => {
-                    return Err(anyhow!(
-                        "GroupByKey window key must be a string, got {other:?}"
-                    ));
-                }
-            };
-            let window = BeamWindow::from_canonical_key(&window_key).ok_or_else(|| {
-                anyhow!("GroupByKey encountered a malformed window key '{window_key}'")
-            })?;
-            let iterable = iterable_value_from_array_row(
-                value_column.as_ref(),
-                value_column.data_type(),
-                row,
-            )?;
-            groups.push((key, window, iterable.list));
-        }
+        let iterable =
+            iterable_value_from_array_row(value_column.as_ref(), value_column.data_type(), row)?;
+        groups.push((key, window, iterable.list));
     }
     Ok(groups)
 }
