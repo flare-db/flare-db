@@ -392,10 +392,6 @@ impl BundleRuntime {
             input_instruction_id, consumer_transform_id,
         );
 
-        let elements = self
-            .store
-            .scan_windowed_values_since(&consumer_transform_id, &input_pcollection_id)
-            .await?;
         debug!("Input element coder: {}", input_coder_id);
 
         let element_coder = StandardBeamCoders::from_urn(
@@ -408,37 +404,95 @@ impl BundleRuntime {
         let window_coder = self.window_coder_for_pcollection(&input_pcollection_id);
         let windowed_value_coder =
             WindowedValueCoder::with_window_coder(element_coder, window_coder);
-        let mut encoded = BytesMut::new();
 
         if opaque_void {
             debug!(
-                "VoidCoder pcollection {}: forwarding {} opaque element(s) unchanged",
-                input_pcollection_id,
-                elements.len()
+                "VoidCoder pcollection {}: forwarding opaque element(s) unchanged",
+                input_pcollection_id
             );
-            for element in elements {
-                match element.value {
-                    BeamRecord::PRIMITIVE(PrimitiveValue::Bytes(raw)) => {
-                        encoded.extend_from_slice(&raw);
+        }
+
+        // Stream the PCollection's windowed values batch-by-batch (one Arrow batch
+        // at a time) so a large input is never fully decoded into memory before
+        // encoding begins. Each decoded batch is then encoded and sent out in
+        // dynamically-sized chunks via the batch-size estimator — mirroring
+        // `process_output_elements` — rather than as one giant `Elements` message.
+        let mut input = self
+            .store
+            .stream_windowed_values_since(
+                consumer_transform_id.clone(),
+                input_pcollection_id.clone(),
+            )
+            .await?;
+
+        let mut batch_size_estimator = BatchSizeEstimator::new(BatchConfig {
+            min_batch_size: 2,
+            ..BatchConfig::default()
+        });
+        let mut target_batch_size = batch_size_estimator.next_batch_size();
+        let mut encoded = BytesMut::new();
+        let mut batch_len = 0usize;
+
+        while let Some(values) = input.next_batch().await? {
+            for element in values {
+                if opaque_void {
+                    match element.value {
+                        BeamRecord::PRIMITIVE(PrimitiveValue::Bytes(raw)) => {
+                            encoded.extend_from_slice(&raw);
+                        }
+                        other => {
+                            return Err(anyhow!(
+                                "expected opaque bytes for VoidCoder pcollection {}, found {:?}",
+                                input_pcollection_id,
+                                other
+                            ));
+                        }
                     }
-                    other => {
-                        return Err(anyhow!(
-                            "expected opaque bytes for VoidCoder pcollection {}, found {:?}",
-                            input_pcollection_id,
-                            other
-                        ));
-                    }
+                } else {
+                    windowed_value_coder.encode(element, &mut encoded);
                 }
-            }
-        } else {
-            for element in elements {
-                windowed_value_coder.encode(element, &mut encoded);
+                batch_len += 1;
+
+                if batch_len >= target_batch_size {
+                    let data = std::mem::take(&mut encoded).freeze().to_vec();
+                    let start = Instant::now();
+                    self.data
+                        .send_elements(Elements {
+                            data: vec![elements::Data {
+                                instruction_id: input_instruction_id.clone(),
+                                transform_id: consumer_transform_id.clone(),
+                                data,
+                                is_last: false,
+                            }],
+                            timers: Vec::new(),
+                        })
+                        .await?;
+                    batch_size_estimator.record(batch_len, start.elapsed());
+                    target_batch_size = batch_size_estimator.next_batch_size();
+                    batch_len = 0;
+                }
             }
         }
 
-        let payload = encoded.freeze();
+        // Flush any trailing elements, then terminate the stream.
+        if batch_len > 0 {
+            let data = std::mem::take(&mut encoded).freeze().to_vec();
+            let start = Instant::now();
+            self.data
+                .send_elements(Elements {
+                    data: vec![elements::Data {
+                        instruction_id: input_instruction_id.clone(),
+                        transform_id: consumer_transform_id.clone(),
+                        data,
+                        is_last: false,
+                    }],
+                    timers: Vec::new(),
+                })
+                .await?;
+            batch_size_estimator.record(batch_len, start.elapsed());
+        }
 
-        // Terminate the stage's inbound timer endpoints before sending the data
+        // Terminate the stage's inbound timer endpoints before the data
         // terminator, so the harness's awaited completion covers both.
         let timers: Vec<elements::Timers> = timer_endpoints
             .into_iter()
@@ -465,25 +519,14 @@ impl BundleRuntime {
         // Sending the elements separately with `is_last = false` followed by an empty
         // `is_last = true` terminator is the portable-safe framing, and the only one
         // the Python harness accepts.
-        let mut data: Vec<elements::Data> = Vec::new();
-        if !payload.is_empty() {
-            data.push(elements::Data {
-                instruction_id: input_instruction_id.clone(),
-                transform_id: consumer_transform_id.clone(),
-                data: payload.to_vec(),
-                is_last: false,
-            });
-        }
-        data.push(elements::Data {
+        let data = vec![elements::Data {
             instruction_id: input_instruction_id,
             transform_id: consumer_transform_id,
             data: Vec::new(),
             is_last: true,
-        });
+        }];
 
-        let elements = Elements { data, timers };
-
-        self.data.send_elements(elements).await?;
+        self.data.send_elements(Elements { data, timers }).await?;
         debug!("Finished sending input elements to worker");
         Ok(())
     }
