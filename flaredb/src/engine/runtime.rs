@@ -36,7 +36,7 @@ use crate::{
     fusion::{pipeline::ConsumerMetaData, stage::ExecutableStage},
     jobservice::urns::beam_urns,
     store::{
-        element_store::FlareElementStore,
+        element_store::{FlareElementStore, PCollectionWriter},
         record::{BeamRecord, PrimitiveValue},
     },
     transforms::{FlareRunnerTransform, SourceProgress},
@@ -226,13 +226,18 @@ impl BundleRuntime {
         let mut stream_ended = false;
         let mut total_decoded: usize = 0;
 
+        // One Paimon writer/committer per bundle: every decoded batch is
+        // appended to a single table writer and committed exactly once, instead
+        // of opening a writer and committing per batch. This keeps Paimon
+        // snapshots/data files proportional to *bundles* rather than *batches*
+        // and makes the bundle's output atomic (a failed bundle writes nothing).
+        let mut writer = PCollectionWriter::new(store.clone(), pcollection_id.clone());
+
         while !stream_ended {
             let payload = {
                 let mut receiver_lock = receiver.lock().await;
                 receiver_lock.recv().await
             };
-            // ToDo: create per bundle schema instred of deriving schema for eveyry record batch.
-            // create paimon writer and commitor per bundle
             match payload {
                 Some(ElementStreamPayload::Data(data_chunk)) => {
                     stream_buffer.extend_from_slice(&data_chunk.data.data);
@@ -293,12 +298,7 @@ impl BundleRuntime {
                                 if batch.len() >= target_batch_size {
                                     let batch_size = batch.len();
                                     let start = Instant::now();
-                                    store
-                                        .write_windowed_value_batch(
-                                            &pcollection_id,
-                                            std::mem::take(&mut batch),
-                                        )
-                                        .await?;
+                                    writer.write(std::mem::take(&mut batch)).await?;
                                     batch_size_estimator.record(batch_size, start.elapsed());
                                     target_batch_size = batch_size_estimator.next_batch_size();
                                 }
@@ -341,15 +341,14 @@ impl BundleRuntime {
             ));
         }
 
-        // Flush any remaining elements in the batch.
+        // Flush any remaining elements in the batch, then commit the bundle.
         if !batch.is_empty() {
             let batch_size = batch.len();
             let start = Instant::now();
-            store
-                .write_windowed_value_batch(&pcollection_id, batch)
-                .await?;
+            writer.write(batch).await?;
             batch_size_estimator.record(batch_size, start.elapsed());
         }
+        writer.commit().await?;
 
         info!(
             "Finished decoding output elements: {} total elements",

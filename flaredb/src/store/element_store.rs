@@ -11,7 +11,7 @@ use paimon::spec::{
     DataType as PaimonDataType, Datum, PredicateBuilder, Schema as PaimonSchema, VarBinaryType,
 };
 use paimon::{
-    Catalog, CatalogOptions, FileSystemCatalog, IncrementalScanMode, Options, Table,
+    Catalog, CatalogOptions, FileSystemCatalog, IncrementalScanMode, Options, Table, TableWrite,
     catalog::Identifier,
 };
 use tokio_stream::StreamExt;
@@ -158,6 +158,24 @@ impl FlareElementStore {
         if values.is_empty() {
             return Ok(());
         }
+        let (batch, schema) = self.build_windowed_batch(pcollection_id, &values)?;
+        let min_ts = values.iter().map(|value| value.timestamp_millis).min();
+        self.ingest_batch(pcollection_id, schema, batch).await?;
+        if let Some(min_ts) = min_ts {
+            self.record_commit_min_ts(pcollection_id, min_ts);
+        }
+        Ok(())
+    }
+
+    /// Build the Arrow batch (logical payload + window metadata) for a decoded
+    /// windowed-value batch, deriving and caching the PCollection schema on first
+    /// use. Shared by the one-shot [`Self::write_windowed_value_batch`] and the
+    /// per-bundle [`PCollectionWriter`].
+    fn build_windowed_batch(
+        &self,
+        pcollection_id: &str,
+        values: &[WindowedValue],
+    ) -> Result<(RecordBatch, Arc<RecordTableSchema>)> {
         let records: Vec<BeamRecord> = values.iter().map(|value| value.value.clone()).collect();
         let base_schema = match self.registry.get(pcollection_id) {
             Some(schema) if schema.has_windowed_metadata => RecordTableSchema {
@@ -186,12 +204,7 @@ impl FlareElementStore {
         });
         self.registry
             .register_if_absent(pcollection_id, schema.clone());
-        let min_ts = values.iter().map(|value| value.timestamp_millis).min();
-        self.ingest_batch(pcollection_id, schema, batch).await?;
-        if let Some(min_ts) = min_ts {
-            self.record_commit_min_ts(pcollection_id, min_ts);
-        }
-        Ok(())
+        Ok((batch, schema))
     }
 
     /// Persists a runner-built [`RecordBatch`] together with one [`WindowedValue`]
@@ -718,6 +731,82 @@ impl FlareElementStore {
     }
 }
 
+/// A Paimon writer opened for a single bundle's output.
+///
+/// Many batches are appended to one table and committed once, instead of
+/// creating a writer + committing per batch. This keeps Paimon snapshots and
+/// data files proportional to *bundles* rather than *batches* (fewer commits =
+/// cheaper downstream incremental reads), and makes a bundle's output atomic:
+/// a failed bundle writes nothing.
+pub struct PCollectionWriter {
+    store: Arc<FlareElementStore>,
+    pcollection_id: String,
+    table: Option<Table>,
+    writer: Option<TableWrite>,
+    /// Running minimum event-time across all batches written so far.
+    min_ts: Option<i64>,
+}
+
+impl PCollectionWriter {
+    /// Begin writing `pcollection_id`'s output for one bundle.
+    pub fn new(store: Arc<FlareElementStore>, pcollection_id: String) -> Self {
+        Self {
+            store,
+            pcollection_id,
+            table: None,
+            writer: None,
+            min_ts: None,
+        }
+    }
+
+    /// Append one decoded windowed-value batch. The writer is opened lazily on
+    /// the first non-empty batch, once the PCollection schema is known.
+    pub async fn write(&mut self, values: Vec<WindowedValue>) -> Result<()> {
+        if values.is_empty() {
+            return Ok(());
+        }
+        let (batch, schema) = self
+            .store
+            .build_windowed_batch(&self.pcollection_id, &values)?;
+        if let Some(ts) = values.iter().map(|value| value.timestamp_millis).min() {
+            self.min_ts = Some(self.min_ts.map_or(ts, |current| current.min(ts)));
+        }
+
+        if self.writer.is_none() {
+            let table = self.store.get_table(&self.pcollection_id, &schema).await?;
+            let writer = table.new_write_builder().new_write()?;
+            self.table = Some(table);
+            self.writer = Some(writer);
+        }
+
+        let batch = materialize_void_columns(batch)?;
+        self.writer
+            .as_mut()
+            .expect("writer initialized above")
+            .write_arrow_batch(&batch)
+            .await?;
+        Ok(())
+    }
+
+    /// Commit all appended batches and fold the bundle's minimum event-time
+    /// into the store's running minimum.
+    pub async fn commit(mut self) -> Result<()> {
+        if let (Some(mut writer), Some(table)) = (self.writer.take(), self.table.take()) {
+            let messages = writer.prepare_commit().await?;
+            table
+                .new_write_builder()
+                .new_commit()
+                .commit(messages)
+                .await?;
+        }
+        if let Some(min_ts) = self.min_ts {
+            self.store
+                .record_commit_min_ts(&self.pcollection_id, min_ts);
+        }
+        Ok(())
+    }
+}
+
 /// Reserved Paimon column holding a JSON-encoded [`WindowMetadata`] per row.
 ///
 /// The column is appended to every windowed PCollection's Arrow schema as a
@@ -1184,6 +1273,53 @@ mod element_store_tests {
             windows: vec![crate::coders::primitives::BeamWindow::Global],
             pane: crate::coders::primitives::PaneInfo::no_firing(),
         }
+    }
+
+    #[tokio::test]
+    async fn pcollection_writer_commits_once_across_batches_and_folds_min_ts() {
+        let (_dir, store) = make_store().await;
+        let store = Arc::new(store);
+        let pc = "pc-bundled";
+
+        // One bundle writing three batches should append the same rows as three
+        // one-shot writes, but through a single Paimon commit.
+        let mut writer = PCollectionWriter::new(store.clone(), pc.to_string());
+        writer.write(vec![windowed_int(1, 30)]).await.unwrap();
+        writer.write(vec![windowed_int(2, 10)]).await.unwrap();
+        writer.write(vec![windowed_int(3, 20)]).await.unwrap();
+        writer.commit().await.unwrap();
+
+        let scanned = store
+            .scan_windowed_values(ScanCollectionRequest {
+                pcollection_id: pc.to_string(),
+            })
+            .await
+            .unwrap();
+        let mut ints: Vec<i64> = scanned
+            .iter()
+            .map(|v| match &v.value {
+                BeamRecord::PRIMITIVE(PrimitiveValue::Int64(n)) => *n,
+                other => panic!("expected int64 primitive, got {other:?}"),
+            })
+            .collect();
+        ints.sort_unstable();
+        assert_eq!(ints, vec![1, 2, 3]);
+
+        // The bundle's minimum event-time is folded across all its batches.
+        assert_eq!(store.take_commit_min_timestamp(pc), Some(10));
+
+        // An empty bundle is a no-op: no table created, no commit, no min-ts.
+        let mut empty = PCollectionWriter::new(store.clone(), "pc-never".to_string());
+        empty.write(Vec::new()).await.unwrap();
+        empty.commit().await.unwrap();
+        assert_eq!(store.take_commit_min_timestamp("pc-never"), None);
+        let never = store
+            .scan_windowed_values(ScanCollectionRequest {
+                pcollection_id: "pc-never".to_string(),
+            })
+            .await
+            .unwrap();
+        assert!(never.is_empty());
     }
 
     #[tokio::test]
