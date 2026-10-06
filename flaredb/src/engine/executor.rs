@@ -209,6 +209,11 @@ impl StageExecutor {
                                 }));
                             }
 
+                            // The input pump reports failures on this channel so the
+                            // bundle fails immediately with the real error instead of
+                            // waiting out the idle timeout.
+                            let (input_error_tx, mut input_error_rx) =
+                                tokio::sync::mpsc::channel::<anyhow::Error>(1);
                             tokio::spawn(async move {
                                 let result = if timer_only {
                                     // A timer-only bundle must not re-deliver the
@@ -237,6 +242,7 @@ impl StageExecutor {
                                         "Failed to send input for instruction {}: {}",
                                         instruction_id_log, err
                                     );
+                                    let _ = input_error_tx.send(err).await;
                                 }
                             });
 
@@ -265,29 +271,46 @@ impl StageExecutor {
                                 });
 
                                 let timeout_id = instruction_id.clone();
+                                let input_error_id = instruction_id.clone();
                                 let proces_bundle_response = crate::engine::liveness::idle_guard(
                                     async {
                                         tokio::pin!(bundle_response_future);
-                                        tokio::select! {
-                                            bundle_response = &mut bundle_response_future => {
-                                                match bundle_response {
-                                                    Ok(response) => {
-                                                        decode_task.await.map_err(|err| {
-                                                            anyhow!("output decode task failed: {}", err)
-                                                        })??;
-                                                        Ok(response)
-                                                    }
-                                                    Err(err) => {
-                                                        decode_task.abort();
-                                                        Err(err)
+                                        let mut watch_input = true;
+                                        loop {
+                                            tokio::select! {
+                                                bundle_response = &mut bundle_response_future => {
+                                                    return match bundle_response {
+                                                        Ok(response) => {
+                                                            decode_task.await.map_err(|err| {
+                                                                anyhow!("output decode task failed: {}", err)
+                                                            })??;
+                                                            Ok(response)
+                                                        }
+                                                        Err(err) => {
+                                                            decode_task.abort();
+                                                            Err(err)
+                                                        }
+                                                    };
+                                                }
+                                                decode_result = &mut decode_task => {
+                                                    decode_result.map_err(|err| {
+                                                        anyhow!("output decode task failed: {}", err)
+                                                    })??;
+                                                    return bundle_response_future.await;
+                                                }
+                                                errored = input_error_rx.recv(), if watch_input => {
+                                                    match errored {
+                                                        Some(err) => {
+                                                            return Err(anyhow!(
+                                                                "failed to send input for instruction {}: {}",
+                                                                input_error_id, err
+                                                            ));
+                                                        }
+                                                        // Input finished cleanly; stop watching
+                                                        // it and keep awaiting the bundle.
+                                                        None => watch_input = false,
                                                     }
                                                 }
-                                            }
-                                            decode_result = &mut decode_task => {
-                                                decode_result.map_err(|err| {
-                                                    anyhow!("output decode task failed: {}", err)
-                                                })??;
-                                                bundle_response_future.await
                                             }
                                         }
                                     },
@@ -305,8 +328,30 @@ impl StageExecutor {
                             }
 
                             let timeout_id = instruction_id.clone();
+                            let input_error_id = instruction_id.clone();
                             let proces_bundle_response = crate::engine::liveness::idle_guard(
-                                bundle_response_future,
+                                async {
+                                    tokio::pin!(bundle_response_future);
+                                    let mut watch_input = true;
+                                    loop {
+                                        tokio::select! {
+                                            response = &mut bundle_response_future => {
+                                                return response;
+                                            }
+                                            errored = input_error_rx.recv(), if watch_input => {
+                                                match errored {
+                                                    Some(err) => {
+                                                        return Err(anyhow!(
+                                                            "failed to send input for instruction {}: {}",
+                                                            input_error_id, err
+                                                        ));
+                                                    }
+                                                    None => watch_input = false,
+                                                }
+                                            }
+                                        }
+                                    }
+                                },
                                 Duration::from_secs(60),
                                 &format!("waiting for SDK bundle {} control response", timeout_id),
                             )
