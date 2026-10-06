@@ -77,6 +77,9 @@ pub struct FlareElementStore {
     /// bundle via [`FlareElementStore::take_commit_min_timestamp`], so a consumer
     /// can clamp its input watermark by the oldest unconsumed input.
     commit_min_ts: Arc<DashMap<String, i64>>,
+    /// Per-table-name locks that serialize table resolution and creation, so
+    /// `get_table`/`get_or_create_table` are safe to call concurrently.
+    table_create_locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl FlareElementStore {
@@ -95,6 +98,7 @@ impl FlareElementStore {
             db_name,
             cursors: Arc::new(DashMap::new()),
             commit_min_ts: Arc::new(DashMap::new()),
+            table_create_locks: Arc::new(DashMap::new()),
         })
     }
 
@@ -651,26 +655,46 @@ impl FlareElementStore {
         Ok(records)
     }
 
+    /// Resolve a table by identifier, distinguishing "absent" from a real error.
+    async fn resolve_existing_table(&self, identifier: &Identifier) -> Result<Option<Table>> {
+        match self.catalog.get_table(identifier).await {
+            Ok(table) => Ok(Some(table)),
+            Err(paimon::Error::TableNotExist { .. }) => Ok(None),
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    /// The per-table-name lock for table resolution and creation.
+    fn creation_lock(&self, table_name: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.table_create_locks
+            .entry(table_name.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .value()
+            .clone()
+    }
+
     /// Resolve (or create) the Paimon table backing a PCollection.
     pub async fn get_table(
         &self,
         pcollection_id: &str,
         table_schema: &RecordTableSchema,
     ) -> Result<Table> {
-        let identifier = self.table_identifier(pcollection_id);
+        let table_name = Self::sanitize_pcollection_id(pcollection_id);
+        let identifier = Identifier::new(self.db_name.as_str(), &table_name);
 
-        match self.catalog.get_table(&identifier).await {
-            Ok(table) => Ok(table),
-            Err(paimon::Error::TableNotExist { .. }) => {
-                let paimon_schema = arrow_schema_to_paimon(&table_schema.arrow_schema)?;
-                self.catalog
-                    .create_table(&identifier, paimon_schema, false)
-                    .await?;
-                let table = self.catalog.get_table(&identifier).await?;
-                Ok(table)
-            }
-            Err(err) => Err(err.into()),
+        // Serialize per table name so concurrent callers do not race creation.
+        let lock = self.creation_lock(&table_name);
+        let _guard = lock.lock().await;
+
+        if let Some(table) = self.resolve_existing_table(&identifier).await? {
+            return Ok(table);
         }
+
+        let paimon_schema = arrow_schema_to_paimon(&table_schema.arrow_schema)?;
+        self.catalog
+            .create_table(&identifier, paimon_schema, true)
+            .await?;
+        Ok(self.catalog.get_table(&identifier).await?)
     }
 
     /// Resolve an already-created Paimon table for a PCollection without
@@ -681,11 +705,7 @@ impl FlareElementStore {
     /// side effect of materializing an empty table.
     pub async fn get_existing_table(&self, pcollection_id: &str) -> Result<Option<Table>> {
         let identifier = self.table_identifier(pcollection_id);
-        match self.catalog.get_table(&identifier).await {
-            Ok(table) => Ok(Some(table)),
-            Err(paimon::Error::TableNotExist { .. }) => Ok(None),
-            Err(err) => Err(err.into()),
-        }
+        self.resolve_existing_table(&identifier).await
     }
 
     pub(crate) fn table_identifier(&self, pcollection_id: &str) -> Identifier {
@@ -713,16 +733,17 @@ impl FlareElementStore {
         schema: PaimonSchema,
     ) -> Result<Table> {
         let identifier = Identifier::new(self.db_name.as_str(), table_name);
-        match self.catalog.get_table(&identifier).await {
-            Ok(table) => Ok(table),
-            Err(paimon::Error::TableNotExist { .. }) => {
-                self.catalog
-                    .create_table(&identifier, schema, false)
-                    .await?;
-                Ok(self.catalog.get_table(&identifier).await?)
-            }
-            Err(err) => Err(err.into()),
+
+        // Serialize per table name so concurrent callers do not race creation.
+        let lock = self.creation_lock(table_name);
+        let _guard = lock.lock().await;
+
+        if let Some(table) = self.resolve_existing_table(&identifier).await? {
+            return Ok(table);
         }
+
+        self.catalog.create_table(&identifier, schema, true).await?;
+        Ok(self.catalog.get_table(&identifier).await?)
     }
 
     /// Commit a single Arrow [`RecordBatch`] to `table`.
@@ -1903,6 +1924,34 @@ mod element_store_tests {
         // Second call: table now exists -> must resolve without erroring
         // (exercises the `Ok(table)` branch instead of `TableNotExist`).
         store.get_table("pc-get-table", &schema).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_get_or_create_table_is_idempotent() {
+        let (_dir, store) = make_store().await;
+        let store = Arc::new(store);
+
+        // Many callers racing to resolve and create the same table must all succeed.
+        for round in 0..50 {
+            let name = format!("stress_table_{round}");
+            let mut handles = Vec::new();
+            for _ in 0..8 {
+                let store = Arc::clone(&store);
+                let name = name.clone();
+                handles.push(tokio::spawn(async move {
+                    store
+                        .get_or_create_table(&name, cursor_paimon_schema().unwrap())
+                        .await
+                        .map(|_| ())
+                }));
+            }
+            for handle in handles {
+                handle
+                    .await
+                    .expect("task panicked")
+                    .expect("concurrent table creation must not fail");
+            }
+        }
     }
 
     //  arrow_schema_to_paimon
