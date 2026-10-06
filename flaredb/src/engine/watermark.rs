@@ -49,7 +49,7 @@
 //! and must be released as many times — and `compute_output` takes the earliest
 //! one: `output = MIN(MAIN upstream outputs, earliest hold)`. They clamp output
 //! only; readiness uses the unclamped input, so a hold never blocks the holding
-//! stage itself. This is the same notion as Dataflow's `WatermarkHold`.
+//! stage itself.
 //!
 //! A stage can also hold its output watermark for **deferred work** — work the
 //! SDK has split off and will run later, such as an SDF residual. Those holds live

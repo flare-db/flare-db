@@ -411,7 +411,7 @@ class FlareRunner(runner.PipelineRunner):
         phases.append(translations.sort_stages)
         partial = True
 
-      # All (known) portable runners (ie Flink and Spark) support these URNs.
+      # Portable runners support these URNs.
       known_urns = frozenset([
           common_urns.composites.RESHUFFLE.urn,
           common_urns.primitives.IMPULSE.urn,
