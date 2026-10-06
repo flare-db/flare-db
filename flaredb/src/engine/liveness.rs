@@ -1,16 +1,14 @@
 //! Harness-liveness supervision.
 //!
-//! A runner must fail fast on a *hung* harness without killing a bundle that is
-//! merely large and slow. A fixed wall-clock deadline conflates the two — a
-//! 100M-event Nexmark source streams data for minutes yet was killed at 60s
-//! because the deadline measured elapsed time, not progress. This module
-//! replaces that deadline with an **inactivity** clock: the transport receive
-//! loops call [`touch`] whenever the worker produces anything (data, a control
-//! response, or a state request), and a bundle is considered hung only after
-//! [`idle_guard`] observes a period of *no* activity.
+//! [`idle_guard`] waits for a bundle to finish, but fails if the SDK worker
+//! stops sending traffic. The Fn transport receive loops, the data, control,
+//! and state channels call [`touch`] on every message the worker sends, which
+//! writes to a process-global clock ([`Liveness`]). [`idle_guard`] returns the
+//! bundle's own result as soon as it is ready; otherwise it errors once the
+//! clock has seen no [`touch`] for the full timeout window.
 //!
-//! This mirrors how Flink and Dataflow supervise workers (heartbeats/leases) —
-//! progress resets the watchdog, rather than a fixed total budget.
+//! Measuring inactivity instead of elapsed time is what lets a stalled worker
+//! be told apart from a large bundle that is still progressing.
 
 use std::future::Future;
 use std::sync::OnceLock;
