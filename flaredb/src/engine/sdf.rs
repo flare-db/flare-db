@@ -74,7 +74,8 @@ struct SplitMonitor {
     prev_index: i64,
     /// Sum of `beam:metric:element_count:v1` at the previous tick.
     prev_total_count: i64,
-    /// Whether a split request should be sent for this bundle.
+    /// Whether splitting is still allowed for this bundle;
+    /// cleared once the SDK declines a split or progress polling fails.
     unsplit: bool,
     /// Upper bound on remaining work.
     estimated_input_elements: i64,
@@ -115,10 +116,11 @@ impl SplittableStageExecutor {
     ///
     /// `seed` is the work item to process, or `None` for the first
     /// (initialization) bundle. `initialized`/`registered` are the stage's flags
-    /// from prior bundles; the outcome carries them forward along with the residual
-    /// work items this bundle produced and the holds of the item it consumed. The
-    /// caller schedules one bundle per work item and applies the item holds as
-    /// output-watermark clamps until the item completes.
+    /// from prior bundles and `progress_tick` is its progress-poll interval
+    /// (`None` for the first); the outcome carries them forward along with the
+    /// residual work items this bundle produced and the holds of the item it
+    /// consumed. The caller schedules one bundle per work item and applies the item
+    /// holds as output-watermark clamps until the item completes.
     pub async fn execute_bundle(
         &mut self,
         stage: &SplittableStage,
@@ -315,7 +317,11 @@ impl SplittableStageExecutor {
 
     /// Run exactly one SDF process bundle seeded with `seed` bytes and return its
     /// response. `register` is `true` only the first time (the descriptor persists
-    /// on the worker across turns).
+    /// on the worker across turns). `allow_split` enables dynamic split for this
+    /// stage, and `progress_tick` is its progress-poll interval from prior bundles
+    /// (`None` for the first). The returned tuple carries the response, the
+    /// residual roots and whole-element work items a split produced, and the
+    /// progress-poll interval to use after this bundle.
     async fn run_process_stage(
         &mut self,
         stage: &ExecutableStage,
@@ -748,13 +754,12 @@ fn clamp_progress_tick(tick: Duration) -> Duration {
     tick.max(MIN_PROGRESS_TICK).min(MAX_PROGRESS_TICK)
 }
 
-/// The stage-shared progress tick carried forward after a bundle.
-///
-/// If bundle finished without ever ticking, shrink the tick by one floor step,
-/// So that a genuinely huge residual doesn't wait too long before being split.
-///
-/// The tick shrinks much more slowly than it grows. This balances avoiding
-/// over-splitting against still allowing genuine splits.
+/// The stage-shared progress tick to carry forward after a bundle.
+/// A bundle that polled at least once keeps its current tick.
+/// A bundle that finished before its first poll shrinks the tick
+/// by one MIN_PROGRESS_TICK (floored), so short bundles pull the
+/// wait back down. Shrinking is far slower than the ×4 growth on each
+/// split, balancing over-splitting against still allowing genuine splits.
 fn next_shared_tick(ticked: bool, tick: Duration) -> Duration {
     if ticked {
         tick
@@ -796,7 +801,12 @@ fn extract_progress_metrics(resp: &ProcessBundleProgressResponse) -> (i64, i64) 
     (index, total_count)
 }
 
-/// The element byte range(and element count) a channel split hands back.
+/// The byte range and element count a channel split hands back.
+/// first_residual_element is an absolute 0-based data-channel index;
+/// handed_back_from is the exclusive upper bound of elements already
+/// handed back (None = through the end of input_spans).
+/// Returns (start, end, count) for the newly relinquished [first, upper) range,
+/// or None when nothing new is relinquished or the boundary is out of range.
 fn channel_split_range(
     first_residual_element: i64,
     handed_back_from: Option<i64>,
