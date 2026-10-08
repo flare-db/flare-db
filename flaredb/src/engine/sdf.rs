@@ -1,10 +1,21 @@
 use std::collections::{HashMap, HashSet};
+use std::io::Cursor;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::Duration;
 
 use anyhow::anyhow;
-use beam_model_rs::v1::{BundleApplication, DelayedBundleApplication, ProcessBundleResponse};
-use log::{error, info};
+use beam_model_rs::v1::process_bundle_split_request::DesiredSplit;
+use beam_model_rs::v1::{
+    BundleApplication, DelayedBundleApplication, ProcessBundleProgressResponse,
+    ProcessBundleResponse,
+};
+use log::{error, info, warn};
 
+use crate::coders::primitives::{VarIntCoder, WindowedValueCoder};
+use crate::coders::{BeamCoder, StandardBeamCoders};
+use crate::engine::harness::control::ControlChannel;
+use crate::fusion::stage::SplittableProcessKind;
+use crate::jobservice::urns::beam_urns;
 use crate::{
     engine::{
         harness::{
@@ -22,6 +33,13 @@ use crate::{
         stage::{ExecutableStage, SplittableStage},
     },
 };
+
+/// The minimum duration between two consecutive `progress + split_evaluation` runs.
+const MIN_PROGRESS_TICK: Duration = Duration::from_millis(100);
+/// The maximum duration between two consecutive `progress + split_evaluation` runs.
+const MAX_PROGRESS_TICK: Duration = Duration::from_secs(30);
+/// Fraction of remaining work SDK keeps after a split.
+const SPLIT_FRACTION_OF_REMAINDER: f64 = 0.5;
 
 /// One deferred bundle's worth of SDF work.
 ///
@@ -46,6 +64,41 @@ pub struct SdfBundleOutcome {
     pub consumed_holds: Vec<Timestamp>,
     /// Residual work items this bundle produced, to be scheduled later.
     pub items: Vec<SdfWorkItem>,
+    /// Duration between two consecutive `progress + split_evaluation` runs, after this bundle.
+    pub progress_tick: Duration,
+}
+
+/// `Progress + split_evaluation` state for a single running bundle.
+struct SplitMonitor {
+    /// `beam:metric:data_channel:read_index:v1` at the previous tick,
+    prev_index: i64,
+    /// Sum of `beam:metric:element_count:v1` at the previous tick.
+    prev_total_count: i64,
+    /// Whether a split request should be sent for this bundle.
+    unsplit: bool,
+    /// Upper bound on remaining work.
+    estimated_input_elements: i64,
+    /// Duration between two consecutive `progress + split_evaluation` runs, for this bundle.
+    tick: Duration,
+    /// Lowest whole input element index already handed back as a residual.
+    handed_back_from: Option<i64>,
+    /// Whether at least one `progress + split_evaluation` run has happened for this bundle.
+    ticked: bool,
+}
+
+impl SplitMonitor {
+    fn new(estimated_input_elements: i64, progress_tick: Option<Duration>) -> Self {
+        Self {
+            // Starts at -2 so the first tick only record numbers.
+            prev_index: -2,
+            prev_total_count: -2,
+            unsplit: true,
+            estimated_input_elements,
+            tick: clamp_progress_tick(progress_tick.unwrap_or(MIN_PROGRESS_TICK)),
+            handed_back_from: None,
+            ticked: false,
+        }
+    }
 }
 
 /// Executor for a `SplittableStage` node
@@ -73,6 +126,7 @@ impl SplittableStageExecutor {
         seed: Option<SdfWorkItem>,
         initialized: bool,
         registered: bool,
+        progress_tick: Option<Duration>,
     ) -> anyhow::Result<(ProcessBundleResponse, SdfBundleOutcome)> {
         let plan = stage.plan();
 
@@ -90,16 +144,28 @@ impl SplittableStageExecutor {
                 .await?
         };
 
-        let response = self
+        // Dynamic split only applies to restriction-based SDF form.
+        let allow_split = matches!(
+            plan.process_kind,
+            SplittableProcessKind::ProcessSizedElementsAndRestrictions
+        );
+
+        let (response, split_residual_roots, channel_items, progress_tick) = self
             .run_process_stage(
                 &plan.process_stage,
                 output_edge_metadata,
                 bytes,
                 !registered,
+                allow_split,
+                progress_tick,
             )
             .await?;
 
-        let items = residual_items(stage, &response.residual_roots);
+        let mut all_residual_roots = response.residual_roots.clone();
+        all_residual_roots.extend(split_residual_roots);
+        let mut items = residual_items(stage, &all_residual_roots);
+        items.extend(channel_items);
+
         Ok((
             response,
             SdfBundleOutcome {
@@ -107,6 +173,7 @@ impl SplittableStageExecutor {
                 registered: true,
                 consumed_holds,
                 items,
+                progress_tick,
             },
         ))
     }
@@ -255,7 +322,14 @@ impl SplittableStageExecutor {
         output_edge_metadata: Option<ConsumerMetaData>,
         seed: Vec<u8>,
         register: bool,
-    ) -> anyhow::Result<ProcessBundleResponse> {
+        allow_split: bool,
+        progress_tick: Option<Duration>,
+    ) -> anyhow::Result<(
+        ProcessBundleResponse,
+        Vec<DelayedBundleApplication>,
+        Vec<SdfWorkItem>,
+        Duration,
+    )> {
         let descriptor_id = stage.id().to_string();
         if register {
             let bundle_status = self.runtime.register_bundle(stage).await?;
@@ -268,14 +342,37 @@ impl SplittableStageExecutor {
             info!("SDF process bundle {} registered", descriptor_id);
         }
 
+        let input_pcol = stage.input_pcol();
+        let input_spans = self
+            .decode_windowed_value_spans(
+                input_pcol.id().as_str(),
+                input_pcol.node().coder_id.as_str(),
+                &seed,
+            )
+            .unwrap_or_else(|err| {
+                warn!(
+                    "failed to decode SDF process input for counting/split ({}); \
+                    whole-element split re-injection disabled for this bundle",
+                    err
+                );
+                Vec::new()
+            });
+        let estimated_input_elements = if !input_spans.is_empty() {
+            input_spans.len() as i64
+        } else if seed.is_empty() {
+            0
+        } else {
+            1
+        };
+
         let (instruction_id, bundle_response_rx) = self
             .runtime
             .control()
             .send_process_bundle_request(&descriptor_id)
             .await?;
         info!(
-            "SDF process stage {} instruction_id={}",
-            descriptor_id, instruction_id
+            "SDF process stage {} instruction_id={}, estimated_input_elements={}",
+            descriptor_id, instruction_id, estimated_input_elements
         );
 
         let source_transform_id = stage_source_transform_id(stage);
@@ -283,7 +380,7 @@ impl SplittableStageExecutor {
         self.send_raw_elements(
             &instruction_id,
             &source_transform_id,
-            seed,
+            seed.clone(),
             &timer_endpoints,
         )
         .await?;
@@ -291,6 +388,48 @@ impl SplittableStageExecutor {
         let control = self.runtime.control().clone();
         let response_future =
             control.recv_process_bundle_response(&instruction_id, bundle_response_rx);
+
+        let mut split_residual_roots: Vec<DelayedBundleApplication> = Vec::new();
+        let mut channel_items: Vec<SdfWorkItem> = Vec::new();
+        let mut monitor = SplitMonitor::new(estimated_input_elements, progress_tick);
+        let monitor_enabled = allow_split && estimated_input_elements > 0;
+
+        let process_future = async {
+            tokio::pin!(response_future);
+
+            let response = loop {
+                let ticker = tokio::time::sleep(monitor.tick);
+                tokio::pin!(ticker);
+
+                tokio::select! {
+                    biased;
+                    bundle_response = &mut response_future => break bundle_response,
+                    _ = &mut ticker, if monitor_enabled => {
+                        if let Err(err) = poll_progress_and_maybe_split(
+                            &control,
+                            &instruction_id,
+                            &source_transform_id,
+                            &mut monitor,
+                            &seed,
+                            &input_spans,
+                            &mut split_residual_roots,
+                            &mut channel_items
+                        ).await {
+                            // Progresss error stops further splitting.
+                            warn!(
+                                "SDF `progress + split_evaluation` run failed for bundle {}, \
+                                disabling further splits for this bundle: {}",
+                                instruction_id,
+                                err
+                            );
+                            monitor.unsplit = false;
+                        }
+                    }
+                }
+            }?;
+
+            Ok::<_, anyhow::Error>(response)
+        };
 
         let control_response = if let Some(output_meta_data) = output_edge_metadata {
             let data_key = DataKey {
@@ -300,7 +439,7 @@ impl SplittableStageExecutor {
             let receiver = self.runtime.data_receiver(data_key);
             let output_runtime = self.runtime.clone();
 
-            let mut decode_task = tokio::spawn(async move {
+            let decode_task = tokio::spawn(async move {
                 output_runtime
                     .process_output_elements(receiver, output_meta_data)
                     .await
@@ -309,27 +448,16 @@ impl SplittableStageExecutor {
             let timeout_id = instruction_id.clone();
             crate::engine::liveness::idle_guard(
                 async {
-                    tokio::pin!(response_future);
-                    tokio::select! {
-                        bundle_response = &mut response_future => {
-                            match bundle_response {
-                                Ok(response) => {
-                                    decode_task.await.map_err(|err| {
-                                        anyhow!("output decode task failed: {}", err)
-                                    })??;
-                                    Ok(response)
-                                }
-                                Err(err) => {
-                                    decode_task.abort();
-                                    Err(err)
-                                }
-                            }
+                    match process_future.await {
+                        Ok(response) => {
+                            decode_task
+                                .await
+                                .map_err(|err| anyhow!("output decode task failed: {}", err))??;
+                            Ok(response)
                         }
-                        decode_result = &mut decode_task => {
-                            decode_result.map_err(|err| {
-                                anyhow!("output decode task failed: {}", err)
-                            })??;
-                            response_future.await
+                        Err(err) => {
+                            decode_task.abort();
+                            Err(err)
                         }
                     }
                 },
@@ -343,7 +471,7 @@ impl SplittableStageExecutor {
         } else {
             let timeout_id = instruction_id.clone();
             crate::engine::liveness::idle_guard(
-                response_future,
+                process_future,
                 Duration::from_secs(60),
                 &format!(
                     "waiting for SDF process bundle {} control response",
@@ -354,7 +482,20 @@ impl SplittableStageExecutor {
         };
 
         match control_response {
-            ControlResponse::ProcessBundleSuccess(response) => Ok(response),
+            ControlResponse::ProcessBundleSuccess(response) => {
+                // Carry the stage-shared progress tick forward. If this bundle finished without
+                // ever ticking, shrink the tick so that a genuinely huge residual doesn't wait
+                // too long before being split.
+                //
+                // The tick shrinks much more slowly than it grows. This balances avoiding
+                // over-splitting against still allowing genuine splits.
+                let next_tick = if monitor.ticked {
+                    monitor.tick
+                } else {
+                    clamp_progress_tick(monitor.tick.saturating_sub(MIN_PROGRESS_TICK))
+                };
+                Ok((response, split_residual_roots, channel_items, next_tick))
+            }
             ControlResponse::ProcessBundleError(err) => {
                 Err(anyhow!("SDF process bundle failed: {}", err))
             }
@@ -363,6 +504,45 @@ impl SplittableStageExecutor {
                 std::mem::discriminant(&other)
             )),
         }
+    }
+
+    /// Decode the byte span of each `WindowedValue` in an SDF process input.
+    fn decode_windowed_value_spans(
+        &mut self,
+        pcol_id: &str,
+        coder_id: &str,
+        bytes: &[u8],
+    ) -> anyhow::Result<Vec<(usize, usize)>> {
+        if bytes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let element_coder = StandardBeamCoders::from_urn(
+            coder_id,
+            None,
+            Some(self.runtime.pipeline_coders().as_ref()),
+        );
+        let window_coder = self.runtime.window_coder_for_pcollection(pcol_id);
+        let windowed_value_coder =
+            WindowedValueCoder::with_window_coder(element_coder, window_coder);
+
+        let mut cursor = Cursor::new(bytes);
+        let mut spans = Vec::new();
+        while (cursor.position() as usize) < bytes.len() {
+            let start = cursor.position() as usize;
+            let decoded = catch_unwind(AssertUnwindSafe(|| {
+                windowed_value_coder.decode(&mut cursor)
+            }));
+            match decoded {
+                Ok(Ok(_)) => spans.push((start, cursor.position() as usize)),
+                Ok(Err(err)) => {
+                    return Err(anyhow!("failed to decode SDF input element: {:?}", err));
+                }
+                Err(_) => return Err(anyhow!("panic while decoding SDF input element")),
+            }
+        }
+
+        Ok(spans)
     }
 
     /// Send raw Beam-encoded bytes to an SDF stage's source transform.
@@ -425,6 +605,82 @@ impl SplittableStageExecutor {
 
         self.runtime.data().send_elements(elements).await
     }
+}
+
+/// Read progress and if bundle looks stalled, ask the SDK to split it.
+async fn poll_progress_and_maybe_split(
+    control: &ControlChannel,
+    bundle_instruction_id: &str,
+    input_transform_id: &str,
+    monitor: &mut SplitMonitor,
+    input_bytes: &[u8],
+    input_spans: &[(usize, usize)],
+    split_residual_roots: &mut Vec<DelayedBundleApplication>,
+    channel_items: &mut Vec<SdfWorkItem>,
+) -> anyhow::Result<()> {
+    monitor.ticked = true;
+
+    let progress = control
+        .send_process_bundle_progress_request(bundle_instruction_id)
+        .await?;
+    let (index, total_count) = extract_progress_metrics(&progress);
+
+    let slow = monitor.prev_index == index && monitor.prev_total_count == total_count;
+    let should_try_split = slow && monitor.unsplit && monitor.estimated_input_elements > 0;
+    if !should_try_split {
+        monitor.prev_index = index;
+        monitor.prev_total_count = total_count;
+        return Ok(());
+    }
+
+    let mut desired_splits = HashMap::new();
+    desired_splits.insert(
+        input_transform_id.to_string(),
+        DesiredSplit {
+            fraction_of_remainder: SPLIT_FRACTION_OF_REMAINDER,
+            allowed_split_points: Vec::new(),
+            estimated_input_elements: monitor.estimated_input_elements,
+        },
+    );
+
+    let split = control
+        .send_process_bundle_split_request(bundle_instruction_id, desired_splits)
+        .await?;
+
+    if split.channel_splits.is_empty() {
+        // SDK cannot split (nothing left, or unsupported)
+        monitor.unsplit = false;
+        return Ok(());
+    }
+
+    // Intra-element remainders (of one or more elements that are partially
+    // processed): process in future.
+    split_residual_roots.extend(split.residual_roots);
+
+    // Whole elements that are entirely unprocessed: process in future.
+    for channel_split in &split.channel_splits {
+        if let Some((start, end, count)) = channel_split_range(
+            channel_split.first_residual_element,
+            monitor.handed_back_from,
+            &input_spans,
+        ) {
+            channel_items.push(SdfWorkItem {
+                seed: input_bytes[start..end].to_vec(),
+                holds: Vec::new(),
+            });
+            monitor.handed_back_from = Some(channel_split.first_residual_element);
+            debug_assert!(count > 0);
+        }
+    }
+
+    if let Some(channel_split) = split.channel_splits.first() {
+        if monitor.estimated_input_elements >= channel_split.first_residual_element {
+            monitor.estimated_input_elements = channel_split.first_residual_element;
+        }
+    }
+    // Increase interval to avoid over-split.
+    monitor.tick = clamp_progress_tick(monitor.tick * 4);
+    Ok(())
 }
 
 /// The residual work items a process bundle produced.
@@ -491,6 +747,63 @@ fn residual_item_holds(
         }
     }
     holds
+}
+
+fn clamp_progress_tick(tick: Duration) -> Duration {
+    tick.max(MIN_PROGRESS_TICK).min(MAX_PROGRESS_TICK)
+}
+
+/// Decode one beam varint (`beam:coder:varint:v1`) payload.
+fn decode_varint_payload(payload: &[u8]) -> Option<i64> {
+    let mut buf = payload;
+    match catch_unwind(AssertUnwindSafe(|| VarIntCoder.decode(&mut buf))) {
+        Ok(Ok(decoded)) => Some(decoded),
+        _ => None,
+    }
+}
+
+/// Extract progress metrics: data-channel read index + sum of emitted
+/// element counts across all PCollections.
+fn extract_progress_metrics(resp: &ProcessBundleProgressResponse) -> (i64, i64) {
+    let mut index = 0i64;
+    let mut total_count = 0i64;
+
+    for info in &resp.monitoring_infos {
+        match info.urn.as_str() {
+            beam_urns::DATA_CHANNEL_READ_INDEX_METRIC => {
+                if let Some(value) = decode_varint_payload(&info.payload) {
+                    index = index.max(value);
+                }
+            }
+            beam_urns::ELEMENT_COUNT_METRIC => {
+                if let Some(value) = decode_varint_payload(&info.payload) {
+                    total_count += value;
+                }
+            }
+            _ => {}
+        }
+    }
+    (index, total_count)
+}
+
+/// The element byte range(and element count) a channel split hands back.
+fn channel_split_range(
+    first_residual_element: i64,
+    handed_back_from: Option<i64>,
+    input_spans: &[(usize, usize)],
+) -> Option<(usize, usize, i64)> {
+    let first = first_residual_element as usize;
+    let upper = handed_back_from
+        .map(|value| value as usize)
+        .unwrap_or(input_spans.len());
+
+    if first < upper {
+        let start = input_spans[first].0;
+        let end = input_spans[upper - 1].1;
+        let count = (upper - first) as i64;
+        return Some((start, end, count));
+    }
+    None
 }
 
 #[cfg(test)]

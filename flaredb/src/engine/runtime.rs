@@ -111,7 +111,7 @@ impl BundleRuntime {
         self.data.get_receiver(data_key)
     }
 
-    fn window_coder_for_pcollection(&self, pcollection_id: &str) -> WindowCoder {
+    pub(crate) fn window_coder_for_pcollection(&self, pcollection_id: &str) -> WindowCoder {
         let pcollection = self
             .pipeline_components
             .pcollections
