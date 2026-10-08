@@ -415,7 +415,7 @@ impl SplittableStageExecutor {
                             &mut split_residual_roots,
                             &mut channel_items
                         ).await {
-                            // Progresss error stops further splitting.
+                            // Progress error stops further splitting.
                             warn!(
                                 "SDF `progress + split_evaluation` run failed for bundle {}, \
                                 disabling further splits for this bundle: {}",
@@ -483,17 +483,7 @@ impl SplittableStageExecutor {
 
         match control_response {
             ControlResponse::ProcessBundleSuccess(response) => {
-                // Carry the stage-shared progress tick forward. If this bundle finished without
-                // ever ticking, shrink the tick so that a genuinely huge residual doesn't wait
-                // too long before being split.
-                //
-                // The tick shrinks much more slowly than it grows. This balances avoiding
-                // over-splitting against still allowing genuine splits.
-                let next_tick = if monitor.ticked {
-                    monitor.tick
-                } else {
-                    clamp_progress_tick(monitor.tick.saturating_sub(MIN_PROGRESS_TICK))
-                };
+                let next_tick = next_shared_tick(monitor.ticked, monitor.tick);
                 Ok((response, split_residual_roots, channel_items, next_tick))
             }
             ControlResponse::ProcessBundleError(err) => {
@@ -666,6 +656,11 @@ async fn poll_progress_and_maybe_split(
         ) {
             channel_items.push(SdfWorkItem {
                 seed: input_bytes[start..end].to_vec(),
+                // TODO(SDF event-time): whole-element channel splits carry no SDK
+                // `output_watermarks`, so they impose no output-watermark hold.
+                //  Until this is addressed, a watermark-gated downstream stage may
+                // run before these items complete on event-time pipelines.
+                // Bounded/global-window pipelines (MIN timestamps) are unaffected.
                 holds: Vec::new(),
             });
             monitor.handed_back_from = Some(channel_split.first_residual_element);
@@ -753,6 +748,21 @@ fn clamp_progress_tick(tick: Duration) -> Duration {
     tick.max(MIN_PROGRESS_TICK).min(MAX_PROGRESS_TICK)
 }
 
+/// The stage-shared progress tick carried forward after a bundle.
+///
+/// If bundle finished without ever ticking, shrink the tick by one floor step,
+/// So that a genuinely huge residual doesn't wait too long before being split.
+///
+/// The tick shrinks much more slowly than it grows. This balances avoiding
+/// over-splitting against still allowing genuine splits.
+fn next_shared_tick(ticked: bool, tick: Duration) -> Duration {
+    if ticked {
+        tick
+    } else {
+        clamp_progress_tick(tick.saturating_sub(MIN_PROGRESS_TICK))
+    }
+}
+
 /// Decode one beam varint (`beam:coder:varint:v1`) payload.
 fn decode_varint_payload(payload: &[u8]) -> Option<i64> {
     let mut buf = payload;
@@ -810,7 +820,9 @@ fn channel_split_range(
 mod tests {
     use super::*;
     use beam_model_rs::v1::executable_stage_payload::WireCoderSetting;
-    use beam_model_rs::v1::{BundleApplication, Components, Environment, PCollection, PTransform};
+    use beam_model_rs::v1::{
+        BundleApplication, Components, Environment, MonitoringInfo, PCollection, PTransform,
+    };
     use indexmap::IndexSet;
     use petgraph::Graph;
 
@@ -945,5 +957,197 @@ mod tests {
         assert_eq!(items[0].holds, vec![5_000]);
         assert_eq!(items[1].seed, b"second".to_vec());
         assert_eq!(items[1].holds, vec![2_000]);
+    }
+
+    /// Encode a signed varint the way the SDK encodes metric payloads.
+    fn varint_payload(value: i64) -> Vec<u8> {
+        let mut buf = bytes::BytesMut::new();
+        VarIntCoder.encode(value, &mut buf);
+        buf.to_vec()
+    }
+
+    fn progress_info(urn: &str, value: i64) -> MonitoringInfo {
+        MonitoringInfo {
+            urn: urn.to_string(),
+            payload: varint_payload(value),
+            ..Default::default()
+        }
+    }
+
+    /// Back-to-back 2-byte elements: element `i` occupies `[2i, 2i + 2)`.
+    fn spans(n: usize) -> Vec<(usize, usize)> {
+        (0..n).map(|i| (2 * i, 2 * i + 2)).collect()
+    }
+
+    #[test]
+    fn progress_tick_is_clamped_to_the_authoritative_range() {
+        assert_eq!(
+            clamp_progress_tick(Duration::from_millis(1)),
+            MIN_PROGRESS_TICK
+        );
+        assert_eq!(clamp_progress_tick(MIN_PROGRESS_TICK), MIN_PROGRESS_TICK);
+        assert_eq!(
+            clamp_progress_tick(Duration::from_millis(400)),
+            Duration::from_millis(400)
+        );
+        assert_eq!(
+            clamp_progress_tick(Duration::from_secs(60)),
+            MAX_PROGRESS_TICK
+        );
+        assert_eq!(clamp_progress_tick(MAX_PROGRESS_TICK), MAX_PROGRESS_TICK);
+    }
+
+    #[test]
+    fn split_backoff_grows_before_clamping_at_the_ceiling() {
+        // Flare multiplies the stage tick by 4 after each successful split and
+        // clamps to [100ms, 30s]; the sequence is what keeps residual bundles
+        // from re-splitting aggressively.
+        let mut tick = MIN_PROGRESS_TICK;
+        let mut observed = Vec::new();
+        for _ in 0..7 {
+            tick = clamp_progress_tick(tick * 4);
+            observed.push(tick);
+        }
+        assert_eq!(
+            observed,
+            vec![
+                Duration::from_millis(400),
+                Duration::from_millis(1_600),
+                Duration::from_millis(6_400),
+                Duration::from_millis(25_600),
+                MAX_PROGRESS_TICK,
+                MAX_PROGRESS_TICK,
+                MAX_PROGRESS_TICK,
+            ]
+        );
+    }
+
+    #[test]
+    fn next_shared_tick_passes_through_when_ticked_and_shrinks_when_not() {
+        // A bundle that polled at least once keeps the shared tick unchanged.
+        assert_eq!(
+            next_shared_tick(true, Duration::from_millis(1_600)),
+            Duration::from_millis(1_600)
+        );
+        // A bundle that finished before its first poll shrinks it by one step.
+        assert_eq!(
+            next_shared_tick(false, Duration::from_millis(1_600)),
+            Duration::from_millis(1_500)
+        );
+        // Shrinking never goes below the floor.
+        assert_eq!(
+            next_shared_tick(false, MIN_PROGRESS_TICK),
+            MIN_PROGRESS_TICK
+        );
+        assert_eq!(
+            next_shared_tick(false, Duration::from_millis(50)),
+            MIN_PROGRESS_TICK
+        );
+    }
+
+    #[test]
+    fn monitor_adopts_the_stage_shared_tick_and_clamps_it() {
+        // No shared tick yet: the first bundle starts at the floor, with clean
+        // `-2` baselines so the first poll only records numbers.
+        let monitor = SplitMonitor::new(7, None);
+        assert_eq!(monitor.tick, MIN_PROGRESS_TICK);
+        assert_eq!(monitor.estimated_input_elements, 7);
+        assert_eq!(monitor.prev_index, -2);
+        assert_eq!(monitor.prev_total_count, -2);
+        assert!(monitor.unsplit);
+        assert!(!monitor.ticked);
+        assert_eq!(monitor.handed_back_from, None);
+
+        // An in-range shared tick is adopted verbatim; out-of-range is clamped.
+        assert_eq!(
+            SplitMonitor::new(1, Some(Duration::from_secs(2))).tick,
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            SplitMonitor::new(1, Some(Duration::from_millis(1))).tick,
+            MIN_PROGRESS_TICK
+        );
+        assert_eq!(
+            SplitMonitor::new(1, Some(Duration::from_secs(120))).tick,
+            MAX_PROGRESS_TICK
+        );
+    }
+
+    #[test]
+    fn decode_varint_payload_round_trips_signed_values() {
+        for value in [0i64, 1, 127, 128, 300, -1, -128] {
+            assert_eq!(decode_varint_payload(&varint_payload(value)), Some(value));
+        }
+    }
+
+    #[test]
+    fn progress_metrics_sum_element_counts_and_take_the_max_read_index() {
+        let resp = ProcessBundleProgressResponse {
+            monitoring_infos: vec![
+                progress_info(beam_urns::DATA_CHANNEL_READ_INDEX_METRIC, 3),
+                progress_info(beam_urns::DATA_CHANNEL_READ_INDEX_METRIC, 5),
+                progress_info(beam_urns::ELEMENT_COUNT_METRIC, 4),
+                progress_info(beam_urns::ELEMENT_COUNT_METRIC, 2),
+                // Unrelated URNs are ignored.
+                progress_info("beam:metric:some_other:v1", 999),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(extract_progress_metrics(&resp), (5, 6));
+    }
+
+    #[test]
+    fn progress_metrics_are_zero_when_absent() {
+        assert_eq!(
+            extract_progress_metrics(&ProcessBundleProgressResponse::default()),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn progress_metrics_floor_a_lone_negative_read_index_at_zero() {
+        // The SDK reports read_index = -1 before it reads the first element. The
+        // accumulator starts at 0 and combines with `max`, so -1 is floored to 0.
+        // This only affects the value before the first element is read and does
+        // not change the equality-based stall detection.
+        let resp = ProcessBundleProgressResponse {
+            monitoring_infos: vec![progress_info(beam_urns::DATA_CHANNEL_READ_INDEX_METRIC, -1)],
+            ..Default::default()
+        };
+        assert_eq!(extract_progress_metrics(&resp), (0, 0));
+    }
+
+    #[test]
+    fn channel_split_range_hands_back_the_whole_tail_on_first_split() {
+        let spans = spans(4);
+        // First split at element 2 with nothing handed back yet: elements 2..4.
+        assert_eq!(channel_split_range(2, None, &spans), Some((4, 8, 2)));
+        // A split at element 0 hands back everything.
+        assert_eq!(channel_split_range(0, None, &spans), Some((0, 8, 4)));
+    }
+
+    #[test]
+    fn channel_split_range_only_hands_back_newly_relinquished_elements() {
+        let spans = spans(4);
+        // Boundary moved down to 1 since the prior hand-back from 2: element 1.
+        assert_eq!(channel_split_range(1, Some(2), &spans), Some((2, 4, 1)));
+        // A deeper move hands back elements 1 and 2.
+        assert_eq!(channel_split_range(1, Some(3), &spans), Some((2, 6, 2)));
+        // Boundary did not move down: nothing new (no duplicate hand-back).
+        assert_eq!(channel_split_range(2, Some(2), &spans), None);
+        assert_eq!(channel_split_range(3, Some(2), &spans), None);
+        assert_eq!(channel_split_range(0, Some(0), &spans), None);
+    }
+
+    #[test]
+    fn channel_split_range_rejects_out_of_range_boundaries() {
+        let spans = spans(3);
+        // The residual can start at/after the data we sent: filter those out.
+        assert_eq!(channel_split_range(3, None, &spans), None);
+        assert_eq!(channel_split_range(9, None, &spans), None);
+        // A negative boundary can never index an element.
+        assert_eq!(channel_split_range(-1, None, &spans), None);
+        // Empty input has nothing to hand back.
+        assert_eq!(channel_split_range(0, None, &[]), None);
     }
 }
