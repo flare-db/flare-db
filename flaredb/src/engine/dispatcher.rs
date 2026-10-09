@@ -38,6 +38,8 @@ struct SdfQueue {
     registered: bool,
     /// Residual work items awaiting a bundle, oldest first.
     items: VecDeque<SdfWorkItem>,
+    /// Stage-specific duration between two consecutive `progress + split_evaluation` runs.
+    progress_tick: Option<Duration>,
 }
 
 /// Add each hold in `holds` to `map[stage]` (a multiset).
@@ -202,7 +204,7 @@ impl ExecutorDispatcher {
                 // A splittable stage runs one bundle per queued work item. Take
                 // the next item here (the initialization bundle has no item), so
                 // each started bundle gets distinct seed bytes.
-                let (sdf_seed, sdf_initialized, sdf_registered) = match &node {
+                let (sdf_seed, sdf_initialized, sdf_registered, sdf_progress_tick) = match &node {
                     ExecutableNode::Splittable(_) => {
                         let queue = sdf_queues.entry(stage_id.clone()).or_default();
                         let seed = if queue.initialized {
@@ -210,9 +212,14 @@ impl ExecutorDispatcher {
                         } else {
                             None
                         };
-                        (seed, queue.initialized, queue.registered)
+                        (
+                            seed,
+                            queue.initialized,
+                            queue.registered,
+                            queue.progress_tick,
+                        )
                     }
-                    _ => (None, false, false),
+                    _ => (None, false, false, None),
                 };
 
                 in_flight.spawn(async move {
@@ -225,6 +232,7 @@ impl ExecutorDispatcher {
                                 sdf_seed,
                                 sdf_initialized,
                                 sdf_registered,
+                                sdf_progress_tick,
                             )
                             .await
                         {
@@ -345,6 +353,7 @@ impl ExecutorDispatcher {
                     let queue = sdf_queues.entry(stage_id.clone()).or_default();
                     queue.initialized = outcome.initialized;
                     queue.registered = outcome.registered;
+                    queue.progress_tick = Some(outcome.progress_tick);
                     for item in &outcome.items {
                         add_holds(&mut residual_holds, &stage_id, &item.holds);
                     }

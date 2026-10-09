@@ -13,6 +13,7 @@ across SDKs.
 | [`fixed_window.py`](./fixed_window.py) | `example/fixed-window` | `FixedWindows`, event-time timestamps, windowed `GroupByKey` |
 | [`sliding_window.py`](./sliding_window.py) | `example/sliding-window` | `SlidingWindows` (overlapping windows) |
 | [`timers.py`](./timers.py) | `example/timers-example` | `BagState`, processing-time + event-time timers, timer-only re-runs, self-verification |
+| [`dynamic_split.py`](./dynamic_split.py) | none | `RestrictionProvider`/`OffsetRestrictionTracker`, runner dynamic split of a running SDF bundle, self-verification |
 
 The FlareIO Java examples (`example/flare-io-read`, `example/flare-io-write`)
 are intentionally not ported here.
@@ -38,6 +39,7 @@ python3 example/python/flatten.py
 python3 example/python/fixed_window.py
 python3 example/python/sliding_window.py
 python3 example/python/timers.py
+python3 example/python/dynamic_split.py
 ```
 
 All examples target the local job service at `127.0.0.1:8099`; override it with
@@ -53,3 +55,7 @@ All examples target the local job service at `127.0.0.1:8099`; override it with
 - `timers.py` writes its `@on_timer` results to `build/timers-example-flush.txt`
   (and `.event`) and asserts them against counts computed from the input,
   failing the run on any mismatch.
+- `dynamic_split.py` never overrides `split()`, so the runner divides the work by
+  dynamically splitting the running bundle. It records every claimed block to
+  `build/dynamic-split-claims.txt` and asserts that blocks `0..BLOCKS-1` each ran
+  exactly once, failing the run on any mismatch.
