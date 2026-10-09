@@ -604,6 +604,7 @@ impl SplittableStageExecutor {
 }
 
 /// Read progress and if bundle looks stalled, ask the SDK to split it.
+#[allow(clippy::too_many_arguments)]
 async fn poll_progress_and_maybe_split(
     control: &ControlChannel,
     bundle_instruction_id: &str,
@@ -658,7 +659,7 @@ async fn poll_progress_and_maybe_split(
         if let Some((start, end, count)) = channel_split_range(
             channel_split.first_residual_element,
             monitor.handed_back_from,
-            &input_spans,
+            input_spans,
         ) {
             channel_items.push(SdfWorkItem {
                 seed: input_bytes[start..end].to_vec(),
@@ -674,11 +675,12 @@ async fn poll_progress_and_maybe_split(
         }
     }
 
-    if let Some(channel_split) = split.channel_splits.first() {
-        if monitor.estimated_input_elements >= channel_split.first_residual_element {
-            monitor.estimated_input_elements = channel_split.first_residual_element;
-        }
+    if let Some(channel_split) = split.channel_splits.first()
+        && monitor.estimated_input_elements >= channel_split.first_residual_element
+    {
+        monitor.estimated_input_elements = channel_split.first_residual_element;
     }
+
     // Increase interval to avoid over-split.
     monitor.tick = clamp_progress_tick(monitor.tick * 4);
     Ok(())
