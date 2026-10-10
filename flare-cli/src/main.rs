@@ -2,7 +2,6 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use flare_sql;
-const BEAM_WORKER_VERSION: &str = "2.76.0";
 
 #[derive(Parser)]
 #[command(name = "flare")]
@@ -15,24 +14,58 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Initial setup: downloads the latest FlareDB release and the worker jar.
+    /// Initial setup: downloads the latest FlareDB release and the Beam Java worker jar.
     Init,
-    /// Start FlareDB instance
+    /// Start a FlareDB instance.
     Up,
-    /// Stop FlareDB instance
+    /// Stop the running FlareDB instance.
     Down,
     /// Launch the interactive SQL shell.
     Sql,
-    /// Show the installed FlareDB version and check for a newer release.
-    #[command(name = "db-version")]
-    DbVersion,
-    /// Update FlareDB to the latest release and remove the old binary.
-    Update,
+    // Show installed versions and available updates.
+    //
+    // Prints the installed flare-cli, FlareDB, and beam-java-worker versions,
+    // then checks R2 for newer releases and reports how to upgrade each.
+    //
+    // Usage:
+    //   flare version
+    #[command(
+        name = "version",
+        about = "Show installed versions and available updates.",
+        long_about = "Show installed versions and available updates.\n\nPrints the installed flare-cli, FlareDB, and beam-java-worker versions, then checks R2 for newer releases and reports how to upgrade each."
+    )]
+    Version,
+    // Update FlareDB and/or the Beam Java worker jar.
+    //
+    // With no flags, both are updated. If a newer flare-cli exists, this
+    // points you at the install script instead of self-updating.
+    //
+    // Usage:
+    //   flare update                 # update everything
+    //   flare update --db            # update only the FlareDB binary
+    //   flare update --java-worker   # update only the worker jar
+    #[command(
+        about = "Update FlareDB and/or the Beam Java worker jar.",
+        long_about = "Update FlareDB and/or the Beam Java worker jar.\n\nWith no flags, both are updated. If a newer flare-cli exists, this points you at the install script instead of self-updating.",
+        after_help = "Examples:\n  flare update                 # update everything\n  flare update --db            # update only the FlareDB binary\n  flare update --java-worker   # update only the worker jar"
+    )]
+    Update {
+        /// Update the FlareDB server binary.
+        #[arg(long)]
+        db: bool,
+        /// Update the Beam Java worker jar.
+        #[arg(long = "java-worker")]
+        java_worker: bool,
+    },
     // View or stream job logs.
     //
     // Usage:
-    //   flare logs                      # Stream logs for the most recent job
-    //   flare logs <JOB_ID>             # Stream logs for a specific job ID
+    //   flare logs               # stream logs for the most recent job
+    //   flare logs <JOB_ID>      # stream logs for a specific job ID
+    #[command(
+        about = "View or stream job logs.",
+        after_help = "Examples:\n  flare logs               # stream logs for the most recent job\n  flare logs <JOB_ID>      # stream logs for a specific job ID"
+    )]
     Logs {
         /// Job ID to view logs for (positional). If omitted, defaults to the most recent job.
         #[arg(value_name = "JOB_ID")]
@@ -57,8 +90,8 @@ async fn main() -> Result<()> {
         Commands::Up => server::up().await?,
         Commands::Down => server::down().await?,
         Commands::Sql => flare_sql::run().await?,
-        Commands::DbVersion => release::db_version().await?,
-        Commands::Update => release::update().await?,
+        Commands::Version => release::version().await?,
+        Commands::Update { db, java_worker } => release::update(db, java_worker).await?,
         Commands::Logs {
             job_id_pos,
             job_id_flag,
@@ -72,8 +105,9 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Finds which FlareDB versions are installed and which is the latest release
-/// published to R2 (https://install.flare-db.com/flaredb/latest.txt).
+/// Version discovery and updates for the three FlareDB artifacts published to
+/// R2 (https://install.flare-db.com): the FlareDB binary, the Beam Java worker
+/// jar, and the `flare` CLI itself.
 pub mod release {
     use crate::{process_control, state};
     use anyhow::{Context, Result, bail};
@@ -84,10 +118,59 @@ pub mod release {
 
     const DEFAULT_BASE_URL: &str = "https://install.flare-db.com";
     const BINARY_PREFIX: &str = "flaredb-";
+    const WORKER_JAR_PREFIX: &str = "beam-sdks-java-harness-";
+    const WORKER_JAR_SUFFIX: &str = "-flare-bundled.jar";
 
     pub struct Installed {
         pub version: Version,
         pub path: PathBuf,
+    }
+
+    /// A release artifact the CLI can discover, report, and update.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub enum Component {
+        /// The FlareDB server binary.
+        Db,
+        /// The Beam Java worker jar.
+        JavaWorker,
+        /// The `flare` CLI itself.
+        Cli,
+    }
+
+    impl Component {
+        /// URL path segment under `base_url` (e.g. `flaredb`).
+        fn key(&self) -> &'static str {
+            match self {
+                Component::Db => "flaredb",
+                Component::JavaWorker => "beam-worker-java",
+                Component::Cli => "cli",
+            }
+        }
+
+        /// Human-readable name for messages.
+        fn label(&self) -> &'static str {
+            match self {
+                Component::Db => "FlareDB",
+                Component::JavaWorker => "beam-java-worker",
+                Component::Cli => "flare-cli",
+            }
+        }
+
+        /// URL of this component's `latest.txt`.
+        fn latest_url(&self) -> String {
+            format!("{}/{}/latest.txt", base_url(), self.key())
+        }
+
+        /// The latest published version of this component.
+        pub async fn latest_version(&self) -> Result<Version> {
+            let url = self.latest_url();
+            let text = http_get_text(&url)
+                .await
+                .with_context(|| format!("could not check the latest {} version", self.label()))?;
+            let text = text.trim();
+            Version::parse(text.trim_start_matches('v'))
+                .with_context(|| format!("unexpected content in {url}: {text:?}"))
+        }
     }
 
     /// Where releases are downloaded from. `FLARE_BASE_URL` overrides it (mirrors, testing).
@@ -121,8 +204,11 @@ pub mod release {
         Version::parse(rest).ok()
     }
 
-    /// Installed FlareDB binaries, sorted from oldest to newest.
-    pub fn installed(bin_dir: &Path) -> Result<Vec<Installed>> {
+    /// Scans `bin_dir` for files whose name `parse` accepts, sorted oldest to newest.
+    fn scan_installed(
+        bin_dir: &Path,
+        parse: impl Fn(&str) -> Option<Version>,
+    ) -> Result<Vec<Installed>> {
         let mut found = Vec::new();
         let entries = match fs::read_dir(bin_dir) {
             Ok(entries) => entries,
@@ -138,7 +224,7 @@ pub mod release {
                 continue;
             }
             let name = entry.file_name().to_string_lossy().to_string();
-            if let Some(version) = parse_binary_name(&name) {
+            if let Some(version) = parse(&name) {
                 found.push(Installed { version, path });
             }
         }
@@ -146,9 +232,36 @@ pub mod release {
         Ok(found)
     }
 
-    /// The newest installed version, if any.
+    /// Installed FlareDB binaries, sorted from oldest to newest.
+    pub fn installed(bin_dir: &Path) -> Result<Vec<Installed>> {
+        scan_installed(bin_dir, parse_binary_name)
+    }
+
+    /// The newest installed FlareDB version, if any.
     pub fn current(bin_dir: &Path) -> Result<Option<Installed>> {
         Ok(installed(bin_dir)?.pop())
+    }
+
+    /// File name of the worker jar for a version.
+    pub fn worker_jar_name(version: &Version) -> String {
+        format!("{WORKER_JAR_PREFIX}{version}{WORKER_JAR_SUFFIX}")
+    }
+
+    /// Parses `beam-sdks-java-harness-2.76.0-flare-bundled.jar`. Anything else returns None.
+    pub fn parse_worker_jar_name(name: &str) -> Option<Version> {
+        let rest = name.strip_prefix(WORKER_JAR_PREFIX)?;
+        let rest = rest.strip_suffix(WORKER_JAR_SUFFIX)?;
+        Version::parse(rest).ok()
+    }
+
+    /// Installed worker jars, sorted from oldest to newest.
+    pub fn installed_java_worker(bin_dir: &Path) -> Result<Vec<Installed>> {
+        scan_installed(bin_dir, parse_worker_jar_name)
+    }
+
+    /// The newest installed worker jar, if any.
+    pub fn current_java_worker(bin_dir: &Path) -> Result<Option<Installed>> {
+        Ok(installed_java_worker(bin_dir)?.pop())
     }
 
     pub async fn http_get_text(url: &str) -> Result<String> {
@@ -169,48 +282,79 @@ pub mod release {
             .with_context(|| format!("failed to read response from {url}"))
     }
 
-    /// The latest stable FlareDB version published to R2.
-    pub async fn latest_version() -> Result<Version> {
-        let url = format!("{}/flaredb/latest.txt", base_url());
-        let text = http_get_text(&url)
-            .await
-            .context("could not check the latest FlareDB version")?;
-        let text = text.trim();
-        Version::parse(text.trim_start_matches('v'))
-            .with_context(|| format!("unexpected content in {url}: {text:?}"))
+    /// `flare version` — installed versions plus available updates.
+    pub async fn version() -> Result<()> {
+        let bin_dir = base_dir()?.join("bin");
+        let cli =
+            Version::parse(env!("CARGO_PKG_VERSION")).context("could not parse CLI version")?;
+        let db = current(&bin_dir)?;
+        let worker = current_java_worker(&bin_dir)?;
+
+        println!("Current versions:");
+        println!("flare-cli:         {cli}");
+        match &db {
+            Some(c) => println!("FlareDB:           {}", c.version),
+            None => println!("FlareDB:           none"),
+        }
+        match &worker {
+            Some(w) => println!("beam-java-worker:  {}", w.version),
+            None => println!("beam-java-worker:  none"),
+        }
+
+        println!();
+        println!("Checking for updates...");
+        println!();
+        println!("Status:");
+        println!();
+
+        report_update(Component::Db, db.map(|i| i.version)).await;
+        report_update(Component::JavaWorker, worker.map(|w| w.version)).await;
+        report_update(Component::Cli, Some(cli)).await;
+
+        Ok(())
     }
 
-    /// `flare db-version`
-    pub async fn db_version() -> Result<()> {
-        let bin_dir = base_dir()?.join("bin");
-        let current = current(&bin_dir)?;
-
-        println!("flare-cli:         {}", env!("CARGO_PKG_VERSION"));
-        match &current {
-            Some(c) => println!("FlareDB installed: {}", c.version),
-            None => println!("FlareDB installed: none"),
-        }
-
-        match latest_version().await {
-            Ok(latest) => {
-                println!("FlareDB latest:    {latest}");
-                println!();
-                match current {
-                    None => println!("FlareDB is not installed. Run 'flare init' to install it."),
-                    Some(c) if latest > c.version => {
-                        println!("A newer version is available. Run 'flare update' to upgrade.")
-                    }
-                    Some(c) if latest == c.version => println!("You are on the latest version."),
-                    Some(_) => println!("Your installed version is newer than the latest release."),
-                }
-            }
+    /// Fetches the latest version for `component` and reports how `current` compares.
+    async fn report_update(component: Component, current: Option<Version>) {
+        let label = component.label();
+        let latest = match component.latest_version().await {
+            Ok(v) => v,
             Err(e) => {
-                println!("FlareDB latest:    unknown");
-                println!();
-                eprintln!("Could not check for updates: {e:#}");
+                println!("{label}: could not check for updates ({e:#})");
+                return;
             }
+        };
+        let hint = match component {
+            Component::Db => "flare update --db",
+            Component::JavaWorker => "flare update --java-worker",
+            Component::Cli => "curl -sSL https://install.flare-db.com | bash",
+        };
+        match current {
+            None => println!("{label}: {latest} available but not installed (run '{hint}')"),
+            Some(c) if latest > c => {
+                println!("{label}: update available {c} -> {latest} (run '{hint}')")
+            }
+            Some(c) if latest < c => {
+                println!("{label}: newer than latest release ({c} vs {latest})")
+            }
+            Some(c) => println!("{label}: up to date ({c})"),
         }
-        Ok(())
+    }
+
+    /// Prints an install-script hint only when a newer CLI exists.
+    async fn suggest_cli_update() {
+        let Ok(current) = Version::parse(env!("CARGO_PKG_VERSION")) else {
+            return;
+        };
+        let Ok(latest) = Component::Cli.latest_version().await else {
+            return;
+        };
+        if latest > current {
+            println!();
+            println!("A newer flare-cli ({latest}) is available (you have {current}).");
+            println!("Update it by running the install script:");
+            println!("  curl -sSL https://install.flare-db.com | bash");
+        }
     }
 
     /// Removes every installed binary except `keep`. Failures are reported, not fatal.
@@ -228,8 +372,8 @@ pub mod release {
         removed
     }
 
-    /// `flare update`
-    pub async fn update() -> Result<()> {
+    /// `flare update [--db] [--java-worker]`
+    pub async fn update(db: bool, java_worker: bool) -> Result<()> {
         let base_dir = base_dir()?;
         let bin_dir = base_dir.join("bin");
 
@@ -246,11 +390,29 @@ pub mod release {
             }
         }
 
+        // With no flags, update everything that can be updated.
+        let (update_db, update_java) = match (db, java_worker) {
+            (false, false) => (true, true),
+            (db, java) => (db, java),
+        };
+
         fs::create_dir_all(&bin_dir)
             .with_context(|| format!("failed to create bin directory {}", bin_dir.display()))?;
 
-        let latest = latest_version().await?;
-        let all = installed(&bin_dir)?;
+        if update_db {
+            update_db_component(&bin_dir).await?;
+        }
+        if update_java {
+            update_java_worker_component(&bin_dir).await?;
+        }
+
+        suggest_cli_update().await;
+        Ok(())
+    }
+
+    async fn update_db_component(bin_dir: &Path) -> Result<()> {
+        let latest = Component::Db.latest_version().await?;
+        let all = installed(bin_dir)?;
 
         if let Some(highest) = all.last().map(|i| i.version.clone()) {
             if highest >= latest {
@@ -266,7 +428,7 @@ pub mod release {
             println!("Installing FlareDB {latest}");
         }
 
-        let new_path = crate::init::install_flaredb(&latest, &bin_dir).await?;
+        let new_path = crate::init::install_flaredb(&latest, bin_dir).await?;
 
         // Only now that the new binary is in place and verified, remove the old ones.
         let removed = prune_except(&all, &latest);
@@ -276,6 +438,36 @@ pub mod release {
             println!("Removed old version {v}");
         }
         println!("Run 'flare up' to start it.");
+        Ok(())
+    }
+
+    async fn update_java_worker_component(bin_dir: &Path) -> Result<()> {
+        let latest = Component::JavaWorker.latest_version().await?;
+        let all = installed_java_worker(bin_dir)?;
+
+        if let Some(highest) = all.last().map(|w| w.version.clone()) {
+            if highest >= latest {
+                println!("beam-java-worker {highest} is already the latest version.");
+                for v in prune_except(&all, &highest) {
+                    println!("Removed old version {v}");
+                }
+                return Ok(());
+            }
+            println!("Updating beam-java-worker {highest} -> {latest}");
+        } else {
+            println!("Installing beam-java-worker {latest}");
+        }
+
+        let new_path = crate::init::install_java_worker(&latest, bin_dir).await?;
+        let removed = prune_except(&all, &latest);
+        println!(
+            "beam-java-worker {latest} installed at {}",
+            new_path.display()
+        );
+        for v in &removed {
+            println!("Removed old version {v}");
+        }
+        println!("Restart 'flare up' to pick up the new worker jar.");
         Ok(())
     }
 
@@ -343,6 +535,37 @@ pub mod release {
             let dir = std::env::temp_dir().join(format!("flare-none-{}", uuid::Uuid::new_v4()));
             assert!(current(&dir).unwrap().is_none());
         }
+
+        #[test]
+        fn parses_worker_jar_names() {
+            assert_eq!(
+                parse_worker_jar_name("beam-sdks-java-harness-2.76.0-flare-bundled.jar"),
+                Some(Version::new(2, 76, 0))
+            );
+            assert!(
+                parse_worker_jar_name("beam-sdks-java-harness-2.76.0-flare-bundled.jar.tmp")
+                    .is_none()
+            );
+            assert!(parse_worker_jar_name("flaredb-2.76.0").is_none());
+            assert!(parse_worker_jar_name("beam.jar").is_none());
+        }
+
+        #[test]
+        fn picks_newest_worker_jar() {
+            let dir = temp_dir();
+            for v in ["2.74.0", "2.76.0", "2.75.1"] {
+                fs::write(
+                    dir.join(format!("beam-sdks-java-harness-{v}-flare-bundled.jar")),
+                    b"x",
+                )
+                .unwrap();
+            }
+            // A FlareDB binary must not be picked up as a worker jar.
+            fs::write(dir.join("flaredb-0.3.2"), b"x").unwrap();
+            let cur = current_java_worker(&dir).unwrap().unwrap();
+            assert_eq!(cur.version, Version::parse("2.76.0").unwrap());
+            fs::remove_dir_all(&dir).unwrap();
+        }
     }
 }
 
@@ -350,7 +573,6 @@ pub mod init {
     use anyhow::bail;
     //#[cfg(not(unix))]
     //use anyhow::bail;
-    use crate::BEAM_WORKER_VERSION;
     use crate::release;
     use anyhow::{Context, Result};
     use indicatif::{ProgressBar, ProgressStyle};
@@ -388,28 +610,27 @@ pub mod init {
                     installed.version,
                     installed.path.display()
                 );
-                println!(
-                    "Run 'flare db-version' to check for updates, or 'flare update' to upgrade."
-                );
+                println!("Run 'flare version' to check for updates, or 'flare update' to upgrade.");
             }
             None => {
-                let latest = release::latest_version().await?;
+                let latest = release::Component::Db.latest_version().await?;
                 println!("Installing FlareDB {latest}");
                 install_flaredb(&latest, &bin_dir).await?;
             }
         }
 
-        let worker_jar_name =
-            format!("beam-sdks-java-harness-{BEAM_WORKER_VERSION}-flare-bundled.jar");
-        let worker_jar_path = bin_dir.join(&worker_jar_name);
-        let worker_url = format!(
-            "https://github.com/flare-db/flare-db/releases/download/beam-worker-java-{BEAM_WORKER_VERSION}/{worker_jar_name}"
-        );
-
-        if worker_jar_path.exists() {
-            println!("Worker jar already exists at {}", worker_jar_path.display());
-        } else {
-            download_with_progress(worker_url.as_str(), &worker_jar_path).await?;
+        match release::current_java_worker(&bin_dir)? {
+            Some(installed) => {
+                println!("Worker jar already exists at {}", installed.path.display());
+                println!(
+                    "Run 'flare version' to check for updates, or 'flare update --java-worker' to upgrade."
+                );
+            }
+            None => {
+                let latest = release::Component::JavaWorker.latest_version().await?;
+                println!("Installing beam-java-worker {latest}");
+                install_java_worker(&latest, &bin_dir).await?;
+            }
         }
 
         Ok(())
@@ -450,6 +671,40 @@ pub mod init {
         // Always clean up scratch files (the .tmp is already gone after a successful rename).
         let _ = fs::remove_file(&archive_path);
         let _ = fs::remove_file(&tmp_binary);
+
+        result?;
+        Ok(final_path)
+    }
+
+    /// Downloads the Beam Java worker jar `version` from R2, verifies its checksum,
+    /// and installs it as `<bin_dir>/<jar name>`. Nothing is left behind on failure.
+    pub async fn install_java_worker(version: &Version, bin_dir: &Path) -> Result<PathBuf> {
+        let jar_name = release::worker_jar_name(version);
+        let final_path = bin_dir.join(&jar_name);
+        let tmp_path = bin_dir.join(format!("{jar_name}.tmp"));
+        let url = format!(
+            "{}/beam-worker-java/{}/{}",
+            release::base_url(),
+            version,
+            jar_name
+        );
+
+        let result: Result<()> = async {
+            download_with_progress(&url, &tmp_path).await?;
+            verify_sha256(&tmp_path, &format!("{url}.sha256")).await?;
+            fs::rename(&tmp_path, &final_path).with_context(|| {
+                format!(
+                    "failed to move {} to {}",
+                    tmp_path.display(),
+                    final_path.display()
+                )
+            })?;
+            Ok(())
+        }
+        .await;
+
+        // Always clean up the scratch file (already gone after a successful rename).
+        let _ = fs::remove_file(&tmp_path);
 
         result?;
         Ok(final_path)
@@ -713,7 +968,6 @@ mod server {
     use super::process_control;
     use super::release;
     use super::state;
-    use crate::BEAM_WORKER_VERSION;
     use anyhow::{Context, Result, bail};
     use std::fs::{self, OpenOptions};
     use std::process::Stdio;
@@ -758,16 +1012,13 @@ mod server {
                 bin_dir.display()
             ),
         };
-        let worker_jar_path = bin_dir.join(format!(
-            "beam-sdks-java-harness-{BEAM_WORKER_VERSION}-flare-bundled.jar"
-        ));
-
-        if !worker_jar_path.exists() {
-            bail!(
-                "Missing worker jar {}. Run 'flare init' first.",
-                worker_jar_path.display()
-            );
-        }
+        let worker_jar_path = match release::current_java_worker(&bin_dir)? {
+            Some(installed) => installed.path,
+            None => bail!(
+                "Missing worker jar in {}. Run 'flare init' first.",
+                bin_dir.display()
+            ),
+        };
 
         fs::create_dir_all(&instances_dir).with_context(|| {
             format!(
