@@ -2,13 +2,13 @@ FlareDB runs Apache Beam pipelines as jobs. Build your pipeline with the Beam Py
 
 ## Prerequisites
 
-- A running FlareDB instance. See the [Quickstart](/quickstart).
+- A running FlareDB instance. See the [Quickstart](https://docs.flare-db.com/quickstart).
 - Python 3.9+.
 - An Apache Beam pipeline. The examples in this guide use Apache Beam 2.76.0.
 
 ## 1. Install the runner dependency
 
-Create and activate a virtual environment, then install the `flaredb-runner` package from the repository. It includes flare and apache-beam dependency.
+Create and activate a virtual environment, then install the `flaredb-runner` package from the repository. It includes flare and apache-beam(2.76.0) dependency.
 
 ```bash
 python3 -m venv .venv
