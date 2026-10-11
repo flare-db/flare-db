@@ -2,11 +2,13 @@
 #
 #
 # Triggers
+#   - Manually: Actions -> "Publish to R2" -> Run workflow -> enter a tag.
+#
+# Automated triggers are currently DISABLED (commented out below). To re-enable:
 #   - After the dist "Release" workflow succeeds for a tag like flare-cli-v0.3.2
 #     or flaredb-v0.3.2
 #     (workflow_run is used because releases created by GITHUB_TOKEN do NOT fire
 #     `on: release`, which is how dist creates them).
-#   - Manually: Actions -> "Publish to R2" -> Run workflow -> enter a tag.
 #   - On pushes to main that change scripts/install.sh.
 #
 # Bucket layout produced
@@ -25,17 +27,18 @@
 name: Publish to R2
 
 on:
-  workflow_run:
-    workflows: ["Release"]
-    types: [completed]
+  # Automated triggers disabled; use workflow_dispatch (manual) instead.
+  # workflow_run:
+  #   workflows: ["Release"]
+  #   types: [completed]
   workflow_dispatch:
     inputs:
       tag:
         description: "Release tag to publish (e.g. flare-cli-v0.3.2)"
         required: true
-  push:
-    branches: [main]
-    paths: ["scripts/install.sh"]
+  # push:
+  #   branches: [main]
+  #   paths: ["scripts/install.sh"]
 
 permissions:
   contents: read
