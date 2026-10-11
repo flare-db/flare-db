@@ -24,8 +24,7 @@ From the repository root:
 ```sh
 python3 -m venv .venv
 source .venv/bin/activate
-pip install apache-beam
-pip install -e runner-sdk/python/flarerunner
+pip install -e runner-sdk/python/flarerunner   # this also installs apache-beam==2.76.0
 ```
 
 Start a local FlareDB instance (see the repository root `README.md`), then run
