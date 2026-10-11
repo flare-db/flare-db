@@ -181,9 +181,8 @@ For Python, use a virtual environment when needed:
 
 ```sh
 python3 -m venv .venv
-. .venv/bin/activate
-pip install apache-beam
-pip install -e runner-sdk/python/flarerunner
+source .venv/bin/activate
+pip install -e runner-sdk/python/flarerunner   # this also installs apache-beam==2.76.0
 ```
 
 ## Pull-request checklist

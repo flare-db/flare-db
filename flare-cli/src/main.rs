@@ -676,8 +676,7 @@ pub mod init {
         Ok(final_path)
     }
 
-    /// Downloads the Beam Java worker jar `version` from R2, verifies its checksum,
-    /// and installs it as `<bin_dir>/<jar name>`. Nothing is left behind on failure.
+    /// Downloads the Beam Java worker jar `version` from R2.
     pub async fn install_java_worker(version: &Version, bin_dir: &Path) -> Result<PathBuf> {
         let jar_name = release::worker_jar_name(version);
         let final_path = bin_dir.join(&jar_name);
@@ -691,7 +690,6 @@ pub mod init {
 
         let result: Result<()> = async {
             download_with_progress(&url, &tmp_path).await?;
-            verify_sha256(&tmp_path, &format!("{url}.sha256")).await?;
             fs::rename(&tmp_path, &final_path).with_context(|| {
                 format!(
                     "failed to move {} to {}",

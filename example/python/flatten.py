@@ -8,8 +8,14 @@ Run from the repository root with a FlareDB instance already started:
 
     python3 example/python/flatten.py
 
-See runner-sdk/python/flarerunner for how to install the flaredb dependency,
-and the repository root README.md for how to start FlareDB.
+    Create a python virtual env and install the flaredb dependency (this also
+    installs apache-beam==2.76.0):
+
+    python3 -m venv .venv
+    source .venv/bin/activate
+    pip install -e runner-sdk/python/flarerunner
+
+See the repository root README.md for how to start FlareDB.
 """
 
 import logging
