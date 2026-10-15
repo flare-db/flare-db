@@ -1112,7 +1112,6 @@ mod timer_tests {
     use crate::coders::primitives::StringUtf8Coder;
     use crate::engine::harness::data::{TimerChunk, TimersKey};
     use crate::engine::timer::TimerStore;
-    use crate::store::element_store::FlareElementStore;
     use beam_model_rs::v1::TimerFamilySpec;
     use prost::Message;
     use tempfile::tempdir;
@@ -1170,15 +1169,10 @@ mod timer_tests {
 
     async fn make_timer_service() -> (tempfile::TempDir, Arc<TimerService>) {
         let dir = tempdir().expect("failed to create tempdir warehouse");
-        let warehouse = dir
-            .path()
-            .to_str()
-            .expect("tempdir path is not valid utf8")
-            .to_string();
-        let store = FlareElementStore::new(warehouse, "timers-test".to_string(), None)
+        let kv = crate::engine::kv::SlateKvStore::open(dir.path(), "timers")
             .await
-            .expect("failed to construct FlareElementStore");
-        let service = Arc::new(TimerService::new(TimerStore::new(Arc::new(store))));
+            .expect("failed to open SlateDB timer store");
+        let service = Arc::new(TimerService::new(TimerStore::with_store(Arc::new(kv))));
         (dir, service)
     }
 

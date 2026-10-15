@@ -29,7 +29,8 @@ For Beam terminology such as PCollections, ParDo, windows, and portable APIs, us
 flaredb/                         Rust server and execution engine
   src/jobservice/                Beam Job + Artifact service; submission becomes a Job
   src/fusion/                    Runner API graph view, SDF rewrite, stage fusion, executable DAG
-  src/engine/                    Scheduler, dispatcher, SDK bundle runtime, Fn API channels
+  src/engine/                    Scheduler, dispatcher, SDK bundle runtime, Fn API channels,
+                                 user state and timers in a SlateDB KV store
   src/transforms/                Rust-native transforms and URN registry
   src/coders/                    Beam value/coder decoding and WindowedValue framing
   src/store/                     BeamRecord ↔ Arrow ↔ Paimon PCollection persistence
@@ -56,6 +57,7 @@ example/                         Submission/integration examples
 | `fusion` | Normalizes, represents, and fuses Runner API transforms | `QueryablePipeline` → `FusedPipeline` → `ExecutableGraph` |
 | `ExecutableGraph` | Petgraph DAG of `Runner`, `Worker`, or `Splittable` nodes | Edges carry `ConsumerMetaData`: PCollection, coder, producer/consumer IDs |
 | `engine` + `harness` | Dependency scheduling and Fn bundle/data orchestration | Tonic Fn APIs are a protocol boundary; do not invent a second transport |
+| `engine/state.rs`, `engine/timer.rs`, `engine/kv.rs` | Beam user state and user timers in a SlateDB KV store | Cells are opaque bytes over the Fn State proto. The Paimon PCollection store does not hold them. |
 | `transforms` | Flare-native PCollection operations | `FlareTransform::execute(ExecutionContext)` reads/writes element-store collections |
 | `store` | Materialize elements as Paimon tables | `BeamRecord` conversion is the coder/storage boundary; schema derives from first batch |
 | `io` / `flare-io` / `flare-sql` | Query and external table I/O | Arrow Flight SQL and DataFusion/Paimon, separate from pipeline scheduling |
@@ -63,10 +65,11 @@ example/                         Submission/integration examples
 ### Technologies actually in the execution path
 
 - **Beam Runner API / generated `beam_model_rs` types:** `Pipeline`, `Components`, `PTransform`, coders, environments, `ProcessBundleDescriptor`, Job/Fn service types.
-- **Beam Fn API:** control registers descriptors and sends `ProcessBundle`; data streams framed `Elements`; logging is routed to job logs. State service accepts a stream but has no request-processing/state backend.
+- **Beam Fn API:** control registers descriptors and sends `ProcessBundle`; data streams framed `Elements`; logging is routed to job logs. The State service answers `StateRequest`s from the harness against the job's user state and timers.
 - **Petgraph:** internal executable DAG and dependency edges.
 - **Arrow:** in-memory `RecordBatch` representation and Flight IPC.
-- **Paimon:** filesystem catalog and tables backing PCollections; FlareDB creates a per-job Paimon database.
+- **SlateDB:** embedded LSM on `object_store` (local filesystem) holding Beam user state and user timers, one database per subsystem (`state`, `timers`) under `<warehouse>/.slate_state/<db>/`.
+- **Paimon:** filesystem catalog and tables backing PCollections. Paimon also holds the per-job `__flare_cursor` read-cursor table. FlareDB creates a per-job Paimon database.
 - **DataFusion / `paimon-datafusion`:** native `GroupByKey` aggregation and SQL/Flight query planning/execution.
 
 There is no Tonbo implementation in the active code path. The current catalog creation is `FileSystemCatalog`; do not assume remote object-storage behavior without finding an implementation/configuration path.
@@ -134,7 +137,7 @@ Worker output bytes
 - Changing **fusion** affects both `ExecutableStage` descriptors and DAG dependencies. Inspect `fusion/pipeline.rs`, `fusion/fuser.rs`, `engine/scheduler.rs`, and the stage data-boundary construction in `engine/runtime.rs`.
 - Changing **coders** must preserve exactly the harness framing. `process_input_elements` deliberately sends payload data followed by an empty `is_last` marker to work with both Java and Python harnesses. Review Java `PortableCoderRewrites` and Python pickled-coder handling too.
 - Changing **storage schema** affects native transforms, SDK stage handoff, Flight I/O, and SQL. The schema registry is in-memory per store/job and Paimon has no native Arrow Null type (`Void` becomes nullable boolean).
-- Changing **stateful behavior** needs a real backend plus Fn State request dispatch; `engine/harness/state.rs` only retains streams and exposes send/receive helpers today. Fusion already treats ParDo state/timers as fusion boundaries.
+- Changing **stateful behavior** means touching the Fn State path end to end. `engine/harness/state.rs` owns the stream and decodes `StateRequest`s. `engine/state.rs` (`backend` and `bag`) and `engine/timer.rs` hold the Beam semantics. `engine/kv.rs` persists the cells in the job's SlateDB store. Only `BagUserState` is served. Event-time timers also drive watermark holds. Fusion already treats ParDo state/timers as fusion boundaries. `__flare_cursor` stays a Paimon table of the element store.
 
 ## Where to look
 
@@ -149,6 +152,7 @@ Worker output bytes
 | Harness protocol / bundles | `flaredb/src/engine/harness/` | `engine/runtime.rs`, `worker/manager.rs` |
 | Element coding | `flaredb/src/coders/` | `engine/runtime.rs`, SDK coder rewrite tests |
 | PCollection persistence | `flaredb/src/store/{record,element_store}.rs` | native transforms, `io/server.rs` |
+| User state / timers | `flaredb/src/engine/state.rs`, `engine/timer.rs` | `engine/kv.rs`, `engine/harness/state.rs` |
 | SQL / Flight | `flaredb/src/io/server.rs` | `flare-io/java/flareio-java`, `flare-sql` |
 | Java runner | `runner-sdk/java/flarerunner/src/main/java/com/flaredb/runner/FlareRunner.java` | tests; `PortableCoderRewrites.java` |
 | Python runner | `runner-sdk/python/flarerunner/flaredb_runner/flare_runner.py` | `tests/flare_runner_test.py`, `example/python/wordcount.py` |

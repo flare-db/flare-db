@@ -1056,7 +1056,7 @@ pub async fn create_catalog(warehouse: String, db_name: String) -> Result<FileSy
     Ok(catalog)
 }
 
-/// Local directory SlateDB uses for a job's user state.
+/// Local directory SlateDB uses for a job's user state and user timers.
 ///
 /// Derived from the store's warehouse and database so each job gets an isolated
 /// embedded state database, alongside the Paimon tables.

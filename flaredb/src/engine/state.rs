@@ -1,20 +1,4 @@
 //! Durable user state.
-//!
-//! A stateful `DoFn` keeps data between elements — a running total, a buffer, a
-//! set. That data is scoped to a key and a window, so different keys never mix,
-//! and it is persisted rather than held in memory, because elements arrive across
-//! many separate bundles and the job can restart.
-//!
-//! The SDK sends generic Fn State requests rather than telling us what the state
-//! means, so we turn each into a cell: decode its `StateKey` into a
-//! [`UserStateAddress`] (transform, state id, window, key), then let
-//! [`UserStateStore`] apply the request — `get`, `append`, or `clear`.
-//!
-//! The cell is stored by [`backend::StateBackend`], a durable key/value table
-//! (`__flare_state`) that locks each key so a read-modify-write can't lose an
-//! update. [`bag::BagState`] is the one kind served today: append chunks, read
-//! them back concatenated (Beam's Value, Combining, and Set states all ride bags
-//! on the wire). The gRPC transport lives in `engine/harness/state.rs`.
 
 pub use self::backend::StateBackend;
 pub use self::bag::BagState;
@@ -108,7 +92,7 @@ impl UserStateAddress {
         }
     }
 
-    /// The opaque composite Paimon key addressing this cell.
+    /// The opaque composite key addressing this cell.
     pub fn composite_key(&self) -> Vec<u8> {
         build_state_key(
             &self.transform_id,
@@ -121,10 +105,9 @@ impl UserStateAddress {
 
 /// Dispatches a Beam user-state operation to the implementation for its kind.
 ///
-/// This is the boundary between the Fn State request handler and the
-/// Paimon-backed store: the harness decodes a `StateKey` into a
-/// [`UserStateAddress`], and this type interprets it according to Beam state
-/// semantics.
+/// This is the boundary between the Fn State request handler and the store. The
+/// harness decodes a `StateKey` into a [`UserStateAddress`]. This type interprets
+/// the address according to the Beam state semantics.
 pub struct UserStateStore {
     backend: StateBackend,
     address: UserStateAddress,
@@ -216,14 +199,14 @@ mod tests {
 pub mod backend {
     //! Opaque key/value storage backend for Beam user state.
     //!
-    //! Backs the Beam Fn State API with a dedicated primary-key Paimon table that
-    //! maps a composite state key (opaque bytes) to a single value blob. The default
-    //! `deduplicate` merge engine gives last-write-wins upserts, and deletes are
-    //! `-D` changelog rows via the `_VALUE_KIND` column. This layer only moves
-    //! opaque bytes in and out of Paimon; the Beam semantics (append =
-    //! read-modify-write, clear = delete) live in the per-state-type modules, e.g.
-    //! [`super::bag`]. The core table read/write operations are delegated to
-    //! [`FlareElementStore`].
+    //! The backend stores one durable cell per state key. The key is the composite
+    //! state key of opaque bytes. The value is one blob. A write is a
+    //! last-write-wins upsert and a clear removes the cell. The cells live in the
+    //! `state` database of the job's SlateDB store.
+    //!
+    //! This layer moves opaque bytes only. The Beam semantics belong to the
+    //! per-state-type modules, such as [`super::bag`]: append is a
+    //! read-modify-write and clear is a delete.
 
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
@@ -231,49 +214,20 @@ pub mod backend {
     use anyhow::Result;
     use tokio::sync::Mutex;
 
-    use crate::{
-        engine::kv::{KvStore, PaimonKvStore},
-        store::element_store::FlareElementStore,
-    };
+    use crate::engine::kv::KvStore;
 
-    /// Paimon table name backing the Beam Fn user-state API.
-    const STATE_TABLE: &str = "__flare_state";
-    const STATE_KEY_COLUMN: &str = "state_key";
-
-    /// Number of dirty cells that triggers an automatic flush. A durable Paimon
-    /// commit costs tens of milliseconds, so committing once per write would make
-    /// a stateful bundle miss its deadline (N3); batching many cells into one
-    /// commit amortizes that cost.
+    /// Automatic flush.
     const STATE_FLUSH_THRESHOLD: usize = 512;
 
-    /// Upper bound on the number of cells retained in the write-back cache.
-    ///
-    /// The cache must be bounded: a stateful job can touch millions of distinct
-    /// cells, and retaining every one exhausts memory (observed as a multi-GB
-    /// `flaredb` RSS with swap exhausted on a 1M-event Q3 run). Clean cells are
-    /// always safe to drop — they can be re-read from Paimon — so only dirty
-    /// (uncommitted) cells are guaranteed to stay. Dirty growth is itself bounded
-    /// by [`STATE_FLUSH_THRESHOLD`], so eviction always makes progress.
     const STATE_CACHE_MAX_ENTRIES: usize = 100_000;
 
-    /// Level the cache is trimmed down to once it exceeds
-    /// [`STATE_CACHE_MAX_ENTRIES`]. Bulk-evicting amortizes the O(n) scan over
-    /// many inserts.
     const STATE_CACHE_EVICT_TARGET: usize = STATE_CACHE_MAX_ENTRIES / 4 * 3;
 
-    /// In-memory write-back cache over the Paimon user-state table.
-    ///
-    /// The Fn State protocol is request/response lockstep: the SDK sends one state
-    /// request and waits for its response before sending the next. Serving each op
-    /// from Paimon therefore costs a scan plus a full durable commit (~40ms),
-    /// which dominates bundle time for a stateful DoFn (N3). Cells touched during
-    /// a job are held here, dirty cells are committed together, and clean cells
-    /// are evicted under memory pressure.
     struct StateCache {
-        /// Authoritative value per touched cell. `None` means the cell is empty
-        /// (absent in Paimon, deleted, or cleared).
+        /// Authoritative value per touched cell. `None` means that the cell is
+        /// empty, deleted, or cleared.
         values: HashMap<Vec<u8>, Option<Vec<u8>>>,
-        /// Cells whose `values` entry has not yet been committed to Paimon.
+        /// Cells whose value the store does not hold yet.
         dirty: HashSet<Vec<u8>>,
     }
 
@@ -285,10 +239,11 @@ pub mod backend {
             }
         }
 
-        /// Drop clean cells until at most `target` remain. Dirty cells are never
-        /// evicted: their value is the client-visible state and must survive until
-        /// it is committed. If everything is dirty the cache stays over `target`,
-        /// but the flush threshold keeps the dirty set small.
+        /// Drop clean cells until at most `target` remain.
+        ///
+        /// Dirty cells never go: their value is the client-visible state and it
+        /// must survive until the commit. A fully dirty cache stays above
+        /// `target`. The flush threshold keeps the dirty set small.
         fn evict_clean_to_fit(&mut self, target: usize) {
             if self.values.len() <= target {
                 return;
@@ -308,8 +263,8 @@ pub mod backend {
 
     /// Opaque key/value storage for Beam user state.
     ///
-    /// The physical store is pluggable via [`KvStore`]: a Paimon primary-key
-    /// table or an embedded SlateDB LSM.
+    /// The cells live in a [`KvStore`]. The trait keeps the SlateDB dependency out
+    /// of this module and gives the tests a seam.
     #[derive(Clone)]
     pub struct StateBackend {
         store: Arc<dyn KvStore>,
@@ -321,16 +276,7 @@ pub mod backend {
     }
 
     impl StateBackend {
-        /// Back state with the element store's Paimon catalog (default).
-        pub fn new(store: Arc<FlareElementStore>) -> Self {
-            Self::with_store(Arc::new(PaimonKvStore::new(
-                store,
-                STATE_TABLE,
-                STATE_KEY_COLUMN,
-            )))
-        }
-
-        /// Back state with an explicit physical [`KvStore`].
+        /// Store the cells in `store`.
         pub fn with_store(store: Arc<dyn KvStore>) -> Self {
             Self {
                 store,
@@ -343,8 +289,8 @@ pub mod backend {
 
         /// Read the value stored for `state_key`, or `None` when absent.
         ///
-        /// Served from the write-back cache when the cell has been touched during
-        /// the job; otherwise read from Paimon and cached (first touch only).
+        /// Read from the write-back cache when the cell is there. Otherwise read
+        /// from the store and cache the value.
         pub async fn get(&self, state_key: &[u8]) -> Result<Option<Vec<u8>>> {
             let mut cache = self.cache.lock().await;
             self.get_locked(&mut cache, state_key).await
@@ -417,10 +363,10 @@ pub mod backend {
             Ok(())
         }
 
-        /// Commit every dirty cell to Paimon in a single durable batch.
+        /// Commit every dirty cell in one durable batch.
         ///
-        /// Called when the pending set grows and when the job's state stream ends,
-        /// so state outlives the in-memory cache without paying a commit per op.
+        /// The backend calls this method when the pending set grows and when the
+        /// state stream ends. The cells then outlive the in-memory cache.
         pub async fn flush(&self) -> Result<()> {
             let mut cache = self.cache.lock().await;
             self.flush_locked(&mut cache).await
@@ -447,24 +393,27 @@ pub mod backend {
         use super::*;
         use tempfile::tempdir;
 
-        async fn make_backend() -> (tempfile::TempDir, Arc<FlareElementStore>, StateBackend) {
-            let dir = tempdir().expect("failed to create tempdir warehouse");
-            let warehouse = dir
-                .path()
-                .to_str()
-                .expect("tempdir path is not valid utf8")
-                .to_string();
-            let store = Arc::new(
-                FlareElementStore::new(warehouse, "testdb".to_string(), None)
-                    .await
-                    .expect("failed to construct FlareElementStore"),
-            );
-            (dir, store.clone(), StateBackend::new(store))
+        /// Open a SlateDB state handle rooted at `dir`.
+        async fn open_kv(dir: &std::path::Path) -> Arc<dyn KvStore> {
+            let kv = crate::engine::kv::SlateKvStore::open(dir, "state")
+                .await
+                .expect("failed to open SlateDB state store");
+            Arc::new(kv)
+        }
+
+        /// A state backend plus the SlateDB handle that it writes through.
+        ///
+        /// A test can open a second backend over the same handle. That backend
+        /// then shows what the first one committed.
+        async fn make_backend() -> (tempfile::TempDir, Arc<dyn KvStore>, StateBackend) {
+            let dir = tempdir().expect("failed to create tempdir");
+            let kv = open_kv(dir.path()).await;
+            (dir, kv.clone(), StateBackend::with_store(kv))
         }
 
         #[tokio::test]
         async fn put_get_delete_roundtrip() {
-            let (_dir, _store, backend) = make_backend().await;
+            let (_dir, _kv, backend) = make_backend().await;
 
             // Missing key reads back None.
             assert!(backend.get(b"key").await.unwrap().is_none());
@@ -476,7 +425,7 @@ pub mod backend {
                 Some(&b"value-1"[..])
             );
 
-            // Last write wins (deduplicate merge engine).
+            // Last write wins.
             backend.put(b"key", b"value-2").await.unwrap();
             assert_eq!(
                 backend.get(b"key").await.unwrap().as_deref(),
@@ -490,7 +439,7 @@ pub mod backend {
 
         #[tokio::test]
         async fn put_is_isolated_between_keys() {
-            let (_dir, _store, backend) = make_backend().await;
+            let (_dir, _kv, backend) = make_backend().await;
 
             backend.put(b"k1", b"one").await.unwrap();
             backend.put(b"k2", b"two").await.unwrap();
@@ -515,7 +464,7 @@ pub mod backend {
 
         #[tokio::test]
         async fn keyed_get_returns_the_matching_key_among_many() {
-            let (_dir, _store, backend) = make_backend().await;
+            let (_dir, _kv, backend) = make_backend().await;
 
             for i in 0..32u8 {
                 backend.put(&[i], &[i, i]).await.unwrap();
@@ -530,7 +479,7 @@ pub mod backend {
 
         #[tokio::test]
         async fn read_modify_write_does_not_lose_concurrent_updates() {
-            let (_dir, _store, backend) = make_backend().await;
+            let (_dir, _kv, backend) = make_backend().await;
             let tasks = 16;
 
             let mut handles = Vec::new();
@@ -556,7 +505,7 @@ pub mod backend {
 
         #[tokio::test]
         async fn flush_persists_the_write_back_cache_to_a_fresh_backend() {
-            let (_dir, store, backend) = make_backend().await;
+            let (_dir, kv, backend) = make_backend().await;
             backend.put(b"k", b"v1").await.unwrap();
             backend
                 .read_modify_write(b"k", |mut current| {
@@ -568,13 +517,13 @@ pub mod backend {
 
             // Writes live in the in-memory cache until flushed, so a backend that
             // has not been flushed sees nothing.
-            let fresh = StateBackend::new(store.clone());
+            let fresh = StateBackend::with_store(kv.clone());
             assert!(fresh.get(b"k").await.unwrap().is_none());
 
             backend.flush().await.unwrap();
 
             // After a flush the value is durable for a backend sharing the store.
-            let reloaded = StateBackend::new(store.clone());
+            let reloaded = StateBackend::with_store(kv.clone());
             assert_eq!(
                 reloaded.get(b"k").await.unwrap().as_deref(),
                 Some(&b"v1+v2"[..])
@@ -583,14 +532,14 @@ pub mod backend {
 
         #[tokio::test]
         async fn dirty_writes_commit_automatically_past_the_threshold() {
-            let (_dir, store, backend) = make_backend().await;
+            let (_dir, kv, backend) = make_backend().await;
 
             for i in 0..=STATE_FLUSH_THRESHOLD as u32 {
                 backend.put(&i.to_be_bytes(), b"v").await.unwrap();
             }
 
             // Crossing the threshold flushed without an explicit `flush` call.
-            let reloaded = StateBackend::new(store.clone());
+            let reloaded = StateBackend::with_store(kv.clone());
             assert_eq!(
                 reloaded.get(&0u32.to_be_bytes()).await.unwrap().as_deref(),
                 Some(&b"v"[..])
@@ -599,23 +548,44 @@ pub mod backend {
 
         #[tokio::test]
         async fn flush_commits_deletes_as_well_as_inserts() {
-            let (_dir, store, backend) = make_backend().await;
+            let (_dir, kv, backend) = make_backend().await;
             backend.put(b"gone", b"value").await.unwrap();
             backend.flush().await.unwrap();
 
             backend.delete(b"gone").await.unwrap();
             backend.flush().await.unwrap();
 
-            let reloaded = StateBackend::new(store.clone());
+            let reloaded = StateBackend::with_store(kv.clone());
             assert!(reloaded.get(b"gone").await.unwrap().is_none());
+        }
+
+        #[tokio::test]
+        async fn flushed_state_survives_a_backend_restart() {
+            let dir = tempdir().expect("failed to create tempdir");
+            let backend = StateBackend::with_store(open_kv(dir.path()).await);
+            backend.put(b"k", b"v1").await.unwrap();
+            backend
+                .read_modify_write(b"k", |mut current| {
+                    current.extend_from_slice(b"+v2");
+                    current
+                })
+                .await
+                .unwrap();
+            backend.flush().await.unwrap();
+            drop(backend);
+
+            // A fresh handle over the same directory sees the committed value.
+            let reopened = StateBackend::with_store(open_kv(dir.path()).await);
+            assert_eq!(
+                reopened.get(b"k").await.unwrap().as_deref(),
+                Some(&b"v1+v2"[..])
+            );
         }
 
         #[tokio::test]
         async fn slate_state_store_roundtrips_and_batches() {
             let dir = tempdir().expect("failed to create tempdir");
-            let store = crate::engine::kv::SlateKvStore::open(dir.path(), "state")
-                .await
-                .expect("failed to open SlateDB state store");
+            let store = open_kv(dir.path()).await;
 
             assert!(store.get(b"missing").await.unwrap().is_none());
 
@@ -726,21 +696,16 @@ pub mod bag {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::{engine::state::build_state_key, store::element_store::FlareElementStore};
+        use crate::engine::{kv::SlateKvStore, state::build_state_key};
         use std::sync::Arc;
         use tempfile::tempdir;
 
         async fn make_bag() -> (tempfile::TempDir, BagState) {
             let dir = tempdir().expect("failed to create tempdir warehouse");
-            let warehouse = dir
-                .path()
-                .to_str()
-                .expect("tempdir path is not valid utf8")
-                .to_string();
-            let store = FlareElementStore::new(warehouse, "testdb".to_string(), None)
+            let kv = SlateKvStore::open(dir.path(), "state")
                 .await
-                .expect("failed to construct FlareElementStore");
-            (dir, BagState::new(StateBackend::new(Arc::new(store))))
+                .expect("failed to open SlateDB state store");
+            (dir, BagState::new(StateBackend::with_store(Arc::new(kv))))
         }
 
         #[tokio::test]
