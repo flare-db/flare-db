@@ -15,7 +15,7 @@ use tonic::{Response, Status};
 
 use crate::{
     engine::{
-        kv::{SlateKvStore, use_slatedb},
+        kv::SlateKvStore,
         state::{StateBackend, UserStateAddress, UserStateKind, UserStateStore},
     },
     store::element_store::{FlareElementStore, slate_state_dir},
@@ -236,25 +236,24 @@ impl StateChannel {
                 }
             }
         }
-        // The in-memory write-back cache holds the job's state; commit it once on
-        // exit so it survives without paying a durable commit per operation.
-        if let Err(e) = backend.flush().await {
-            warn!("failed to flush user state on driver exit: {}", e);
-        }
+        flush_state_on_exit(&backend).await;
         info!("state request driver stopped");
     }
 }
 
-/// Select and construct the physical state backend for a job.
+/// Commit the write-back cache when the state driver exits.
 ///
-/// Defaults to an embedded SlateDB LSM under the job's warehouse. Set
-/// `FLAREDB_STATE_BACKEND=paimon` to use the legacy Paimon state table instead.
-async fn build_state_backend(store: Arc<FlareElementStore>) -> Result<StateBackend> {
-    if !use_slatedb() {
-        info!("using Paimon state backend");
-        return Ok(StateBackend::new(store));
+/// The cache holds the cells in memory. A cell that stays in the cache is lost
+/// when the process exits.
+async fn flush_state_on_exit(backend: &StateBackend) {
+    if let Err(e) = backend.flush().await {
+        warn!("failed to flush user state on driver exit: {}", e);
     }
+}
 
+/// Construct a job's state backend in the `state` database under
+/// `<warehouse>/.slate_state/<db>/`.
+async fn build_state_backend(store: Arc<FlareElementStore>) -> Result<StateBackend> {
     let dir = slate_state_dir(&store);
     let kv = SlateKvStore::open(&dir, "state").await?;
     info!("using SlateDB state backend at {}", dir.display());
@@ -403,7 +402,66 @@ mod tests {
         let store = FlareElementStore::new(warehouse, "testdb".to_string(), None)
             .await
             .expect("failed to construct FlareElementStore");
-        (dir, StateBackend::new(Arc::new(store)))
+        let backend = build_state_backend(Arc::new(store))
+            .await
+            .expect("failed to build the state backend");
+        (dir, backend)
+    }
+
+    #[tokio::test]
+    async fn state_lands_in_slate_db_and_survives_the_exit_flush() {
+        let dir = tempdir().expect("failed to create tempdir warehouse");
+        let warehouse = dir
+            .path()
+            .to_str()
+            .expect("tempdir path is not valid utf8")
+            .to_string();
+        let store = Arc::new(
+            FlareElementStore::new(warehouse, "testdb".to_string(), None)
+                .await
+                .expect("failed to construct FlareElementStore"),
+        );
+
+        let backend = build_state_backend(store.clone()).await.unwrap();
+        handle_state_request(&backend, bag_request("1", b"w", b"k", append_op(b"state")))
+            .await
+            .unwrap();
+
+        // The driver commits the write-back cache when the state stream ends.
+        flush_state_on_exit(&backend).await;
+        drop(backend);
+
+        // The cells live in the job's SlateDB store.
+        let db_dir = slate_state_dir(&store).join("state");
+        assert!(
+            db_dir.is_dir(),
+            "expected the SlateDB state store at {}",
+            db_dir.display()
+        );
+        assert!(
+            std::fs::read_dir(&db_dir)
+                .expect("failed to list the SlateDB state store")
+                .next()
+                .is_some(),
+            "SlateDB wrote nothing under {}",
+            db_dir.display()
+        );
+        // The element store holds no user-state table.
+        assert!(store
+            .get_existing_table("__flare_state")
+            .await
+            .unwrap()
+            .is_none());
+
+        // A reopened store returns the committed cell.
+        let kv = SlateKvStore::open(&slate_state_dir(&store), "state")
+            .await
+            .expect("failed to reopen the SlateDB state store");
+        let reopened = StateBackend::with_store(Arc::new(kv));
+        let response = handle_state_request(&reopened, bag_request("2", b"w", b"k", get_op()))
+            .await
+            .unwrap();
+        assert_eq!(get_response_data(response), b"state");
     }
 
     /// A `StateRequest` targeting `BagUserState` for the given window/key.
