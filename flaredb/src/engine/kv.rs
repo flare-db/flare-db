@@ -8,10 +8,11 @@
 //! memory flat.
 //!
 //! A job's store lives under `<warehouse>/.slate_state/<db>/`, one database per
-//! subsystem (`state` and `timers`).
+//! subsystem (`cursors`, `state`, and `timers`).
 //!
-//! The element store keeps `__flare_cursor` in a separate Paimon table. A cursor
-//! must share the durability of the PCollection it points into.
+//! The element store keeps durable read cursors in the `cursors` database so
+//! snapshot positions use point gets and batched writes rather than Paimon
+//! commits.
 
 use std::sync::Arc;
 
