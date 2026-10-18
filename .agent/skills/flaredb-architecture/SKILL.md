@@ -69,7 +69,7 @@ example/                         Submission/integration examples
 - **Petgraph:** internal executable DAG and dependency edges.
 - **Arrow:** in-memory `RecordBatch` representation and Flight IPC.
 - **SlateDB:** embedded LSM on `object_store` (local filesystem) holding Beam user state and user timers, one database per subsystem (`state`, `timers`) under `<warehouse>/.slate_state/<db>/`.
-- **Paimon:** filesystem catalog and tables backing PCollections. Paimon also holds the per-job `__flare_cursor` read-cursor table. FlareDB creates a per-job Paimon database.
+- **Paimon:** filesystem catalog and tables backing PCollections. FlareDB creates a per-job Paimon database.
 - **DataFusion / `paimon-datafusion`:** native `GroupByKey` aggregation and SQL/Flight query planning/execution.
 
 There is no Tonbo implementation in the active code path. The current catalog creation is `FileSystemCatalog`; do not assume remote object-storage behavior without finding an implementation/configuration path.
@@ -137,7 +137,7 @@ Worker output bytes
 - Changing **fusion** affects both `ExecutableStage` descriptors and DAG dependencies. Inspect `fusion/pipeline.rs`, `fusion/fuser.rs`, `engine/scheduler.rs`, and the stage data-boundary construction in `engine/runtime.rs`.
 - Changing **coders** must preserve exactly the harness framing. `process_input_elements` deliberately sends payload data followed by an empty `is_last` marker to work with both Java and Python harnesses. Review Java `PortableCoderRewrites` and Python pickled-coder handling too.
 - Changing **storage schema** affects native transforms, SDK stage handoff, Flight I/O, and SQL. The schema registry is in-memory per store/job and Paimon has no native Arrow Null type (`Void` becomes nullable boolean).
-- Changing **stateful behavior** means touching the Fn State path end to end. `engine/harness/state.rs` owns the stream and decodes `StateRequest`s. `engine/state.rs` (`backend` and `bag`) and `engine/timer.rs` hold the Beam semantics. `engine/kv.rs` persists the cells in the job's SlateDB store. Only `BagUserState` is served. Event-time timers also drive watermark holds. Fusion already treats ParDo state/timers as fusion boundaries. `__flare_cursor` stays a Paimon table of the element store.
+- Changing **stateful behavior** means touching the Fn State path end to end. `engine/harness/state.rs` owns the stream and decodes `StateRequest`s. `engine/state.rs` (`backend` and `bag`) and `engine/timer.rs` hold the Beam semantics. `engine/kv.rs` persists the cells in the job's SlateDB store; `store/element_store.rs` uses the same abstraction for read cursors in the `cursors` database. Only `BagUserState` is served. Event-time timers also drive watermark holds. Fusion already treats ParDo state/timers as fusion boundaries.
 
 ## Where to look
 

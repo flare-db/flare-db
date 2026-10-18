@@ -7,9 +7,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use dashmap::DashMap;
-use paimon::spec::{
-    DataType as PaimonDataType, Datum, PredicateBuilder, Schema as PaimonSchema, VarBinaryType,
-};
+use paimon::spec::Schema as PaimonSchema;
 use paimon::{
     Catalog, CatalogOptions, FileSystemCatalog, IncrementalScanMode, Options, Table, TableWrite,
     catalog::Identifier, table::ArrowRecordBatchStream,
@@ -18,6 +16,7 @@ use tokio_stream::StreamExt;
 
 use crate::{
     coders::primitives::WindowedValue,
+    engine::kv::{KvStore, SlateKvStore},
     store::record::{
         BeamRecord, RecordTableSchema, WindowMetadata, arrow_fields_to_paimon,
         beamrecords_to_record_batch, derive_table_schema, materialize_void_columns,
@@ -67,11 +66,15 @@ pub struct FlareElementStore {
     /// Per-reader incremental read cursor: the id of the last Paimon snapshot a
     /// reader has consumed from a PCollection. Keyed by
     /// `(reader_id, pcollection_id)` and cached here for the process; the
-    /// authoritative value is the durable `__flare_cursor` Paimon table
-    /// (write-through in [`FlareElementStore::set_cursor`], read-through in
+    /// authoritative value is the SlateDB `cursors` database (write-through in
+    /// [`FlareElementStore::set_cursor`], read-through in
     /// [`FlareElementStore::cursor`]). See
     /// [`FlareElementStore::scan_windowed_values_since`].
     cursors: Arc<DashMap<String, i64>>,
+    /// Durable per-reader cursor positions, in SlateDB under
+    /// `<warehouse>/.slate_state/<db>/cursors`. The in-memory `cursors` map is a
+    /// write-through cache; this store is authoritative.
+    cursor_store: Arc<dyn KvStore>,
     /// Running minimum event-time among rows committed to a PCollection since the
     /// producer last reported. Read and cleared by the driver after each producer
     /// bundle via [`FlareElementStore::take_commit_min_timestamp`], so a consumer
@@ -92,11 +95,17 @@ impl FlareElementStore {
             Some(catalog) => catalog,
             None => Arc::new(create_catalog(warehouse, db_name.clone()).await?),
         };
+        let cursor_dir = std::path::Path::new(catalog.warehouse())
+            .join(".slate_state")
+            .join(&db_name);
+        let cursor_store: Arc<dyn KvStore> =
+            Arc::new(SlateKvStore::open(&cursor_dir, "cursors").await?);
         Ok(Self {
             registry: FlareSchemaRegistry::new(),
             catalog,
             db_name,
             cursors: Arc::new(DashMap::new()),
+            cursor_store,
             commit_min_ts: Arc::new(DashMap::new()),
             table_create_locks: Arc::new(DashMap::new()),
         })
@@ -358,39 +367,28 @@ impl FlareElementStore {
     /// The last snapshot id `reader_id` has consumed from `pcollection_id`, or
     /// `None` if it has never read it.
     ///
-    /// Durable: read through the in-memory cache, falling back to the
-    /// `__flare_cursor` Paimon table so a reader's position survives a restart
-    /// (and stays consistent with the durable PCollection store).
+    /// Durable: read through the in-memory cache, falling back to the SlateDB
+    /// `cursors` database so a reader's position survives a restart.
     pub async fn cursor(&self, reader_id: &str, pcollection_id: &str) -> Result<Option<i64>> {
         let key = Self::cursor_key(reader_id, pcollection_id);
         if let Some(value) = self.cursors.get(&key) {
             return Ok(Some(*value));
         }
-        for batch in self
-            .read_table_batches_by_binary_key(CURSOR_TABLE, CURSOR_KEY_COLUMN, key.as_bytes())
-            .await?
-        {
-            let keys = batch
-                .column_by_name(CURSOR_KEY_COLUMN)
-                .and_then(|column| column.as_any().downcast_ref::<BinaryArray>());
-            let values = batch
-                .column_by_name(CURSOR_VALUE_COLUMN)
-                .and_then(|column| column.as_any().downcast_ref::<BinaryArray>());
-            let (Some(keys), Some(values)) = (keys, values) else {
-                continue;
-            };
-            for row in 0..batch.num_rows() {
-                if keys.value(row) == key.as_bytes() {
-                    let snapshot_id: i64 = std::str::from_utf8(values.value(row))?.parse()?;
-                    self.cursors.insert(key, snapshot_id);
-                    return Ok(Some(snapshot_id));
-                }
+        match self.cursor_store.get(key.as_bytes()).await? {
+            Some(bytes) => {
+                let snapshot_id = decode_snapshot(&bytes)?;
+                self.cursors.insert(key, snapshot_id);
+                Ok(Some(snapshot_id))
             }
+            None => Ok(None),
         }
-        Ok(None)
     }
 
-    /// Advance `reader_id`'s read cursor for `pcollection_id`, durably.
+    /// Advance `reader_id`'s read cursor for `pcollection_id`.
+    ///
+    /// The SlateDB write completes before the in-memory cache is updated, so a
+    /// durable-write failure cannot leave the process serving an unpersisted
+    /// cursor.
     pub async fn set_cursor(
         &self,
         reader_id: &str,
@@ -398,12 +396,12 @@ impl FlareElementStore {
         snapshot_id: i64,
     ) -> Result<()> {
         let key = Self::cursor_key(reader_id, pcollection_id);
-        self.cursors.insert(key.clone(), snapshot_id);
-        let table = self
-            .get_or_create_table(CURSOR_TABLE, cursor_paimon_schema()?)
+        let value = encode_snapshot(snapshot_id);
+        self.cursor_store
+            .apply(&[(key.as_bytes().to_vec(), Some(value))])
             .await?;
-        let batch = build_cursor_record_batch(key.as_bytes(), snapshot_id.to_string().as_bytes())?;
-        self.write_table_batch(&table, &batch).await
+        self.cursors.insert(key, snapshot_id);
+        Ok(())
     }
 
     /// The latest committed snapshot id of a PCollection's Paimon table, or `None`
@@ -776,42 +774,6 @@ impl FlareElementStore {
         }
         Ok(batches)
     }
-
-    /// Read all committed batches of `table_name` whose `key_column` equals
-    /// `key`, or an empty `Vec` when the table does not exist.
-    ///
-    /// The equality predicate is pushed into Paimon scan planning (see
-    /// `ReadBuilder::with_filter`). In Paimon 0.3.0 this is
-    /// planner-level pruning: it may still return rows that only share a split
-    /// with the match, so callers must verify returned rows themselves. It is a
-    /// targeted read, not a guaranteed point lookup.
-    pub async fn read_table_batches_by_binary_key(
-        &self,
-        table_name: &str,
-        key_column: &str,
-        key: &[u8],
-    ) -> Result<Vec<RecordBatch>> {
-        let identifier = Identifier::new(self.db_name.as_str(), table_name);
-        let table = match self.catalog.get_table(&identifier).await {
-            Ok(table) => table,
-            Err(paimon::Error::TableNotExist { .. }) => return Ok(Vec::new()),
-            Err(err) => return Err(err.into()),
-        };
-
-        let predicate = PredicateBuilder::new(table.schema().fields())
-            .equal(key_column, Datum::Bytes(key.to_vec()))?;
-
-        let mut read_builder = table.new_read_builder();
-        read_builder.with_filter(predicate);
-        let plan = read_builder.new_scan().plan().await?;
-        let read = read_builder.new_read()?;
-        let mut stream = read.to_arrow(plan.splits())?;
-        let mut batches = Vec::new();
-        while let Some(batch) = stream.next().await {
-            batches.push(batch?);
-        }
-        Ok(batches)
-    }
 }
 
 /// A Paimon writer opened for a single bundle's output.
@@ -1056,7 +1018,7 @@ pub async fn create_catalog(warehouse: String, db_name: String) -> Result<FileSy
     Ok(catalog)
 }
 
-/// Local directory SlateDB uses for a job's user state and user timers.
+/// Local directory SlateDB uses for a job's cursors, user state, and user timers.
 ///
 /// Derived from the store's warehouse and database so each job gets an isolated
 /// embedded state database, alongside the Paimon tables.
@@ -1066,44 +1028,17 @@ pub fn slate_state_dir(store: &FlareElementStore) -> std::path::PathBuf {
         .join(&store.db_name)
 }
 
-/// Convert an Arrow [`Schema`](ArrowSchema) into a Paimon [`Schema`](PaimonSchema).
-///
-/// The resulting schema preserves Arrow field names and converted data types,
-/// and is built with no partition keys, no primary keys, no options, and no comment.
-/// Paimon table backing durable per-reader read cursors.
-const CURSOR_TABLE: &str = "__flare_cursor";
-const CURSOR_KEY_COLUMN: &str = "cursor_key";
-const CURSOR_VALUE_COLUMN: &str = "snapshot_id";
-
-/// Paimon schema for the primary-key read-cursor table.
-fn cursor_paimon_schema() -> Result<PaimonSchema> {
-    let schema = PaimonSchema::builder()
-        .column(
-            CURSOR_KEY_COLUMN,
-            PaimonDataType::VarBinary(VarBinaryType::try_new(false, VarBinaryType::MAX_LENGTH)?),
-        )
-        .column(
-            CURSOR_VALUE_COLUMN,
-            PaimonDataType::VarBinary(VarBinaryType::try_new(false, VarBinaryType::MAX_LENGTH)?),
-        )
-        .primary_key([CURSOR_KEY_COLUMN])
-        .option("bucket", "1")
-        .build()?;
-    Ok(schema)
+/// Encode a Paimon snapshot id for a SlateDB cursor value.
+fn encode_snapshot(snapshot_id: i64) -> Vec<u8> {
+    snapshot_id.to_be_bytes().to_vec()
 }
 
-/// Build a single-row cursor batch; the primary key makes this an upsert.
-fn build_cursor_record_batch(key: &[u8], value: &[u8]) -> Result<RecordBatch> {
-    let schema = ArrowSchema::new(vec![
-        ArrowField::new(CURSOR_KEY_COLUMN, DataType::Binary, false),
-        ArrowField::new(CURSOR_VALUE_COLUMN, DataType::Binary, false),
-    ]);
-    let key_array = BinaryArray::from_iter_values([key]);
-    let value_array = BinaryArray::from_iter_values([value]);
-    Ok(RecordBatch::try_new(
-        Arc::new(schema),
-        vec![Arc::new(key_array), Arc::new(value_array)],
-    )?)
+/// Decode a Paimon snapshot id from its fixed-width SlateDB cursor value.
+fn decode_snapshot(bytes: &[u8]) -> Result<i64> {
+    let bytes: [u8; 8] = bytes
+        .try_into()
+        .map_err(|_| anyhow!("invalid cursor value length {}", bytes.len()))?;
+    Ok(i64::from_be_bytes(bytes))
 }
 
 /// Decode one Arrow [`RecordBatch`] of a windowed PCollection back into
@@ -1137,6 +1072,10 @@ fn windowed_values_from_batch(
     Ok(values)
 }
 
+/// Convert an Arrow [`Schema`](ArrowSchema) into a Paimon [`Schema`](PaimonSchema).
+///
+/// The resulting schema preserves Arrow field names and converted data types,
+/// and is built with no partition keys, no primary keys, no options, and no comment.
 pub fn arrow_schema_to_paimon(schema: &ArrowSchema) -> Result<PaimonSchema> {
     let arrow_fields: Vec<ArrowField> =
         schema.fields().iter().map(|f| f.as_ref().clone()).collect();
@@ -1575,6 +1514,28 @@ mod element_store_tests {
             .unwrap();
         let cursor = store.cursor("reader", "pc-durable").await.unwrap();
         assert!(cursor.is_some());
+        assert!(
+            store
+                .get_existing_table("__flare_cursor")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let cursor_dir = slate_state_dir(&store).join("cursors");
+        assert!(
+            cursor_dir.is_dir(),
+            "expected the SlateDB cursor store at {}",
+            cursor_dir.display()
+        );
+        assert!(
+            std::fs::read_dir(&cursor_dir)
+                .expect("failed to list the SlateDB cursor store")
+                .next()
+                .is_some(),
+            "SlateDB wrote nothing under {}",
+            cursor_dir.display()
+        );
         drop(store);
 
         // A fresh store over the same warehouse sees the same cursor, so a
@@ -1586,6 +1547,15 @@ mod element_store_tests {
             reopened.cursor("reader", "pc-durable").await.unwrap(),
             cursor
         );
+    }
+
+    #[test]
+    fn cursor_snapshot_encoding_is_fixed_width_big_endian() {
+        let snapshot_id = 0x0102_0304_0506_0708;
+        let encoded = encode_snapshot(snapshot_id);
+        assert_eq!(encoded, snapshot_id.to_be_bytes());
+        assert_eq!(decode_snapshot(&encoded).unwrap(), snapshot_id);
+        assert!(decode_snapshot(&encoded[..7]).is_err());
     }
 
     #[tokio::test]
@@ -1939,10 +1909,13 @@ mod element_store_tests {
                 let store = Arc::clone(&store);
                 let name = name.clone();
                 handles.push(tokio::spawn(async move {
-                    store
-                        .get_or_create_table(&name, cursor_paimon_schema().unwrap())
-                        .await
-                        .map(|_| ())
+                    let schema = arrow_schema_to_paimon(&ArrowSchema::new(vec![ArrowField::new(
+                        "value",
+                        DataType::Int64,
+                        false,
+                    )]))
+                    .unwrap();
+                    store.get_or_create_table(&name, schema).await.map(|_| ())
                 }));
             }
             for handle in handles {
