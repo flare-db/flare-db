@@ -268,14 +268,10 @@ pub struct RecordTableSchema {
 
 /// The persisted form of Beam window metadata, independent of an element's logical coder.
 ///
-/// The element's table row stores this metadata in the reserved
-/// `__flare_window_metadata` binary column as JSON. This separates Beam's
-/// execution metadata from the logical element columns while keeping both in
-/// the same persisted row.
-///
-/// Both this type and its nested [`BeamWindow`]/[`PaneInfo`] values derive
-/// `serde`, so the JSON layout stays stable as long as those deriving types keep
-/// their variant and field names.
+/// The element store persists these fields as typed Arrow columns. This keeps
+/// Beam execution metadata distinguishable from logical element columns while
+/// allowing Parquet and DataFusion to operate on timestamps, pane fields, and
+/// window identities without parsing a per-row JSON document.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WindowMetadata {
     /// Event timestamp in milliseconds since the Unix epoch.
@@ -284,6 +280,27 @@ pub struct WindowMetadata {
     pub windows: Vec<BeamWindow>,
     /// Beam pane timing and firing indices.
     pub pane: PaneInfo,
+}
+
+impl WindowMetadata {
+    /// The latest finite window boundary, or `None` when any window is opaque.
+    ///
+    /// This is the element-level upper bound used by optional window pruning:
+    /// an element cannot belong to a wholly finite window range beyond this
+    /// timestamp. Opaque SDK windows deliberately have no inferred bound.
+    pub fn max_finite_window_end_millis(&self) -> Option<i64> {
+        if self.windows.is_empty() {
+            return None;
+        }
+        self.windows
+            .iter()
+            .try_fold(i64::MIN, |latest, window| match window {
+                BeamWindow::Opaque { .. } => None,
+                BeamWindow::Global | BeamWindow::Interval { .. } => {
+                    Some(latest.max(window.max_timestamp_millis()))
+                }
+            })
+    }
 }
 
 impl From<&WindowedValue> for WindowMetadata {

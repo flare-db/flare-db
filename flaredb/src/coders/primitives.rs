@@ -385,10 +385,9 @@ impl WindowedValue {
 /// Interval bounds are expressed in milliseconds since the Unix epoch and use
 /// Beam's half-open interval convention: `[start_millis, end_millis)`.
 ///
-/// Derives `serde` so a window can be round-tripped through the JSON-encoded
-/// window metadata persisted by the element store, and `Hash`/`Eq` so it can
-/// participate in a grouping key (for example `GroupByKey`'s `(key, window)`
-/// identity).
+/// Derives `Hash`/`Eq` so a window can participate in a grouping key (for
+/// example `GroupByKey`'s `(key, window)` identity). The `serde` derives remain
+/// available to callers but are no longer used for PCollection window storage.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum BeamWindow {
     /// The single global window.
@@ -427,7 +426,7 @@ impl BeamWindow {
     /// The element store persists one such key per window in the reserved
     /// `__flare_window_key` column so runner-native transforms (for example
     /// `GroupByKey`) can group by window in the query engine instead of decoding
-    /// the JSON metadata per element. Use [`Self::from_canonical_key`] to recover
+    /// packed metadata per element. Use [`Self::from_canonical_key`] to recover
     /// the window.
     pub fn canonical_key(&self) -> String {
         match self {
@@ -499,12 +498,21 @@ pub enum PaneTiming {
 }
 
 impl PaneTiming {
-    fn from_bits(bits: u8) -> Self {
+    pub(crate) fn from_bits(bits: u8) -> Self {
         match bits {
             0 => PaneTiming::Early,
             1 => PaneTiming::OnTime,
             2 => PaneTiming::Late,
             _ => PaneTiming::Unknown,
+        }
+    }
+
+    pub(crate) fn bits(self) -> u8 {
+        match self {
+            PaneTiming::Early => 0,
+            PaneTiming::OnTime => 1,
+            PaneTiming::Late => 2,
+            PaneTiming::Unknown => 3,
         }
     }
 }
@@ -513,8 +521,8 @@ impl PaneTiming {
 ///
 /// Fields mirror the portable `PaneInfo` message and describe how a particular
 /// firing of a window relates to the whole (first/last, timing, and indices).
-/// Derives `serde` so it can round-trip through the store's JSON window
-/// metadata.
+/// The `serde` derives remain available to callers but are no longer used for
+/// PCollection window storage.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PaneInfo {
     pub is_first: bool,

@@ -590,7 +590,13 @@ async fn open_sorted_input_stream(
     cursor: Option<i64>,
     config: &GbkSortConfig,
 ) -> Result<(Option<SortedInputStream>, Option<i64>)> {
-    let (stream, latest) = store.open_incremental_arrow(pcollection_id, cursor).await?;
+    let (stream, latest) = store
+        .open_incremental_arrow_projected(
+            pcollection_id,
+            cursor,
+            Some(&[KEY_COLUMN, VALUE_COLUMN, WINDOW_KEY_COLUMN]),
+        )
+        .await?;
     let Some(stream) = stream else {
         return Ok((None, latest));
     };
@@ -598,7 +604,7 @@ async fn open_sorted_input_stream(
     let table_schema = store.registry.get(pcollection_id).ok_or_else(|| {
         anyhow!("GroupByKey input PCollection {pcollection_id} has no registered schema")
     })?;
-    let schema = schema_with_group_key(&table_schema.arrow_schema);
+    let schema = schema_with_group_key(&gbk_input_schema(&table_schema.arrow_schema)?);
     let spill_parent = Path::new(store.catalog.warehouse()).join(".gbk-spill");
     std::fs::create_dir_all(&spill_parent)?;
     let temp_dir = tempfile::Builder::new()
@@ -658,6 +664,22 @@ async fn open_sorted_input_stream(
         }),
         latest,
     ))
+}
+
+fn gbk_input_schema(table_schema: &ArrowSchema) -> Result<Arc<ArrowSchema>> {
+    let fields = [KEY_COLUMN, VALUE_COLUMN, WINDOW_KEY_COLUMN]
+        .into_iter()
+        .map(|name| {
+            table_schema
+                .field_with_name(name)
+                .map(|field| Arc::new(field.clone()))
+                .map_err(|_| anyhow!("GroupByKey input is missing the '{name}' column"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Arc::new(ArrowSchema::new_with_metadata(
+        fields,
+        table_schema.metadata().clone(),
+    )))
 }
 
 fn schema_with_group_key(schema: &SchemaRef) -> SchemaRef {
