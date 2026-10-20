@@ -296,9 +296,9 @@ impl WindowMergeService {
             ))
         };
 
-        let (response, output) = crate::engine::liveness::idle_guard(
+        let (response, output) = crate::engine::guard::idle_guard(
             exchange,
-            crate::engine::liveness::worker_idle_timeout(),
+            crate::engine::guard::worker_idle_timeout(),
             "waiting for SDK MergeWindows output and control response",
         )
         .await?;

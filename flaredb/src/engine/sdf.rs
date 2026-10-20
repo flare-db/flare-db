@@ -201,7 +201,7 @@ impl SplittableStageExecutor {
         let response_future =
             control.recv_process_bundle_response(&instruction_id, bundle_response_rx);
 
-        let control_response = crate::engine::liveness::idle_guard(
+        let control_response = crate::engine::guard::idle_guard(
             async {
                 tokio::pin!(response_future);
                 tokio::select! {
@@ -228,7 +228,7 @@ impl SplittableStageExecutor {
                     }
                 }
             },
-            crate::engine::liveness::worker_idle_timeout(),
+            crate::engine::guard::worker_idle_timeout(),
             "waiting for SDF initialization stage control response/data",
         )
         .await?;
@@ -306,7 +306,7 @@ impl SplittableStageExecutor {
             });
 
             let timeout_id = instruction_id.clone();
-            crate::engine::liveness::idle_guard(
+            crate::engine::guard::idle_guard(
                 async {
                     tokio::pin!(response_future);
                     tokio::select! {
@@ -332,7 +332,7 @@ impl SplittableStageExecutor {
                         }
                     }
                 },
-                crate::engine::liveness::worker_idle_timeout(),
+                crate::engine::guard::worker_idle_timeout(),
                 &format!(
                     "waiting for SDF process bundle {} output data and control response",
                     timeout_id
@@ -341,9 +341,9 @@ impl SplittableStageExecutor {
             .await?
         } else {
             let timeout_id = instruction_id.clone();
-            crate::engine::liveness::idle_guard(
+            crate::engine::guard::idle_guard(
                 response_future,
-                crate::engine::liveness::worker_idle_timeout(),
+                crate::engine::guard::worker_idle_timeout(),
                 &format!(
                     "waiting for SDF process bundle {} control response",
                     timeout_id

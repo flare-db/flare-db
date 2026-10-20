@@ -185,7 +185,7 @@ impl DataChannel {
                                 elements.data.len(),
                                 elements.timers.len()
                             );
-                            crate::engine::liveness::touch();
+                            crate::engine::guard::touch();
                             route_elements(elements, &runner_stream);
                         }
                         Ok(None) => {

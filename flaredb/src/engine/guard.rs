@@ -1,4 +1,4 @@
-//! Harness-liveness supervision.
+//! Harness worker guard supervision.
 //!
 //! [`idle_guard`] waits for a bundle to finish, but fails if the SDK worker
 //! stops sending traffic. The Fn transport receive loops, the data, control,
