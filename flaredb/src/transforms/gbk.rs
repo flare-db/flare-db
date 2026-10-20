@@ -363,36 +363,18 @@ impl FlareTransform for GroupByKey {
             let sort_started = Instant::now();
             let mut decoded_rows = 0usize;
             let mut next_progress = 1_000_000usize;
+            let mut decode_time = std::time::Duration::ZERO;
+            let mut group_time = std::time::Duration::ZERO;
+            let mut write_time = std::time::Duration::ZERO;
             while let Some(batch) = sorted_input.stream.next().await {
                 let batch = batch?;
                 decoded_rows += batch.num_rows();
-                if decoded_rows >= next_progress {
-                    info!(
-                        "GroupByKey: decoded {decoded_rows} sorted rows in {:?}",
-                        sort_started.elapsed()
-                    );
-                    next_progress = (decoded_rows / 1_000_000 + 1) * 1_000_000;
-                }
-                for key_group in decoder.push_batch(&batch, &sorted_input.table_schema)? {
-                    fired += process_key_group(
-                        key_group,
-                        needs_merge,
-                        ctx.window_merger.as_deref(),
-                        &input_pcollection_id,
-                        &spec,
-                        ctx.input_watermark,
-                        ctx.processing_time,
-                        &self.state,
-                        &mut writer,
-                        &mut output,
-                    )
-                    .await?;
-                }
-                flush_output_if_full(&mut writer, &mut output).await?;
-            }
-            if let Some(key_group) = decoder.finish() {
-                fired += process_key_group(
-                    key_group,
+                let decode_started = Instant::now();
+                let groups = decoder.push_batch(&batch, &sorted_input.table_schema)?;
+                decode_time += decode_started.elapsed();
+                let group_started = Instant::now();
+                fired += process_key_groups_batch(
+                    groups,
                     needs_merge,
                     ctx.window_merger.as_deref(),
                     &input_pcollection_id,
@@ -400,7 +382,31 @@ impl FlareTransform for GroupByKey {
                     ctx.input_watermark,
                     ctx.processing_time,
                     &self.state,
-                    &mut writer,
+                    &mut output,
+                )
+                .await?;
+                group_time += group_started.elapsed();
+                let write_started = Instant::now();
+                flush_output_if_full(&mut writer, &mut output).await?;
+                write_time += write_started.elapsed();
+                if decoded_rows >= next_progress {
+                    info!(
+                        "GroupByKey: decoded {decoded_rows} rows, fired {fired} panes in {:?} (decode={decode_time:?}, group/merge={group_time:?}, output_write={write_time:?})",
+                        sort_started.elapsed(),
+                    );
+                    next_progress = (decoded_rows / 1_000_000 + 1) * 1_000_000;
+                }
+            }
+            if let Some(key_group) = decoder.finish() {
+                fired += process_key_groups_batch(
+                    vec![key_group],
+                    needs_merge,
+                    ctx.window_merger.as_deref(),
+                    &input_pcollection_id,
+                    &spec,
+                    ctx.input_watermark,
+                    ctx.processing_time,
+                    &self.state,
                     &mut output,
                 )
                 .await?;
@@ -815,45 +821,6 @@ impl SortedGroupDecoder {
 
 type WindowValues = Vec<(BeamWindow, Vec<BeamRecord>)>;
 
-/// Ask the SDK-owned `WindowFn` to merge each key's original window set, then
-/// fold elements from windows that merged together into one runner-native
-/// group.
-async fn merge_group_windows(
-    window_merger: Option<&WindowMergeService>,
-    pcollection_id: &str,
-    groups: Vec<(PrimitiveValue, BeamWindow, Vec<BeamRecord>)>,
-) -> Result<Vec<(PrimitiveValue, BeamWindow, Vec<BeamRecord>)>, Error> {
-    let window_merger = window_merger.ok_or_else(|| {
-        anyhow!(
-            "GroupByKey input {pcollection_id} uses a merging window function, but the SDK window merger is unavailable"
-        )
-    })?;
-
-    let mut by_key: HashMap<String, (PrimitiveValue, WindowValues)> = HashMap::new();
-    for (key, window, values) in groups {
-        let key_id = format!("{key:?}");
-        by_key
-            .entry(key_id)
-            .or_insert_with(|| (key, Vec::new()))
-            .1
-            .push((window, values));
-    }
-
-    let mut remapped = Vec::new();
-    for (key, original_groups) in by_key.into_values() {
-        let original_windows: Vec<_> = original_groups
-            .iter()
-            .map(|(window, _)| window.clone())
-            .collect();
-        let merge_results = window_merger
-            .merge_windows_for_pcollection(pcollection_id, &original_windows)
-            .await?;
-        remapped.extend(apply_merge_results(&key, original_groups, merge_results)?);
-    }
-
-    Ok(remapped)
-}
-
 fn apply_merge_results(
     key: &PrimitiveValue,
     original_groups: Vec<(BeamWindow, Vec<BeamRecord>)>,
@@ -888,8 +855,8 @@ fn apply_merge_results(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn process_key_group(
-    key_group: DecodedKeyGroup,
+async fn process_key_groups_batch(
+    key_groups: Vec<DecodedKeyGroup>,
     needs_merge: bool,
     window_merger: Option<&WindowMergeService>,
     input_pcollection_id: &str,
@@ -897,26 +864,62 @@ async fn process_key_group(
     input_watermark: i64,
     processing_time: i64,
     state_backend: &dyn GbkStateBackend,
-    writer: &mut PCollectionWriter,
     output: &mut Vec<WindowedValue>,
 ) -> Result<usize> {
-    let groups: Vec<(PrimitiveValue, BeamWindow, Vec<BeamRecord>)> = key_group
-        .windows
-        .into_iter()
-        .map(|(window, values)| (key_group.key.clone(), window, values))
-        .collect();
-    let groups = if needs_merge {
-        if groups
+    if key_groups.is_empty() {
+        return Ok(0);
+    }
+    let mut groups = Vec::new();
+    let mut custom_merges = Vec::new();
+    for key_group in key_groups {
+        let is_interval = key_group
+            .windows
             .iter()
-            .all(|(_, window, _)| matches!(window, BeamWindow::Interval { .. }))
-        {
-            merge_interval_groups(groups)?
-        } else {
-            merge_group_windows(window_merger, input_pcollection_id, groups).await?
+            .all(|(window, _)| matches!(window, BeamWindow::Interval { .. }));
+        if needs_merge && !is_interval {
+            custom_merges.push(key_group);
+            continue;
         }
-    } else {
-        groups
-    };
+
+        let groups_for_key: Vec<_> = key_group
+            .windows
+            .into_iter()
+            .map(|(window, values)| (key_group.key.clone(), window, values))
+            .collect();
+        if needs_merge {
+            groups.extend(merge_interval_groups(groups_for_key)?);
+        } else {
+            groups.extend(groups_for_key);
+        }
+    }
+
+    if !custom_merges.is_empty() {
+        let window_merger = window_merger.ok_or_else(|| {
+            anyhow!(
+                "GroupByKey input {input_pcollection_id} uses a merging window function, but the SDK window merger is unavailable"
+            )
+        })?;
+        let requests: Vec<Vec<BeamWindow>> = custom_merges
+            .iter()
+            .map(|key_group| {
+                key_group
+                    .windows
+                    .iter()
+                    .map(|(window, _)| window.clone())
+                    .collect()
+            })
+            .collect();
+        let merged = window_merger
+            .merge_windows_batch_for_pcollection(input_pcollection_id, &requests)
+            .await?;
+        for (key_group, merge_results) in custom_merges.into_iter().zip(merged) {
+            groups.extend(apply_merge_results(
+                &key_group.key,
+                key_group.windows,
+                merge_results,
+            )?);
+        }
+    }
 
     let mut fired = 0;
     for (key, window, values) in groups {
@@ -927,7 +930,6 @@ async fn process_key_group(
             output.push(value);
             fired += 1;
         }
-        flush_output_if_full(writer, output).await?;
     }
     Ok(fired)
 }
