@@ -204,6 +204,7 @@ mod tests {
                 processing_time: 0,
                 input_watermark: i64::MAX,
                 output_coder: None,
+                window_merger: None,
                 source_reports: None,
             })
             .await

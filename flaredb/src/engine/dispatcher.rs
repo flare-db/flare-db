@@ -1,20 +1,21 @@
 use crate::engine::sdf::{SdfBundleOutcome, SdfWorkItem, SplittableStageExecutor};
+use crate::engine::window::WindowMergeService;
 use crate::transforms::SourceProgress;
 use crate::{
-    engine::timer::{TimerEntry, build_timer_store},
+    engine::timer::{build_timer_store, TimerEntry},
     engine::{
         executor::StageExecutor,
-        harness::{Channels, control::ControlResponse, state::SideInputRegistry},
+        harness::{control::ControlResponse, state::SideInputRegistry, Channels},
         runtime::BundleRuntime,
         scheduler::NodeScheduler,
         timer::TimerService,
-        watermark::{MIN_TIMESTAMP, Timestamp, format_timestamp},
+        watermark::{format_timestamp, Timestamp, MIN_TIMESTAMP},
     },
     fusion::pipeline::{ExecutableGraph, ExecutableNode},
     store::element_store::FlareElementStore,
 };
 use anyhow::anyhow;
-use beam_model_rs::v1::{Coder, Components};
+use beam_model_rs::v1::{ApiServiceDescriptor, Coder, Components};
 use std::{collections::HashMap, collections::VecDeque, sync::Arc, time::Duration};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -72,6 +73,7 @@ pub struct ExecutorDispatcher {
     store: Arc<FlareElementStore>,
     pipeline_coders: Arc<HashMap<String, Coder>>,
     pipeline_components: Arc<Components>,
+    window_merger: Option<Arc<WindowMergeService>>,
     timer_service: Arc<TimerService>,
     /// Runner-source progress reports (TestStream) sent from bundle execution.
     source_reports_tx: mpsc::UnboundedSender<SourceProgress>,
@@ -91,6 +93,7 @@ impl ExecutorDispatcher {
             store,
             pipeline_coders: Arc::new(HashMap::new()),
             pipeline_components: Arc::new(Components::default()),
+            window_merger: None,
             timer_service,
             source_reports_tx,
             source_reports_rx,
@@ -143,6 +146,16 @@ impl ExecutorDispatcher {
             .stream_requests(self.store.clone(), side_inputs);
         self.pipeline_coders = Arc::new(coders);
         self.pipeline_components = Arc::new(pipeline_graph.components.clone());
+        self.window_merger = Some(Arc::new(WindowMergeService::new(
+            self.channels.control(),
+            self.channels.data(),
+            self.pipeline_coders.clone(),
+            self.pipeline_components.clone(),
+            ApiServiceDescriptor {
+                url: crate::DEFAULT_API_SERVICE_URL.to_string(),
+                ..Default::default()
+            },
+        )));
         Ok(())
     }
 
@@ -460,6 +473,7 @@ impl ExecutorDispatcher {
             self.store.clone(),
             self.pipeline_coders.clone(),
             self.pipeline_components.clone(),
+            self.window_merger.clone(),
             self.timer_service.clone(),
             self.source_reports_tx.clone(),
         )

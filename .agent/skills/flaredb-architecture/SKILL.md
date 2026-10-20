@@ -13,6 +13,8 @@ A Beam SDK does **not** send language-specific user code to Rust. It translates 
 
 Side inputs are not a separate execution engine or storage system. Fusion materializes the side-input producer as a normal windowed PCollection in Paimon; the Fn State service reads that PCollection, groups it by window, encodes values with the PCollection coder, and serves iterable or multimap requests from a per-job in-memory cache. Multimap support covers key enumeration, keyed-value lookup, and the bulk keys-values protocol advertised through `RUNNER_CAPABILITIES`.
 
+Custom windows remain SDK-owned. FlareDB stores their encoded bytes opaquely (`BeamWindow::Opaque`) and, when `GroupByKey` sees a `NEEDS_MERGE` windowing strategy, invokes the original `WindowFn` through a synthetic `beam:transform:merge_windows:v1` SDK bundle. Rust remaps the original windows onto the SDK-returned merged windows before running the normal grouping and trigger path.
+
 The important split is therefore:
 
 ```text
@@ -59,6 +61,7 @@ example/                         Submission/integration examples
 | `fusion` | Normalizes, represents, and fuses Runner API transforms | `QueryablePipeline` → `FusedPipeline` → `ExecutableGraph` |
 | `ExecutableGraph` | Petgraph DAG of `Runner`, `Worker`, or `Splittable` nodes | Edges carry `ConsumerMetaData`: PCollection, coder, producer/consumer IDs |
 | `engine` + `harness` | Dependency scheduling and Fn bundle/data orchestration | Tonic Fn APIs are a protocol boundary; do not invent a second transport |
+| `engine/window.rs` | SDK-backed merging `WindowFn` client | Builds source/merge/sink descriptors per windowing strategy and caches original-window → merged-window mappings |
 | `engine/state.rs`, `engine/timer.rs`, `engine/kv.rs` | Beam user state and user timers in a SlateDB KV store | Cells are opaque bytes over the Fn State proto. The Paimon PCollection store does not hold them. |
 | `engine/harness/state.rs` | Fn State requests for `BagUserState`, iterable side inputs, and multimap side inputs | User state is served from SlateDB. Side inputs are projected from materialized Paimon PCollections into window-keyed encoded bytes or keyed value maps. |
 | `transforms` | Flare-native PCollection operations | `FlareTransform::execute(ExecutionContext)` reads/writes element-store collections |
@@ -68,7 +71,7 @@ example/                         Submission/integration examples
 ### Technologies actually in the execution path
 
 - **Beam Runner API / generated `beam_model_rs` types:** `Pipeline`, `Components`, `PTransform`, coders, environments, `ProcessBundleDescriptor`, Job/Fn service types.
-- **Beam Fn API:** control registers descriptors and sends `ProcessBundle`; data streams framed `Elements`; logging is routed to job logs. The State service answers `StateRequest`s for user state and iterable/multimap side inputs. User timers use the timer service and SlateDB timer store, not the PCollection store.
+- **Beam Fn API:** control registers descriptors and sends `ProcessBundle`; data streams framed `Elements`; logging is routed to job logs. The State service answers `StateRequest`s for user state and iterable/multimap side inputs. User timers use the timer service and SlateDB timer store, not the PCollection store. `WindowMergeService` also registers a descriptor containing source → `merge_windows` → sink to execute custom window merging inside the SDK harness.
 - **Petgraph:** internal executable DAG and dependency edges.
 - **Arrow:** in-memory `RecordBatch` representation and Flight IPC.
 - **SlateDB:** embedded LSM on `object_store` (local filesystem) holding Beam user state and user timers, one database per subsystem (`state`, `timers`) under `<warehouse>/.slate_state/<db>/`.
@@ -139,6 +142,27 @@ beam:transform:impulse:v1
 
 The implementation anchors are `jobservice/job.rs`, `fusion/{pipeline,fuser}.rs`, `transforms/mod.rs`, `engine/{dispatcher,executor,runtime}.rs`, and `store/element_store.rs`.
 
+### Concrete window trace: custom merging windows
+
+```text
+SDK WindowFn assigns custom windows
+  → WindowedValueCoder sees length-prefix(custom coder)
+  → BeamWindow::Opaque stores the custom bytes and a canonical window key
+  → GroupByKey reads NEEDS_MERGE from the input windowing strategy
+  → DataFusion groups elements by (key, original custom window)
+  → WindowMergeService registers one synthetic SDK bundle per strategy
+  → source → beam:transform:merge_windows:v1(window_fn payload) → sink
+  → SDK returns unmerged windows and merged(original windows) results
+  → runner validates that every original window is consumed exactly once
+  → elements remap to merged windows and enter the existing trigger/firing state
+```
+
+The merge wire shape is `KV<nonce, Iterable<Window>>` in and
+`KV<nonce, KV<Iterable<Window>, Iterable<KV<Window, Iterable<Window>>>>>`
+out. The wrapper `WindowedValue` is always in the global window. Do not merge
+the union of windows across different keys: that can transitively merge sessions
+that only belong to separate keys.
+
 ## Module relationships: what a change pulls in
 
 ```text
@@ -173,6 +197,16 @@ Side-input StateRequest
   → StateGetResponse concatenated framed bytes
 ```
 
+```text
+Merging GroupByKey
+  → ExecutionContext.window_merger
+  → WindowMergeService.merge_windows_for_pcollection
+  → ControlChannel Register + ProcessBundle
+  → DataChannel source payload + sink response
+  → BeamWindow original → merged mapping cache
+  → GroupByKey WindowState / TriggerRunner
+```
+
 - Adding a **native transform** requires more than an implementation: define/reference its URN in `jobservice/urns.rs`, register it in `transforms::from_urn`, confirm fuser classification/boundaries, ensure `ExecutableGraph` can reach it, and test coder/store behavior.
 - Changing **fusion** affects both `ExecutableStage` descriptors and DAG dependencies. Inspect `fusion/pipeline.rs`, `fusion/fuser.rs`, `engine/scheduler.rs`, and the stage data-boundary construction in `engine/runtime.rs`.
 - Changing **coders** must preserve exactly the harness framing. `process_input_elements` deliberately sends payload data followed by an empty `is_last` marker to work with both Java and Python harnesses. Review Java `PortableCoderRewrites` and Python pickled-coder handling too.
@@ -191,6 +225,7 @@ Side-input StateRequest
 | Scheduling / run lifecycle | `flaredb/src/engine/{scheduler,dispatcher}.rs` | `executor.rs`, `jobservice/server.rs` |
 | Harness protocol / bundles | `flaredb/src/engine/harness/` | `engine/runtime.rs`, `worker/manager.rs` |
 | Element coding | `flaredb/src/coders/` | `engine/runtime.rs`, SDK coder rewrite tests |
+| Custom windows / merging | `flaredb/src/engine/window.rs` | `coders/primitives.rs`, `transforms/gbk.rs`, `engine/runtime.rs` |
 | PCollection persistence | `flaredb/src/store/{record,element_store}.rs` | native transforms, `io/server.rs` |
 | User state / timers | `flaredb/src/engine/state.rs`, `engine/timer.rs` | `engine/kv.rs`, `engine/harness/state.rs` |
 | Side inputs | `engine/harness/state.rs` (`SideInputRegistry`, `SideInputResolver`) | `engine/dispatcher.rs`, `engine/watermark.rs`, `engine/scheduler.rs`, `store/element_store.rs`, `fusion/{pipeline,refs,stage,fuser}.rs` |
@@ -205,6 +240,7 @@ Side-input StateRequest
 - `fusion/fuser.rs` has pipeline-shape/fusion tests; start there for stage-boundary changes.
 - `fusion/expander.rs` tests the splittable-ParDo rewrite; `engine/scheduler.rs` tests DAG readiness/fan-in.
 - `engine/harness/state.rs` tests iterable and multimap window filtering, key enumeration, keyed lookup, bulk keys-values framing, nested coders, length-prefixed opaque values, empty windows, and rejected mutations.
+- `engine/window.rs` tests the synthetic descriptor, merge response decoding, and original-window validation; `transforms/gbk.rs` tests remapping consumed windows into one group.
 - `engine/watermark.rs` and `engine/scheduler.rs` test producer-before-consumer side-input barriers, including the scheduler's debug dependency invariant.
 - `store/element_store.rs` and `store/record.rs` have focused async/schema/record tests.
 - `runner-sdk/java/flarerunner/src/test/` covers artifacts, job behavior, options, and coder rewrites.
@@ -247,6 +283,10 @@ rg 'StandardBeamCoders|WindowedValueCoder|length_prefix|pickled_python|javasdk' 
 rg 'SideInputRegistry|SideInputResolver|IterableSideInput|MultimapSideInput|MultimapKeysSideInput' flaredb/src
 rg 'MultimapKeysValuesSideInput|MULTIMAP_KEYS_VALUES_SIDE_INPUT_PROTOCOL|RUNNER_CAPABILITIES' flaredb/src
 rg 'unproduced_side_inputs|side_input_consumers|side_inputs_produced' flaredb/src/engine
+
+# Custom window coding and SDK merging path
+rg 'BeamWindow::Opaque|OpaqueLengthPrefixed|try_from_coder' flaredb/src/coders flaredb/src/engine
+rg 'WindowMergeService|merge_windows_for_pcollection|MERGE_WINDOWS_TRANSFORM' flaredb/src
 ```
 
 Search from protocol representation toward execution, not from a guessed module name. For ambiguous behavior, follow **definition → implementation → call sites → closest test**.
@@ -259,4 +299,6 @@ Search from protocol representation toward execution, not from a guessed module 
 - `NodeScheduler::output_edge_metadata` currently returns the first outgoing edge. Graph construction represents fan-out, but verify the execution path for fan-out changes.
 - Fn State serves `BagUserState`, `IterableSideInput`, `MultimapKeysSideInput`, `MultimapSideInput`, and `MultimapKeysValuesSideInput`. Continuation-token pagination and dynamic/streaming side-input refreshes are not implemented. Responses return all matching encoded data with an empty continuation token.
 - The iterable side-input cache assumes the materialized producer is stable after its first completed bundle. Invalidation tied to later producer updates is part of future streaming support, not current batch behavior.
+- Custom window bytes are opaque to Rust; only the SDK harness may interpret or merge them. A direct custom window coder without a self-delimiting wrapper is rejected rather than guessed.
+- Merging support covers bounded/batch behavior where the original window set is complete before `GroupByKey`. Retroactive reassignment after an already-emitted pane is not implemented.
 - `beam/model/` is vendored source and `beam-model-rs/build.rs` can generate checked-in bindings, but `beam-model-rs` is commented out of the workspace and `flaredb` uses crates.io `beam-model-rs = 2.70.0`. Confirm the compiled model before modifying either.

@@ -1,29 +1,29 @@
 use std::{
     collections::{BTreeMap, HashMap},
     io::Cursor,
-    panic::{AssertUnwindSafe, catch_unwind},
+    panic::{catch_unwind, AssertUnwindSafe},
     sync::Arc,
     time::Instant,
 };
 
 use anyhow::anyhow;
 use beam_model_rs::v1::{
-    ApiServiceDescriptor, Coder, Components, Elements, FunctionSpec, PTransform, ParDoPayload,
-    ProcessBundleDescriptor, RemoteGrpcPort, elements,
+    elements, ApiServiceDescriptor, Coder, Components, Elements, FunctionSpec, PTransform,
+    ParDoPayload, ProcessBundleDescriptor, RemoteGrpcPort,
 };
 use bytes::{Buf, BytesMut};
 use log::{debug, info};
 use prost::Message;
-use tokio::sync::{Mutex, mpsc::UnboundedReceiver};
+use tokio::sync::{mpsc::UnboundedReceiver, Mutex};
 
 use crate::{
     coders::{
-        BeamCoder, StandardBeamCoders, length_prefix_pickled_leaves,
+        length_prefix_pickled_leaves,
         primitives::{
             BeamWindow, PaneInfo, Timer as WireTimer, TimerCoder, WindowCoder, WindowedValue,
             WindowedValueCoder,
         },
-        resolve_length_prefixed_coder_id,
+        resolve_length_prefixed_coder_id, BeamCoder, StandardBeamCoders,
     },
     engine::timer::{TimeDomain, TimerEntry, TimerKey},
     engine::{
@@ -32,6 +32,7 @@ use crate::{
             data::{DataChannel, DataKey, ElementStreamPayload},
         },
         timer::TimerService,
+        window::WindowMergeService,
     },
     fusion::{pipeline::ConsumerMetaData, stage::ExecutableStage},
     jobservice::urns::beam_urns,
@@ -71,12 +72,7 @@ pub(crate) fn resolve_window_coder(
                 })
         })
         .unwrap_or(beam_urns::GLOBAL_WINDOW_CODER);
-    let urn = pipeline_coders
-        .get(window_coder_id)
-        .and_then(|coder| coder.spec.as_ref())
-        .map(|spec| spec.urn.as_str())
-        .unwrap_or(window_coder_id);
-    Ok(WindowCoder::from_urn(urn))
+    WindowCoder::try_from_coder(window_coder_id, pipeline_coders)
 }
 
 #[derive(Clone)]
@@ -86,17 +82,20 @@ pub struct BundleRuntime {
     store: Arc<FlareElementStore>,
     pipeline_coders: Arc<HashMap<String, Coder>>,
     pipeline_components: Arc<Components>,
+    window_merger: Option<Arc<WindowMergeService>>,
     timer_service: Arc<TimerService>,
     source_reports: tokio::sync::mpsc::UnboundedSender<SourceProgress>,
 }
 
 impl BundleRuntime {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         control: ControlChannel,
         data: DataChannel,
         store: Arc<FlareElementStore>,
         pipeline_coders: Arc<HashMap<String, Coder>>,
         pipeline_components: Arc<Components>,
+        window_merger: Option<Arc<WindowMergeService>>,
         timer_service: Arc<TimerService>,
         source_reports: tokio::sync::mpsc::UnboundedSender<SourceProgress>,
     ) -> Self {
@@ -106,6 +105,7 @@ impl BundleRuntime {
             store,
             pipeline_coders,
             pipeline_components,
+            window_merger,
             timer_service,
             source_reports,
         }
@@ -138,6 +138,10 @@ impl BundleRuntime {
 
     pub fn pipeline_components(&self) -> &Arc<Components> {
         &self.pipeline_components
+    }
+
+    pub fn window_merger(&self) -> Option<Arc<WindowMergeService>> {
+        self.window_merger.clone()
     }
 
     pub fn data_receiver(
@@ -705,14 +709,8 @@ fn resolve_timer_family(
         let key_id = coder.component_coder_ids.first()?;
         let window_id = coder.component_coder_ids.get(1)?;
         let key_coder = StandardBeamCoders::from_urn(key_id, None, Some(coders));
-        let window_urn = coders
-            .get(window_id)
-            .and_then(|c| c.spec.as_ref())
-            .map(|s| s.urn.as_str())?;
-        Some((
-            TimerCoder::new(key_coder, WindowCoder::from_urn(window_urn)),
-            domain,
-        ))
+        let window_coder = WindowCoder::try_from_coder(window_id, coders).ok()?;
+        Some((TimerCoder::new(key_coder, window_coder), domain))
     } else {
         // Some SDKs register the key coder directly; assume a global window.
         let key_coder = StandardBeamCoders::from_urn(

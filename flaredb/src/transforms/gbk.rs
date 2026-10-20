@@ -3,32 +3,36 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use anyhow::{Error, anyhow};
+use anyhow::{anyhow, Error};
 use async_trait::async_trait;
 use beam_model_rs::v1::{
-    Coder, Components, Environment, FunctionSpec, PCollection, PTransform, WindowingStrategy,
+    merge_status, Coder, Components, Environment, FunctionSpec, PCollection, PTransform,
+    WindowingStrategy,
 };
 use datafusion::{
     functions_aggregate::expr_fn::array_agg,
     physical_plan::SendableRecordBatchStream,
-    prelude::{SessionContext, col},
+    prelude::{col, SessionContext},
 };
 use log::info;
 use tokio_stream::StreamExt;
 
 use crate::{
     coders::primitives::{BeamWindow, WindowedValue},
-    engine::trigger::{
-        AccumulationMode, TriggerContext, TriggerRunner, TriggerSpec, pane_info, pane_timing,
+    engine::{
+        trigger::{
+            pane_info, pane_timing, AccumulationMode, TriggerContext, TriggerRunner, TriggerSpec,
+        },
+        window::{MergedWindows, WindowMergeService},
     },
     jobservice::urns::beam_urns,
     store::{
-        KEY_COLUMN, VALUE_COLUMN,
         element_store::WINDOW_KEY_COLUMN,
         record::{
-            BeamGbk, BeamRecord, IterableValue, PrimitiveValue, iterable_value_from_array_row,
-            primitive_value_from_array_row,
+            iterable_value_from_array_row, primitive_value_from_array_row, BeamGbk, BeamRecord,
+            IterableValue, PrimitiveValue,
         },
+        KEY_COLUMN, VALUE_COLUMN,
     },
     transforms::{ExecutionContext, FlareTransform},
 };
@@ -124,6 +128,10 @@ impl FlareTransform for GroupByKey {
             .expect("GroupByKey expects exactly one input PCollection");
 
         let spec = TriggerSpec::from_windowing_strategy(ctx.windowing_strategy.as_ref());
+        let needs_merge = ctx
+            .windowing_strategy
+            .as_ref()
+            .is_some_and(|strategy| strategy.merge_status == merge_status::Enum::NeedsMerge as i32);
 
         // Read only the input appended since this stage's last run. The cursor is
         // this stage's position in the input PCollection's changelog.
@@ -145,6 +153,12 @@ impl FlareTransform for GroupByKey {
             let mut stream = group_batches_stream(batches).await?;
             while let Some(batch) = stream.next().await {
                 let groups = decode_group_batch(&batch?)?;
+                let groups = if needs_merge {
+                    merge_group_windows(ctx.window_merger.as_deref(), &input_pcollection_id, groups)
+                        .await?
+                } else {
+                    groups
+                };
                 let mut states = self.states.lock().expect("gbk state lock not poisoned");
                 for (key, window, values) in groups {
                     let identity = group_identity(&key, &window);
@@ -311,6 +325,80 @@ fn decode_group_batch(
     Ok(groups)
 }
 
+type WindowValues = Vec<(BeamWindow, Vec<BeamRecord>)>;
+
+/// Ask the SDK-owned `WindowFn` to merge each key's original window set, then
+/// fold elements from windows that merged together into one runner-native
+/// group.
+async fn merge_group_windows(
+    window_merger: Option<&WindowMergeService>,
+    pcollection_id: &str,
+    groups: Vec<(PrimitiveValue, BeamWindow, Vec<BeamRecord>)>,
+) -> Result<Vec<(PrimitiveValue, BeamWindow, Vec<BeamRecord>)>, Error> {
+    let window_merger = window_merger.ok_or_else(|| {
+        anyhow!(
+            "GroupByKey input {pcollection_id} uses a merging window function, but the SDK window merger is unavailable"
+        )
+    })?;
+
+    let mut by_key: HashMap<String, (PrimitiveValue, WindowValues)> = HashMap::new();
+    for (key, window, values) in groups {
+        let key_id = format!("{key:?}");
+        by_key
+            .entry(key_id)
+            .or_insert_with(|| (key, Vec::new()))
+            .1
+            .push((window, values));
+    }
+
+    let mut remapped = Vec::new();
+    for (key, original_groups) in by_key.into_values() {
+        let original_windows: Vec<_> = original_groups
+            .iter()
+            .map(|(window, _)| window.clone())
+            .collect();
+        let merge_results = window_merger
+            .merge_windows_for_pcollection(pcollection_id, &original_windows)
+            .await?;
+        remapped.extend(apply_merge_results(&key, original_groups, merge_results)?);
+    }
+
+    Ok(remapped)
+}
+
+fn apply_merge_results(
+    key: &PrimitiveValue,
+    original_groups: Vec<(BeamWindow, Vec<BeamRecord>)>,
+    merge_results: Vec<MergedWindows>,
+) -> Result<Vec<(PrimitiveValue, BeamWindow, Vec<BeamRecord>)>, Error> {
+    let original_to_merged: HashMap<String, BeamWindow> = merge_results
+        .into_iter()
+        .flat_map(|result| {
+            let merged = result.merged;
+            result
+                .originals
+                .into_iter()
+                .map(move |original| (original.canonical_key(), merged.clone()))
+        })
+        .collect();
+
+    let mut merged_groups: HashMap<String, (BeamWindow, Vec<BeamRecord>)> = HashMap::new();
+    for (original, values) in original_groups {
+        let original_key = original.canonical_key();
+        let merged_window = original_to_merged.get(&original_key).ok_or_else(|| {
+            anyhow!("MergeWindows did not map original window {original_key} for key {key:?}")
+        })?;
+        let entry = merged_groups
+            .entry(merged_window.canonical_key())
+            .or_insert_with(|| (merged_window.clone(), Vec::new()));
+        entry.1.extend(values);
+    }
+    Ok(merged_groups
+        .into_values()
+        .map(|(window, values)| (key.clone(), window, values))
+        .collect())
+}
+
 /// Evaluate every group's trigger and build the output pane for each firing.
 ///
 /// A window fires whenever its trigger says so. In addition, once a window's
@@ -443,6 +531,7 @@ mod tests {
                 processing_time: 0,
                 input_watermark,
                 output_coder: None,
+                window_merger: None,
                 source_reports: None,
             })
             .await
@@ -470,6 +559,7 @@ mod tests {
                 processing_time: 0,
                 input_watermark,
                 output_coder: None,
+                window_merger: None,
                 source_reports: None,
             })
             .await
@@ -522,6 +612,71 @@ mod tests {
                 ((key, start, end), values)
             })
             .collect()
+    }
+
+    fn custom_window(id: u8) -> BeamWindow {
+        BeamWindow::Opaque {
+            coder_id: "test-window-coder".to_string(),
+            bytes: vec![id],
+        }
+    }
+
+    #[test]
+    fn merging_windows_combines_consumed_original_groups() {
+        let first = custom_window(1);
+        let second = custom_window(2);
+        let third = custom_window(3);
+        let merged = BeamWindow::Opaque {
+            coder_id: "test-window-coder".to_string(),
+            bytes: vec![9],
+        };
+        let key = PrimitiveValue::String("alice".to_string());
+        let groups = apply_merge_results(
+            &key,
+            vec![
+                (
+                    first.clone(),
+                    vec![BeamRecord::PRIMITIVE(PrimitiveValue::Int64(10))],
+                ),
+                (
+                    second.clone(),
+                    vec![BeamRecord::PRIMITIVE(PrimitiveValue::Int64(20))],
+                ),
+                (
+                    third.clone(),
+                    vec![BeamRecord::PRIMITIVE(PrimitiveValue::Int64(30))],
+                ),
+            ],
+            vec![
+                MergedWindows {
+                    merged: merged.clone(),
+                    originals: vec![first, second],
+                },
+                MergedWindows {
+                    merged: third.clone(),
+                    originals: vec![third.clone()],
+                },
+            ],
+        )
+        .unwrap();
+
+        let by_window: HashMap<String, Vec<i64>> = groups
+            .into_iter()
+            .map(|(_, window, values)| {
+                let mut values: Vec<i64> = values
+                    .into_iter()
+                    .map(|record| match record {
+                        BeamRecord::PRIMITIVE(PrimitiveValue::Int64(value)) => value,
+                        other => panic!("expected int64 value, got {other:?}"),
+                    })
+                    .collect();
+                values.sort_unstable();
+                (window.canonical_key(), values)
+            })
+            .collect();
+
+        assert_eq!(by_window.get(&merged.canonical_key()), Some(&vec![10, 20]));
+        assert_eq!(by_window.get(&third.canonical_key()), Some(&vec![30]));
     }
 
     #[tokio::test]
@@ -759,7 +914,7 @@ mod tests {
     #[tokio::test]
     async fn a_late_element_fires_a_second_late_pane() {
         use beam_model_rs::v1::{
-            Trigger as TriggerProto, accumulation_mode, trigger as trigger_proto,
+            accumulation_mode, trigger as trigger_proto, Trigger as TriggerProto,
         };
 
         let (_dir, store) = make_store().await;
