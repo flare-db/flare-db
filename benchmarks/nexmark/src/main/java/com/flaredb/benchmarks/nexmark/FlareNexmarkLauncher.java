@@ -7,6 +7,11 @@ import java.io.IOException;
 import java.util.Arrays;
 import java.util.Comparator;
 import org.apache.beam.sdk.Pipeline;
+import org.apache.beam.sdk.PipelineResult;
+import org.apache.beam.sdk.metrics.MetricNameFilter;
+import org.apache.beam.sdk.metrics.MetricQueryResults;
+import org.apache.beam.sdk.metrics.MetricResult;
+import org.apache.beam.sdk.metrics.MetricsFilter;
 import org.apache.beam.sdk.nexmark.NexmarkConfiguration;
 import org.apache.beam.sdk.nexmark.NexmarkPerf;
 import org.apache.beam.sdk.nexmark.NexmarkQueryName;
@@ -89,18 +94,22 @@ public class FlareNexmarkLauncher {
     PCollection<TimestampedValue<KnownSize>> results =
         (PCollection<TimestampedValue<KnownSize>>) (PCollection<?>) source.apply(query);
 
-    // Output formatting & optional logging
+    // Output formatting, optional logging, and a terminal counter so every
+    // emitted result contributes to the benchmark's Results metric.
     if (options.getLogResults()) {
       results
           .apply(queryName + ".Format", NexmarkUtils.format(queryName))
-          .apply(queryName + ".Results.Log", NexmarkUtils.log(queryName + ".Results"));
+          .apply(queryName + ".Results.Log", NexmarkUtils.log(queryName + ".Results"))
+          .apply(queryName + ".Results.Count", NexmarkUtils.devNull(queryName));
+    } else {
+      results.apply(queryName + ".Results.Count", NexmarkUtils.devNull(queryName));
     }
 
     // Measure job execution time
     long startTime = System.currentTimeMillis();
     LOG.info("Submitting query {} job to FlareDB at {}", queryName, options.getJobEndpoint());
 
-    p.run();
+    PipelineResult pipelineResult = p.run();
 
     long endTime = System.currentTimeMillis();
     double runtimeSec = Math.max(0.001, (endTime - startTime) / 1000.0);
@@ -109,7 +118,7 @@ public class FlareNexmarkLauncher {
     perf.runtimeSec = runtimeSec;
     perf.numEvents = configuration.numEvents;
     perf.eventsPerSec = configuration.numEvents / runtimeSec;
-    perf.numResults = 0; // Estimated or reported
+    perf.numResults = countResults(pipelineResult, queryName);
 
     LOG.info(
         "Completed query {} in {}s (Events/sec: {})",
@@ -118,6 +127,22 @@ public class FlareNexmarkLauncher {
         String.format("%.1f", perf.eventsPerSec));
 
     return perf;
+  }
+
+  private static long countResults(PipelineResult pipelineResult, String queryName) {
+    MetricQueryResults metrics =
+        pipelineResult
+            .metrics()
+            .queryMetrics(
+                MetricsFilter.builder()
+                    .addNameFilter(MetricNameFilter.named(queryName, "discarded"))
+                    .build());
+
+    long results = 0;
+    for (MetricResult<Long> counter : metrics.getCounters()) {
+      results += counter.getAttempted();
+    }
+    return results;
   }
 
   /** Locates the Nexmark shadow (uber) JAR produced by the {@code shadowJar} task. */

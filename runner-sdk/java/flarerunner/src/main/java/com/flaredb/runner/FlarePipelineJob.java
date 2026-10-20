@@ -4,10 +4,13 @@ import java.io.IOException;
 import java.util.concurrent.TimeUnit;
 import org.apache.beam.model.jobmanagement.v1.JobApi.CancelJobRequest;
 import org.apache.beam.model.jobmanagement.v1.JobApi.CancelJobResponse;
+import org.apache.beam.model.jobmanagement.v1.JobApi.GetJobMetricsRequest;
+import org.apache.beam.model.jobmanagement.v1.JobApi.GetJobMetricsResponse;
 import org.apache.beam.model.jobmanagement.v1.JobApi.GetJobStateRequest;
 import org.apache.beam.model.jobmanagement.v1.JobApi.JobState;
 import org.apache.beam.model.jobmanagement.v1.JobApi.JobStateEvent;
 import org.apache.beam.model.jobmanagement.v1.JobServiceGrpc.JobServiceBlockingStub;
+import org.apache.beam.runners.core.metrics.MetricsContainerStepMap;
 import org.apache.beam.runners.portability.CloseableResource;
 import org.apache.beam.sdk.PipelineResult;
 import org.apache.beam.sdk.metrics.MetricResults;
@@ -20,9 +23,8 @@ import org.joda.time.Duration;
  * successful job submission. It encapsulates the Beam Job API job identifier and implements the
  * {@link PipelineResult} contract.
  *
- * <p>{@link #getState()} and {@link #cancel()} are backed by live calls to the Job Service. {@link
- * #waitUntilFinish} and {@link #metrics()} are not currently supported and will be implemented in a
- * future release.
+ * <p>{@link #getState()}, {@link #cancel()}, and {@link #metrics()} are backed by live calls to the
+ * Job Service. {@link #waitUntilFinish} is not currently supported.
  *
  * <p>Owns the job-service channel handed to it by {@link FlareRunner#run}; callers that want to
  * release it deterministically (rather than leaving it open for further {@link #getState()} or
@@ -73,7 +75,17 @@ class FlarePipelineJob implements PipelineResult, AutoCloseable {
 
   @Override
   public MetricResults metrics() {
-    throw new UnsupportedOperationException("Not supported yet.");
+    GetJobMetricsResponse response =
+        jobService
+            .get()
+            .withDeadlineAfter(jobServerTimeout, TimeUnit.SECONDS)
+            .getJobMetrics(GetJobMetricsRequest.newBuilder().setJobId(jobId).build());
+
+    MetricsContainerStepMap attempted = new MetricsContainerStepMap();
+    if (response.hasMetrics()) {
+      attempted.getUnboundContainer().update(response.getMetrics().getAttemptedList());
+    }
+    return MetricsContainerStepMap.asAttemptedOnlyMetricResults(attempted);
   }
 
   @Override

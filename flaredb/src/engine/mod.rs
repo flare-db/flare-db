@@ -3,6 +3,7 @@ pub mod executor;
 pub mod harness;
 pub mod kv;
 pub mod liveness;
+pub mod metrics;
 pub mod runtime;
 pub mod scheduler;
 pub mod sdf;

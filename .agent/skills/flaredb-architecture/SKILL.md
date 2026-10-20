@@ -15,6 +15,8 @@ Side inputs are not a separate execution engine or storage system. Fusion materi
 
 Custom windows remain SDK-owned. FlareDB stores their encoded bytes opaquely (`BeamWindow::Opaque`) and, when `GroupByKey` sees a `NEEDS_MERGE` windowing strategy, invokes the original `WindowFn` through a synthetic `beam:transform:merge_windows:v1` SDK bundle. Rust remaps the original windows onto the SDK-returned merged windows before running the normal grouping and trigger path.
 
+SDK metrics are reported on completed `ProcessBundleResponse` messages. FlareDB keeps a per-job accumulator keyed by metric URN, payload type, and labels, merges counters/distributions/gauges/string sets across bundles, and exposes the result through `GetJobMetrics`. Metrics are attempted-only in practice and remain in memory with the job lifecycle.
+
 The important split is therefore:
 
 ```text
@@ -61,6 +63,7 @@ example/                         Submission/integration examples
 | `fusion` | Normalizes, represents, and fuses Runner API transforms | `QueryablePipeline` → `FusedPipeline` → `ExecutableGraph` |
 | `ExecutableGraph` | Petgraph DAG of `Runner`, `Worker`, or `Splittable` nodes | Edges carry `ConsumerMetaData`: PCollection, coder, producer/consumer IDs |
 | `engine` + `harness` | Dependency scheduling and Fn bundle/data orchestration | Tonic Fn APIs are a protocol boundary; do not invent a second transport |
+| `engine/metrics.rs` | Per-job aggregation of SDK monitoring infos | Merges bundle metrics and backs the Job Service `GetJobMetrics` response |
 | `engine/window.rs` | SDK-backed merging `WindowFn` client | Builds source/merge/sink descriptors per windowing strategy and caches original-window → merged-window mappings |
 | `engine/state.rs`, `engine/timer.rs`, `engine/kv.rs` | Beam user state and user timers in a SlateDB KV store | Cells are opaque bytes over the Fn State proto. The Paimon PCollection store does not hold them. |
 | `engine/harness/state.rs` | Fn State requests for `BagUserState`, iterable side inputs, and multimap side inputs | User state is served from SlateDB. Side inputs are projected from materialized Paimon PCollections into window-keyed encoded bytes or keyed value maps. |
@@ -71,7 +74,7 @@ example/                         Submission/integration examples
 ### Technologies actually in the execution path
 
 - **Beam Runner API / generated `beam_model_rs` types:** `Pipeline`, `Components`, `PTransform`, coders, environments, `ProcessBundleDescriptor`, Job/Fn service types.
-- **Beam Fn API:** control registers descriptors and sends `ProcessBundle`; data streams framed `Elements`; logging is routed to job logs. The State service answers `StateRequest`s for user state and iterable/multimap side inputs. User timers use the timer service and SlateDB timer store, not the PCollection store. `WindowMergeService` also registers a descriptor containing source → `merge_windows` → sink to execute custom window merging inside the SDK harness.
+- **Beam Fn API:** control registers descriptors and sends `ProcessBundle`; data streams framed `Elements`; logging is routed to job logs. Completed bundles return monitoring infos for job metrics. The State service answers `StateRequest`s for user state and iterable/multimap side inputs. User timers use the timer service and SlateDB timer store, not the PCollection store. `WindowMergeService` also registers a descriptor containing source → `merge_windows` → sink to execute custom window merging inside the SDK harness.
 - **Petgraph:** internal executable DAG and dependency edges.
 - **Arrow:** in-memory `RecordBatch` representation and Flight IPC.
 - **SlateDB:** embedded LSM on `object_store` (local filesystem) holding Beam user state and user timers, one database per subsystem (`state`, `timers`) under `<warehouse>/.slate_state/<db>/`.
@@ -96,6 +99,7 @@ There is no Tonbo implementation in the active code path. The current catalog cr
 7. A **worker node** calls `BundleRuntime::register_bundle`, which adds Runner API source/sink data boundaries and sends a `ProcessBundleDescriptor` over Fn Control. `StageExecutor` sends stored input through Fn Data, receives output, decodes each WindowedValue with `StandardBeamCoders`, and writes `BeamRecord` batches to the output PCollection table.
 8. A **runner node** builds/registers a descriptor, then invokes `FlareTransform::execute`. Its `ExecutionContext` identifies input and output PCollections in the same `FlareElementStore`.
 9. `FlareElementStore` derives a `RecordTableSchema` from a PCollection’s first output batch, converts records to Arrow, commits them to Paimon, and scans them back for the next stage. PCollection tables are therefore the inter-stage exchange medium, not merely an output sink.
+10. Successful SDK bundle responses feed monitoring infos into the active per-job metrics accumulator. `GetJobMetrics` returns those infos as attempted and committed metric results for the Java and Python runners.
 
 ### Side-input trace
 
@@ -163,6 +167,22 @@ out. The wrapper `WindowedValue` is always in the global window. Do not merge
 the union of windows across different keys: that can transitively merge sessions
 that only belong to separate keys.
 
+### Metrics trace
+
+```text
+SDK DoFn Records metrics
+  → ProcessBundleResponse.monitoring_infos
+  → ControlChannel records into JobMetrics
+  → merge by (URN, type, sorted labels)
+  → Job Service GetJobMetrics: attempted = committed = aggregated infos
+  → Java MetricsContainerStepMap or Python PortableMetrics
+  → PipelineResult.metrics().queryMetrics(...)
+```
+
+Counter and distribution payloads are summed/combined; gauges keep the newest
+timestamp; string sets are unioned. Unsupported or malformed metric payloads are
+logged and skipped so metrics cannot fail an otherwise successful pipeline.
+
 ## Module relationships: what a change pulls in
 
 ```text
@@ -225,6 +245,7 @@ Merging GroupByKey
 | Scheduling / run lifecycle | `flaredb/src/engine/{scheduler,dispatcher}.rs` | `executor.rs`, `jobservice/server.rs` |
 | Harness protocol / bundles | `flaredb/src/engine/harness/` | `engine/runtime.rs`, `worker/manager.rs` |
 | Element coding | `flaredb/src/coders/` | `engine/runtime.rs`, SDK coder rewrite tests |
+| Metrics | `flaredb/src/engine/metrics.rs` | `engine/harness/control.rs`, `jobservice/server.rs`, Java/Python runner metrics clients |
 | Custom windows / merging | `flaredb/src/engine/window.rs` | `coders/primitives.rs`, `transforms/gbk.rs`, `engine/runtime.rs` |
 | PCollection persistence | `flaredb/src/store/{record,element_store}.rs` | native transforms, `io/server.rs` |
 | User state / timers | `flaredb/src/engine/state.rs`, `engine/timer.rs` | `engine/kv.rs`, `engine/harness/state.rs` |
@@ -241,6 +262,7 @@ Merging GroupByKey
 - `fusion/expander.rs` tests the splittable-ParDo rewrite; `engine/scheduler.rs` tests DAG readiness/fan-in.
 - `engine/harness/state.rs` tests iterable and multimap window filtering, key enumeration, keyed lookup, bulk keys-values framing, nested coders, length-prefixed opaque values, empty windows, and rejected mutations.
 - `engine/window.rs` tests the synthetic descriptor, merge response decoding, and original-window validation; `transforms/gbk.rs` tests remapping consumed windows into one group.
+- `engine/metrics.rs`, `engine/harness/control.rs`, and `jobservice/server.rs` test metric aggregation, bundle-to-job recording, and `GetJobMetrics`; Java/Python runner tests verify client metric queries.
 - `engine/watermark.rs` and `engine/scheduler.rs` test producer-before-consumer side-input barriers, including the scheduler's debug dependency invariant.
 - `store/element_store.rs` and `store/record.rs` have focused async/schema/record tests.
 - `runner-sdk/java/flarerunner/src/test/` covers artifacts, job behavior, options, and coder rewrites.
@@ -287,6 +309,9 @@ rg 'unproduced_side_inputs|side_input_consumers|side_inputs_produced' flaredb/sr
 # Custom window coding and SDK merging path
 rg 'BeamWindow::Opaque|OpaqueLengthPrefixed|try_from_coder' flaredb/src/coders flaredb/src/engine
 rg 'WindowMergeService|merge_windows_for_pcollection|MERGE_WINDOWS_TRANSFORM' flaredb/src
+
+# Metrics path
+rg 'JobMetrics|monitoring_infos|GetJobMetrics|queryMetrics' flaredb/src runner-sdk
 ```
 
 Search from protocol representation toward execution, not from a guessed module name. For ambiguous behavior, follow **definition → implementation → call sites → closest test**.
@@ -301,4 +326,5 @@ Search from protocol representation toward execution, not from a guessed module 
 - The iterable side-input cache assumes the materialized producer is stable after its first completed bundle. Invalidation tied to later producer updates is part of future streaming support, not current batch behavior.
 - Custom window bytes are opaque to Rust; only the SDK harness may interpret or merge them. A direct custom window coder without a self-delimiting wrapper is rejected rather than guessed.
 - Merging support covers bounded/batch behavior where the original window set is complete before `GroupByKey`. Retroactive reassignment after an already-emitted pane is not implemented.
+- Metrics support covers int64 counters, distributions, gauges, and string sets. Metrics are in-memory for the current FlareDB process and are not restored after restart.
 - `beam/model/` is vendored source and `beam-model-rs/build.rs` can generate checked-in bindings, but `beam-model-rs` is commented out of the workspace and `flaredb` uses crates.io `beam-model-rs = 2.70.0`. Confirm the compiled model before modifying either.
