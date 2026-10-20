@@ -10,6 +10,7 @@ use beam_model_rs::v1::{
 use uuid::Uuid;
 
 use crate::{
+    engine::window::WindowMergeService,
     jobservice::urns::beam_urns,
     store::element_store::FlareElementStore,
     transforms::{flatten::Flatten, gbk::GroupByKey, impluse::Impulse},
@@ -121,6 +122,9 @@ pub struct ExecutionContext {
     /// for it (see [`FlareTransform::needs_output_coder`]). A runner source decodes
     /// its pre-encoded elements with it.
     pub output_coder: Option<crate::coders::StandardBeamCoders>,
+    /// SDK-backed merging service, used by runner-native transforms that need
+    /// to invoke a custom merging `WindowFn`.
+    pub window_merger: Option<Arc<WindowMergeService>>,
     /// Sink for source progress reports (watermark / processing time / finish).
     pub source_reports: Option<SourceReportSink>,
 }

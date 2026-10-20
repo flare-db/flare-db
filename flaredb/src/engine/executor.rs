@@ -14,8 +14,8 @@ use crate::{
             data::{DataKey, TimersKey},
         },
         runtime::{
-            BundleRuntime, runner_consumer_transform_id, runner_output_pcollection_id,
-            stage_sink_transform_id, stage_source_transform_id, stage_timer_endpoints,
+            runner_consumer_transform_id, runner_output_pcollection_id, stage_sink_transform_id,
+            stage_source_transform_id, stage_timer_endpoints, BundleRuntime,
         },
     },
     fusion::pipeline::{ConsumerMetaData, ExecutableNode},
@@ -455,6 +455,7 @@ impl StageExecutor {
                                 processing_time: self.runtime.timer_service().now(),
                                 input_watermark,
                                 output_coder: output_coder.clone(),
+                                window_merger: self.runtime.window_merger(),
                                 source_reports: Some(SourceReportSink(
                                     self.runtime.source_reports().clone(),
                                 )),
