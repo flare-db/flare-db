@@ -628,11 +628,26 @@ fn tuple_storage_type(tuple: &TupleValue) -> ArrowDataType {
     ArrowDataType::Struct(fields.into())
 }
 
-/// Arrow storage type for a nested value that is either a primitive or a tuple.
+/// Arrow storage type for a nested value that is a primitive, tuple, or KV.
 fn nested_value_storage_type(record: &BeamRecord) -> Result<ArrowDataType> {
     match record {
         BeamRecord::PRIMITIVE(value) => Ok(primitive_data_type(value)),
         BeamRecord::TUPLE(tuple) => Ok(tuple_storage_type(tuple)),
+        BeamRecord::KV(kv) => {
+            let key_data_type = tuple_component_data_type(&kv.key);
+            let value_data_type = nested_value_storage_type(&kv.value)?;
+            let value_data_type = match value_data_type {
+                ArrowDataType::Null => ArrowDataType::Boolean,
+                other => other,
+            };
+            Ok(ArrowDataType::Struct(
+                vec![
+                    ArrowField::new("key", key_data_type, true),
+                    ArrowField::new("value", value_data_type, true),
+                ]
+                .into(),
+            ))
+        }
         other => Err(anyhow!(
             "unsupported nested value record type: {:?}",
             other.record_type()
@@ -640,26 +655,44 @@ fn nested_value_storage_type(record: &BeamRecord) -> Result<ArrowDataType> {
     }
 }
 
+fn is_nested_kv_struct(fields: &arrow_schema::Fields) -> bool {
+    fields.len() == 2 && fields[0].name() == "key" && fields[1].name() == "value"
+}
+
 /// Build an Arrow array for a nested value column whose elements are primitives
-/// or tuples.
+/// or recursively nested tuples/KVs.
 fn nested_values_to_array(records: &[BeamRecord], data_type: &ArrowDataType) -> Result<ArrayRef> {
     match data_type {
         ArrowDataType::Struct(fields) => {
             let arity = fields.len();
             let mut children: Vec<ArrayRef> = Vec::with_capacity(arity);
-            for index in 0..arity {
-                let child_type = fields[index].data_type();
-                let mut child_values = Vec::with_capacity(records.len());
+            if is_nested_kv_struct(fields) {
+                let mut keys = Vec::with_capacity(records.len());
+                let mut values = Vec::with_capacity(records.len());
                 for record in records {
-                    let BeamRecord::TUPLE(tuple) = record else {
-                        return Err(anyhow!("expected tuple record"));
+                    let BeamRecord::KV(kv) = record else {
+                        return Err(anyhow!("expected nested KV record"));
                     };
-                    let value = tuple.values.get(index).ok_or_else(|| {
-                        anyhow!("tuple component count mismatch: expected at least {arity}")
-                    })?;
-                    child_values.push(value.clone());
+                    keys.push(kv.key.clone());
+                    values.push((*kv.value).clone());
                 }
-                children.push(primitive_values_to_array(&child_values, child_type)?);
+                children.push(primitive_values_to_array(&keys, fields[0].data_type())?);
+                children.push(nested_values_to_array(&values, fields[1].data_type())?);
+            } else {
+                for index in 0..arity {
+                    let child_type = fields[index].data_type();
+                    let mut child_values = Vec::with_capacity(records.len());
+                    for record in records {
+                        let BeamRecord::TUPLE(tuple) = record else {
+                            return Err(anyhow!("expected tuple record"));
+                        };
+                        let value = tuple.values.get(index).ok_or_else(|| {
+                            anyhow!("tuple component count mismatch: expected at least {arity}")
+                        })?;
+                        child_values.push(value.clone());
+                    }
+                    children.push(primitive_values_to_array(&child_values, child_type)?);
+                }
             }
             Ok(Arc::new(StructArray::try_new(
                 fields.clone(),
@@ -692,6 +725,22 @@ fn nested_value_from_array_row(
                 .as_any()
                 .downcast_ref::<StructArray>()
                 .ok_or_else(|| anyhow!("expected StructArray for tuple column"))?;
+            if is_nested_kv_struct(fields) {
+                let key = primitive_value_from_array_row(
+                    struct_array.column(0).as_ref(),
+                    fields[0].data_type(),
+                    row,
+                )?;
+                let value = nested_value_from_array_row(
+                    struct_array.column(1).as_ref(),
+                    fields[1].data_type(),
+                    row,
+                )?;
+                return Ok(BeamRecord::KV(BeamKV {
+                    key,
+                    value: Box::new(value),
+                }));
+            }
             let mut values = Vec::with_capacity(fields.len());
             for index in 0..fields.len() {
                 values.push(primitive_value_from_array_row(
@@ -2170,6 +2219,44 @@ mod tests {
             };
             assert_eq!(kv.key, expected_key);
             assert_tuple(&kv.value, &expected_value);
+        }
+    }
+
+    #[test]
+    fn roundtrip_kv_with_nested_kv_value() {
+        let records = vec![
+            BeamRecord::KV(BeamKV {
+                key: i(1),
+                value: Box::new(BeamRecord::KV(BeamKV {
+                    key: s("auction-a"),
+                    value: Box::new(BeamRecord::PRIMITIVE(i(7))),
+                })),
+            }),
+            BeamRecord::KV(BeamKV {
+                key: i(2),
+                value: Box::new(BeamRecord::KV(BeamKV {
+                    key: s("auction-b"),
+                    value: Box::new(BeamRecord::PRIMITIVE(i(8))),
+                })),
+            }),
+        ];
+        let schema = derive_table_schema("pc", &records).unwrap();
+        let batch = beamrecords_to_record_batch(&records, &schema).unwrap();
+        let back = record_batch_to_beamrecords(&batch, &schema).unwrap();
+
+        for (record, expected_key, expected_inner_key, expected_value) in [
+            (&back[0], i(1), s("auction-a"), i(7)),
+            (&back[1], i(2), s("auction-b"), i(8)),
+        ] {
+            let BeamRecord::KV(outer) = record else {
+                panic!("expected outer KV, got {record:?}");
+            };
+            assert_eq!(outer.key, expected_key);
+            let BeamRecord::KV(inner) = outer.value.as_ref() else {
+                panic!("expected nested KV, got {:?}", outer.value);
+            };
+            assert_eq!(inner.key, expected_inner_key);
+            assert_primitive(&inner.value, &expected_value);
         }
     }
 
