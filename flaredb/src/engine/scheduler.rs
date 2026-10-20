@@ -360,11 +360,17 @@ impl NodeScheduler {
 
     /// Returns metadata for the first outgoing edge from `idx`, if any.
     pub fn output_edge_metadata(&self, idx: NodeIndex) -> Option<ConsumerMetaData> {
-        self.graph
-            .get_executable_graph()
+        let graph = self.graph.get_executable_graph();
+        graph
             .edges_directed(idx, Direction::Outgoing)
             .next()
             .map(|edge| edge.weight().clone())
+            .or_else(|| {
+                graph[idx]
+                    .output_pcols()
+                    .into_iter()
+                    .find_map(|pcollection| self.graph.side_input_output_metadata(&pcollection))
+            })
     }
 
     /// Returns the root `ConsumerMetaData` for the graph.

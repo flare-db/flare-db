@@ -11,7 +11,7 @@ FlareDB is a single-node Rust runtime that accepts Apache Beam portable pipeline
 
 A Beam SDK does **not** send language-specific user code to Rust. It translates a pipeline into Beam Runner API protobufs. FlareDB keeps SDK-owned work as `ExecutableStage`s and asks a Java or Python SDK harness to execute that work through the Beam Fn API. FlareDB-specific execution begins where a stage is classified as runner-owned: today `Impulse`, `GroupByKey`, and `Flatten` are Rust `FlareTransform`s.
 
-Side inputs are not a separate execution engine or storage system. Fusion materializes the side-input producer as a normal windowed PCollection in Paimon; the Fn State service reads that PCollection, groups it by window, encodes values with the PCollection coder, and serves `IterableSideInput` requests from a per-job in-memory cache. Multimap side inputs remain unsupported.
+Side inputs are not a separate execution engine or storage system. Fusion materializes the side-input producer as a normal windowed PCollection in Paimon; the Fn State service reads that PCollection, groups it by window, encodes values with the PCollection coder, and serves iterable or multimap requests from a per-job in-memory cache. Multimap support covers key enumeration and keyed-value lookup; the optional bulk keys-values protocol is not advertised.
 
 The important split is therefore:
 
@@ -32,7 +32,7 @@ flaredb/                         Rust server and execution engine
   src/jobservice/                Beam Job + Artifact service; submission becomes a Job
   src/fusion/                    Runner API graph view, SDF rewrite, stage fusion, executable DAG
   src/engine/                    Scheduler, dispatcher, SDK bundle runtime, Fn API channels,
-                                 user state/timers in SlateDB, iterable side inputs from Paimon
+                                 user state/timers in SlateDB, side inputs from Paimon
   src/transforms/                Rust-native transforms and URN registry
   src/coders/                    Beam value/coder decoding and WindowedValue framing
   src/store/                     BeamRecord ↔ Arrow ↔ Paimon PCollection persistence
@@ -60,7 +60,7 @@ example/                         Submission/integration examples
 | `ExecutableGraph` | Petgraph DAG of `Runner`, `Worker`, or `Splittable` nodes | Edges carry `ConsumerMetaData`: PCollection, coder, producer/consumer IDs |
 | `engine` + `harness` | Dependency scheduling and Fn bundle/data orchestration | Tonic Fn APIs are a protocol boundary; do not invent a second transport |
 | `engine/state.rs`, `engine/timer.rs`, `engine/kv.rs` | Beam user state and user timers in a SlateDB KV store | Cells are opaque bytes over the Fn State proto. The Paimon PCollection store does not hold them. |
-| `engine/harness/state.rs` | Fn State requests for `BagUserState` and iterable side inputs | User state is served from SlateDB. Iterable side inputs are projected from materialized Paimon PCollections into window-keyed encoded bytes. |
+| `engine/harness/state.rs` | Fn State requests for `BagUserState`, iterable side inputs, and multimap side inputs | User state is served from SlateDB. Side inputs are projected from materialized Paimon PCollections into window-keyed encoded bytes or keyed value maps. |
 | `transforms` | Flare-native PCollection operations | `FlareTransform::execute(ExecutionContext)` reads/writes element-store collections |
 | `store` | Materialize elements as Paimon tables | `BeamRecord` conversion is the coder/storage boundary; schema derives from first batch |
 | `io` / `flare-io` / `flare-sql` | Query and external table I/O | Arrow Flight SQL and DataFusion/Paimon, separate from pipeline scheduling |
@@ -68,7 +68,7 @@ example/                         Submission/integration examples
 ### Technologies actually in the execution path
 
 - **Beam Runner API / generated `beam_model_rs` types:** `Pipeline`, `Components`, `PTransform`, coders, environments, `ProcessBundleDescriptor`, Job/Fn service types.
-- **Beam Fn API:** control registers descriptors and sends `ProcessBundle`; data streams framed `Elements`; logging is routed to job logs. The State service answers `StateRequest`s for user state and iterable side inputs. User timers use the timer service and SlateDB timer store, not the PCollection store.
+- **Beam Fn API:** control registers descriptors and sends `ProcessBundle`; data streams framed `Elements`; logging is routed to job logs. The State service answers `StateRequest`s for user state and iterable/multimap side inputs. User timers use the timer service and SlateDB timer store, not the PCollection store.
 - **Petgraph:** internal executable DAG and dependency edges.
 - **Arrow:** in-memory `RecordBatch` representation and Flight IPC.
 - **SlateDB:** embedded LSM on `object_store` (local filesystem) holding Beam user state and user timers, one database per subsystem (`state`, `timers`) under `<warehouse>/.slate_state/<db>/`.
@@ -94,27 +94,30 @@ There is no Tonbo implementation in the active code path. The current catalog cr
 8. A **runner node** builds/registers a descriptor, then invokes `FlareTransform::execute`. Its `ExecutionContext` identifies input and output PCollections in the same `FlareElementStore`.
 9. `FlareElementStore` derives a `RecordTableSchema` from a PCollection’s first output batch, converts records to Arrow, commits them to Paimon, and scans them back for the next stage. PCollection tables are therefore the inter-stage exchange medium, not merely an output sink.
 
-### Iterable side-input trace
+### Side-input trace
 
-FlareDB currently supports Beam's iterable materialization, including the materialization used by singleton views.
+FlareDB supports Beam's iterable materialization and multimap key/keyed-value reads. This covers singleton views, `View.asMap().get(key)`, and related explicit side-input access.
 
 ```text
 side-input producer PCollection
-  → fused as a materialized Worker/Runner output
+  → materialized as a Worker, Runner, or Splittable boundary output
   → PCollectionWriter writes logical element columns
     + __flare_window_metadata (timestamp/windows/pane JSON)
     + __flare_window_key (canonical window keys)
   → producer bundle completes and releases the consumer's side-input barrier
-  → StateRequest(StateKey.IterableSideInput, StateGet)
+  → StateRequest(StateKey.{IterableSideInput|MultimapKeysSideInput|MultimapSideInput}, StateGet)
   → SideInputResolver maps (transform_id, side_input_id) to PCollection/coders
   → FlareElementStore.scan_windowed_values reads the PCollection
-  → group by BeamWindow and encode with StandardBeamCoders::encode_element
-  → cache per side input and window:
-       HashMap<SideInputKey, Arc<HashMap<BeamWindow, Vec<u8>>>>
-  → StateGetResponse.data contains concatenated values for the requested window
+  → group by BeamWindow and encode with StandardBeamCoders::encode
+  → iterable: concatenated element bytes
+  → multimap: unique encoded keys plus value bytes grouped by encoded key
+  → per-job cache keyed by SideInputKey and BeamWindow
+  → StateGetResponse.data contains fully framed values or keys; continuation token is empty
 ```
 
-The registry and cache are built in `engine/harness/state.rs`; `ExecutorDispatcher::prepare_pipeline` passes the registry into the state stream after pipeline coders have been rewritten. The cache is in memory and per job. Paimon remains the durable source of truth, so the cache is rebuilt lazily after a process restart. Current support assumes a bounded side input stabilizes after its producer's first completed bundle; it does not implement continuation-token pagination or dynamic streaming side-input refreshes.
+The registry resolves each consumer's access-pattern URN from `ParDoPayload`, then records either the PCollection element coder or the KV coder's separate key/value component coders. `ExecutorDispatcher::prepare_pipeline` passes the registry into the state stream after pipeline coders have been rewritten. The cache is in memory and per job. Paimon remains the durable source of truth, so the cache is rebuilt lazily after a process restart. Current support assumes a bounded side input stabilizes after its producer's first completed bundle; it does not implement continuation-token pagination, the bulk keys-values capability, or dynamic streaming side-input refreshes.
+
+Side-input-only PCollections have no ordinary graph consumer edge. Fusion must include them in splittable boundary outputs, and `NodeScheduler::output_edge_metadata` synthesizes metadata for them so their producer actually commits the Paimon table.
 
 ### Concrete transform trace: Impulse → ParDo → GroupByKey
 
@@ -159,19 +162,19 @@ Worker output bytes
 ```
 
 ```text
-Iterable side-input StateRequest
+Side-input StateRequest
   → ExecutorDispatcher installs SideInputRegistry
   → StateChannel services the Fn State stream
   → SideInputResolver scans the materialized PCollection once
-  → BeamWindow-keyed encoded bytes (in-memory cache)
-  → StateGetResponse concatenated bytes
+  → BeamWindow-keyed iterable bytes or multimap key/value maps (in-memory cache)
+  → StateGetResponse concatenated framed bytes
 ```
 
 - Adding a **native transform** requires more than an implementation: define/reference its URN in `jobservice/urns.rs`, register it in `transforms::from_urn`, confirm fuser classification/boundaries, ensure `ExecutableGraph` can reach it, and test coder/store behavior.
 - Changing **fusion** affects both `ExecutableStage` descriptors and DAG dependencies. Inspect `fusion/pipeline.rs`, `fusion/fuser.rs`, `engine/scheduler.rs`, and the stage data-boundary construction in `engine/runtime.rs`.
 - Changing **coders** must preserve exactly the harness framing. `process_input_elements` deliberately sends payload data followed by an empty `is_last` marker to work with both Java and Python harnesses. Review Java `PortableCoderRewrites` and Python pickled-coder handling too.
 - Changing **storage schema** affects native transforms, SDK stage handoff, Flight I/O, and SQL. The schema registry is in-memory per store/job and Paimon has no native Arrow Null type (`Void` becomes nullable boolean).
-- Changing **stateful behavior** means touching the Fn State path end to end. `engine/harness/state.rs` owns request dispatch: `BagUserState` goes through `engine/state.rs`, while `IterableSideInput` resolves to a materialized PCollection. `engine/state.rs` (`backend` and `bag`) and `engine/timer.rs` hold user-state and timer semantics. `engine/kv.rs` persists user cells in the job's SlateDB store; `store/element_store.rs` uses the same abstraction for read cursors in the `cursors` database. Event-time timers also drive watermark holds. Fusion already treats ParDo state/timers and side-input-bearing ParDos as fusion boundaries.
+- Changing **stateful behavior** means touching the Fn State path end to end. `engine/harness/state.rs` owns request dispatch: `BagUserState` goes through `engine/state.rs`, while iterable and multimap side-input keys resolve to materialized PCollections. `engine/state.rs` (`backend` and `bag`) and `engine/timer.rs` hold user-state and timer semantics. `engine/kv.rs` persists user cells in the job's SlateDB store; `store/element_store.rs` uses the same abstraction for read cursors in the `cursors` database. Event-time timers also drive watermark holds. Fusion already treats ParDo state/timers and side-input-bearing ParDos as fusion boundaries.
 
 ## Where to look
 
@@ -187,7 +190,7 @@ Iterable side-input StateRequest
 | Element coding | `flaredb/src/coders/` | `engine/runtime.rs`, SDK coder rewrite tests |
 | PCollection persistence | `flaredb/src/store/{record,element_store}.rs` | native transforms, `io/server.rs` |
 | User state / timers | `flaredb/src/engine/state.rs`, `engine/timer.rs` | `engine/kv.rs`, `engine/harness/state.rs` |
-| Iterable side inputs | `engine/harness/state.rs` (`SideInputRegistry`, `SideInputResolver`) | `engine/dispatcher.rs`, `engine/watermark.rs`, `store/element_store.rs`, `fusion/{refs,stage,fuser}.rs` |
+| Side inputs | `engine/harness/state.rs` (`SideInputRegistry`, `SideInputResolver`) | `engine/dispatcher.rs`, `engine/watermark.rs`, `engine/scheduler.rs`, `store/element_store.rs`, `fusion/{pipeline,refs,stage,fuser}.rs` |
 | SQL / Flight | `flaredb/src/io/server.rs` | `flare-io/java/flareio-java`, `flare-sql` |
 | Java runner | `runner-sdk/java/flarerunner/src/main/java/com/flaredb/runner/FlareRunner.java` | tests; `PortableCoderRewrites.java` |
 | Python runner | `runner-sdk/python/flarerunner/flaredb_runner/flare_runner.py` | `tests/flare_runner_test.py`, `example/python/wordcount.py` |
@@ -198,7 +201,7 @@ Iterable side-input StateRequest
 
 - `fusion/fuser.rs` has pipeline-shape/fusion tests; start there for stage-boundary changes.
 - `fusion/expander.rs` tests the splittable-ParDo rewrite; `engine/scheduler.rs` tests DAG readiness/fan-in.
-- `engine/harness/state.rs` tests iterable side-input window filtering, non-nested encoding, length-prefixed opaque values, empty windows, and rejected mutations.
+- `engine/harness/state.rs` tests iterable and multimap window filtering, keyed lookup, nested coder framing, length-prefixed opaque values, empty windows, and rejected mutations.
 - `engine/watermark.rs` and `engine/scheduler.rs` test producer-before-consumer side-input barriers, including the scheduler's debug dependency invariant.
 - `store/element_store.rs` and `store/record.rs` have focused async/schema/record tests.
 - `runner-sdk/java/flarerunner/src/test/` covers artifacts, job behavior, options, and coder rewrites.
@@ -237,8 +240,8 @@ rg 'FlareElementStore|write_beamrecord_batch|scan_collection|PaimonTableProvider
 # Coder interpretation or SDK compatibility rewrite
 rg 'StandardBeamCoders|WindowedValueCoder|length_prefix|pickled_python|javasdk' flaredb runner-sdk
 
-# Iterable side-input registry, cache, and scheduling path
-rg 'SideInputRegistry|SideInputResolver|IterableSideInput|encode_element' flaredb/src
+# Side-input registry, cache, and scheduling path
+rg 'SideInputRegistry|SideInputResolver|IterableSideInput|MultimapSideInput|MultimapKeysSideInput' flaredb/src
 rg 'unproduced_side_inputs|side_input_consumers|side_inputs_produced' flaredb/src/engine
 ```
 
@@ -250,6 +253,6 @@ Search from protocol representation toward execution, not from a guessed module 
 - Worker runtimes are local Java/Python subprocesses. `Docker` and `External` variants return `unimplemented`.
 - The Job Service runs work synchronously in `Run`; several Job API methods remain TODO. Treat capability claims in prose as less reliable than the service implementation.
 - `NodeScheduler::output_edge_metadata` currently returns the first outgoing edge. Graph construction represents fan-out, but verify the execution path for fan-out changes.
-- Fn State currently serves `BagUserState` and `IterableSideInput`. Multimap side inputs, continuation-token pagination, and dynamic/streaming side-input refreshes are not implemented. `IterableSideInput` responses return all matching encoded values with an empty continuation token.
+- Fn State serves `BagUserState`, `IterableSideInput`, `MultimapKeysSideInput`, and `MultimapSideInput`. `MultimapKeysValuesSideInput`, continuation-token pagination, and dynamic/streaming side-input refreshes are not implemented. Responses return all matching encoded data with an empty continuation token.
 - The iterable side-input cache assumes the materialized producer is stable after its first completed bundle. Invalidation tied to later producer updates is part of future streaming support, not current batch behavior.
 - `beam/model/` is vendored source and `beam-model-rs/build.rs` can generate checked-in bindings, but `beam-model-rs` is commented out of the workspace and `flaredb` uses crates.io `beam-model-rs = 2.70.0`. Confirm the compiled model before modifying either.

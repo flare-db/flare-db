@@ -6,10 +6,12 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use beam_model_rs::v1::{
-    Coder, Components, StateAppendResponse, StateClearResponse, StateGetResponse, StateRequest,
-    StateResponse, beam_fn_state_server::BeamFnState, state_key, state_request, state_response,
+    Coder, Components, ParDoPayload, StateAppendResponse, StateClearResponse, StateGetResponse,
+    StateRequest, StateResponse, beam_fn_state_server::BeamFnState, state_key, state_request,
+    state_response,
 };
 use log::{error, info, warn};
+use prost::Message;
 use tokio::sync::{
     Mutex,
     mpsc::{self},
@@ -27,8 +29,15 @@ use crate::{
         runtime::resolve_window_coder,
         state::{StateBackend, UserStateAddress, UserStateKind, UserStateStore},
     },
-    fusion::pipeline::{ExecutableGraph, ExecutableNode},
-    store::element_store::{FlareElementStore, ScanCollectionRequest, slate_state_dir},
+    fusion::{
+        pipeline::{ExecutableGraph, ExecutableNode},
+        refs::SideInputRef,
+    },
+    jobservice::urns::beam_urns,
+    store::{
+        element_store::{FlareElementStore, ScanCollectionRequest, slate_state_dir},
+        record::BeamRecord,
+    },
 };
 
 pub struct StateInner {
@@ -121,13 +130,24 @@ struct SideInputKey {
 }
 
 #[derive(Debug, Clone)]
+enum SideInputMaterialization {
+    Iterable {
+        element_coder: StandardBeamCoders,
+    },
+    Multimap {
+        key_coder: StandardBeamCoders,
+        value_coder: StandardBeamCoders,
+    },
+}
+
+#[derive(Debug, Clone)]
 struct SideInputSpec {
     pcollection_id: String,
-    element_coder: StandardBeamCoders,
+    materialization: SideInputMaterialization,
     window_coder: WindowCoder,
 }
 
-/// Fn State lookup metadata for iterable side inputs in a prepared pipeline.
+/// Fn State lookup metadata for materialized side inputs in a prepared pipeline.
 #[derive(Debug, Clone, Default)]
 pub struct SideInputRegistry {
     specs: Arc<HashMap<SideInputKey, SideInputSpec>>,
@@ -157,15 +177,46 @@ impl SideInputRegistry {
                 let pcollection_id = pcollection.id().clone();
                 if !produced_pcollections.contains(&pcollection_id) {
                     return Err(anyhow!(
-                        "iterable side input '{}' on transform '{}' references PCollection '{}' with no executable producer",
+                        "side input '{}' on transform '{}' references PCollection '{}' with no executable producer",
                         side_input.local_name(),
                         side_input.transform().id(),
                         pcollection_id
                     ));
                 }
                 let coder_id = pcollection.node().coder_id.clone();
-                let element_coder =
-                    StandardBeamCoders::from_urn(&coder_id, None, Some(pipeline_coders));
+                let access_pattern = side_input_access_pattern(&side_input)?;
+                let materialization = match access_pattern.as_str() {
+                    beam_urns::ITERABLE_SIDE_INPUT_ACCESS => SideInputMaterialization::Iterable {
+                        element_coder: StandardBeamCoders::from_urn(
+                            &coder_id,
+                            None,
+                            Some(pipeline_coders),
+                        ),
+                    },
+                    beam_urns::MULTIMAP_SIDE_INPUT_ACCESS => {
+                        let (key_coder_id, value_coder_id) =
+                            multimap_coder_components(&coder_id, pipeline_coders)?;
+                        SideInputMaterialization::Multimap {
+                            key_coder: StandardBeamCoders::from_urn(
+                                &key_coder_id,
+                                None,
+                                Some(pipeline_coders),
+                            ),
+                            value_coder: StandardBeamCoders::from_urn(
+                                &value_coder_id,
+                                None,
+                                Some(pipeline_coders),
+                            ),
+                        }
+                    }
+                    other => {
+                        return Err(anyhow!(
+                            "unsupported side-input access pattern '{other}' on transform '{}' side input '{}'",
+                            side_input.transform().id(),
+                            side_input.local_name()
+                        ));
+                    }
+                };
                 let window_coder =
                     resolve_window_coder(components, pipeline_coders, &pcollection_id)?;
                 let key = SideInputKey {
@@ -174,12 +225,12 @@ impl SideInputRegistry {
                 };
                 let spec = SideInputSpec {
                     pcollection_id,
-                    element_coder,
+                    materialization,
                     window_coder,
                 };
                 if let Some(existing) = specs.insert(key.clone(), spec) {
                     return Err(anyhow!(
-                        "duplicate iterable side input reference for transform '{}' and side input '{}' (PCollections '{}' and '{}')",
+                        "duplicate side input reference for transform '{}' and side input '{}' (PCollections '{}' and '{}')",
                         key.transform_id,
                         key.side_input_id,
                         existing.pcollection_id,
@@ -209,13 +260,84 @@ impl SideInputRegistry {
     }
 }
 
+fn side_input_access_pattern(side_input: &SideInputRef) -> Result<String> {
+    let transform = side_input.transform().node();
+    let spec = transform.spec.as_ref().ok_or_else(|| {
+        anyhow!(
+            "side-input consumer transform '{}' has no function spec",
+            side_input.transform().id()
+        )
+    })?;
+    let payload = ParDoPayload::decode(spec.payload.as_slice()).map_err(|e| {
+        anyhow!(
+            "failed to decode side-input consumer payload for transform '{}': {e}",
+            side_input.transform().id()
+        )
+    })?;
+    payload
+        .side_inputs
+        .get(side_input.local_name())
+        .and_then(|side| side.access_pattern.as_ref())
+        .map(|access_pattern| access_pattern.urn.clone())
+        .ok_or_else(|| {
+            anyhow!(
+                "side input '{}' on transform '{}' has no access pattern",
+                side_input.local_name(),
+                side_input.transform().id()
+            )
+        })
+}
+
+fn multimap_coder_components(
+    coder_id: &str,
+    pipeline_coders: &HashMap<String, Coder>,
+) -> Result<(String, String)> {
+    let coder = pipeline_coders
+        .get(coder_id)
+        .ok_or_else(|| anyhow!("multimap side-input coder '{coder_id}' was not found"))?;
+    let urn = coder
+        .spec
+        .as_ref()
+        .map(|spec| spec.urn.as_str())
+        .unwrap_or(coder_id);
+    if urn != beam_urns::KV_CODER {
+        return Err(anyhow!(
+            "multimap side input requires a KV coder, found '{urn}' for coder '{coder_id}'"
+        ));
+    }
+    match coder.component_coder_ids.as_slice() {
+        [key, value] => Ok((key.clone(), value.clone())),
+        components => Err(anyhow!(
+            "multimap side-input KV coder '{coder_id}' has {} component coder(s), expected 2",
+            components.len()
+        )),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct IterableSideInputAddress {
     key: SideInputKey,
     window: Vec<u8>,
 }
 
-type EncodedSideInputWindows = HashMap<BeamWindow, Vec<u8>>;
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct MultimapSideInputAddress {
+    key: SideInputKey,
+    window: Vec<u8>,
+    /// `None` requests all keys; `Some(key)` requests values for one key.
+    map_key: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone)]
+enum EncodedSideInputWindow {
+    Iterable(Vec<u8>),
+    Multimap {
+        keys: Vec<u8>,
+        values: HashMap<Vec<u8>, Vec<u8>>,
+    },
+}
+
+type EncodedSideInputWindows = HashMap<BeamWindow, EncodedSideInputWindow>;
 type SideInputCache = HashMap<SideInputKey, Arc<EncodedSideInputWindows>>;
 
 /// Per-job side-input reader over the materialized PCollections. Values are
@@ -236,6 +358,36 @@ impl SideInputResolver {
         }
     }
 
+    async fn cached_windows(
+        &self,
+        key: &SideInputKey,
+        spec: &SideInputSpec,
+    ) -> Result<Arc<EncodedSideInputWindows>> {
+        let mut cache = self.cache.lock().await;
+        if let Some(windows) = cache.get(key) {
+            return Ok(windows.clone());
+        }
+
+        let values = self
+            .store
+            .scan_windowed_values(ScanCollectionRequest {
+                pcollection_id: spec.pcollection_id.clone(),
+            })
+            .await?;
+        let windows = match &spec.materialization {
+            SideInputMaterialization::Iterable { element_coder } => {
+                encode_iterable_windows(values, element_coder)?
+            }
+            SideInputMaterialization::Multimap {
+                key_coder,
+                value_coder,
+            } => encode_multimap_windows(values, key_coder, value_coder)?,
+        };
+        let windows = Arc::new(windows);
+        cache.insert(key.clone(), windows.clone());
+        Ok(windows)
+    }
+
     async fn read_iterable(&self, address: &IterableSideInputAddress) -> Result<Vec<u8>> {
         let spec = self.registry.get(&address.key).ok_or_else(|| {
             anyhow!(
@@ -244,45 +396,147 @@ impl SideInputResolver {
                 address.key.side_input_id
             )
         })?;
+        if !matches!(
+            &spec.materialization,
+            SideInputMaterialization::Iterable { .. }
+        ) {
+            return Err(anyhow!(
+                "side input transform_id='{}' side_input_id='{}' is not iterable",
+                address.key.transform_id,
+                address.key.side_input_id
+            ));
+        }
         let window = spec
             .window_coder
             .decode_window(&address.window)
             .map_err(|e| anyhow!("invalid side-input window: {e}"))?;
-
-        let mut cache = self.cache.lock().await;
-        if !cache.contains_key(&address.key) {
-            let values = self
-                .store
-                .scan_windowed_values(ScanCollectionRequest {
-                    pcollection_id: spec.pcollection_id.clone(),
-                })
-                .await?;
-            let mut grouped = EncodedSideInputWindows::new();
-            for value in values {
-                let mut seen_windows = HashSet::new();
-                for value_window in value.windows {
-                    if !seen_windows.insert(value_window.clone()) {
-                        continue;
-                    }
-                    let encoded = grouped.entry(value_window).or_default();
-                    let before = encoded.len();
-                    spec.element_coder
-                        .encode_element(value.value.clone(), encoded);
-                    // Beam's data stream decoder advances one byte when a coder
-                    // decodes to zero bytes, so preserve that element boundary.
-                    if encoded.len() == before {
-                        encoded.push(0);
-                    }
-                }
+        let windows = self.cached_windows(&address.key, spec).await?;
+        Ok(match windows.get(&window) {
+            Some(EncodedSideInputWindow::Iterable(data)) => data.clone(),
+            Some(EncodedSideInputWindow::Multimap { .. }) => {
+                return Err(anyhow!(
+                    "side input transform_id='{}' side_input_id='{}' is not iterable",
+                    address.key.transform_id,
+                    address.key.side_input_id
+                ));
             }
-            cache.insert(address.key.clone(), Arc::new(grouped));
-        }
+            None => Vec::new(),
+        })
+    }
 
-        Ok(cache
-            .get(&address.key)
-            .and_then(|grouped| grouped.get(&window))
-            .cloned()
-            .unwrap_or_default())
+    async fn read_multimap(&self, address: &MultimapSideInputAddress) -> Result<Vec<u8>> {
+        let spec = self.registry.get(&address.key).ok_or_else(|| {
+            anyhow!(
+                "unknown multimap side input transform_id='{}' side_input_id='{}'",
+                address.key.transform_id,
+                address.key.side_input_id
+            )
+        })?;
+        if !matches!(
+            &spec.materialization,
+            SideInputMaterialization::Multimap { .. }
+        ) {
+            return Err(anyhow!(
+                "side input transform_id='{}' side_input_id='{}' is not a multimap",
+                address.key.transform_id,
+                address.key.side_input_id
+            ));
+        }
+        let window = spec
+            .window_coder
+            .decode_window(&address.window)
+            .map_err(|e| anyhow!("invalid side-input window: {e}"))?;
+        let windows = self.cached_windows(&address.key, spec).await?;
+        let Some(EncodedSideInputWindow::Multimap { keys, values }) = windows.get(&window) else {
+            return Ok(Vec::new());
+        };
+        match &address.map_key {
+            None => Ok(keys.clone()),
+            Some(key) => Ok(values.get(key).cloned().unwrap_or_default()),
+        }
+    }
+}
+
+fn encode_iterable_windows(
+    values: Vec<crate::coders::primitives::WindowedValue>,
+    element_coder: &StandardBeamCoders,
+) -> Result<EncodedSideInputWindows> {
+    let mut grouped = EncodedSideInputWindows::new();
+    for value in values {
+        let mut seen_windows = HashSet::new();
+        for window in value.windows {
+            if !seen_windows.insert(window.clone()) {
+                continue;
+            }
+            let entry = grouped
+                .entry(window)
+                .or_insert_with(|| EncodedSideInputWindow::Iterable(Vec::new()));
+            let EncodedSideInputWindow::Iterable(encoded) = entry else {
+                return Err(anyhow!(
+                    "side-input PCollection mixed iterable and multimap values"
+                ));
+            };
+            append_encoded_element(element_coder, value.value.clone(), encoded);
+        }
+    }
+    Ok(grouped)
+}
+
+fn encode_multimap_windows(
+    values: Vec<crate::coders::primitives::WindowedValue>,
+    key_coder: &StandardBeamCoders,
+    value_coder: &StandardBeamCoders,
+) -> Result<EncodedSideInputWindows> {
+    let mut grouped = EncodedSideInputWindows::new();
+    for value in values {
+        let BeamRecord::KV(kv) = value.value else {
+            return Err(anyhow!(
+                "multimap side input requires KV values, found a different BeamRecord"
+            ));
+        };
+        let value_windows = value.windows;
+        let key = kv.key;
+        let value = *kv.value;
+        let mut seen_windows = HashSet::new();
+        for window in value_windows {
+            if !seen_windows.insert(window.clone()) {
+                continue;
+            }
+            let entry = grouped
+                .entry(window)
+                .or_insert_with(|| EncodedSideInputWindow::Multimap {
+                    keys: Vec::new(),
+                    values: HashMap::new(),
+                });
+            let EncodedSideInputWindow::Multimap { keys, values } = entry else {
+                return Err(anyhow!(
+                    "side-input PCollection mixed iterable and multimap values"
+                ));
+            };
+
+            let mut encoded_key = Vec::new();
+            append_encoded_element(
+                key_coder,
+                BeamRecord::PRIMITIVE(key.clone()),
+                &mut encoded_key,
+            );
+            if !values.contains_key(&encoded_key) {
+                keys.extend_from_slice(&encoded_key);
+            }
+            let encoded_values = values.entry(encoded_key).or_default();
+            append_encoded_element(value_coder, value.clone(), encoded_values);
+        }
+    }
+    Ok(grouped)
+}
+
+fn append_encoded_element(coder: &StandardBeamCoders, value: BeamRecord, encoded: &mut Vec<u8>) {
+    let before = encoded.len();
+    coder.encode(value, encoded);
+    // Beam's data stream decoder advances one byte when a coder decodes to zero
+    // bytes, so preserve that element boundary.
+    if encoded.len() == before {
+        encoded.push(0);
     }
 }
 
@@ -467,7 +721,20 @@ fn describe_request(request: &StateRequest) -> String {
             side_input.side_input_id,
             side_input.window.len()
         ),
-        Some(_) => "non-bag-user-state".to_string(),
+        Some(state_key::Type::MultimapKeysSideInput(side_input)) => format!(
+            "multimap_keys_side_input(transform_id={}, side_input_id={}, window={}B)",
+            side_input.transform_id,
+            side_input.side_input_id,
+            side_input.window.len()
+        ),
+        Some(state_key::Type::MultimapSideInput(side_input)) => format!(
+            "multimap_side_input(transform_id={}, side_input_id={}, window={}B, key={}B)",
+            side_input.transform_id,
+            side_input.side_input_id,
+            side_input.window.len(),
+            side_input.key.len()
+        ),
+        Some(_) => "unsupported-state-key".to_string(),
         None => "no-state-key".to_string(),
     };
     let op = match request.request {
@@ -485,6 +752,7 @@ fn describe_request(request: &StateRequest) -> String {
 enum StateTarget {
     UserState(UserStateAddress),
     IterableSideInput(IterableSideInputAddress),
+    MultimapSideInput(MultimapSideInputAddress),
 }
 
 /// Dispatch a user-state request without side-input lookup metadata.
@@ -527,6 +795,9 @@ async fn handle_state_request_with_side_inputs(
         }
         StateTarget::IterableSideInput(address) => {
             handle_iterable_side_input_request(side_inputs, id, address, body).await
+        }
+        StateTarget::MultimapSideInput(address) => {
+            handle_multimap_side_input_request(side_inputs, id, address, body).await
         }
     }
 }
@@ -617,6 +888,47 @@ async fn handle_iterable_side_input_request(
     }
 }
 
+async fn handle_multimap_side_input_request(
+    side_inputs: Option<&SideInputResolver>,
+    id: String,
+    address: MultimapSideInputAddress,
+    body: Option<state_request::Request>,
+) -> std::result::Result<StateResponse, (String, String)> {
+    match body {
+        Some(state_request::Request::Get(get)) => {
+            if !get.continuation_token.is_empty() {
+                return Err((id, "continuation tokens are not supported".to_string()));
+            }
+            let Some(side_inputs) = side_inputs else {
+                return Err((
+                    id,
+                    "multimap side-input resolver is not initialized".to_string(),
+                ));
+            };
+            match side_inputs.read_multimap(&address).await {
+                Ok(data) => Ok(StateResponse {
+                    id,
+                    error: String::new(),
+                    response: Some(state_response::Response::Get(StateGetResponse {
+                        continuation_token: Vec::new(),
+                        data,
+                    })),
+                }),
+                Err(e) => Err((id, format!("get multimap side input failed: {e}"))),
+            }
+        }
+        Some(state_request::Request::Append(_)) => Err((
+            id,
+            "append is not supported for multimap side inputs".to_string(),
+        )),
+        Some(state_request::Request::Clear(_)) => Err((
+            id,
+            "clear is not supported for multimap side inputs".to_string(),
+        )),
+        None => Err((id, "state request has no request body".to_string())),
+    }
+}
+
 /// Decode a Beam `StateKey` into a supported state target.
 fn state_target(key: state_key::Type) -> std::result::Result<StateTarget, String> {
     match key {
@@ -636,8 +948,28 @@ fn state_target(key: state_key::Type) -> std::result::Result<StateTarget, String
                 window: side_input.window,
             }))
         }
+        state_key::Type::MultimapKeysSideInput(side_input) => {
+            Ok(StateTarget::MultimapSideInput(MultimapSideInputAddress {
+                key: SideInputKey {
+                    transform_id: side_input.transform_id,
+                    side_input_id: side_input.side_input_id,
+                },
+                window: side_input.window,
+                map_key: None,
+            }))
+        }
+        state_key::Type::MultimapSideInput(side_input) => {
+            Ok(StateTarget::MultimapSideInput(MultimapSideInputAddress {
+                key: SideInputKey {
+                    transform_id: side_input.transform_id,
+                    side_input_id: side_input.side_input_id,
+                },
+                window: side_input.window,
+                map_key: Some(side_input.key),
+            }))
+        }
         other => Err(format!(
-            "unsupported state key type '{}' (supported types: '{}' and 'iterable_side_input')",
+            "unsupported state key type '{}' (supported types: '{}', 'iterable_side_input', 'multimap_keys_side_input', and 'multimap_side_input')",
             state_key_kind(&other),
             UserStateKind::Bag.wire_name(),
         )),
@@ -664,10 +996,10 @@ fn state_key_kind(key: &state_key::Type) -> &'static str {
 mod tests {
     use super::*;
     use crate::{
-        coders::primitives::{LengthPrefixCoder, PaneInfo, StringUtf8Coder},
+        coders::primitives::{LengthPrefixCoder, PaneInfo, StringUtf8Coder, VarIntCoder},
         store::{
             element_store::FlareElementStore,
-            record::{BeamRecord, PrimitiveValue},
+            record::{BeamKV, BeamRecord, PrimitiveValue},
         },
     };
     use beam_model_rs::v1::{StateKey, state_key};
@@ -713,7 +1045,39 @@ mod tests {
             key,
             SideInputSpec {
                 pcollection_id: "side-input-pc".to_string(),
-                element_coder,
+                materialization: SideInputMaterialization::Iterable { element_coder },
+                window_coder: WindowCoder::Interval,
+            },
+        )]);
+        let resolver = SideInputResolver::new(store.clone(), registry);
+        (dir, store, resolver)
+    }
+
+    async fn make_multimap_resolver()
+    -> (tempfile::TempDir, Arc<FlareElementStore>, SideInputResolver) {
+        let dir = tempdir().expect("failed to create tempdir warehouse");
+        let warehouse = dir
+            .path()
+            .to_str()
+            .expect("tempdir path is not valid utf8")
+            .to_string();
+        let store = Arc::new(
+            FlareElementStore::new(warehouse, "testdb".to_string(), None)
+                .await
+                .expect("failed to construct FlareElementStore"),
+        );
+        let key = SideInputKey {
+            transform_id: "select".to_string(),
+            side_input_id: "max-price".to_string(),
+        };
+        let registry = SideInputRegistry::from_entries([(
+            key,
+            SideInputSpec {
+                pcollection_id: "side-input-pc".to_string(),
+                materialization: SideInputMaterialization::Multimap {
+                    key_coder: StandardBeamCoders::VarInt(VarIntCoder),
+                    value_coder: StandardBeamCoders::StringUtf8(StringUtf8Coder),
+                },
                 window_coder: WindowCoder::Interval,
             },
         )]);
@@ -740,6 +1104,50 @@ mod tests {
             }),
             request: Some(op),
         }
+    }
+
+    fn multimap_keys_request(id: &str, window: &[u8]) -> StateRequest {
+        StateRequest {
+            id: id.to_string(),
+            instruction_id: "instruction".to_string(),
+            state_key: Some(StateKey {
+                r#type: Some(state_key::Type::MultimapKeysSideInput(
+                    state_key::MultimapKeysSideInput {
+                        transform_id: "select".to_string(),
+                        side_input_id: "max-price".to_string(),
+                        window: window.to_vec(),
+                    },
+                )),
+            }),
+            request: Some(get_op()),
+        }
+    }
+
+    fn multimap_value_request(id: &str, window: &[u8], key: &[u8]) -> StateRequest {
+        StateRequest {
+            id: id.to_string(),
+            instruction_id: "instruction".to_string(),
+            state_key: Some(StateKey {
+                r#type: Some(state_key::Type::MultimapSideInput(
+                    state_key::MultimapSideInput {
+                        transform_id: "select".to_string(),
+                        side_input_id: "max-price".to_string(),
+                        window: window.to_vec(),
+                        key: key.to_vec(),
+                    },
+                )),
+            }),
+            request: Some(get_op()),
+        }
+    }
+
+    fn kv_record(key: i64, value: &str) -> BeamRecord {
+        BeamRecord::KV(BeamKV {
+            key: PrimitiveValue::Int64(key),
+            value: Box::new(BeamRecord::PRIMITIVE(PrimitiveValue::String(
+                value.to_string(),
+            ))),
+        })
     }
 
     fn encoded_window(window: &BeamWindow) -> Vec<u8> {
@@ -1000,7 +1408,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn iterable_side_input_returns_matching_window_in_non_nested_encoding() {
+    async fn iterable_side_input_returns_matching_window_with_nested_encoding() {
         let (_dir, store, resolver) =
             make_side_input_resolver(StandardBeamCoders::StringUtf8(StringUtf8Coder)).await;
         let first = BeamWindow::Interval {
@@ -1041,7 +1449,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(get_response_data(response), b"onetwo");
+        assert_eq!(get_response_data(response), b"\x03one\x03two".to_vec());
     }
 
     #[tokio::test]
@@ -1121,5 +1529,58 @@ mod tests {
         .unwrap_err();
         assert_eq!(id, "side-4");
         assert!(error.contains("append is not supported"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn multimap_side_input_returns_unique_keys_and_values_per_window() {
+        let (_dir, store, resolver) = make_multimap_resolver().await;
+        let first = BeamWindow::Interval {
+            start_millis: 0,
+            end_millis: 1_000,
+        };
+        let second = BeamWindow::Interval {
+            start_millis: 1_000,
+            end_millis: 2_000,
+        };
+        store
+            .write_windowed_value_batch(
+                "side-input-pc",
+                vec![
+                    windowed(kv_record(1, "a"), first.clone()),
+                    windowed(kv_record(2, "b"), first.clone()),
+                    windowed(kv_record(1, "c"), first.clone()),
+                    windowed(kv_record(3, "other"), second),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let backend = build_state_backend(store).await.unwrap();
+        let keys = handle_state_request_with_side_inputs(
+            &backend,
+            Some(&resolver),
+            multimap_keys_request("multi-1", &encoded_window(&first)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(get_response_data(keys), vec![1, 2]);
+
+        let values = handle_state_request_with_side_inputs(
+            &backend,
+            Some(&resolver),
+            multimap_value_request("multi-2", &encoded_window(&first), &[1]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(get_response_data(values), b"\x01a\x01c".to_vec());
+
+        let missing = handle_state_request_with_side_inputs(
+            &backend,
+            Some(&resolver),
+            multimap_value_request("multi-3", &encoded_window(&first), &[99]),
+        )
+        .await
+        .unwrap();
+        assert!(get_response_data(missing).is_empty());
     }
 }

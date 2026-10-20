@@ -58,6 +58,12 @@ impl ExecutableGraph {
         // map is left uncollapsed; splittable stages are folded into `Splittable`
         // nodes lazily while walking downstream from the root.
         let mut consumer_map: HashMap<String, Vec<ConsumerLink>> = HashMap::new();
+        let mut side_input_pcollections = HashSet::new();
+        for stage in sdk_stages.iter() {
+            for side_input in stage.side_inputs() {
+                side_input_pcollections.insert(side_input.collection().id.clone());
+            }
+        }
 
         for stage in sdk_stages.iter() {
             let stage_input_id = stage.input_pcol().id.clone();
@@ -143,6 +149,7 @@ impl ExecutableGraph {
                             &sdk_stages,
                             &runner_stages,
                             &consumer_map,
+                            &side_input_pcollections,
                             &mut splittable_cache,
                         );
 
@@ -186,6 +193,7 @@ impl ExecutableGraph {
                             &sdk_stages,
                             &runner_stages,
                             &consumer_map,
+                            &side_input_pcollections,
                             &mut splittable_cache,
                         );
 
@@ -229,6 +237,7 @@ impl ExecutableGraph {
         sdk_stages: &IndexSet<ExecutableStage>,
         runner_stages: &IndexSet<PTransformNode>,
         consumer_map: &HashMap<String, Vec<ConsumerLink>>,
+        side_input_pcollections: &HashSet<String>,
         cache: &mut HashMap<String, ExecutableNode>,
     ) -> ExecutableNode {
         let ExecutableNode::Worker(stage) = node else {
@@ -243,8 +252,13 @@ impl ExecutableGraph {
             return existing.clone();
         }
 
-        let (splittable, member_ids) =
-            self.build_splittable_node(stage, sdk_stages, runner_stages, consumer_map);
+        let (splittable, member_ids) = self.build_splittable_node(
+            stage,
+            sdk_stages,
+            runner_stages,
+            consumer_map,
+            side_input_pcollections,
+        );
         for member_id in member_ids {
             cache.insert(member_id, splittable.clone());
         }
@@ -264,6 +278,7 @@ impl ExecutableGraph {
         sdk_stages: &IndexSet<ExecutableStage>,
         runner_stages: &IndexSet<PTransformNode>,
         consumer_map: &HashMap<String, Vec<ConsumerLink>>,
+        side_input_pcollections: &HashSet<String>,
     ) -> (ExecutableNode, Vec<String>) {
         let mut nested_graph = Graph::<ExecutableNode, ConsumerMetaData>::new();
         let mut nested_indices = HashMap::new();
@@ -285,7 +300,7 @@ impl ExecutableGraph {
             member_ids.push(stage_id);
 
             for output_pcol in stage.get_output_pcol_ids() {
-                let mut has_external_consumer = false;
+                let mut has_external_consumer = side_input_pcollections.contains(&output_pcol);
 
                 if let Some(consumers) = consumer_map.get(&output_pcol) {
                     for consumer in consumers {
@@ -490,6 +505,39 @@ impl ExecutableGraph {
 
     pub fn get_executable_graph(&self) -> &Graph<ExecutableNode, ConsumerMetaData> {
         &self.graph
+    }
+
+    /// Metadata for a PCollection consumed only as a side input. Such a
+    /// PCollection has no ordinary graph edge, but its producer still needs an
+    /// output metadata entry so bundle output is decoded and committed.
+    pub(crate) fn side_input_output_metadata(
+        &self,
+        pcollection_id: &str,
+    ) -> Option<ConsumerMetaData> {
+        for node in self.graph.node_weights() {
+            let ExecutableNode::Worker(stage) = node else {
+                continue;
+            };
+            if let Some(side_input) = stage
+                .side_inputs()
+                .iter()
+                .find(|side| side.collection().id == pcollection_id)
+            {
+                let pcollection = self.components.pcollections.get(pcollection_id)?;
+                return Some(ConsumerMetaData {
+                    producer_transform_id: node.id(),
+                    produced_pcol_id: pcollection_id.to_string(),
+                    coder_id: pcollection.coder_id.clone(),
+                    component_coder: self
+                        .components
+                        .coders
+                        .get(&pcollection.coder_id)
+                        .map(|coder| coder.component_coder_ids.clone()),
+                    consumer_transfrom_id: side_input.transform().node().unique_name.clone(),
+                });
+            }
+        }
+        None
     }
 
     #[cfg(test)]
