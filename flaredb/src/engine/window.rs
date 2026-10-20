@@ -3,14 +3,13 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
-    time::Duration,
 };
 
-use anyhow::{anyhow, ensure, Context};
+use anyhow::{Context, anyhow, ensure};
 use beam_model_rs::v1::{
-    accumulation_mode, closing_behavior, elements, merge_status, on_time_behavior, output_time,
-    trigger, ApiServiceDescriptor, Coder, Components, Elements, FunctionSpec, PCollection,
-    PTransform, ProcessBundleDescriptor, RemoteGrpcPort, Trigger, WindowingStrategy,
+    ApiServiceDescriptor, Coder, Components, Elements, FunctionSpec, PCollection, PTransform,
+    ProcessBundleDescriptor, RemoteGrpcPort, Trigger, WindowingStrategy, accumulation_mode,
+    closing_behavior, elements, merge_status, on_time_behavior, output_time, trigger,
 };
 use bytes::{Buf, BufMut, BytesMut};
 use prost::Message;
@@ -18,8 +17,9 @@ use tokio::sync::Mutex;
 
 use crate::{
     coders::primitives::{
-        decode_varint, decode_window_from, decode_windowed_value_header, encode_varint,
-        encode_windowed_value_header, BeamWindow, PaneInfo, WindowCoder, BEAM_MIN_TIMESTAMP_MILLIS,
+        BEAM_MIN_TIMESTAMP_MILLIS, BeamWindow, PaneInfo, WindowCoder, decode_varint,
+        decode_window_from, decode_windowed_value_header, encode_varint,
+        encode_windowed_value_header,
     },
     engine::harness::{
         control::{ControlChannel, ControlResponse},
@@ -28,7 +28,7 @@ use crate::{
     jobservice::urns::beam_urns,
 };
 
-const MERGE_TIMEOUT: Duration = Duration::from_secs(60);
+const MERGE_CACHE_MAX_ENTRIES: usize = 1024;
 
 /// One merge callback result from the SDK's `MergeWindows` transform.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,7 +144,7 @@ impl WindowMergeService {
         let bundle = self.prepare_bundle(strategy_id).await?;
         let result = self.invoke(&bundle, &distinct).await?;
         let result = Arc::new(result);
-        cache.insert(cache_key, result.clone());
+        insert_merge_cache(&mut cache, cache_key, result.clone());
         Ok(result.as_ref().clone())
     }
 
@@ -268,7 +268,7 @@ impl WindowMergeService {
 
         let (response, output) = crate::engine::liveness::idle_guard(
             exchange,
-            MERGE_TIMEOUT,
+            crate::engine::liveness::worker_idle_timeout(),
             "waiting for SDK MergeWindows output and control response",
         )
         .await?;
@@ -285,6 +285,20 @@ impl WindowMergeService {
         validate_merge_result(windows, &merged)?;
         Ok(merged)
     }
+}
+
+fn insert_merge_cache(
+    cache: &mut HashMap<MergeCacheKey, Arc<Vec<MergedWindows>>>,
+    key: MergeCacheKey,
+    value: Arc<Vec<MergedWindows>>,
+) {
+    if cache.len() >= MERGE_CACHE_MAX_ENTRIES
+        && !cache.contains_key(&key)
+        && let Some(oldest) = cache.keys().next().cloned()
+    {
+        cache.remove(&oldest);
+    }
+    cache.insert(key, value);
 }
 
 fn distinct_windows(windows: &[BeamWindow]) -> Vec<BeamWindow> {
@@ -850,5 +864,21 @@ mod tests {
         );
         assert!(descriptor.coders.contains_key("window-outer"));
         assert!(descriptor.coders.contains_key("window-inner"));
+    }
+
+    #[test]
+    fn merge_cache_is_bounded() {
+        let mut cache = HashMap::new();
+        for index in 0..=MERGE_CACHE_MAX_ENTRIES {
+            insert_merge_cache(
+                &mut cache,
+                MergeCacheKey {
+                    strategy_id: "strategy".to_string(),
+                    windows: vec![index.to_string()],
+                },
+                Arc::new(Vec::new()),
+            );
+        }
+        assert_eq!(cache.len(), MERGE_CACHE_MAX_ENTRIES);
     }
 }

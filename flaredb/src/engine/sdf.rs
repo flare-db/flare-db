@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
 
 use anyhow::anyhow;
 use beam_model_rs::v1::{BundleApplication, DelayedBundleApplication, ProcessBundleResponse};
@@ -229,7 +228,7 @@ impl SplittableStageExecutor {
                     }
                 }
             },
-            Duration::from_secs(60),
+            crate::engine::liveness::worker_idle_timeout(),
             "waiting for SDF initialization stage control response/data",
         )
         .await?;
@@ -333,7 +332,7 @@ impl SplittableStageExecutor {
                         }
                     }
                 },
-                Duration::from_secs(60),
+                crate::engine::liveness::worker_idle_timeout(),
                 &format!(
                     "waiting for SDF process bundle {} output data and control response",
                     timeout_id
@@ -344,7 +343,7 @@ impl SplittableStageExecutor {
             let timeout_id = instruction_id.clone();
             crate::engine::liveness::idle_guard(
                 response_future,
-                Duration::from_secs(60),
+                crate::engine::liveness::worker_idle_timeout(),
                 &format!(
                     "waiting for SDF process bundle {} control response",
                     timeout_id

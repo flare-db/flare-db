@@ -14,8 +14,8 @@ use crate::{
             data::{DataKey, TimersKey},
         },
         runtime::{
-            runner_consumer_transform_id, runner_output_pcollection_id, stage_sink_transform_id,
-            stage_source_transform_id, stage_timer_endpoints, BundleRuntime,
+            BundleRuntime, runner_consumer_transform_id, runner_output_pcollection_id,
+            stage_sink_transform_id, stage_source_transform_id, stage_timer_endpoints,
         },
     },
     fusion::pipeline::{ConsumerMetaData, ExecutableNode},
@@ -314,7 +314,7 @@ impl StageExecutor {
                                             }
                                         }
                                     },
-                                    Duration::from_secs(60),
+                                    crate::engine::liveness::worker_idle_timeout(),
                                     &format!(
                                         "waiting for SDK bundle {} output data and control response",
                                         timeout_id
@@ -352,7 +352,7 @@ impl StageExecutor {
                                         }
                                     }
                                 },
-                                Duration::from_secs(60),
+                                crate::engine::liveness::worker_idle_timeout(),
                                 &format!("waiting for SDK bundle {} control response", timeout_id),
                             )
                             .await?;

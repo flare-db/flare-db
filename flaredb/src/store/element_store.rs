@@ -454,7 +454,7 @@ impl FlareElementStore {
     /// Shared by [`Self::read_incremental_batches`] (which collects) and
     /// [`Self::stream_windowed_values_since`] (which streams), so both follow
     /// identical snapshot-range planning.
-    async fn open_incremental_arrow(
+    pub(crate) async fn open_incremental_arrow(
         &self,
         pcollection_id: &str,
         cursor: Option<i64>,
