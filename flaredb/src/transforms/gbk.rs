@@ -9,10 +9,14 @@ use std::{
 };
 
 use anyhow::{Error, Result, anyhow};
-use arrow_array::{Array, ArrayRef, BinaryArray, RecordBatch, builder::BinaryBuilder};
+use arrow_array::{
+    Array, ArrayRef, BinaryArray, Int16Array, ListArray, RecordBatch, UInt32Array,
+    builder::BinaryBuilder,
+};
 use arrow_schema::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef,
 };
+use arrow_select::take::take;
 use async_trait::async_trait;
 use beam_model_rs::v1::{
     Coder, Components, Environment, FunctionSpec, PCollection, PTransform, WindowingStrategy,
@@ -44,7 +48,10 @@ use crate::{
     jobservice::urns::beam_urns,
     store::{
         KEY_COLUMN, VALUE_COLUMN,
-        element_store::{FlareElementStore, PCollectionWriter, WINDOW_KEY_COLUMN},
+        element_store::{
+            FlareElementStore, PCollectionWriter, WINDOW_COUNT_COLUMN, WINDOW_EXTRA_KEYS_COLUMN,
+            WINDOW_KEY_COLUMN,
+        },
         record::{
             BeamGbk, BeamRecord, IterableValue, PrimitiveValue, RecordTableSchema,
             primitive_value_from_array_row, record_batch_to_beamrecords,
@@ -126,6 +133,12 @@ struct WindowState {
     evaluated_this_run: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct GroupIdentity {
+    key: Vec<u8>,
+    window: Vec<u8>,
+}
+
 impl WindowState {
     fn new(key: PrimitiveValue, window: BeamWindow, trigger: TriggerRunner) -> Self {
         Self {
@@ -150,6 +163,10 @@ impl WindowState {
 trait GbkStateBackend: Send + Sync {
     async fn begin_run(&self);
 
+    async fn last_evaluated_watermark(&self) -> Option<i64>;
+
+    async fn mark_watermark_evaluated(&self, watermark: i64);
+
     async fn apply_group(
         &self,
         key: PrimitiveValue,
@@ -171,8 +188,9 @@ trait GbkStateBackend: Send + Sync {
 
 #[derive(Default)]
 struct InMemoryGbkStateInner {
-    states: HashMap<String, WindowState>,
-    ready_scan: Option<VecDeque<String>>,
+    states: HashMap<GroupIdentity, WindowState>,
+    ready_scan: Option<VecDeque<GroupIdentity>>,
+    last_evaluated_watermark: Option<i64>,
 }
 
 #[derive(Clone, Default)]
@@ -188,6 +206,20 @@ impl GbkStateBackend for InMemoryGbkState {
         for state in inner.states.values_mut() {
             state.evaluated_this_run = false;
         }
+    }
+
+    async fn last_evaluated_watermark(&self) -> Option<i64> {
+        self.inner
+            .lock()
+            .expect("gbk state lock not poisoned")
+            .last_evaluated_watermark
+    }
+
+    async fn mark_watermark_evaluated(&self, watermark: i64) {
+        self.inner
+            .lock()
+            .expect("gbk state lock not poisoned")
+            .last_evaluated_watermark = Some(watermark);
     }
 
     async fn apply_group(
@@ -278,8 +310,22 @@ impl GbkStateBackend for InMemoryGbkState {
 }
 
 /// Identity of a `(key, window)` group, used to key the state map.
-fn group_identity(key: &PrimitiveValue, window: &BeamWindow) -> String {
-    format!("{key:?}\u{1}{}", window.canonical_key())
+fn group_identity(key: &PrimitiveValue, window: &BeamWindow) -> GroupIdentity {
+    GroupIdentity {
+        key: encoded_primitive_sort_key(key),
+        window: window.to_binary_key(),
+    }
+}
+
+fn window_prune_cutoff(
+    previous_watermark: Option<i64>,
+    allowed_lateness: i64,
+    needs_merge: bool,
+) -> Option<i64> {
+    if needs_merge {
+        return None;
+    }
+    previous_watermark.map(|watermark| watermark.saturating_sub(allowed_lateness))
 }
 
 /// Runner-native implementation of Beam's `GroupByKey`.
@@ -342,6 +388,18 @@ impl FlareTransform for GroupByKey {
             .windowing_strategy
             .as_ref()
             .is_some_and(|strategy| strategy.merge_status == merge_status::Enum::NeedsMerge as i32);
+        let previous_watermark = self.state.last_evaluated_watermark().await;
+        let window_prune_before =
+            window_prune_cutoff(previous_watermark, spec.allowed_lateness, needs_merge);
+        if let Some(cutoff) = window_prune_before {
+            info!(
+                "GroupByKey: pruning finite windows ending at or before {cutoff} based on previously evaluated watermark {previous_watermark:?}"
+            );
+        } else if needs_merge && previous_watermark.is_some() {
+            info!(
+                "GroupByKey: input pruning disabled because the windowing strategy requires merging"
+            );
+        }
         self.state.begin_run().await;
 
         // Read only the input appended since this stage's last run. The cursor is
@@ -351,8 +409,14 @@ impl FlareTransform for GroupByKey {
             .cursor(&ctx.stage_id, &input_pcollection_id)
             .await?;
         let config = GbkSortConfig::from_env();
-        let (sorted_input, latest) =
-            open_sorted_input_stream(&ctx.store, &input_pcollection_id, cursor, &config).await?;
+        let (sorted_input, latest) = open_sorted_input_stream(
+            &ctx.store,
+            &input_pcollection_id,
+            cursor,
+            window_prune_before,
+            &config,
+        )
+        .await?;
         let mut writer =
             PCollectionWriter::new(ctx.store.clone(), ctx.output_pcollection_id.clone());
         let mut output = Vec::with_capacity(OUTPUT_BATCH_SIZE);
@@ -444,6 +508,9 @@ impl FlareTransform for GroupByKey {
                 .set_cursor(&ctx.stage_id, &input_pcollection_id, latest)
                 .await?;
         }
+        self.state
+            .mark_watermark_evaluated(ctx.input_watermark)
+            .await;
 
         if fired == 0 {
             info!(
@@ -558,18 +625,27 @@ impl PartitionStream for OneShotPaimonPartition {
             .expect("GroupByKey input stream may only be executed once");
         let rows_seen = Arc::clone(&self.rows_seen);
         let started = self.started;
-        let stream = stream.map(move |batch| {
-            let batch = batch.map_err(|error| DataFusionError::External(Box::new(error)))?;
-            let previous = rows_seen.fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
-            let current = previous + batch.num_rows() as u64;
-            if previous / 1_000_000 != current / 1_000_000 {
-                info!(
-                    "GroupByKey: sorted {current} input rows in {:?}",
-                    started.elapsed()
-                );
-            }
-            add_encoded_key_column(batch)
-                .map_err(|error| DataFusionError::Execution(error.to_string()))
+        let stream = futures::StreamExt::flat_map(stream, move |batch| {
+            let batches = match batch {
+                Ok(batch) => {
+                    let previous = rows_seen.fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
+                    let current = previous + batch.num_rows() as u64;
+                    if previous / 1_000_000 != current / 1_000_000 {
+                        info!(
+                            "GroupByKey: sorted {current} input rows in {:?}",
+                            started.elapsed()
+                        );
+                    }
+                    match add_encoded_key_column(batch).and_then(flatten_window_batch) {
+                        Ok(batches) => batches.into_iter().map(Ok).collect(),
+                        Err(error) => {
+                            vec![Err(DataFusionError::Execution(error.to_string()))]
+                        }
+                    }
+                }
+                Err(error) => vec![Err(DataFusionError::External(Box::new(error)))],
+            };
+            tokio_stream::iter(batches)
         });
         Box::pin(RecordBatchStreamAdapter::new(
             Arc::clone(&self.schema),
@@ -588,15 +664,33 @@ async fn open_sorted_input_stream(
     store: &Arc<FlareElementStore>,
     pcollection_id: &str,
     cursor: Option<i64>,
+    window_prune_before: Option<i64>,
     config: &GbkSortConfig,
 ) -> Result<(Option<SortedInputStream>, Option<i64>)> {
-    let (stream, latest) = store
-        .open_incremental_arrow_projected(
-            pcollection_id,
-            cursor,
-            Some(&[KEY_COLUMN, VALUE_COLUMN, WINDOW_KEY_COLUMN]),
-        )
-        .await?;
+    let projection = [
+        KEY_COLUMN,
+        VALUE_COLUMN,
+        WINDOW_KEY_COLUMN,
+        WINDOW_EXTRA_KEYS_COLUMN,
+        WINDOW_COUNT_COLUMN,
+    ];
+    let (stream, latest) = match window_prune_before {
+        Some(cutoff) => {
+            store
+                .open_incremental_arrow_pruned_before(
+                    pcollection_id,
+                    cursor,
+                    Some(&projection),
+                    cutoff,
+                )
+                .await?
+        }
+        None => {
+            store
+                .open_incremental_arrow_projected(pcollection_id, cursor, Some(&projection))
+                .await?
+        }
+    };
     let Some(stream) = stream else {
         return Ok((None, latest));
     };
@@ -604,7 +698,8 @@ async fn open_sorted_input_stream(
     let table_schema = store.registry.get(pcollection_id).ok_or_else(|| {
         anyhow!("GroupByKey input PCollection {pcollection_id} has no registered schema")
     })?;
-    let schema = schema_with_group_key(&gbk_input_schema(&table_schema.arrow_schema)?);
+    let input_schema = gbk_input_schema(&table_schema.arrow_schema)?;
+    let schema = gbk_flattened_schema(&input_schema);
     let spill_parent = Path::new(store.catalog.warehouse()).join(".gbk-spill");
     std::fs::create_dir_all(&spill_parent)?;
     let temp_dir = tempfile::Builder::new()
@@ -643,13 +738,6 @@ async fn open_sorted_input_stream(
     )?;
 
     let df = session.table("gbk_input").await?;
-    let df = df.unnest_columns(&[WINDOW_KEY_COLUMN])?;
-    let df = df.select_columns(&[
-        KEY_COLUMN,
-        VALUE_COLUMN,
-        WINDOW_KEY_COLUMN,
-        GROUP_KEY_COLUMN,
-    ])?;
     let df = df.sort(vec![
         col(GROUP_KEY_COLUMN).sort(true, false),
         col(WINDOW_KEY_COLUMN).sort(true, false),
@@ -667,19 +755,170 @@ async fn open_sorted_input_stream(
 }
 
 fn gbk_input_schema(table_schema: &ArrowSchema) -> Result<Arc<ArrowSchema>> {
-    let fields = [KEY_COLUMN, VALUE_COLUMN, WINDOW_KEY_COLUMN]
-        .into_iter()
-        .map(|name| {
-            table_schema
-                .field_with_name(name)
-                .map(|field| Arc::new(field.clone()))
-                .map_err(|_| anyhow!("GroupByKey input is missing the '{name}' column"))
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let fields = [
+        KEY_COLUMN,
+        VALUE_COLUMN,
+        WINDOW_KEY_COLUMN,
+        WINDOW_EXTRA_KEYS_COLUMN,
+        WINDOW_COUNT_COLUMN,
+    ]
+    .into_iter()
+    .map(|name| {
+        table_schema
+            .field_with_name(name)
+            .map(|field| Arc::new(field.clone()))
+            .map_err(|_| anyhow!("GroupByKey input is missing the '{name}' column"))
+    })
+    .collect::<Result<Vec<_>>>()?;
     Ok(Arc::new(ArrowSchema::new_with_metadata(
         fields,
         table_schema.metadata().clone(),
     )))
+}
+
+fn gbk_flattened_schema(input_schema: &ArrowSchema) -> SchemaRef {
+    let mut fields = [KEY_COLUMN, VALUE_COLUMN, WINDOW_KEY_COLUMN]
+        .into_iter()
+        .map(|name| {
+            input_schema
+                .field_with_name(name)
+                .expect("GBK input schema was validated")
+                .clone()
+        })
+        .map(Arc::new)
+        .collect::<Vec<_>>();
+    fields.push(Arc::new(ArrowField::new(
+        GROUP_KEY_COLUMN,
+        ArrowDataType::Binary,
+        false,
+    )));
+    Arc::new(ArrowSchema::new_with_metadata(
+        fields,
+        input_schema.metadata().clone(),
+    ))
+}
+
+/// Expands scalar-plus-extra window storage into one row per `(element, window)`.
+///
+/// The common one-window case takes the scalar path without materializing a
+/// generic list. Multi-window rows append only their extra windows. This keeps
+/// the Paimon stream single-pass while preserving Beam's per-window grouping.
+fn flatten_window_batch(batch: RecordBatch) -> Result<Vec<RecordBatch>> {
+    let counts = batch
+        .column_by_name(WINDOW_COUNT_COLUMN)
+        .ok_or_else(|| anyhow!("GBK input is missing '{WINDOW_COUNT_COLUMN}'"))?
+        .as_any()
+        .downcast_ref::<Int16Array>()
+        .ok_or_else(|| anyhow!("'{WINDOW_COUNT_COLUMN}' must be Int16"))?;
+    let first_windows = batch
+        .column_by_name(WINDOW_KEY_COLUMN)
+        .ok_or_else(|| anyhow!("GBK input is missing '{WINDOW_KEY_COLUMN}'"))?
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .ok_or_else(|| anyhow!("'{WINDOW_KEY_COLUMN}' must be Binary"))?;
+    let extra_windows = batch
+        .column_by_name(WINDOW_EXTRA_KEYS_COLUMN)
+        .ok_or_else(|| anyhow!("GBK input is missing '{WINDOW_EXTRA_KEYS_COLUMN}'"))?
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .ok_or_else(|| anyhow!("'{WINDOW_EXTRA_KEYS_COLUMN}' must be a List"))?;
+    let extra_window_values = extra_windows
+        .values()
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .ok_or_else(|| anyhow!("'{WINDOW_EXTRA_KEYS_COLUMN}' must contain Binary keys"))?;
+    let offsets = extra_windows.value_offsets();
+
+    let mut scalar_rows = Vec::with_capacity(batch.num_rows());
+    let mut extra_rows = Vec::new();
+    let mut extra_window_indices = Vec::new();
+    for row in 0..batch.num_rows() {
+        let declared = usize::try_from(counts.value(row))
+            .map_err(|_| anyhow!("negative window count at GBK input row {row}"))?;
+        let start = usize::try_from(offsets[row])
+            .map_err(|_| anyhow!("negative extra-window offset at GBK input row {row}"))?;
+        let end = usize::try_from(offsets[row + 1])
+            .map_err(|_| anyhow!("negative extra-window offset at GBK input row {}", row + 1))?;
+        let extra_count = end.saturating_sub(start);
+        let first_present = !first_windows.is_null(row);
+        if declared != extra_count + usize::from(first_present) {
+            return Err(anyhow!(
+                "window count does not match scalar and extra keys at GBK input row {row}"
+            ));
+        }
+        if first_present {
+            scalar_rows.push(u32::try_from(row).map_err(|_| anyhow!("GBK row index exceeds u32"))?);
+        }
+        for window_index in start..end {
+            if extra_window_values.is_null(window_index) {
+                return Err(anyhow!("null extra window key at GBK input row {row}"));
+            }
+            extra_rows.push(u32::try_from(row).map_err(|_| anyhow!("GBK row index exceeds u32"))?);
+            extra_window_indices.push(
+                u32::try_from(window_index).map_err(|_| anyhow!("GBK window index exceeds u32"))?,
+            );
+        }
+    }
+
+    let mut batches = Vec::with_capacity(2);
+    if !scalar_rows.is_empty() {
+        batches.push(take_flattened_window_batch(
+            &batch,
+            &scalar_rows,
+            first_windows,
+            &scalar_rows,
+        )?);
+    }
+    if !extra_rows.is_empty() {
+        batches.push(take_flattened_window_batch(
+            &batch,
+            &extra_rows,
+            extra_window_values,
+            &extra_window_indices,
+        )?);
+    }
+    Ok(batches)
+}
+
+fn take_flattened_window_batch(
+    batch: &RecordBatch,
+    row_indices: &[u32],
+    window_values: &BinaryArray,
+    window_indices: &[u32],
+) -> Result<RecordBatch> {
+    let indices = UInt32Array::from(row_indices.to_vec());
+    let window_indices = UInt32Array::from(window_indices.to_vec());
+    let key = batch
+        .column_by_name(KEY_COLUMN)
+        .ok_or_else(|| anyhow!("GBK input is missing '{KEY_COLUMN}'"))?;
+    let value = batch
+        .column_by_name(VALUE_COLUMN)
+        .ok_or_else(|| anyhow!("GBK input is missing '{VALUE_COLUMN}'"))?;
+    let group_key = batch
+        .column_by_name(GROUP_KEY_COLUMN)
+        .ok_or_else(|| anyhow!("GBK input is missing '{GROUP_KEY_COLUMN}'"))?;
+    let columns = vec![
+        take(key.as_ref(), &indices, None)?,
+        take(value.as_ref(), &indices, None)?,
+        take(window_values, &window_indices, None)?,
+        take(group_key.as_ref(), &indices, None)?,
+    ];
+    let source_schema = batch.schema();
+    let fields = vec![
+        Arc::new(source_schema.field_with_name(KEY_COLUMN)?.clone()),
+        Arc::new(source_schema.field_with_name(VALUE_COLUMN)?.clone()),
+        Arc::new(ArrowField::new(
+            WINDOW_KEY_COLUMN,
+            window_values.data_type().clone(),
+            true,
+        )),
+        Arc::new(source_schema.field_with_name(GROUP_KEY_COLUMN)?.clone()),
+    ];
+    let schema = Arc::new(ArrowSchema::new_with_metadata(
+        fields,
+        source_schema.metadata().clone(),
+    ));
+    Ok(RecordBatch::try_new(schema, columns)?)
 }
 
 fn schema_with_group_key(schema: &SchemaRef) -> SchemaRef {
@@ -770,6 +1009,10 @@ impl SortedGroupDecoder {
         let window_column = batch.column_by_name(WINDOW_KEY_COLUMN).ok_or_else(|| {
             anyhow!("GroupByKey result is missing the '{WINDOW_KEY_COLUMN}' column")
         })?;
+        let window_keys = window_column
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .ok_or_else(|| anyhow!("GroupByKey window key must be a Binary column"))?;
         let encoded_key_column = batch.column_by_name(GROUP_KEY_COLUMN).ok_or_else(|| {
             anyhow!("GroupByKey result is missing the '{GROUP_KEY_COLUMN}' column")
         })?;
@@ -788,21 +1031,9 @@ impl SortedGroupDecoder {
                 ));
             };
             let encoded_key = encoded_keys.value(row).to_vec();
-            let window_key = match primitive_value_from_array_row(
-                window_column.as_ref(),
-                window_column.data_type(),
-                row,
-            )? {
-                PrimitiveValue::String(value) => value,
-                other => {
-                    return Err(anyhow!(
-                        "GroupByKey window key must be a string, got {other:?}"
-                    ));
-                }
-            };
-            let window = BeamWindow::from_canonical_key(&window_key).ok_or_else(|| {
-                anyhow!("GroupByKey encountered a malformed window key '{window_key}'")
-            })?;
+            let window_key = window_keys.value(row);
+            let window = BeamWindow::from_binary_key(window_key)
+                .ok_or_else(|| anyhow!("GroupByKey encountered a malformed binary window key"))?;
             let value = *kv.value;
 
             let replace_key = self
@@ -823,7 +1054,7 @@ impl SortedGroupDecoder {
             });
             match current.windows.last_mut() {
                 Some((current_window, values))
-                    if current_window.canonical_key() == window.canonical_key() =>
+                    if current_window.to_binary_key() == window.to_binary_key() =>
                 {
                     values.push(value);
                 }
@@ -848,25 +1079,25 @@ fn apply_merge_results(
     original_groups: Vec<(BeamWindow, Vec<BeamRecord>)>,
     merge_results: Vec<MergedWindows>,
 ) -> Result<Vec<(PrimitiveValue, BeamWindow, Vec<BeamRecord>)>, Error> {
-    let original_to_merged: HashMap<String, BeamWindow> = merge_results
+    let original_to_merged: HashMap<Vec<u8>, BeamWindow> = merge_results
         .into_iter()
         .flat_map(|result| {
             let merged = result.merged;
             result
                 .originals
                 .into_iter()
-                .map(move |original| (original.canonical_key(), merged.clone()))
+                .map(move |original| (original.to_binary_key(), merged.clone()))
         })
         .collect();
 
-    let mut merged_groups: HashMap<String, (BeamWindow, Vec<BeamRecord>)> = HashMap::new();
+    let mut merged_groups: HashMap<Vec<u8>, (BeamWindow, Vec<BeamRecord>)> = HashMap::new();
     for (original, values) in original_groups {
-        let original_key = original.canonical_key();
+        let original_key = original.to_binary_key();
         let merged_window = original_to_merged.get(&original_key).ok_or_else(|| {
-            anyhow!("MergeWindows did not map original window {original_key} for key {key:?}")
+            anyhow!("MergeWindows did not map an original window for key {key:?}")
         })?;
         let entry = merged_groups
-            .entry(merged_window.canonical_key())
+            .entry(merged_window.to_binary_key())
             .or_insert_with(|| (merged_window.clone(), Vec::new()));
         entry.1.extend(values);
     }
@@ -1119,6 +1350,30 @@ mod tests {
             }),
             timestamp_millis,
             windows,
+            pane: PaneInfo::no_firing(),
+        }
+    }
+
+    fn kv_void_windowed(key: &str, timestamp_millis: i64) -> WindowedValue {
+        WindowedValue {
+            value: BeamRecord::KV(BeamKV {
+                key: PrimitiveValue::String(key.to_string()),
+                value: Box::new(BeamRecord::PRIMITIVE(PrimitiveValue::Void)),
+            }),
+            timestamp_millis,
+            windows: vec![BeamWindow::Global],
+            pane: PaneInfo::no_firing(),
+        }
+    }
+
+    fn void_key_kv_windowed(value: Vec<u8>) -> WindowedValue {
+        WindowedValue {
+            value: BeamRecord::KV(BeamKV {
+                key: PrimitiveValue::Void,
+                value: Box::new(BeamRecord::PRIMITIVE(PrimitiveValue::Bytes(value))),
+            }),
+            timestamp_millis: 1,
+            windows: vec![BeamWindow::Global],
             pane: PaneInfo::no_firing(),
         }
     }
@@ -1517,6 +1772,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn void_valued_kv_groups_roundtrip_through_gbk() {
+        let (_dir, store) = make_store().await;
+        let input = "gbk-in-void";
+        let output = "gbk-out-void";
+        store
+            .write_windowed_value_batch(
+                input,
+                vec![
+                    kv_void_windowed("a", 1),
+                    kv_void_windowed("b", 2),
+                    kv_void_windowed("a", 3),
+                ],
+            )
+            .await
+            .unwrap();
+
+        run_gbk(&store, input, output).await;
+        let values = scan_output(&store, output).await;
+        let mut grouped: HashMap<String, Vec<PrimitiveValue>> = HashMap::new();
+        for value in values {
+            let BeamRecord::GBK(gbk) = value.value else {
+                panic!("expected GBK output");
+            };
+            let PrimitiveValue::String(key) = gbk.key else {
+                panic!("expected string key");
+            };
+            grouped.insert(
+                key,
+                gbk.value
+                    .list
+                    .into_iter()
+                    .map(|record| match record {
+                        BeamRecord::PRIMITIVE(value) => value,
+                        other => panic!("expected primitive value, got {other:?}"),
+                    })
+                    .collect(),
+            );
+        }
+        assert_eq!(
+            grouped.get("a"),
+            Some(&vec![PrimitiveValue::Void, PrimitiveValue::Void])
+        );
+        assert_eq!(grouped.get("b"), Some(&vec![PrimitiveValue::Void]));
+    }
+
+    #[tokio::test]
+    async fn void_key_groups_roundtrip_through_gbk() {
+        let (_dir, store) = make_store().await;
+        let input = "gbk-in-void-key";
+        let output = "gbk-out-void-key";
+        store
+            .write_windowed_value_batch(
+                input,
+                vec![
+                    void_key_kv_windowed(vec![1, 2]),
+                    void_key_kv_windowed(vec![3, 4]),
+                ],
+            )
+            .await
+            .unwrap();
+
+        run_gbk(&store, input, output).await;
+        let values = scan_output(&store, output).await;
+        assert_eq!(values.len(), 1);
+        let BeamRecord::GBK(gbk) = &values[0].value else {
+            panic!("expected GBK output");
+        };
+        assert_eq!(gbk.key, PrimitiveValue::Void);
+        assert_eq!(
+            gbk.value.list,
+            vec![
+                BeamRecord::PRIMITIVE(PrimitiveValue::Bytes(vec![1, 2])),
+                BeamRecord::PRIMITIVE(PrimitiveValue::Bytes(vec![3, 4]))
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn empty_input_produces_empty_output() {
         let (_dir, store) = make_store().await;
         let input = "gbk-in-empty";
@@ -1672,6 +2005,46 @@ mod tests {
         assert_eq!(panes[1].pane.timing, PaneTiming::Late);
     }
 
+    #[tokio::test]
+    async fn an_element_after_committed_window_expiry_is_pruned() {
+        let (_dir, store) = make_store().await;
+        let input = "gbk-in-too-late";
+        let output = "gbk-out-too-late";
+        let transform = GroupByKey::with(
+            "gbk-too-late".to_string(),
+            HashMap::from([("in".to_string(), input.to_string())]),
+            HashMap::from([("out".to_string(), output.to_string())]),
+            "GroupByKey".to_string(),
+        );
+
+        store
+            .write_windowed_value_batch(
+                input,
+                vec![kv_windowed("a", 1, vec![interval(0, 100)], 10)],
+            )
+            .await
+            .unwrap();
+        run_gbk_with(&transform, &store, input, output, 99).await;
+        assert_eq!(scan_output(&store, output).await.len(), 1);
+
+        // The first run committed watermark 99 and closed [0, 100), whose max
+        // timestamp is 99. A later element for that window is too late.
+        store
+            .write_windowed_value_batch(
+                input,
+                vec![kv_windowed("a", 2, vec![interval(0, 100)], 20)],
+            )
+            .await
+            .unwrap();
+        run_gbk_with(&transform, &store, input, output, 99).await;
+
+        assert_eq!(
+            scan_output(&store, output).await.len(),
+            1,
+            "too-late input must not create a new pane"
+        );
+    }
+
     #[test]
     fn encoded_sort_keys_match_primitive_key_equality() {
         assert_eq!(
@@ -1696,6 +2069,13 @@ mod tests {
             encoded_primitive_sort_key(&PrimitiveValue::Float64(same_nan)),
             encoded_primitive_sort_key(&PrimitiveValue::Float64(other_nan))
         );
+    }
+
+    #[test]
+    fn window_pruning_requires_previous_watermark_and_no_merge() {
+        assert_eq!(window_prune_cutoff(None, 0, false), None);
+        assert_eq!(window_prune_cutoff(Some(1_000), 100, false), Some(900));
+        assert_eq!(window_prune_cutoff(Some(1_000), 100, true), None);
     }
 
     #[tokio::test]
@@ -1770,7 +2150,7 @@ mod tests {
             spill_limit_bytes: 128 * 1024 * 1024,
             spill_reservation_bytes: 256 * 1024,
         };
-        let (mut sorted, latest) = open_sorted_input_stream(&store, input, None, &config)
+        let (mut sorted, latest) = open_sorted_input_stream(&store, input, None, None, &config)
             .await
             .unwrap();
         let sorted = sorted.as_mut().expect("spill input should open");
