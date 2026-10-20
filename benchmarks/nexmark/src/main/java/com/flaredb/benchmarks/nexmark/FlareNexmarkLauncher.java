@@ -114,9 +114,13 @@ public class FlareNexmarkLauncher {
     LOG.info("Submitting query {} job to FlareDB at {}", queryName, options.getJobEndpoint());
 
     PipelineResult pipelineResult = p.run();
-
-    long endTime = System.currentTimeMillis();
-    NexmarkPerf perf = buildPerformance(query, pipelineResult, startTime, endTime);
+    NexmarkPerf perf;
+    try {
+      long endTime = System.currentTimeMillis();
+      perf = buildPerformance(query, pipelineResult, startTime, endTime);
+    } finally {
+      closePipelineResult(pipelineResult);
+    }
 
     LOG.info(
         "Completed query {} in {}s (Events/sec: {}, Results/sec: {})",
@@ -127,6 +131,18 @@ public class FlareNexmarkLauncher {
     LOG.info("NexmarkPerf {}", perf);
 
     return perf;
+  }
+
+  static void closePipelineResult(PipelineResult pipelineResult) throws IOException {
+    if (pipelineResult instanceof AutoCloseable closeable) {
+      try {
+        closeable.close();
+      } catch (IOException e) {
+        throw e;
+      } catch (Exception e) {
+        throw new IOException("failed to close pipeline result", e);
+      }
+    }
   }
 
   private NexmarkPerf buildPerformance(
