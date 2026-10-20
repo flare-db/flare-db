@@ -10,6 +10,7 @@ use beam_model_rs::v1::{
     StateRequest, StateResponse, beam_fn_state_server::BeamFnState, state_key, state_request,
     state_response,
 };
+use bytes::Buf;
 use log::{error, info, warn};
 use prost::Message;
 use tokio::sync::{
@@ -22,7 +23,7 @@ use tonic::{Response, Status};
 use crate::{
     coders::{
         StandardBeamCoders,
-        primitives::{BeamWindow, WindowCoder},
+        primitives::{BeamWindow, IterableCoder, WindowCoder},
     },
     engine::{
         kv::SlateKvStore,
@@ -36,7 +37,7 @@ use crate::{
     jobservice::urns::beam_urns,
     store::{
         element_store::{FlareElementStore, ScanCollectionRequest, slate_state_dir},
-        record::BeamRecord,
+        record::{BeamRecord, IterableValue},
     },
 };
 
@@ -321,11 +322,17 @@ struct IterableSideInputAddress {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum MultimapReadKind {
+    Keys,
+    Values(Vec<u8>),
+    KeysValues,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct MultimapSideInputAddress {
     key: SideInputKey,
     window: Vec<u8>,
-    /// `None` requests all keys; `Some(key)` requests values for one key.
-    map_key: Option<Vec<u8>>,
+    kind: MultimapReadKind,
 }
 
 #[derive(Debug, Clone)]
@@ -432,16 +439,17 @@ impl SideInputResolver {
                 address.key.side_input_id
             )
         })?;
-        if !matches!(
-            &spec.materialization,
-            SideInputMaterialization::Multimap { .. }
-        ) {
+        let SideInputMaterialization::Multimap {
+            key_coder,
+            value_coder,
+        } = &spec.materialization
+        else {
             return Err(anyhow!(
                 "side input transform_id='{}' side_input_id='{}' is not a multimap",
                 address.key.transform_id,
                 address.key.side_input_id
             ));
-        }
+        };
         let window = spec
             .window_coder
             .decode_window(&address.window)
@@ -450,11 +458,56 @@ impl SideInputResolver {
         let Some(EncodedSideInputWindow::Multimap { keys, values }) = windows.get(&window) else {
             return Ok(Vec::new());
         };
-        match &address.map_key {
-            None => Ok(keys.clone()),
-            Some(key) => Ok(values.get(key).cloned().unwrap_or_default()),
+        match &address.kind {
+            MultimapReadKind::Keys => Ok(keys.clone()),
+            MultimapReadKind::Values(key) => Ok(values.get(key).cloned().unwrap_or_default()),
+            MultimapReadKind::KeysValues => {
+                encode_multimap_key_values(keys, values, key_coder, value_coder)
+            }
         }
     }
+}
+
+fn encode_multimap_key_values(
+    encoded_keys: &[u8],
+    values_by_key: &HashMap<Vec<u8>, Vec<u8>>,
+    key_coder: &StandardBeamCoders,
+    value_coder: &StandardBeamCoders,
+) -> Result<Vec<u8>> {
+    let value_iterable_coder =
+        StandardBeamCoders::Iterable(IterableCoder::new(value_coder.clone()));
+    let mut encoded = Vec::new();
+    let mut keys = encoded_keys;
+
+    while keys.has_remaining() {
+        let key = key_coder
+            .decode(&mut keys)
+            .map_err(|e| anyhow!("failed to decode cached multimap key: {e}"))?;
+        let mut encoded_key = Vec::new();
+        append_encoded_element(key_coder, key.clone(), &mut encoded_key);
+        let encoded_values = values_by_key.get(&encoded_key).ok_or_else(|| {
+            anyhow!("cached multimap key has no corresponding encoded value list")
+        })?;
+
+        let mut values = encoded_values.as_slice();
+        let mut decoded_values = Vec::new();
+        while values.has_remaining() {
+            decoded_values.push(
+                value_coder
+                    .decode(&mut values)
+                    .map_err(|e| anyhow!("failed to decode cached multimap value: {e}"))?,
+            );
+        }
+
+        append_encoded_element(key_coder, key, &mut encoded);
+        append_encoded_element(
+            &value_iterable_coder,
+            BeamRecord::ITERABLE(IterableValue::from_records(decoded_values)),
+            &mut encoded,
+        );
+    }
+
+    Ok(encoded)
 }
 
 fn encode_iterable_windows(
@@ -734,6 +787,12 @@ fn describe_request(request: &StateRequest) -> String {
             side_input.window.len(),
             side_input.key.len()
         ),
+        Some(state_key::Type::MultimapKeysValuesSideInput(side_input)) => format!(
+            "multimap_keys_values_side_input(transform_id={}, side_input_id={}, window={}B)",
+            side_input.transform_id,
+            side_input.side_input_id,
+            side_input.window.len()
+        ),
         Some(_) => "unsupported-state-key".to_string(),
         None => "no-state-key".to_string(),
     };
@@ -955,7 +1014,7 @@ fn state_target(key: state_key::Type) -> std::result::Result<StateTarget, String
                     side_input_id: side_input.side_input_id,
                 },
                 window: side_input.window,
-                map_key: None,
+                kind: MultimapReadKind::Keys,
             }))
         }
         state_key::Type::MultimapSideInput(side_input) => {
@@ -965,11 +1024,21 @@ fn state_target(key: state_key::Type) -> std::result::Result<StateTarget, String
                     side_input_id: side_input.side_input_id,
                 },
                 window: side_input.window,
-                map_key: Some(side_input.key),
+                kind: MultimapReadKind::Values(side_input.key),
+            }))
+        }
+        state_key::Type::MultimapKeysValuesSideInput(side_input) => {
+            Ok(StateTarget::MultimapSideInput(MultimapSideInputAddress {
+                key: SideInputKey {
+                    transform_id: side_input.transform_id,
+                    side_input_id: side_input.side_input_id,
+                },
+                window: side_input.window,
+                kind: MultimapReadKind::KeysValues,
             }))
         }
         other => Err(format!(
-            "unsupported state key type '{}' (supported types: '{}', 'iterable_side_input', 'multimap_keys_side_input', and 'multimap_side_input')",
+            "unsupported state key type '{}' (supported types: '{}', 'iterable_side_input', 'multimap_keys_side_input', 'multimap_side_input', and 'multimap_keys_values_side_input')",
             state_key_kind(&other),
             UserStateKind::Bag.wire_name(),
         )),
@@ -1134,6 +1203,23 @@ mod tests {
                         side_input_id: "max-price".to_string(),
                         window: window.to_vec(),
                         key: key.to_vec(),
+                    },
+                )),
+            }),
+            request: Some(get_op()),
+        }
+    }
+
+    fn multimap_keys_values_request(id: &str, window: &[u8]) -> StateRequest {
+        StateRequest {
+            id: id.to_string(),
+            instruction_id: "instruction".to_string(),
+            state_key: Some(StateKey {
+                r#type: Some(state_key::Type::MultimapKeysValuesSideInput(
+                    state_key::MultimapKeysValuesSideInput {
+                        transform_id: "select".to_string(),
+                        side_input_id: "max-price".to_string(),
+                        window: window.to_vec(),
                     },
                 )),
             }),
@@ -1582,5 +1668,24 @@ mod tests {
         .await
         .unwrap();
         assert!(get_response_data(missing).is_empty());
+
+        let bulk = handle_state_request_with_side_inputs(
+            &backend,
+            Some(&resolver),
+            multimap_keys_values_request("multi-4", &encoded_window(&first)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            get_response_data(bulk),
+            vec![
+                0x01, // key 1
+                0x00, 0x00, 0x00, 0x02, // two values
+                0x01, b'a', 0x01, b'c', // nested UTF-8 values
+                0x02, // key 2
+                0x00, 0x00, 0x00, 0x01, // one value
+                0x01, b'b',
+            ]
+        );
     }
 }

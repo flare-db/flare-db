@@ -11,7 +11,7 @@ FlareDB is a single-node Rust runtime that accepts Apache Beam portable pipeline
 
 A Beam SDK does **not** send language-specific user code to Rust. It translates a pipeline into Beam Runner API protobufs. FlareDB keeps SDK-owned work as `ExecutableStage`s and asks a Java or Python SDK harness to execute that work through the Beam Fn API. FlareDB-specific execution begins where a stage is classified as runner-owned: today `Impulse`, `GroupByKey`, and `Flatten` are Rust `FlareTransform`s.
 
-Side inputs are not a separate execution engine or storage system. Fusion materializes the side-input producer as a normal windowed PCollection in Paimon; the Fn State service reads that PCollection, groups it by window, encodes values with the PCollection coder, and serves iterable or multimap requests from a per-job in-memory cache. Multimap support covers key enumeration and keyed-value lookup; the optional bulk keys-values protocol is not advertised.
+Side inputs are not a separate execution engine or storage system. Fusion materializes the side-input producer as a normal windowed PCollection in Paimon; the Fn State service reads that PCollection, groups it by window, encodes values with the PCollection coder, and serves iterable or multimap requests from a per-job in-memory cache. Multimap support covers key enumeration, keyed-value lookup, and the bulk keys-values protocol advertised through `RUNNER_CAPABILITIES`.
 
 The important split is therefore:
 
@@ -105,17 +105,20 @@ side-input producer PCollection
     + __flare_window_metadata (timestamp/windows/pane JSON)
     + __flare_window_key (canonical window keys)
   → producer bundle completes and releases the consumer's side-input barrier
-  → StateRequest(StateKey.{IterableSideInput|MultimapKeysSideInput|MultimapSideInput}, StateGet)
+  → StateRequest(StateKey.{IterableSideInput|MultimapKeysSideInput|MultimapSideInput|MultimapKeysValuesSideInput}, StateGet)
   → SideInputResolver maps (transform_id, side_input_id) to PCollection/coders
   → FlareElementStore.scan_windowed_values reads the PCollection
   → group by BeamWindow and encode with StandardBeamCoders::encode
   → iterable: concatenated element bytes
   → multimap: unique encoded keys plus value bytes grouped by encoded key
+  → keys-values: one framed KV<K, Iterable<V>> entry per key
   → per-job cache keyed by SideInputKey and BeamWindow
   → StateGetResponse.data contains fully framed values or keys; continuation token is empty
 ```
 
-The registry resolves each consumer's access-pattern URN from `ParDoPayload`, then records either the PCollection element coder or the KV coder's separate key/value component coders. `ExecutorDispatcher::prepare_pipeline` passes the registry into the state stream after pipeline coders have been rewritten. The cache is in memory and per job. Paimon remains the durable source of truth, so the cache is rebuilt lazily after a process restart. Current support assumes a bounded side input stabilizes after its producer's first completed bundle; it does not implement continuation-token pagination, the bulk keys-values capability, or dynamic streaming side-input refreshes.
+The registry resolves each consumer's access-pattern URN from `ParDoPayload`, then records either the PCollection element coder or the KV coder's separate key/value component coders. `ExecutorDispatcher::prepare_pipeline` passes the registry into the state stream after pipeline coders have been rewritten. The cache is in memory and per job. Paimon remains the durable source of truth, so the cache is rebuilt lazily after a process restart.
+
+Worker launch sets `RUNNER_CAPABILITIES=beam:protocol:multimap_keys_values_side_input:v1` for both Java and Python harnesses. This lets Beam request bulk entries first and fall back to point lookups when needed. Current support assumes a bounded side input stabilizes after its producer's first completed bundle; it does not implement continuation-token pagination or dynamic streaming side-input refreshes.
 
 Side-input-only PCollections have no ordinary graph consumer edge. Fusion must include them in splittable boundary outputs, and `NodeScheduler::output_edge_metadata` synthesizes metadata for them so their producer actually commits the Paimon table.
 
@@ -201,7 +204,7 @@ Side-input StateRequest
 
 - `fusion/fuser.rs` has pipeline-shape/fusion tests; start there for stage-boundary changes.
 - `fusion/expander.rs` tests the splittable-ParDo rewrite; `engine/scheduler.rs` tests DAG readiness/fan-in.
-- `engine/harness/state.rs` tests iterable and multimap window filtering, keyed lookup, nested coder framing, length-prefixed opaque values, empty windows, and rejected mutations.
+- `engine/harness/state.rs` tests iterable and multimap window filtering, key enumeration, keyed lookup, bulk keys-values framing, nested coders, length-prefixed opaque values, empty windows, and rejected mutations.
 - `engine/watermark.rs` and `engine/scheduler.rs` test producer-before-consumer side-input barriers, including the scheduler's debug dependency invariant.
 - `store/element_store.rs` and `store/record.rs` have focused async/schema/record tests.
 - `runner-sdk/java/flarerunner/src/test/` covers artifacts, job behavior, options, and coder rewrites.
@@ -242,6 +245,7 @@ rg 'StandardBeamCoders|WindowedValueCoder|length_prefix|pickled_python|javasdk' 
 
 # Side-input registry, cache, and scheduling path
 rg 'SideInputRegistry|SideInputResolver|IterableSideInput|MultimapSideInput|MultimapKeysSideInput' flaredb/src
+rg 'MultimapKeysValuesSideInput|MULTIMAP_KEYS_VALUES_SIDE_INPUT_PROTOCOL|RUNNER_CAPABILITIES' flaredb/src
 rg 'unproduced_side_inputs|side_input_consumers|side_inputs_produced' flaredb/src/engine
 ```
 
@@ -253,6 +257,6 @@ Search from protocol representation toward execution, not from a guessed module 
 - Worker runtimes are local Java/Python subprocesses. `Docker` and `External` variants return `unimplemented`.
 - The Job Service runs work synchronously in `Run`; several Job API methods remain TODO. Treat capability claims in prose as less reliable than the service implementation.
 - `NodeScheduler::output_edge_metadata` currently returns the first outgoing edge. Graph construction represents fan-out, but verify the execution path for fan-out changes.
-- Fn State serves `BagUserState`, `IterableSideInput`, `MultimapKeysSideInput`, and `MultimapSideInput`. `MultimapKeysValuesSideInput`, continuation-token pagination, and dynamic/streaming side-input refreshes are not implemented. Responses return all matching encoded data with an empty continuation token.
+- Fn State serves `BagUserState`, `IterableSideInput`, `MultimapKeysSideInput`, `MultimapSideInput`, and `MultimapKeysValuesSideInput`. Continuation-token pagination and dynamic/streaming side-input refreshes are not implemented. Responses return all matching encoded data with an empty continuation token.
 - The iterable side-input cache assumes the materialized producer is stable after its first completed bundle. Invalidation tied to later producer updates is part of future streaming support, not current batch behavior.
 - `beam/model/` is vendored source and `beam-model-rs/build.rs` can generate checked-in bindings, but `beam-model-rs` is commented out of the workspace and `flaredb` uses crates.io `beam-model-rs = 2.70.0`. Confirm the compiled model before modifying either.
