@@ -217,9 +217,13 @@ struct StageState {
     residual_holds: BTreeMap<Timestamp, usize>,
 
     /// Main inputs not yet produced by their producer *for the first time*; empty
-    /// means every input is available. This is the fan-in barrier and never
+    /// means every main input is available. This is the fan-in barrier and never
     /// regresses once an input has been produced.
     unproduced: BTreeSet<PCollectionId>,
+    /// Side inputs not yet produced by their producer. A side input is a
+    /// read-only materialization, not a main data stream, so it gates first-run
+    /// readiness without entering [`Self::pending`] or clamping output.
+    unproduced_side_inputs: BTreeSet<PCollectionId>,
     /// Main inputs whose producer has appended output that this stage has not yet
     /// consumed. Populated on every producer bundle completion (push-wake) and
     /// drained when the stage starts a bundle. This is what re-arms a *completed*
@@ -283,7 +287,10 @@ impl StageState {
     /// Whether this stage may run a bundle now, given its current input
     /// watermark.
     fn is_ready(&self) -> bool {
-        if self.in_flight >= self.max_in_flight || !self.unproduced.is_empty() {
+        if self.in_flight >= self.max_in_flight
+            || !self.unproduced.is_empty()
+            || !self.unproduced_side_inputs.is_empty()
+        {
             return false;
         }
         // A stage that has never run starts once its inputs are produced; a
@@ -323,6 +330,8 @@ pub struct WatermarkManager {
     producers: HashMap<PCollectionId, StageId>,
     /// PCollection id to the stages that consume it as a main input.
     consumers: HashMap<PCollectionId, Vec<StageId>>,
+    /// PCollection id to the stages that consume it as a side input.
+    side_input_consumers: HashMap<PCollectionId, Vec<StageId>>,
 }
 
 impl WatermarkManager {
@@ -335,7 +344,8 @@ impl WatermarkManager {
     ///
     /// Main inputs come from incoming graph edges, side inputs from the stage's
     /// side-input refs, and outputs from the node's output PCollections. Roots
-    /// (nodes with no incoming edges) become sources.
+    /// (nodes with no incoming edges) become sources. Side inputs independently
+    /// gate the first run of their consumer until the producer commits them.
     pub fn from_executable_graph(executable: &ExecutableGraph) -> Self {
         let graph = executable.get_executable_graph();
         let mut manager = Self::new();
@@ -412,6 +422,12 @@ impl WatermarkManager {
                 consumers.push(stage.clone());
             }
         }
+        for input in &side_inputs {
+            let consumers = self.side_input_consumers.entry(input.clone()).or_default();
+            if !consumers.contains(&stage) {
+                consumers.push(stage.clone());
+            }
+        }
         let source = main_inputs.is_empty().then(SourceState::default);
         // A source has no upstream, so its input watermark is already maximal;
         // this keeps `refresh` from reporting it as newly advanced.
@@ -421,6 +437,7 @@ impl WatermarkManager {
             MIN_TIMESTAMP
         };
         let unproduced = main_inputs.iter().cloned().collect();
+        let unproduced_side_inputs = side_inputs.iter().cloned().collect();
         self.stages.insert(
             stage,
             StageState {
@@ -433,6 +450,7 @@ impl WatermarkManager {
                 watermark_holds: BTreeMap::new(),
                 residual_holds: BTreeMap::new(),
                 unproduced,
+                unproduced_side_inputs,
                 pending: BTreeSet::new(),
                 pending_min: MAX_TIMESTAMP,
                 in_flight: 0,
@@ -669,6 +687,13 @@ impl WatermarkManager {
             .unwrap_or(false)
     }
 
+    /// Whether every side input needed by a stage's first run has been produced.
+    pub fn side_inputs_produced(&self, stage: &str) -> bool {
+        self.stages
+            .get(stage)
+            .is_some_and(|stage| stage.unproduced_side_inputs.is_empty())
+    }
+
     /// The number of bundles currently executing for `stage`.
     pub fn in_flight_bundles(&self, stage: &str) -> usize {
         self.stages.get(stage).map(|s| s.in_flight).unwrap_or(0)
@@ -815,18 +840,28 @@ impl WatermarkManager {
 
         let mut newly_ready = Vec::new();
         for pcollection in outputs {
-            let Some(consumers) = self.consumers.get(&pcollection).cloned() else {
-                continue;
-            };
-            for consumer in consumers {
-                if let Some(consumer_state) = self.stages.get_mut(&consumer) {
-                    consumer_state.unproduced.remove(&pcollection);
-                    consumer_state.pending.insert(pcollection.clone());
-                    if let Some(output_min_ts) = output_min_ts {
-                        consumer_state.pending_min = consumer_state.pending_min.min(output_min_ts);
+            if let Some(consumers) = self.consumers.get(&pcollection).cloned() {
+                for consumer in consumers {
+                    if let Some(consumer_state) = self.stages.get_mut(&consumer) {
+                        consumer_state.unproduced.remove(&pcollection);
+                        consumer_state.pending.insert(pcollection.clone());
+                        if let Some(output_min_ts) = output_min_ts {
+                            consumer_state.pending_min =
+                                consumer_state.pending_min.min(output_min_ts);
+                        }
+                        if consumer_state.is_ready() {
+                            newly_ready.push(consumer);
+                        }
                     }
-                    if consumer_state.is_ready() {
-                        newly_ready.push(consumer);
+                }
+            }
+            if let Some(consumers) = self.side_input_consumers.get(&pcollection).cloned() {
+                for consumer in consumers {
+                    if let Some(consumer_state) = self.stages.get_mut(&consumer) {
+                        consumer_state.unproduced_side_inputs.remove(&pcollection);
+                        if consumer_state.is_ready() {
+                            newly_ready.push(consumer);
+                        }
                     }
                 }
             }
@@ -845,6 +880,7 @@ impl WatermarkManager {
     pub fn is_complete(&self) -> bool {
         self.stages.values().all(|stage| {
             stage.completed
+                && stage.unproduced_side_inputs.is_empty()
                 && stage.pending.is_empty()
                 && !stage.rerun_pending
                 && stage.queued == 0
@@ -1141,6 +1177,35 @@ mod tests {
         manager.report_source_watermark("S", 200).unwrap();
         manager.refresh();
         assert_eq!(manager.input_watermark("C"), Some(100));
+    }
+
+    #[test]
+    fn side_input_consumer_waits_for_its_producer_before_first_run() {
+        let mut manager = manager(&[
+            ("Main", &[], &[], &["p"]),
+            ("Side", &[], &[], &["side"]),
+            ("Consumer", &["p"], &["side"], &["r"]),
+        ]);
+
+        manager.start_bundle("Main").unwrap();
+        manager.complete_bundle("Main").unwrap();
+        assert!(
+            manager
+                .ready_stages()
+                .iter()
+                .all(|stage| stage != "Consumer"),
+            "main input alone must not release a side-input consumer"
+        );
+
+        manager.start_bundle("Side").unwrap();
+        manager.complete_bundle("Side").unwrap();
+        assert!(
+            manager
+                .ready_stages()
+                .iter()
+                .any(|stage| stage == "Consumer"),
+            "side-input producer completion must release the consumer"
+        );
     }
 
     #[test]

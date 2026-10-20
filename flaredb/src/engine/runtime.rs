@@ -43,6 +43,42 @@ use crate::{
     utils::batch_size_estimator::{BatchConfig, BatchSizeEstimator},
 };
 
+/// Resolve the window coder for a PCollection from its windowing strategy.
+pub(crate) fn resolve_window_coder(
+    pipeline_components: &Components,
+    pipeline_coders: &HashMap<String, Coder>,
+    pcollection_id: &str,
+) -> anyhow::Result<WindowCoder> {
+    let pcollection = pipeline_components
+        .pcollections
+        .get(pcollection_id)
+        .ok_or_else(|| anyhow!("PCollection not found: {pcollection_id}"))?;
+    let strategy = pipeline_components
+        .windowing_strategies
+        .get(&pcollection.windowing_strategy_id);
+    let window_coder_id = strategy
+        .map(|strategy| strategy.window_coder_id.as_str())
+        .filter(|id| !id.is_empty())
+        .or_else(|| {
+            strategy
+                .and_then(|strategy| strategy.window_fn.as_ref())
+                .filter(|window_fn| window_fn.urn == "beam:window_fn:fixed_windows:v1")
+                .and_then(|_| {
+                    pipeline_coders.iter().find_map(|(id, coder)| {
+                        (coder.spec.as_ref()?.urn == beam_urns::INTERVAL_WINDOW_CODER)
+                            .then_some(id.as_str())
+                    })
+                })
+        })
+        .unwrap_or(beam_urns::GLOBAL_WINDOW_CODER);
+    let urn = pipeline_coders
+        .get(window_coder_id)
+        .and_then(|coder| coder.spec.as_ref())
+        .map(|spec| spec.urn.as_str())
+        .unwrap_or(window_coder_id);
+    Ok(WindowCoder::from_urn(urn))
+}
+
 #[derive(Clone)]
 pub struct BundleRuntime {
     control: ControlChannel,
@@ -112,37 +148,12 @@ impl BundleRuntime {
     }
 
     fn window_coder_for_pcollection(&self, pcollection_id: &str) -> WindowCoder {
-        let pcollection = self
-            .pipeline_components
-            .pcollections
-            .get(pcollection_id)
-            .unwrap_or_else(|| panic!("PCollection not found: {pcollection_id}"));
-        let strategy = self
-            .pipeline_components
-            .windowing_strategies
-            .get(&pcollection.windowing_strategy_id);
-        let window_coder_id = strategy
-            .map(|strategy| strategy.window_coder_id.as_str())
-            .filter(|id| !id.is_empty())
-            .or_else(|| {
-                strategy
-                    .and_then(|strategy| strategy.window_fn.as_ref())
-                    .filter(|window_fn| window_fn.urn == "beam:window_fn:fixed_windows:v1")
-                    .and_then(|_| {
-                        self.pipeline_coders.iter().find_map(|(id, coder)| {
-                            (coder.spec.as_ref()?.urn == beam_urns::INTERVAL_WINDOW_CODER)
-                                .then_some(id.as_str())
-                        })
-                    })
-            })
-            .unwrap_or(beam_urns::GLOBAL_WINDOW_CODER);
-        let urn = self
-            .pipeline_coders
-            .get(window_coder_id)
-            .and_then(|coder| coder.spec.as_ref())
-            .map(|spec| spec.urn.as_str())
-            .unwrap_or(window_coder_id);
-        WindowCoder::from_urn(urn)
+        resolve_window_coder(
+            self.pipeline_components.as_ref(),
+            self.pipeline_coders.as_ref(),
+            pcollection_id,
+        )
+        .unwrap_or_else(|e| panic!("{e}"))
     }
 
     pub async fn register_bundle(

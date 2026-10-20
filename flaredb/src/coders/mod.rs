@@ -354,6 +354,46 @@ impl StandardBeamCoders {
         }
     }
 
+    /// Encode one element in the **non-nested** (top-level element) context.
+    ///
+    /// This is the inverse of [`Self::decode_element`]. It is used for Fn State
+    /// streams such as iterable side inputs, where the SDK decodes each value with
+    /// the PCollection's element coder directly rather than wrapping it in a
+    /// `WindowedValue`.
+    pub fn encode_element(&self, record: BeamRecord, buf: &mut impl BufMut) {
+        match self {
+            StandardBeamCoders::StringUtf8(_) => match record {
+                BeamRecord::PRIMITIVE(PrimitiveValue::String(s)) => {
+                    buf.put_slice(s.as_bytes());
+                }
+                _ => panic!("Mismatched coder"),
+            },
+            StandardBeamCoders::Bytes(_) => match record {
+                BeamRecord::PRIMITIVE(PrimitiveValue::Bytes(bytes)) => {
+                    buf.put_slice(bytes.as_slice());
+                }
+                _ => panic!("Mismatched coder"),
+            },
+            StandardBeamCoders::Kv(key_coder, value_coder) => match record {
+                BeamRecord::KV(kv) => {
+                    key_coder.encode_key(&kv.key, buf);
+                    value_coder.encode_element(*kv.value, buf);
+                }
+                _ => panic!("Mismatched coder"),
+            },
+            StandardBeamCoders::Gbk(key_coder, value_coder) => match record {
+                BeamRecord::GBK(kv) => {
+                    key_coder.encode_key(&kv.key, buf);
+                    value_coder.encode(kv.value.list, buf);
+                }
+                _ => panic!("Mismatched coder"),
+            },
+            // Self-delimiting primitives and nested composites encode identically
+            // in top-level and nested contexts.
+            _ => self.encode(record, buf),
+        }
+    }
+
     fn decode_nested(&self, buf: &mut impl Buf) -> Result<BeamRecord, CodersError> {
         match self {
             StandardBeamCoders::StringUtf8(coder) => Ok(BeamRecord::PRIMITIVE(
@@ -486,6 +526,7 @@ pub fn resolve_length_prefixed_coder_id(id: &str, coders: &HashMap<String, Coder
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::BytesMut;
 
     fn coder(urn: &str, components: &[&str]) -> Coder {
         Coder {
@@ -523,6 +564,33 @@ mod tests {
             StandardBeamCoders::from_urn("SomethingElseCoder", None, Some(&coders)),
             StandardBeamCoders::Bytes(_)
         ));
+    }
+
+    #[test]
+    fn top_level_element_encoding_does_not_length_prefix_strings_or_bytes() {
+        let string = StandardBeamCoders::StringUtf8(StringUtf8Coder);
+        let mut encoded = BytesMut::new();
+        string.encode_element(
+            BeamRecord::PRIMITIVE(PrimitiveValue::String("abc".to_string())),
+            &mut encoded,
+        );
+        assert_eq!(&encoded[..], b"abc");
+        assert_eq!(
+            string.decode_element(&mut &encoded[..]).unwrap(),
+            BeamRecord::PRIMITIVE(PrimitiveValue::String("abc".to_string()))
+        );
+
+        let bytes = StandardBeamCoders::Bytes(BytesCoder);
+        let mut encoded = BytesMut::new();
+        bytes.encode_element(
+            BeamRecord::PRIMITIVE(PrimitiveValue::Bytes(vec![1, 2, 3])),
+            &mut encoded,
+        );
+        assert_eq!(&encoded[..], &[1, 2, 3]);
+        assert_eq!(
+            bytes.decode_element(&mut &encoded[..]).unwrap(),
+            BeamRecord::PRIMITIVE(PrimitiveValue::Bytes(vec![1, 2, 3]))
+        );
     }
 
     #[test]

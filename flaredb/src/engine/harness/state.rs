@@ -1,9 +1,13 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Result, anyhow};
 use beam_model_rs::v1::{
-    StateAppendResponse, StateClearResponse, StateGetResponse, StateRequest, StateResponse,
-    beam_fn_state_server::BeamFnState, state_key, state_request, state_response,
+    Coder, Components, StateAppendResponse, StateClearResponse, StateGetResponse, StateRequest,
+    StateResponse, beam_fn_state_server::BeamFnState, state_key, state_request, state_response,
 };
 use log::{error, info, warn};
 use tokio::sync::{
@@ -14,11 +18,17 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Response, Status};
 
 use crate::{
+    coders::{
+        StandardBeamCoders,
+        primitives::{BeamWindow, WindowCoder},
+    },
     engine::{
         kv::SlateKvStore,
+        runtime::resolve_window_coder,
         state::{StateBackend, UserStateAddress, UserStateKind, UserStateStore},
     },
-    store::element_store::{FlareElementStore, slate_state_dir},
+    fusion::pipeline::{ExecutableGraph, ExecutableNode},
+    store::element_store::{FlareElementStore, ScanCollectionRequest, slate_state_dir},
 };
 
 pub struct StateInner {
@@ -104,6 +114,178 @@ impl BeamFnState for FlareStateService {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SideInputKey {
+    transform_id: String,
+    side_input_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct SideInputSpec {
+    pcollection_id: String,
+    element_coder: StandardBeamCoders,
+    window_coder: WindowCoder,
+}
+
+/// Fn State lookup metadata for iterable side inputs in a prepared pipeline.
+#[derive(Debug, Clone, Default)]
+pub struct SideInputRegistry {
+    specs: Arc<HashMap<SideInputKey, SideInputSpec>>,
+}
+
+impl SideInputRegistry {
+    /// Resolve every side input declared by an executable worker stage to its
+    /// materialized PCollection, element coder, and window coder.
+    pub fn from_executable_graph(
+        graph: &ExecutableGraph,
+        pipeline_coders: &HashMap<String, Coder>,
+    ) -> Result<Self> {
+        let executable = graph.get_executable_graph();
+        let produced_pcollections: HashSet<String> = executable
+            .node_weights()
+            .flat_map(|node| node.output_pcols())
+            .collect();
+        let components: &Components = &graph.components;
+        let mut specs = HashMap::new();
+
+        for node in executable.node_weights() {
+            let ExecutableNode::Worker(stage) = node else {
+                continue;
+            };
+            for side_input in stage.side_inputs() {
+                let pcollection = side_input.collection();
+                let pcollection_id = pcollection.id().clone();
+                if !produced_pcollections.contains(&pcollection_id) {
+                    return Err(anyhow!(
+                        "iterable side input '{}' on transform '{}' references PCollection '{}' with no executable producer",
+                        side_input.local_name(),
+                        side_input.transform().id(),
+                        pcollection_id
+                    ));
+                }
+                let coder_id = pcollection.node().coder_id.clone();
+                let element_coder =
+                    StandardBeamCoders::from_urn(&coder_id, None, Some(pipeline_coders));
+                let window_coder =
+                    resolve_window_coder(components, pipeline_coders, &pcollection_id)?;
+                let key = SideInputKey {
+                    transform_id: side_input.transform().id().clone(),
+                    side_input_id: side_input.local_name().to_string(),
+                };
+                let spec = SideInputSpec {
+                    pcollection_id,
+                    element_coder,
+                    window_coder,
+                };
+                if let Some(existing) = specs.insert(key.clone(), spec) {
+                    return Err(anyhow!(
+                        "duplicate iterable side input reference for transform '{}' and side input '{}' (PCollections '{}' and '{}')",
+                        key.transform_id,
+                        key.side_input_id,
+                        existing.pcollection_id,
+                        specs
+                            .get(&key)
+                            .expect("inserted side input spec must be present")
+                            .pcollection_id
+                    ));
+                }
+            }
+        }
+
+        Ok(Self {
+            specs: Arc::new(specs),
+        })
+    }
+
+    fn get(&self, key: &SideInputKey) -> Option<&SideInputSpec> {
+        self.specs.get(key)
+    }
+
+    #[cfg(test)]
+    fn from_entries(entries: impl IntoIterator<Item = (SideInputKey, SideInputSpec)>) -> Self {
+        Self {
+            specs: Arc::new(entries.into_iter().collect()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct IterableSideInputAddress {
+    key: SideInputKey,
+    window: Vec<u8>,
+}
+
+type EncodedSideInputWindows = HashMap<BeamWindow, Vec<u8>>;
+type SideInputCache = HashMap<SideInputKey, Arc<EncodedSideInputWindows>>;
+
+/// Per-job side-input reader over the materialized PCollections. Values are
+/// grouped and encoded once per side input, then reused for subsequent StateGet
+/// requests in the bounded run.
+struct SideInputResolver {
+    store: Arc<FlareElementStore>,
+    registry: SideInputRegistry,
+    cache: Mutex<SideInputCache>,
+}
+
+impl SideInputResolver {
+    fn new(store: Arc<FlareElementStore>, registry: SideInputRegistry) -> Self {
+        Self {
+            store,
+            registry,
+            cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    async fn read_iterable(&self, address: &IterableSideInputAddress) -> Result<Vec<u8>> {
+        let spec = self.registry.get(&address.key).ok_or_else(|| {
+            anyhow!(
+                "unknown iterable side input transform_id='{}' side_input_id='{}'",
+                address.key.transform_id,
+                address.key.side_input_id
+            )
+        })?;
+        let window = spec
+            .window_coder
+            .decode_window(&address.window)
+            .map_err(|e| anyhow!("invalid side-input window: {e}"))?;
+
+        let mut cache = self.cache.lock().await;
+        if !cache.contains_key(&address.key) {
+            let values = self
+                .store
+                .scan_windowed_values(ScanCollectionRequest {
+                    pcollection_id: spec.pcollection_id.clone(),
+                })
+                .await?;
+            let mut grouped = EncodedSideInputWindows::new();
+            for value in values {
+                let mut seen_windows = HashSet::new();
+                for value_window in value.windows {
+                    if !seen_windows.insert(value_window.clone()) {
+                        continue;
+                    }
+                    let encoded = grouped.entry(value_window).or_default();
+                    let before = encoded.len();
+                    spec.element_coder
+                        .encode_element(value.value.clone(), encoded);
+                    // Beam's data stream decoder advances one byte when a coder
+                    // decodes to zero bytes, so preserve that element boundary.
+                    if encoded.len() == before {
+                        encoded.push(0);
+                    }
+                }
+            }
+            cache.insert(address.key.clone(), Arc::new(grouped));
+        }
+
+        Ok(cache
+            .get(&address.key)
+            .and_then(|grouped| grouped.get(&window))
+            .cloned()
+            .unwrap_or_default())
+    }
+}
+
 /// Client-side channel for the executor to service the worker's State stream.
 #[derive(Clone)]
 pub struct StateChannel {
@@ -173,14 +355,18 @@ impl StateChannel {
     }
 
     /// Start a background task that services Beam Fn State requests against
-    /// `store` until the stream ends or the channel is reset.
-    pub fn stream_requests(&self, store: Arc<FlareElementStore>) {
+    /// user state and materialized side-input PCollections until the stream ends
+    /// or the channel is reset.
+    pub fn stream_requests(&self, store: Arc<FlareElementStore>, side_inputs: SideInputRegistry) {
         let channel = self.clone();
         let task_slot = self.stream_task.clone();
 
         let join_handle = tokio::spawn(async move {
-            match build_state_backend(store).await {
-                Ok(backend) => channel.drive_state_requests(backend).await,
+            match build_state_backend(store.clone()).await {
+                Ok(backend) => {
+                    let side_inputs = SideInputResolver::new(store, side_inputs);
+                    channel.drive_state_requests(backend, side_inputs).await
+                }
                 Err(e) => error!("failed to construct state backend: {e}"),
             }
         });
@@ -188,7 +374,7 @@ impl StateChannel {
         *task_slot.lock().unwrap() = Some(join_handle);
     }
 
-    async fn drive_state_requests(&self, backend: StateBackend) {
+    async fn drive_state_requests(&self, backend: StateBackend, side_inputs: SideInputResolver) {
         info!("state request driver started");
         loop {
             match self.recv_request().await {
@@ -196,7 +382,12 @@ impl StateChannel {
                     crate::engine::liveness::touch();
                     let summary = describe_request(&request);
                     let started = std::time::Instant::now();
-                    let response = handle_state_request(&backend, request).await;
+                    let response = handle_state_request_with_side_inputs(
+                        &backend,
+                        Some(&side_inputs),
+                        request,
+                    )
+                    .await;
                     // A stateful DoFn drives many state ops per bundle; if each is
                     // slow the bundle misses its deadline (N3), so surface the slow
                     // ones with the request summary.
@@ -270,6 +461,12 @@ fn describe_request(request: &StateRequest) -> String {
             bag.window.len(),
             bag.key.len()
         ),
+        Some(state_key::Type::IterableSideInput(side_input)) => format!(
+            "iterable_side_input(transform_id={}, side_input_id={}, window={}B)",
+            side_input.transform_id,
+            side_input.side_input_id,
+            side_input.window.len()
+        ),
         Some(_) => "non-bag-user-state".to_string(),
         None => "no-state-key".to_string(),
     };
@@ -285,29 +482,62 @@ fn describe_request(request: &StateRequest) -> String {
     )
 }
 
-/// Dispatch a single [`StateRequest`] through the user-state abstraction.
+enum StateTarget {
+    UserState(UserStateAddress),
+    IterableSideInput(IterableSideInputAddress),
+}
+
+/// Dispatch a user-state request without side-input lookup metadata.
 ///
-/// `StateKey` is decoded here (transport concern) into a transport-agnostic
-/// [`UserStateAddress`]; the state layer interprets it. Unsupported key types
-/// return an error matching the original request id.
-///
+/// Production calls [`handle_state_request_with_side_inputs`]; this narrow
+/// helper keeps user-state tests independent of PCollection setup.
+#[cfg(test)]
 async fn handle_state_request(
     backend: &StateBackend,
+    request: StateRequest,
+) -> std::result::Result<StateResponse, (String, String)> {
+    handle_state_request_with_side_inputs(backend, None, request).await
+}
+
+/// Dispatch a single [`StateRequest`] through either user state or an iterable
+/// side-input lookup.
+///
+/// `StateKey` is decoded here (transport concern). Unsupported key types return
+/// an error matching the original request id.
+async fn handle_state_request_with_side_inputs(
+    backend: &StateBackend,
+    side_inputs: Option<&SideInputResolver>,
     request: StateRequest,
 ) -> std::result::Result<StateResponse, (String, String)> {
     let id = request.id.clone();
     let state_key = request.state_key.and_then(|k| k.r#type);
     let body = request.request;
 
-    let address = match state_key {
-        Some(key) => match user_state_address(key) {
-            Ok(address) => address,
+    let target = match state_key {
+        Some(key) => match state_target(key) {
+            Ok(target) => target,
             Err(message) => return Err((id, message)),
         },
         None => return Err((id, "state request has no state key".to_string())),
     };
-    let user_state = UserStateStore::new(backend.clone(), address);
 
+    match target {
+        StateTarget::UserState(address) => {
+            handle_user_state_request(backend, id, address, body).await
+        }
+        StateTarget::IterableSideInput(address) => {
+            handle_iterable_side_input_request(side_inputs, id, address, body).await
+        }
+    }
+}
+
+async fn handle_user_state_request(
+    backend: &StateBackend,
+    id: String,
+    address: UserStateAddress,
+    body: Option<state_request::Request>,
+) -> std::result::Result<StateResponse, (String, String)> {
+    let user_state = UserStateStore::new(backend.clone(), address);
     match body {
         Some(state_request::Request::Get(get)) => {
             if !get.continuation_token.is_empty() {
@@ -346,22 +576,68 @@ async fn handle_state_request(
     }
 }
 
-/// Decode a Beam `StateKey` user-state variant into a [`UserStateAddress`].
-///
-/// Only `BagUserState` is implemented; every other variant (side inputs and the
-/// multimap/ordered-list user-state kinds) is rejected explicitly so the SDK
-/// gets a clear error instead of a silent wrong answer.
-fn user_state_address(key: state_key::Type) -> std::result::Result<UserStateAddress, String> {
+async fn handle_iterable_side_input_request(
+    side_inputs: Option<&SideInputResolver>,
+    id: String,
+    address: IterableSideInputAddress,
+    body: Option<state_request::Request>,
+) -> std::result::Result<StateResponse, (String, String)> {
+    match body {
+        Some(state_request::Request::Get(get)) => {
+            if !get.continuation_token.is_empty() {
+                return Err((id, "continuation tokens are not supported".to_string()));
+            }
+            let Some(side_inputs) = side_inputs else {
+                return Err((
+                    id,
+                    "iterable side-input resolver is not initialized".to_string(),
+                ));
+            };
+            match side_inputs.read_iterable(&address).await {
+                Ok(data) => Ok(StateResponse {
+                    id,
+                    error: String::new(),
+                    response: Some(state_response::Response::Get(StateGetResponse {
+                        continuation_token: Vec::new(),
+                        data,
+                    })),
+                }),
+                Err(e) => Err((id, format!("get iterable side input failed: {e}"))),
+            }
+        }
+        Some(state_request::Request::Append(_)) => Err((
+            id,
+            "append is not supported for iterable side inputs".to_string(),
+        )),
+        Some(state_request::Request::Clear(_)) => Err((
+            id,
+            "clear is not supported for iterable side inputs".to_string(),
+        )),
+        None => Err((id, "state request has no request body".to_string())),
+    }
+}
+
+/// Decode a Beam `StateKey` into a supported state target.
+fn state_target(key: state_key::Type) -> std::result::Result<StateTarget, String> {
     match key {
-        state_key::Type::BagUserState(bag) => Ok(UserStateAddress::new(
+        state_key::Type::BagUserState(bag) => Ok(StateTarget::UserState(UserStateAddress::new(
             UserStateKind::Bag,
             bag.transform_id,
             bag.user_state_id,
             bag.window,
             bag.key,
-        )),
+        ))),
+        state_key::Type::IterableSideInput(side_input) => {
+            Ok(StateTarget::IterableSideInput(IterableSideInputAddress {
+                key: SideInputKey {
+                    transform_id: side_input.transform_id,
+                    side_input_id: side_input.side_input_id,
+                },
+                window: side_input.window,
+            }))
+        }
         other => Err(format!(
-            "unsupported state key type '{}' (only '{}' is supported)",
+            "unsupported state key type '{}' (supported types: '{}' and 'iterable_side_input')",
             state_key_kind(&other),
             UserStateKind::Bag.wire_name(),
         )),
@@ -387,8 +663,15 @@ fn state_key_kind(key: &state_key::Type) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::element_store::FlareElementStore;
+    use crate::{
+        coders::primitives::{LengthPrefixCoder, PaneInfo, StringUtf8Coder},
+        store::{
+            element_store::FlareElementStore,
+            record::{BeamRecord, PrimitiveValue},
+        },
+    };
     use beam_model_rs::v1::{StateKey, state_key};
+    use bytes::BytesMut;
     use std::sync::Arc;
     use tempfile::tempdir;
 
@@ -406,6 +689,72 @@ mod tests {
             .await
             .expect("failed to build the state backend");
         (dir, backend)
+    }
+
+    async fn make_side_input_resolver(
+        element_coder: StandardBeamCoders,
+    ) -> (tempfile::TempDir, Arc<FlareElementStore>, SideInputResolver) {
+        let dir = tempdir().expect("failed to create tempdir warehouse");
+        let warehouse = dir
+            .path()
+            .to_str()
+            .expect("tempdir path is not valid utf8")
+            .to_string();
+        let store = Arc::new(
+            FlareElementStore::new(warehouse, "testdb".to_string(), None)
+                .await
+                .expect("failed to construct FlareElementStore"),
+        );
+        let key = SideInputKey {
+            transform_id: "select".to_string(),
+            side_input_id: "max-price".to_string(),
+        };
+        let registry = SideInputRegistry::from_entries([(
+            key,
+            SideInputSpec {
+                pcollection_id: "side-input-pc".to_string(),
+                element_coder,
+                window_coder: WindowCoder::Interval,
+            },
+        )]);
+        let resolver = SideInputResolver::new(store.clone(), registry);
+        (dir, store, resolver)
+    }
+
+    fn iterable_side_input_request(
+        id: &str,
+        window: &[u8],
+        op: state_request::Request,
+    ) -> StateRequest {
+        StateRequest {
+            id: id.to_string(),
+            instruction_id: "instruction".to_string(),
+            state_key: Some(StateKey {
+                r#type: Some(state_key::Type::IterableSideInput(
+                    state_key::IterableSideInput {
+                        transform_id: "select".to_string(),
+                        side_input_id: "max-price".to_string(),
+                        window: window.to_vec(),
+                    },
+                )),
+            }),
+            request: Some(op),
+        }
+    }
+
+    fn encoded_window(window: &BeamWindow) -> Vec<u8> {
+        let mut encoded = BytesMut::new();
+        WindowCoder::Interval.encode_window(window, &mut encoded);
+        encoded.to_vec()
+    }
+
+    fn windowed(value: BeamRecord, window: BeamWindow) -> crate::coders::primitives::WindowedValue {
+        crate::coders::primitives::WindowedValue {
+            value,
+            timestamp_millis: 0,
+            windows: vec![window],
+            pane: PaneInfo::no_firing(),
+        }
     }
 
     #[tokio::test]
@@ -447,11 +796,13 @@ mod tests {
             db_dir.display()
         );
         // The element store holds no user-state table.
-        assert!(store
-            .get_existing_table("__flare_state")
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            store
+                .get_existing_table("__flare_state")
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         // A reopened store returns the committed cell.
         let kv = SlateKvStore::open(&slate_state_dir(&store), "state")
@@ -646,5 +997,129 @@ mod tests {
         let (id, error) = handle_state_request(&backend, request).await.unwrap_err();
         assert_eq!(id, "1");
         assert!(error.contains("continuation"), "unexpected error: {error}");
+    }
+
+    #[tokio::test]
+    async fn iterable_side_input_returns_matching_window_in_non_nested_encoding() {
+        let (_dir, store, resolver) =
+            make_side_input_resolver(StandardBeamCoders::StringUtf8(StringUtf8Coder)).await;
+        let first = BeamWindow::Interval {
+            start_millis: 0,
+            end_millis: 1_000,
+        };
+        let second = BeamWindow::Interval {
+            start_millis: 1_000,
+            end_millis: 2_000,
+        };
+        store
+            .write_windowed_value_batch(
+                "side-input-pc",
+                vec![
+                    windowed(
+                        BeamRecord::PRIMITIVE(PrimitiveValue::String("one".to_string())),
+                        first.clone(),
+                    ),
+                    windowed(
+                        BeamRecord::PRIMITIVE(PrimitiveValue::String("two".to_string())),
+                        first.clone(),
+                    ),
+                    windowed(
+                        BeamRecord::PRIMITIVE(PrimitiveValue::String("other".to_string())),
+                        second,
+                    ),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let backend = build_state_backend(store).await.unwrap();
+        let response = handle_state_request_with_side_inputs(
+            &backend,
+            Some(&resolver),
+            iterable_side_input_request("side-1", &encoded_window(&first), get_op()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(get_response_data(response), b"onetwo");
+    }
+
+    #[tokio::test]
+    async fn iterable_side_input_supports_length_prefixed_opaque_values() {
+        let (_dir, store, resolver) =
+            make_side_input_resolver(StandardBeamCoders::LengthPrefix(LengthPrefixCoder)).await;
+        let window = BeamWindow::Interval {
+            start_millis: 0,
+            end_millis: 1_000,
+        };
+        store
+            .write_windowed_value_batch(
+                "side-input-pc",
+                vec![windowed(
+                    BeamRecord::PRIMITIVE(PrimitiveValue::Bytes(vec![0x2a])),
+                    window.clone(),
+                )],
+            )
+            .await
+            .unwrap();
+
+        let backend = build_state_backend(store).await.unwrap();
+        let response = handle_state_request_with_side_inputs(
+            &backend,
+            Some(&resolver),
+            iterable_side_input_request("side-2", &encoded_window(&window), get_op()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(get_response_data(response), vec![1, 0x2a]);
+    }
+
+    #[tokio::test]
+    async fn iterable_side_input_missing_window_is_empty_and_mutation_is_rejected() {
+        let (_dir, store, resolver) =
+            make_side_input_resolver(StandardBeamCoders::StringUtf8(StringUtf8Coder)).await;
+        let present = BeamWindow::Interval {
+            start_millis: 0,
+            end_millis: 1_000,
+        };
+        let missing = BeamWindow::Interval {
+            start_millis: 2_000,
+            end_millis: 3_000,
+        };
+        store
+            .write_windowed_value_batch(
+                "side-input-pc",
+                vec![windowed(
+                    BeamRecord::PRIMITIVE(PrimitiveValue::String("value".to_string())),
+                    present,
+                )],
+            )
+            .await
+            .unwrap();
+
+        let backend = build_state_backend(store).await.unwrap();
+        let response = handle_state_request_with_side_inputs(
+            &backend,
+            Some(&resolver),
+            iterable_side_input_request("side-3", &encoded_window(&missing), get_op()),
+        )
+        .await
+        .unwrap();
+        assert!(get_response_data(response).is_empty());
+
+        let (id, error) = handle_state_request_with_side_inputs(
+            &backend,
+            Some(&resolver),
+            iterable_side_input_request(
+                "side-4",
+                &encoded_window(&missing),
+                append_op(b"not-allowed"),
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(id, "side-4");
+        assert!(error.contains("append is not supported"), "{error}");
     }
 }

@@ -279,7 +279,14 @@ impl JobService for FlareJobService {
             })?;
 
             let mut dispatcher = self.dispatcher.lock().await;
-            dispatcher.prepare_pipeline(job_graph.as_ref());
+            dispatcher
+                .prepare_pipeline(job_graph.as_ref())
+                .map_err(|e| {
+                    Status::internal(truncate_grpc_error(format!(
+                        "failed to prepare pipeline for job {}: {}",
+                        preparation_id, e
+                    )))
+                })?;
 
             let mut scheduler = NodeScheduler::new((*job_graph).clone());
             dispatcher.run_pipeline(&mut scheduler).await.map_err(|e| {
