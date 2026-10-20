@@ -28,6 +28,7 @@ slatedb = { version = "0.17", default-features = false }
 datafusion = { version = "54.1.0", default-features = false }
 dashmap = "6.1.0"
 prost = "0.14.3"
+prost-types = "0.14"
 petgraph = "0.8.3"
 log = "0.4.29"
 indexmap = "2.13.0"
@@ -48,5 +49,4 @@ features = ["v4"]
 
 [dev-dependencies]
 tempfile = "3"
-prost-types = "0.14"
 tokio = { version = "1.38", features = ["test-util"] }

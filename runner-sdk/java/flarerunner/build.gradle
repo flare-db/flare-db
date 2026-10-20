@@ -18,6 +18,7 @@ java {
 
 dependencies {
     implementation libs.beam.core
+    implementation libs.beam.runners.core
     implementation libs.beam.runners.portability
     implementation libs.slf4j.api
 

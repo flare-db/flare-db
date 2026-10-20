@@ -17,6 +17,7 @@ spotless = "8.10.2"
 [libraries]
 beam-core = { group = "org.apache.beam", name = "beam-sdks-java-core", version.ref = "beam" }
 beam-arrow = { group = "org.apache.beam", name = "beam-sdks-java-extensions-arrow", version.ref = "beam" }
+beam-runners-core = { group = "org.apache.beam", name = "beam-runners-core-java", version.ref = "beam" }
 beam-runners-portability = { group = "org.apache.beam", name = "beam-runners-portability-java", version.ref = "beam" }
 beam-nexmark = { group = "org.apache.beam", name = "beam-sdks-java-nexmark", version.ref = "beam" }
 

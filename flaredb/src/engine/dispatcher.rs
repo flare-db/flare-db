@@ -1,3 +1,4 @@
+use crate::engine::metrics::JobMetrics;
 use crate::engine::sdf::{SdfBundleOutcome, SdfWorkItem, SplittableStageExecutor};
 use crate::engine::window::WindowMergeService;
 use crate::transforms::SourceProgress;
@@ -109,6 +110,11 @@ impl ExecutorDispatcher {
     /// `flare-worker.log`.
     pub async fn set_log_target(&self, instance_id: &str, job_id: &str) -> anyhow::Result<()> {
         self.channels.set_log_target(instance_id, job_id).await
+    }
+
+    /// Install the metrics accumulator for the job that is about to run.
+    pub(crate) fn set_job_metrics(&self, metrics: Arc<JobMetrics>) {
+        self.channels.control().set_job_metrics(metrics);
     }
 
     /// Point the element store (and timer store) at the job's warehouse database.
