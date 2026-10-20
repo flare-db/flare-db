@@ -528,6 +528,39 @@ impl WindowCoder {
             _ => panic!("Unsupported Beam window coder: {urn}"),
         }
     }
+
+    /// Encode one window in the top-level context used by Fn State side-input
+    /// keys.
+    pub fn encode_window(self, window: &BeamWindow, buf: &mut impl BufMut) {
+        match (self, window) {
+            (WindowCoder::Global, BeamWindow::Global) => {}
+            (
+                WindowCoder::Interval,
+                BeamWindow::Interval {
+                    start_millis,
+                    end_millis,
+                },
+            ) => {
+                encode_timestamp_millis(*end_millis, buf);
+                encode_varint((*end_millis - *start_millis) as u64, buf);
+            }
+            _ => panic!("Window value does not match the configured Beam window coder"),
+        }
+    }
+
+    /// Decode a window from the top-level byte representation carried by an
+    /// iterable side-input state key.
+    pub fn decode_window(self, bytes: &[u8]) -> Result<BeamWindow, CodersError> {
+        let mut buf = bytes;
+        let window = decode_window(&mut buf, self);
+        if buf.has_remaining() {
+            return Err(CodersError::WhileDecoding(format!(
+                "window coder left {} trailing byte(s)",
+                buf.remaining()
+            )));
+        }
+        Ok(window)
+    }
 }
 
 /// Encodes and decodes Beam `WindowedValue` framing around an element coder.
@@ -696,22 +729,7 @@ fn encode_windows(windows: &[BeamWindow], coder: WindowCoder, buf: &mut impl Buf
     buf.put_i32(windows.len() as i32);
 
     for window in windows {
-        match (coder, window) {
-            (WindowCoder::Global, BeamWindow::Global) => {}
-            (
-                WindowCoder::Interval,
-                BeamWindow::Interval {
-                    start_millis,
-                    end_millis,
-                },
-            ) => {
-                // IntervalWindowCoder encodes the end timestamp followed by the
-                // non-negative span (end - start), both in Beam's timestamp/varint format.
-                encode_timestamp_millis(*end_millis, buf);
-                encode_varint((*end_millis - *start_millis) as u64, buf);
-            }
-            _ => panic!("Window value does not match the configured Beam window coder"),
-        }
+        coder.encode_window(window, buf);
     }
 }
 

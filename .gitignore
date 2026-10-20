@@ -33,3 +33,6 @@ __pycache__/
 
 
 .venv
+
+graphify-out
+.codex

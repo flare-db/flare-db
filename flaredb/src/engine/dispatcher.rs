@@ -4,7 +4,7 @@ use crate::{
     engine::timer::{TimerEntry, build_timer_store},
     engine::{
         executor::StageExecutor,
-        harness::{Channels, control::ControlResponse},
+        harness::{Channels, control::ControlResponse, state::SideInputRegistry},
         runtime::BundleRuntime,
         scheduler::NodeScheduler,
         timer::TimerService,
@@ -125,20 +125,25 @@ impl ExecutorDispatcher {
 
     /// Start dispatcher tasks and cache the pipeline coders/components used to
     /// build a [`StageExecutor`].
-    pub fn prepare_pipeline(&mut self, pipeline_graph: &ExecutableGraph) {
-        // Start data channel dispatcher to listen and demux incoming elements.
-        self.channels.stream_elements();
-        // Start control channel dispatcher to route responses to waiting futures.
-        self.channels.stream_responses();
-        // Start state channel dispatcher to service Fn State requests against the
-        // job's element store (bag user state).
-        self.channels.state().stream_requests(self.store.clone());
+    pub fn prepare_pipeline(&mut self, pipeline_graph: &ExecutableGraph) -> anyhow::Result<()> {
         // Resolve `pickled_python` leaves through length-prefixed wrappers so the
         // runner's decoder sees the same coder graph the SDK is asked to emit.
         let mut coders = pipeline_graph.components.coders.clone();
         crate::coders::length_prefix_pickled_leaves(&mut coders);
+        let side_inputs = SideInputRegistry::from_executable_graph(pipeline_graph, &coders)?;
+
+        // Start data channel dispatcher to listen and demux incoming elements.
+        self.channels.stream_elements();
+        // Start control channel dispatcher to route responses to waiting futures.
+        self.channels.stream_responses();
+        // Start state channel dispatcher to service user state and materialized
+        // iterable side inputs from the same job store.
+        self.channels
+            .state()
+            .stream_requests(self.store.clone(), side_inputs);
         self.pipeline_coders = Arc::new(coders);
         self.pipeline_components = Arc::new(pipeline_graph.components.clone());
+        Ok(())
     }
 
     /// Build a [`StageExecutor`] from the currently prepared state.
