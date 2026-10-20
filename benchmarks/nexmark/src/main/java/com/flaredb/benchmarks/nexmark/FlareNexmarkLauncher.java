@@ -1,11 +1,14 @@
 package com.flaredb.benchmarks.nexmark;
 
 import com.flaredb.benchmarks.nexmark.queries.BatchQueryRegistry;
+import com.flaredb.runner.FlarePipelineJob;
 import com.flaredb.runner.FlareRunner;
 import java.io.File;
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.Comparator;
+import java.util.List;
+import java.util.Map;
 import org.apache.beam.sdk.Pipeline;
 import org.apache.beam.sdk.PipelineResult;
 import org.apache.beam.sdk.metrics.MetricNameFilter;
@@ -19,6 +22,7 @@ import org.apache.beam.sdk.nexmark.NexmarkUtils;
 import org.apache.beam.sdk.nexmark.model.Event;
 import org.apache.beam.sdk.nexmark.model.KnownSize;
 import org.apache.beam.sdk.nexmark.queries.NexmarkQuery;
+import org.apache.beam.sdk.testutils.metrics.MetricsReader;
 import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.sdk.values.TimestampedValue;
 import org.slf4j.Logger;
@@ -112,19 +116,111 @@ public class FlareNexmarkLauncher {
     PipelineResult pipelineResult = p.run();
 
     long endTime = System.currentTimeMillis();
-    double runtimeSec = Math.max(0.001, (endTime - startTime) / 1000.0);
-
-    NexmarkPerf perf = new NexmarkPerf();
-    perf.runtimeSec = runtimeSec;
-    perf.numEvents = configuration.numEvents;
-    perf.eventsPerSec = configuration.numEvents / runtimeSec;
-    perf.numResults = countResults(pipelineResult, queryName);
+    NexmarkPerf perf = buildPerformance(query, pipelineResult, startTime, endTime);
 
     LOG.info(
-        "Completed query {} in {}s (Events/sec: {})",
+        "Completed query {} in {}s (Events/sec: {}, Results/sec: {})",
         queryName,
-        String.format("%.2f", runtimeSec),
-        String.format("%.1f", perf.eventsPerSec));
+        String.format("%.2f", perf.runtimeSec),
+        String.format("%.1f", perf.eventsPerSec),
+        String.format("%.1f", perf.resultsPerSec));
+    LOG.info("NexmarkPerf {}", perf);
+
+    return perf;
+  }
+
+  private NexmarkPerf buildPerformance(
+      NexmarkQuery<?> query, PipelineResult pipelineResult, long startTime, long endTime)
+      throws IOException {
+    NexmarkPerf perf = new NexmarkPerf();
+    perf.jobId = pipelineResult instanceof FlarePipelineJob flareJob ? flareJob.getJobId() : null;
+    perf.errors = List.of();
+
+    long eventCount = -1;
+    long eventBytes = -1;
+    long eventStart = -1;
+    long eventEnd = -1;
+    if (query.eventMonitor != null) {
+      MetricsReader eventMetrics = new MetricsReader(pipelineResult, query.eventMonitor.name);
+      eventCount = eventMetrics.getCounterMetric(query.eventMonitor.prefix + ".elements");
+      eventBytes = eventMetrics.getCounterMetric(query.eventMonitor.prefix + ".bytes");
+      eventStart = eventMetrics.getStartTimeMetric(query.eventMonitor.prefix + ".processingTime");
+      eventEnd = eventMetrics.getEndTimeMetric(query.eventMonitor.prefix + ".processingTime");
+    }
+
+    long resultCount = -1;
+    long resultBytes = -1;
+    long resultStart = -1;
+    long resultEnd = -1;
+    long timestampStart = -1;
+    long timestampEnd = -1;
+    if (query.resultMonitor != null) {
+      MetricsReader resultMetrics = new MetricsReader(pipelineResult, query.resultMonitor.name);
+      resultCount = resultMetrics.getCounterMetric(query.resultMonitor.prefix + ".elements");
+      resultBytes = resultMetrics.getCounterMetric(query.resultMonitor.prefix + ".bytes");
+      resultStart =
+          resultMetrics.getStartTimeMetric(query.resultMonitor.prefix + ".processingTime");
+      resultEnd = resultMetrics.getEndTimeMetric(query.resultMonitor.prefix + ".processingTime");
+      timestampStart =
+          resultMetrics.getStartTimeMetric(query.resultMonitor.prefix + ".eventTimestamp");
+      timestampEnd = resultMetrics.getEndTimeMetric(query.resultMonitor.prefix + ".eventTimestamp");
+    }
+
+    if (resultCount < 0) {
+      resultCount = countResults(pipelineResult, query.getName());
+    }
+
+    long effectiveEnd = -1;
+    if (eventEnd >= 0 && resultEnd >= 0) {
+      effectiveEnd = Math.max(eventEnd, resultEnd);
+    } else if (resultEnd >= 0) {
+      effectiveEnd = resultEnd;
+    } else if (eventEnd >= 0) {
+      effectiveEnd = eventEnd;
+    }
+
+    double wallClockSec = Math.max(0.001, (endTime - startTime) / 1000.0);
+    perf.runtimeSec =
+        effectiveEnd >= 0 && eventStart >= 0 && effectiveEnd >= eventStart
+            ? (effectiveEnd - eventStart) / 1000.0
+            : wallClockSec;
+    perf.numEvents = eventCount >= 0 ? eventCount : configuration.numEvents;
+    perf.numResults = Math.max(0, resultCount);
+
+    if (perf.runtimeSec > 0.0) {
+      perf.eventsPerSec = perf.numEvents / perf.runtimeSec;
+      perf.resultsPerSec = perf.numResults / perf.runtimeSec;
+      if (eventBytes >= 0) {
+        perf.eventBytesPerSec = eventBytes / perf.runtimeSec;
+      }
+      if (resultBytes >= 0) {
+        perf.resultBytesPerSec = resultBytes / perf.runtimeSec;
+      }
+    }
+
+    if (eventStart >= 0) {
+      perf.startupDelaySec = (eventStart - startTime) / 1000.0;
+    }
+    if (resultStart >= 0 && eventStart >= 0 && resultStart >= eventStart) {
+      perf.processingDelaySec = (resultStart - eventStart) / 1000.0;
+    }
+    if (timestampStart >= 0 && timestampEnd >= 0 && perf.runtimeSec > 0.0) {
+      double timeDilation = ((timestampEnd - timestampStart) / 1000.0) / perf.runtimeSec;
+      perf = NexmarkUtils.MAPPER.updateValue(perf, Map.of("timeDilation", timeDilation));
+    }
+    if (resultEnd >= 0) {
+      perf.shutdownDelaySec = Math.max(0.0, (endTime - resultEnd) / 1000.0);
+    }
+
+    NexmarkPerf.ProgressSnapshot snapshot =
+        NexmarkUtils.MAPPER.convertValue(
+            Map.of(
+                "secSinceStart", wallClockSec,
+                "runtimeSec", perf.runtimeSec,
+                "numEvents", perf.numEvents,
+                "numResults", perf.numResults),
+            NexmarkPerf.ProgressSnapshot.class);
+    perf.snapshots = List.of(snapshot);
 
     return perf;
   }

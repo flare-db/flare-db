@@ -130,6 +130,11 @@ public class FlarePipelineJobTest {
   }
 
   @Test
+  public void exposesTheJobId() throws Exception {
+    assertEquals("job-42", newJob("job-42", new FakeJobService(JobState.Enum.RUNNING)).getJobId());
+  }
+
+  @Test
   public void cancelReturnsMappedStateFromJobService() throws Exception {
     FlarePipelineJob job = newJob("job-1", new FakeJobService(JobState.Enum.CANCELLED));
 

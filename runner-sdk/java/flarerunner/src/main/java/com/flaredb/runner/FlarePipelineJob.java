@@ -30,7 +30,7 @@ import org.joda.time.Duration;
  * release it deterministically (rather than leaving it open for further {@link #getState()} or
  * {@link #cancel()} calls) should call {@link #close()}.
  */
-class FlarePipelineJob implements PipelineResult, AutoCloseable {
+public class FlarePipelineJob implements PipelineResult, AutoCloseable {
 
   private final String jobId;
   private final int jobServerTimeout;
@@ -41,6 +41,11 @@ class FlarePipelineJob implements PipelineResult, AutoCloseable {
     this.jobId = jobId;
     this.jobServerTimeout = jobServerTimeout;
     this.jobService = jobService;
+  }
+
+  /** Returns the FlareDB Job API identifier for this run. */
+  public String getJobId() {
+    return jobId;
   }
 
   @Override
