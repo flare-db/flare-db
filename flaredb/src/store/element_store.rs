@@ -910,24 +910,24 @@ impl WindowedValueStream {
 /// These fields used to be packed into one JSON binary column. Storing them as
 /// native Arrow values makes them visible to Parquet encodings, DataFusion
 /// predicates, and column projection while preserving one row per element.
-pub(crate) const WINDOW_TIMESTAMP_COLUMN: &str = "__flare_timestamp_millis";
-pub(crate) const WINDOW_MAX_END_COLUMN: &str = "__flare_max_window_end_millis";
-pub(crate) const WINDOW_PANE_TIMING_COLUMN: &str = "__flare_pane_timing";
-pub(crate) const WINDOW_PANE_INDEX_COLUMN: &str = "__flare_pane_index";
+pub(crate) const WINDOW_TIMESTAMP_COLUMN: &str = "flare_timestamp_millis";
+pub(crate) const WINDOW_MAX_END_COLUMN: &str = "flare_max_window_end_millis";
+pub(crate) const WINDOW_PANE_TIMING_COLUMN: &str = "flare_pane_timing";
+pub(crate) const WINDOW_PANE_INDEX_COLUMN: &str = "flare_pane_index";
 pub(crate) const WINDOW_PANE_NON_SPECULATIVE_INDEX_COLUMN: &str =
-    "__flare_pane_non_speculative_index";
-pub(crate) const WINDOW_PANE_IS_FIRST_COLUMN: &str = "__flare_pane_is_first";
-pub(crate) const WINDOW_PANE_IS_LAST_COLUMN: &str = "__flare_pane_is_last";
+    "flare_pane_non_speculative_index";
+pub(crate) const WINDOW_PANE_IS_FIRST_COLUMN: &str = "flare_pane_is_first";
+pub(crate) const WINDOW_PANE_IS_LAST_COLUMN: &str = "flare_pane_is_last";
 
 /// Reserved Paimon column holding the element's first window identity.
 ///
 /// Most Beam elements have one window. Keeping that identity as a scalar avoids
 /// list expansion on the GBK hot path while preserving exact window bytes.
-pub(crate) const WINDOW_KEY_COLUMN: &str = "__flare_window_key";
+pub(crate) const WINDOW_KEY_COLUMN: &str = "flare_window_key";
 /// Remaining window identities after [`WINDOW_KEY_COLUMN`], in original order.
-pub(crate) const WINDOW_EXTRA_KEYS_COLUMN: &str = "__flare_extra_window_keys";
+pub(crate) const WINDOW_EXTRA_KEYS_COLUMN: &str = "flare_extra_window_keys";
 /// Number of windows carried by the element.
-pub(crate) const WINDOW_COUNT_COLUMN: &str = "__flare_window_count";
+pub(crate) const WINDOW_COUNT_COLUMN: &str = "flare_window_count";
 
 fn has_typed_window_metadata(schema: &ArrowSchema) -> bool {
     [
@@ -1596,7 +1596,7 @@ mod element_store_tests {
         assert!(
             schema
                 .arrow_schema
-                .field_with_name("__flare_window_metadata")
+                .field_with_name("flare_window_metadata")
                 .is_err(),
             "legacy JSON metadata column must not be written"
         );

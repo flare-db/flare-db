@@ -60,7 +60,7 @@ use crate::{
     transforms::{ExecutionContext, FlareTransform},
 };
 
-const GROUP_KEY_COLUMN: &str = "__flare_gbk_group_key";
+const GROUP_KEY_COLUMN: &str = "flare_gbk_group_key";
 const DEFAULT_SORT_MEMORY_LIMIT_BYTES: usize = 1024 * 1024 * 1024;
 const DEFAULT_SORT_SPILL_LIMIT_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const DEFAULT_SORT_SPILL_RESERVATION_BYTES: usize = 10 * 1024 * 1024;
