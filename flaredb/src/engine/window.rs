@@ -3,14 +3,13 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
-    time::Duration,
 };
 
-use anyhow::{anyhow, ensure, Context};
+use anyhow::{Context, anyhow, ensure};
 use beam_model_rs::v1::{
-    accumulation_mode, closing_behavior, elements, merge_status, on_time_behavior, output_time,
-    trigger, ApiServiceDescriptor, Coder, Components, Elements, FunctionSpec, PCollection,
-    PTransform, ProcessBundleDescriptor, RemoteGrpcPort, Trigger, WindowingStrategy,
+    ApiServiceDescriptor, Coder, Components, Elements, FunctionSpec, PCollection, PTransform,
+    ProcessBundleDescriptor, RemoteGrpcPort, Trigger, WindowingStrategy, accumulation_mode,
+    closing_behavior, elements, merge_status, on_time_behavior, output_time, trigger,
 };
 use bytes::{Buf, BufMut, BytesMut};
 use prost::Message;
@@ -18,8 +17,9 @@ use tokio::sync::Mutex;
 
 use crate::{
     coders::primitives::{
-        decode_varint, decode_window_from, decode_windowed_value_header, encode_varint,
-        encode_windowed_value_header, BeamWindow, PaneInfo, WindowCoder, BEAM_MIN_TIMESTAMP_MILLIS,
+        BEAM_MIN_TIMESTAMP_MILLIS, BeamWindow, PaneInfo, WindowCoder, decode_varint,
+        decode_window_from, decode_windowed_value_header, encode_varint,
+        encode_windowed_value_header,
     },
     engine::harness::{
         control::{ControlChannel, ControlResponse},
@@ -28,7 +28,7 @@ use crate::{
     jobservice::urns::beam_urns,
 };
 
-const MERGE_TIMEOUT: Duration = Duration::from_secs(60);
+const MERGE_CACHE_MAX_ENTRIES: usize = 1024;
 
 /// One merge callback result from the SDK's `MergeWindows` transform.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,13 +86,20 @@ impl WindowMergeService {
         }
     }
 
-    /// Merge the supplied windows using the window function assigned to
-    /// `pcollection_id`.
-    pub(crate) async fn merge_windows_for_pcollection(
+    /// Merge several independent window sets for one PCollection in a single SDK
+    /// bundle.
+    ///
+    /// Each request is a separate `KV<nonce, Iterable<Window>>` element, so the
+    /// SDK still merges windows independently per key. Batching only amortizes
+    /// the Fn API control/data round trips.
+    pub(crate) async fn merge_windows_batch_for_pcollection(
         &self,
         pcollection_id: &str,
-        windows: &[BeamWindow],
-    ) -> anyhow::Result<Vec<MergedWindows>> {
+        requests: &[Vec<BeamWindow>],
+    ) -> anyhow::Result<Vec<Vec<MergedWindows>>> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
         let pcollection = self
             .components
             .pcollections
@@ -114,38 +121,56 @@ impl WindowMergeService {
             strategy.merge_status
         );
 
-        self.merge_for_strategy(strategy_id, windows).await
-    }
+        let distinct: Vec<Vec<BeamWindow>> = requests
+            .iter()
+            .map(|windows| distinct_windows(windows))
+            .collect();
+        let cache_keys: Vec<MergeCacheKey> = distinct
+            .iter()
+            .map(|windows| {
+                let mut canonical: Vec<String> =
+                    windows.iter().map(BeamWindow::canonical_key).collect();
+                canonical.sort();
+                MergeCacheKey {
+                    strategy_id: strategy_id.to_string(),
+                    windows: canonical,
+                }
+            })
+            .collect();
 
-    async fn merge_for_strategy(
-        &self,
-        strategy_id: &str,
-        windows: &[BeamWindow],
-    ) -> anyhow::Result<Vec<MergedWindows>> {
-        let distinct = distinct_windows(windows);
-        if distinct.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut canonical: Vec<String> = distinct.iter().map(BeamWindow::canonical_key).collect();
-        canonical.sort();
-        let cache_key = MergeCacheKey {
-            strategy_id: strategy_id.to_string(),
-            windows: canonical,
-        };
-
-        // Serialize requests for one cache key. WindowFn.merge executes SDK code,
-        // but the mapping for a fixed strategy and window set is deterministic.
-        let mut cache = self.cache.lock().await;
-        if let Some(cached) = cache.get(&cache_key) {
-            return Ok(cached.as_ref().clone());
+        let mut results: Vec<Option<Vec<MergedWindows>>> = vec![None; distinct.len()];
+        let mut misses = Vec::new();
+        {
+            let cache = self.cache.lock().await;
+            for (index, cache_key) in cache_keys.iter().enumerate() {
+                if let Some(cached) = cache.get(cache_key) {
+                    results[index] = Some(cached.as_ref().clone());
+                } else {
+                    misses.push((index, distinct[index].clone()));
+                }
+            }
         }
 
         let bundle = self.prepare_bundle(strategy_id).await?;
-        let result = self.invoke(&bundle, &distinct).await?;
-        let result = Arc::new(result);
-        cache.insert(cache_key, result.clone());
-        Ok(result.as_ref().clone())
+        if !misses.is_empty() {
+            let inputs: Vec<Vec<BeamWindow>> =
+                misses.iter().map(|(_, windows)| windows.clone()).collect();
+            let merged = self.invoke_batch(&bundle, &inputs).await?;
+            let mut cache = self.cache.lock().await;
+            for ((index, _), merged) in misses.into_iter().zip(merged) {
+                insert_merge_cache(
+                    &mut cache,
+                    cache_keys[index].clone(),
+                    Arc::new(merged.clone()),
+                );
+                results[index] = Some(merged);
+            }
+        }
+
+        results
+            .into_iter()
+            .map(|result| result.ok_or_else(|| anyhow!("missing MergeWindows batch result")))
+            .collect()
     }
 
     async fn prepare_bundle(&self, strategy_id: &str) -> anyhow::Result<Arc<MergeBundle>> {
@@ -180,14 +205,19 @@ impl WindowMergeService {
         Ok(bundle)
     }
 
-    async fn invoke(
+    async fn invoke_batch(
         &self,
         bundle: &MergeBundle,
-        windows: &[BeamWindow],
-    ) -> anyhow::Result<Vec<MergedWindows>> {
-        let nonce = uuid::Uuid::new_v4().as_bytes().to_vec();
+        requests: &[Vec<BeamWindow>],
+    ) -> anyhow::Result<Vec<Vec<MergedWindows>>> {
+        let requests: Vec<(Vec<u8>, Vec<BeamWindow>)> = requests
+            .iter()
+            .map(|windows| (uuid::Uuid::new_v4().as_bytes().to_vec(), windows.clone()))
+            .collect();
         let mut encoded_input = Vec::new();
-        encode_merge_input(&mut encoded_input, &nonce, windows, &bundle.window_coder);
+        for (nonce, windows) in &requests {
+            encode_merge_input(&mut encoded_input, nonce, windows, &bundle.window_coder);
+        }
 
         let output_key = DataKey {
             instruction_id: String::new(),
@@ -266,9 +296,9 @@ impl WindowMergeService {
             ))
         };
 
-        let (response, output) = crate::engine::liveness::idle_guard(
+        let (response, output) = crate::engine::guard::idle_guard(
             exchange,
-            MERGE_TIMEOUT,
+            crate::engine::guard::worker_idle_timeout(),
             "waiting for SDK MergeWindows output and control response",
         )
         .await?;
@@ -278,13 +308,46 @@ impl WindowMergeService {
         );
 
         let merged = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            decode_merge_output(&output, &nonce, &bundle.window_coder)
+            decode_merge_output_batch(&output, &bundle.window_coder)
         }))
         .map_err(|_| anyhow!("malformed SDK MergeWindows output: window decoding panicked"))?
         .context("decoding SDK MergeWindows output")?;
-        validate_merge_result(windows, &merged)?;
-        Ok(merged)
+        let mut by_nonce = HashMap::with_capacity(merged.len());
+        for (nonce, merged) in merged {
+            ensure!(
+                by_nonce.insert(nonce.clone(), merged).is_none(),
+                "SDK MergeWindows returned a duplicate nonce"
+            );
+        }
+
+        let mut results = Vec::with_capacity(requests.len());
+        for (nonce, windows) in requests {
+            let merged = by_nonce.remove(&nonce).ok_or_else(|| {
+                anyhow!("SDK MergeWindows returned no result for a batch element")
+            })?;
+            validate_merge_result(&windows, &merged)?;
+            results.push(merged);
+        }
+        ensure!(
+            by_nonce.is_empty(),
+            "SDK MergeWindows returned results for unknown nonce(s)"
+        );
+        Ok(results)
     }
+}
+
+fn insert_merge_cache(
+    cache: &mut HashMap<MergeCacheKey, Arc<Vec<MergedWindows>>>,
+    key: MergeCacheKey,
+    value: Arc<Vec<MergedWindows>>,
+) {
+    if cache.len() >= MERGE_CACHE_MAX_ENTRIES
+        && !cache.contains_key(&key)
+        && let Some(oldest) = cache.keys().next().cloned()
+    {
+        cache.remove(&oldest);
+    }
+    cache.insert(key, value);
 }
 
 fn distinct_windows(windows: &[BeamWindow]) -> Vec<BeamWindow> {
@@ -546,26 +609,32 @@ fn encode_merge_input(
     }
 }
 
-fn decode_merge_output(
+fn decode_merge_output_batch(
     bytes: &[u8],
-    expected_nonce: &[u8],
     window_coder: &WindowCoder,
-) -> anyhow::Result<Vec<MergedWindows>> {
+) -> anyhow::Result<Vec<(Vec<u8>, Vec<MergedWindows>)>> {
     let mut buf = bytes;
-    let (_, outer_windows, _) = decode_windowed_value_header(&mut buf, &WindowCoder::Global);
+    let mut results = Vec::new();
+    while buf.has_remaining() {
+        results.push(decode_merge_output_element(&mut buf, window_coder)?);
+    }
+    Ok(results)
+}
+
+fn decode_merge_output_element(
+    buf: &mut &[u8],
+    window_coder: &WindowCoder,
+) -> anyhow::Result<(Vec<u8>, Vec<MergedWindows>)> {
+    let (_, outer_windows, _) = decode_windowed_value_header(buf, &WindowCoder::Global);
     ensure!(
         outer_windows == vec![BeamWindow::Global],
         "MergeWindows output must be in the global window"
     );
 
-    let nonce = decode_nested_bytes(&mut buf)?;
-    ensure!(
-        nonce == expected_nonce,
-        "MergeWindows response nonce did not match the request"
-    );
+    let nonce = decode_nested_bytes(buf)?;
 
-    let unmerged = decode_window_iterable(&mut buf, window_coder)?;
-    let pair_count = decode_count(&mut buf)?;
+    let unmerged = decode_window_iterable(buf, window_coder)?;
+    let pair_count = decode_count(buf)?;
     let mut merged = Vec::with_capacity(pair_count + unmerged.len());
     for window in unmerged {
         merged.push(MergedWindows {
@@ -574,19 +643,14 @@ fn decode_merge_output(
         });
     }
     for _ in 0..pair_count {
-        let result = decode_window_from(&mut buf, window_coder);
-        let originals = decode_window_iterable(&mut buf, window_coder)?;
+        let result = decode_window_from(buf, window_coder);
+        let originals = decode_window_iterable(buf, window_coder)?;
         merged.push(MergedWindows {
             merged: result,
             originals,
         });
     }
-    ensure!(
-        !buf.has_remaining(),
-        "MergeWindows response left {} trailing byte(s)",
-        buf.remaining()
-    );
-    Ok(merged)
+    Ok((nonce, merged))
 }
 
 fn decode_count(buf: &mut impl Buf) -> anyhow::Result<usize> {
@@ -752,7 +816,10 @@ mod tests {
             &window_coder,
         );
 
-        let decoded = decode_merge_output(&bytes, nonce, &window_coder).unwrap();
+        let decoded = decode_merge_output_batch(&bytes, &window_coder).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].0, nonce);
+        let decoded = decoded[0].1.clone();
         assert_eq!(
             decoded,
             vec![
@@ -768,6 +835,38 @@ mod tests {
         );
         validate_merge_result(&[first.clone(), second.clone(), third.clone()], &decoded).unwrap();
         assert!(validate_merge_result(&[first, second, third, fourth], &decoded).is_err());
+    }
+
+    #[test]
+    fn merge_output_decodes_multiple_batch_elements() {
+        let (_, window_coder) = custom_window_coder();
+        let first_window = BeamWindow::Opaque {
+            coder_id: "window-inner".to_string(),
+            bytes: vec![1],
+        };
+        let second_window = BeamWindow::Opaque {
+            coder_id: "window-inner".to_string(),
+            bytes: vec![2],
+        };
+        let mut bytes = output_with_merge(
+            b"first",
+            std::slice::from_ref(&first_window),
+            &[],
+            &window_coder,
+        );
+        bytes.extend(output_with_merge(
+            b"second",
+            std::slice::from_ref(&second_window),
+            &[],
+            &window_coder,
+        ));
+
+        let decoded = decode_merge_output_batch(&bytes, &window_coder).unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].0, b"first");
+        assert_eq!(decoded[0].1[0].merged, first_window);
+        assert_eq!(decoded[1].0, b"second");
+        assert_eq!(decoded[1].1[0].merged, second_window);
     }
 
     #[test]
@@ -850,5 +949,21 @@ mod tests {
         );
         assert!(descriptor.coders.contains_key("window-outer"));
         assert!(descriptor.coders.contains_key("window-inner"));
+    }
+
+    #[test]
+    fn merge_cache_is_bounded() {
+        let mut cache = HashMap::new();
+        for index in 0..=MERGE_CACHE_MAX_ENTRIES {
+            insert_merge_cache(
+                &mut cache,
+                MergeCacheKey {
+                    strategy_id: "strategy".to_string(),
+                    windows: vec![index.to_string()],
+                },
+                Arc::new(Vec::new()),
+            );
+        }
+        assert_eq!(cache.len(), MERGE_CACHE_MAX_ENTRIES);
     }
 }

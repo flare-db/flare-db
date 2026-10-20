@@ -1,29 +1,29 @@
 use std::{
     collections::{BTreeMap, HashMap},
     io::Cursor,
-    panic::{catch_unwind, AssertUnwindSafe},
+    panic::{AssertUnwindSafe, catch_unwind},
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use anyhow::anyhow;
 use beam_model_rs::v1::{
-    elements, ApiServiceDescriptor, Coder, Components, Elements, FunctionSpec, PTransform,
-    ParDoPayload, ProcessBundleDescriptor, RemoteGrpcPort,
+    ApiServiceDescriptor, Coder, Components, Elements, FunctionSpec, PTransform, ParDoPayload,
+    ProcessBundleDescriptor, RemoteGrpcPort, elements,
 };
 use bytes::{Buf, BytesMut};
 use log::{debug, info};
 use prost::Message;
-use tokio::sync::{mpsc::UnboundedReceiver, Mutex};
+use tokio::sync::{Mutex, mpsc::UnboundedReceiver};
 
 use crate::{
     coders::{
-        length_prefix_pickled_leaves,
+        BeamCoder, StandardBeamCoders, length_prefix_pickled_leaves,
         primitives::{
             BeamWindow, PaneInfo, Timer as WireTimer, TimerCoder, WindowCoder, WindowedValue,
             WindowedValueCoder,
         },
-        resolve_length_prefixed_coder_id, BeamCoder, StandardBeamCoders,
+        resolve_length_prefixed_coder_id,
     },
     engine::timer::{TimeDomain, TimerEntry, TimerKey},
     engine::{
@@ -240,6 +240,10 @@ impl BundleRuntime {
         let pcollection_id = edge_metadata.produced_pcol_id.clone();
         let mut stream_ended = false;
         let mut total_decoded: usize = 0;
+        let progress_started = Instant::now();
+        let mut next_progress = 1_000_000usize;
+        let mut write_time = Duration::ZERO;
+        info!("Receiving output elements for {pcollection_id}");
 
         // One Paimon writer/committer per bundle: every decoded batch is
         // appended to a single table writer and committed exactly once, instead
@@ -300,6 +304,13 @@ impl BundleRuntime {
                                 stream_buffer.advance(consumed);
 
                                 total_decoded += 1;
+                                if total_decoded >= next_progress {
+                                    info!(
+                                        "Decoded {total_decoded} output elements for {pcollection_id} in {:?}",
+                                        progress_started.elapsed()
+                                    );
+                                    next_progress = (total_decoded / 1_000_000 + 1) * 1_000_000;
+                                }
                                 let value = match opaque_element {
                                     Some(raw) => BeamRecord::PRIMITIVE(PrimitiveValue::Bytes(raw)),
                                     None => windowed_value.value.clone(),
@@ -314,7 +325,9 @@ impl BundleRuntime {
                                     let batch_size = batch.len();
                                     let start = Instant::now();
                                     writer.write(std::mem::take(&mut batch)).await?;
-                                    batch_size_estimator.record(batch_size, start.elapsed());
+                                    let elapsed = start.elapsed();
+                                    write_time += elapsed;
+                                    batch_size_estimator.record(batch_size, elapsed);
                                     target_batch_size = batch_size_estimator.next_batch_size();
                                 }
                             }
@@ -361,13 +374,20 @@ impl BundleRuntime {
             let batch_size = batch.len();
             let start = Instant::now();
             writer.write(batch).await?;
-            batch_size_estimator.record(batch_size, start.elapsed());
+            let elapsed = start.elapsed();
+            write_time += elapsed;
+            batch_size_estimator.record(batch_size, elapsed);
         }
+        let commit_started = Instant::now();
         writer.commit().await?;
+        write_time += commit_started.elapsed();
 
         info!(
-            "Finished decoding output elements: {} total elements",
-            total_decoded
+            "Finished decoding output elements: {} total elements for {} in {:?} (paimon_write={:?})",
+            total_decoded,
+            pcollection_id,
+            progress_started.elapsed(),
+            write_time,
         );
 
         Ok(())

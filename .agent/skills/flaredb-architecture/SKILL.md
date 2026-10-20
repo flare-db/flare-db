@@ -109,8 +109,8 @@ FlareDB supports Beam's iterable materialization and multimap key/keyed-value re
 side-input producer PCollection
   → materialized as a Worker, Runner, or Splittable boundary output
   → PCollectionWriter writes logical element columns
-    + __flare_window_metadata (timestamp/windows/pane JSON)
-    + __flare_window_key (canonical window keys)
+    + flare_timestamp_millis (typed Beam timestamp)
+    + flare_window_key (canonical window keys)
   → producer bundle completes and releases the consumer's side-input barrier
   → StateRequest(StateKey.{IterableSideInput|MultimapKeysSideInput|MultimapSideInput|MultimapKeysValuesSideInput}, StateGet)
   → SideInputResolver maps (transform_id, side_input_id) to PCollection/coders

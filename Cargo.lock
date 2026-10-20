@@ -2355,6 +2355,7 @@ dependencies = [
  "arrow-flight",
  "arrow-ipc",
  "arrow-schema",
+ "arrow-select",
  "async-trait",
  "beam-model-rs",
  "bytes 1.12.1",

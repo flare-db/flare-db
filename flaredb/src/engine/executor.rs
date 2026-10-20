@@ -14,8 +14,8 @@ use crate::{
             data::{DataKey, TimersKey},
         },
         runtime::{
-            runner_consumer_transform_id, runner_output_pcollection_id, stage_sink_transform_id,
-            stage_source_transform_id, stage_timer_endpoints, BundleRuntime,
+            BundleRuntime, runner_consumer_transform_id, runner_output_pcollection_id,
+            stage_sink_transform_id, stage_source_transform_id, stage_timer_endpoints,
         },
     },
     fusion::pipeline::{ConsumerMetaData, ExecutableNode},
@@ -272,7 +272,7 @@ impl StageExecutor {
 
                                 let timeout_id = instruction_id.clone();
                                 let input_error_id = instruction_id.clone();
-                                let proces_bundle_response = crate::engine::liveness::idle_guard(
+                                let proces_bundle_response = crate::engine::guard::idle_guard(
                                     async {
                                         tokio::pin!(bundle_response_future);
                                         let mut watch_input = true;
@@ -314,7 +314,7 @@ impl StageExecutor {
                                             }
                                         }
                                     },
-                                    Duration::from_secs(60),
+                                    crate::engine::guard::worker_idle_timeout(),
                                     &format!(
                                         "waiting for SDK bundle {} output data and control response",
                                         timeout_id
@@ -329,7 +329,7 @@ impl StageExecutor {
 
                             let timeout_id = instruction_id.clone();
                             let input_error_id = instruction_id.clone();
-                            let proces_bundle_response = crate::engine::liveness::idle_guard(
+                            let proces_bundle_response = crate::engine::guard::idle_guard(
                                 async {
                                     tokio::pin!(bundle_response_future);
                                     let mut watch_input = true;
@@ -352,7 +352,7 @@ impl StageExecutor {
                                         }
                                     }
                                 },
-                                Duration::from_secs(60),
+                                crate::engine::guard::worker_idle_timeout(),
                                 &format!("waiting for SDK bundle {} control response", timeout_id),
                             )
                             .await?;

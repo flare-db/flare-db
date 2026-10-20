@@ -385,10 +385,9 @@ impl WindowedValue {
 /// Interval bounds are expressed in milliseconds since the Unix epoch and use
 /// Beam's half-open interval convention: `[start_millis, end_millis)`.
 ///
-/// Derives `serde` so a window can be round-tripped through the JSON-encoded
-/// window metadata persisted by the element store, and `Hash`/`Eq` so it can
-/// participate in a grouping key (for example `GroupByKey`'s `(key, window)`
-/// identity).
+/// Derives `Hash`/`Eq` so a window can participate in a grouping key (for
+/// example `GroupByKey`'s `(key, window)` identity). The `serde` derives remain
+/// available to callers but are no longer used for PCollection window storage.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum BeamWindow {
     /// The single global window.
@@ -422,13 +421,10 @@ impl BeamWindow {
         }
     }
 
-    /// A compact, deterministic string identity for this window.
+    /// A deterministic, human-readable string identity for this window.
     ///
-    /// The element store persists one such key per window in the reserved
-    /// `__flare_window_key` column so runner-native transforms (for example
-    /// `GroupByKey`) can group by window in the query engine instead of decoding
-    /// the JSON metadata per element. Use [`Self::from_canonical_key`] to recover
-    /// the window.
+    /// The element store uses `to_binary_key` for its hot path. These
+    /// string helpers remain as a stable diagnostic and compatibility API.
     pub fn canonical_key(&self) -> String {
         match self {
             BeamWindow::Global => "global".to_string(),
@@ -464,6 +460,81 @@ impl BeamWindow {
             end_millis: end.parse().ok()?,
         })
     }
+
+    /// Encodes this window as a compact, deterministic binary identity.
+    ///
+    /// Interval bounds are encoded in lexicographically ordered form so
+    /// DataFusion can sort binary window keys without decoding them. Opaque
+    /// custom-window bytes are retained verbatim and are not interpreted by the
+    /// runner.
+    pub(crate) fn to_binary_key(&self) -> Vec<u8> {
+        match self {
+            BeamWindow::Global => vec![0],
+            BeamWindow::Interval {
+                start_millis,
+                end_millis,
+            } => {
+                let mut encoded = Vec::with_capacity(17);
+                encoded.push(1);
+                encoded.extend_from_slice(&ordered_i64_bytes(*start_millis));
+                encoded.extend_from_slice(&ordered_i64_bytes(*end_millis));
+                encoded
+            }
+            BeamWindow::Opaque { coder_id, bytes } => {
+                let coder_id = coder_id.as_bytes();
+                let coder_len =
+                    u32::try_from(coder_id.len()).expect("Beam window coder id exceeds u32 length");
+                let mut encoded = Vec::with_capacity(
+                    1 + std::mem::size_of::<u32>() + coder_id.len() + bytes.len(),
+                );
+                encoded.push(2);
+                encoded.extend_from_slice(&coder_len.to_be_bytes());
+                encoded.extend_from_slice(coder_id);
+                encoded.extend_from_slice(bytes);
+                encoded
+            }
+        }
+    }
+
+    /// Decodes a key produced by [`Self::to_binary_key`].
+    ///
+    /// Malformed input is rejected rather than guessed so stored metadata cannot
+    /// silently change Beam grouping semantics.
+    pub(crate) fn from_binary_key(key: &[u8]) -> Option<Self> {
+        match key.split_first() {
+            Some((0, [])) => Some(BeamWindow::Global),
+            Some((1, bounds)) if bounds.len() == 16 => {
+                let start = ordered_i64_from_bytes(&bounds[..8])?;
+                let end = ordered_i64_from_bytes(&bounds[8..])?;
+                Some(BeamWindow::Interval {
+                    start_millis: start,
+                    end_millis: end,
+                })
+            }
+            Some((2, opaque)) if opaque.len() >= 4 => {
+                let coder_len = u32::from_be_bytes(opaque[..4].try_into().ok()?) as usize;
+                let coder_end = 4usize.checked_add(coder_len)?;
+                if coder_end > opaque.len() {
+                    return None;
+                }
+                let coder_id = std::str::from_utf8(&opaque[4..coder_end]).ok()?;
+                Some(BeamWindow::Opaque {
+                    coder_id: coder_id.to_string(),
+                    bytes: opaque[coder_end..].to_vec(),
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+fn ordered_i64_bytes(value: i64) -> [u8; 8] {
+    ((value as u64) ^ (1u64 << 63)).to_be_bytes()
+}
+
+fn ordered_i64_from_bytes(bytes: &[u8]) -> Option<i64> {
+    let encoded = u64::from_be_bytes(bytes.try_into().ok()?);
+    Some((encoded ^ (1u64 << 63)) as i64)
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -499,12 +570,21 @@ pub enum PaneTiming {
 }
 
 impl PaneTiming {
-    fn from_bits(bits: u8) -> Self {
+    pub(crate) fn from_bits(bits: u8) -> Self {
         match bits {
             0 => PaneTiming::Early,
             1 => PaneTiming::OnTime,
             2 => PaneTiming::Late,
             _ => PaneTiming::Unknown,
+        }
+    }
+
+    pub(crate) fn bits(self) -> u8 {
+        match self {
+            PaneTiming::Early => 0,
+            PaneTiming::OnTime => 1,
+            PaneTiming::Late => 2,
+            PaneTiming::Unknown => 3,
         }
     }
 }
@@ -513,8 +593,8 @@ impl PaneTiming {
 ///
 /// Fields mirror the portable `PaneInfo` message and describe how a particular
 /// firing of a window relates to the whole (first/last, timing, and indices).
-/// Derives `serde` so it can round-trip through the store's JSON window
-/// metadata.
+/// The `serde` derives remain available to callers but are no longer used for
+/// PCollection window storage.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PaneInfo {
     pub is_first: bool,
@@ -1551,7 +1631,9 @@ mod tests {
         // IntervalWindowCoder is end timestamp followed by unsigned span.
         assert_eq!(
             &buf[8..23],
-            &[0, 0, 0, 1, 0x80, 0, 0, 0, 0, 0, 0xea, 0x60, 0xe0, 0xd4, 0x03,]
+            &[
+                0, 0, 0, 1, 0x80, 0, 0, 0, 0, 0, 0xea, 0x60, 0xe0, 0xd4, 0x03,
+            ]
         );
 
         let mut bytes = buf.freeze();
@@ -1575,7 +1657,9 @@ mod tests {
         );
         assert_eq!(
             encoded.as_ref(),
-            &[0, 0, 0, 1, 0x80, 0x00, 0x01, 0x52, 0x9a, 0xa4, 0x9b, 0x68, 0x80, 0xdd, 0xdb, 0x01,]
+            &[
+                0, 0, 0, 1, 0x80, 0x00, 0x01, 0x52, 0x9a, 0xa4, 0x9b, 0x68, 0x80, 0xdd, 0xdb, 0x01,
+            ]
         );
 
         let mut bytes = encoded.freeze();
@@ -1948,6 +2032,61 @@ mod beam_wire_tests {
         assert_eq!(decoded.windows, vec![window]);
         assert_eq!(decoded.pane, value.pane);
         assert_eq!(decoded.value, value.value);
+    }
+
+    #[test]
+    fn binary_window_keys_roundtrip_and_order_intervals() {
+        let windows = vec![
+            BeamWindow::Global,
+            BeamWindow::Interval {
+                start_millis: -10,
+                end_millis: 5,
+            },
+            BeamWindow::Interval {
+                start_millis: 0,
+                end_millis: 5,
+            },
+            BeamWindow::Interval {
+                start_millis: 0,
+                end_millis: 10,
+            },
+            BeamWindow::Opaque {
+                coder_id: "CustomWindowCoder".to_string(),
+                bytes: vec![0, 255, 16, 32],
+            },
+        ];
+
+        let encoded = windows
+            .iter()
+            .map(BeamWindow::to_binary_key)
+            .collect::<Vec<_>>();
+        for (window, key) in windows.iter().zip(&encoded) {
+            assert_eq!(BeamWindow::from_binary_key(key), Some(window.clone()));
+        }
+
+        assert!(encoded[1] < encoded[2]);
+        assert!(encoded[2] < encoded[3]);
+        assert_eq!(
+            windows[4].to_binary_key()[1..5],
+            ("CustomWindowCoder".len() as u32).to_be_bytes()
+        );
+        assert!(windows[4].to_binary_key().ends_with(&[0, 255, 16, 32]));
+    }
+
+    #[test]
+    fn malformed_binary_window_keys_are_rejected() {
+        for key in [
+            vec![],
+            vec![0, 1],
+            vec![1],
+            vec![1; 16],
+            vec![2],
+            vec![2, 0, 0],
+            vec![2, 0, 0, 0, 2, b'x'],
+            vec![9],
+        ] {
+            assert_eq!(BeamWindow::from_binary_key(&key), None);
+        }
     }
 }
 

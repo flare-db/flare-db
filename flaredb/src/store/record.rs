@@ -2,9 +2,9 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use arrow_array::{
-    Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Float64Array, Int64Array,
-    LargeBinaryArray, LargeStringArray, ListArray, NullArray, RecordBatch, StringArray,
-    StringViewArray, StructArray, builder::BooleanBuilder,
+    Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, FixedSizeListArray, Float64Array,
+    Int64Array, LargeBinaryArray, LargeListArray, LargeStringArray, ListArray, MapArray, NullArray,
+    RecordBatch, StringArray, StringViewArray, StructArray, builder::BooleanBuilder,
 };
 use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema, TimeUnit};
@@ -268,14 +268,10 @@ pub struct RecordTableSchema {
 
 /// The persisted form of Beam window metadata, independent of an element's logical coder.
 ///
-/// The element's table row stores this metadata in the reserved
-/// `__flare_window_metadata` binary column as JSON. This separates Beam's
-/// execution metadata from the logical element columns while keeping both in
-/// the same persisted row.
-///
-/// Both this type and its nested [`BeamWindow`]/[`PaneInfo`] values derive
-/// `serde`, so the JSON layout stays stable as long as those deriving types keep
-/// their variant and field names.
+/// The element store persists these fields as typed Arrow columns. This keeps
+/// Beam execution metadata distinguishable from logical element columns while
+/// allowing Parquet and DataFusion to operate on timestamps, pane fields, and
+/// window identities without parsing a per-row JSON document.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WindowMetadata {
     /// Event timestamp in milliseconds since the Unix epoch.
@@ -284,6 +280,27 @@ pub struct WindowMetadata {
     pub windows: Vec<BeamWindow>,
     /// Beam pane timing and firing indices.
     pub pane: PaneInfo,
+}
+
+impl WindowMetadata {
+    /// The latest finite window boundary, or `None` when any window is opaque.
+    ///
+    /// This is the element-level upper bound used by optional window pruning:
+    /// an element cannot belong to a wholly finite window range beyond this
+    /// timestamp. Opaque SDK windows deliberately have no inferred bound.
+    pub fn max_finite_window_end_millis(&self) -> Option<i64> {
+        if self.windows.is_empty() {
+            return None;
+        }
+        self.windows
+            .iter()
+            .try_fold(i64::MIN, |latest, window| match window {
+                BeamWindow::Opaque { .. } => None,
+                BeamWindow::Global | BeamWindow::Interval { .. } => {
+                    Some(latest.max(window.max_timestamp_millis()))
+                }
+            })
+    }
 }
 
 impl From<&WindowedValue> for WindowMetadata {
@@ -1189,39 +1206,163 @@ pub fn record_batch_to_beamrecords(
     Ok(records)
 }
 
-/// Paimon cannot store Arrow `Null`. Rewrite top-level `Null` columns as
-/// nullable `Boolean` columns where every value is null. This is a lossless
-/// surrogate for `PrimitiveValue::Void`.
+/// Rewrites logical Arrow `Null` types to the nullable Boolean surrogate Paimon
+/// uses for `PrimitiveValue::Void`, including nested list, struct, map, and
+/// fixed-size-list children.
+pub fn materialize_void_schema(schema: &Schema) -> Schema {
+    Schema::new_with_metadata(
+        schema
+            .fields()
+            .iter()
+            .map(|field| Arc::new(materialize_void_field(field)))
+            .collect::<Vec<_>>(),
+        schema.metadata().clone(),
+    )
+}
+
+/// Paimon cannot store Arrow `Null`. Rewrite every logical `Null` array,
+/// including nested children, as all-null nullable `Boolean` values. Null cells
+/// decode back to `PrimitiveValue::Void`.
 pub fn materialize_void_columns(batch: RecordBatch) -> Result<RecordBatch> {
     let schema = batch.schema();
-    let mut new_fields = Vec::new();
-    let mut new_columns: Vec<ArrayRef> = Vec::new();
-    let mut modified = false;
-
-    for (i, field) in schema.fields().iter().enumerate() {
-        if field.data_type() == &ArrowDataType::Null {
-            modified = true;
-            new_fields.push(Arc::new(ArrowField::new(
-                field.name(),
-                ArrowDataType::Boolean,
-                true,
-            )));
-            let nulls = Some(NullBuffer::new_null(batch.num_rows()));
-            let values = BooleanBuffer::new_unset(batch.num_rows());
-            new_columns.push(Arc::new(BooleanArray::new(values, nulls)));
-        } else {
-            new_fields.push(field.clone());
-            new_columns.push(batch.column(i).clone());
-        }
-    }
-
-    if !modified {
+    let new_schema = Arc::new(materialize_void_schema(&schema));
+    if new_schema == schema {
         return Ok(batch);
     }
-
-    let new_schema = Arc::new(Schema::new(new_fields));
+    let new_columns = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, field)| materialize_void_array(batch.column(i), field.data_type()))
+        .collect::<Result<Vec<_>>>()?;
     RecordBatch::try_new(new_schema, new_columns)
-        .context("failed to materialize Null columns for Paimon storage")
+        .map_err(|error| anyhow!("failed to materialize Null columns for Paimon storage: {error}"))
+}
+
+fn materialize_void_field(field: &ArrowField) -> ArrowField {
+    let nullable = field.is_nullable() || field.data_type() == &ArrowDataType::Null;
+    field
+        .clone()
+        .with_data_type(materialize_void_type(field.data_type()))
+        .with_nullable(nullable)
+}
+
+fn materialize_void_type(data_type: &ArrowDataType) -> ArrowDataType {
+    match data_type {
+        ArrowDataType::Null => ArrowDataType::Boolean,
+        ArrowDataType::List(field) => ArrowDataType::List(Arc::new(materialize_void_field(field))),
+        ArrowDataType::LargeList(field) => {
+            ArrowDataType::LargeList(Arc::new(materialize_void_field(field)))
+        }
+        ArrowDataType::FixedSizeList(field, size) => {
+            ArrowDataType::FixedSizeList(Arc::new(materialize_void_field(field)), *size)
+        }
+        ArrowDataType::Struct(fields) => ArrowDataType::Struct(
+            fields
+                .iter()
+                .map(|field| Arc::new(materialize_void_field(field)))
+                .collect(),
+        ),
+        ArrowDataType::Map(entries, sorted) => {
+            ArrowDataType::Map(Arc::new(materialize_void_field(entries)), *sorted)
+        }
+        other => other.clone(),
+    }
+}
+
+fn materialize_void_array(array: &ArrayRef, data_type: &ArrowDataType) -> Result<ArrayRef> {
+    match data_type {
+        ArrowDataType::Null => {
+            let values = BooleanBuffer::new_unset(array.len());
+            let nulls = Some(NullBuffer::new_null(array.len()));
+            Ok(Arc::new(BooleanArray::new(values, nulls)))
+        }
+        ArrowDataType::List(field) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .ok_or_else(|| anyhow!("expected ListArray while materializing Void columns"))?;
+            let child = materialize_void_array(values.values(), field.data_type())?;
+            Ok(Arc::new(ListArray::new(
+                Arc::new(materialize_void_field(field)),
+                values.offsets().clone(),
+                child,
+                values.nulls().cloned(),
+            )))
+        }
+        ArrowDataType::LargeList(field) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<LargeListArray>()
+                .ok_or_else(|| {
+                    anyhow!("expected LargeListArray while materializing Void columns")
+                })?;
+            let child = materialize_void_array(values.values(), field.data_type())?;
+            Ok(Arc::new(LargeListArray::new(
+                Arc::new(materialize_void_field(field)),
+                values.offsets().clone(),
+                child,
+                values.nulls().cloned(),
+            )))
+        }
+        ArrowDataType::FixedSizeList(field, size) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .ok_or_else(|| {
+                    anyhow!("expected FixedSizeListArray while materializing Void columns")
+                })?;
+            let child = materialize_void_array(values.values(), field.data_type())?;
+            Ok(Arc::new(FixedSizeListArray::new(
+                Arc::new(materialize_void_field(field)),
+                *size,
+                child,
+                values.nulls().cloned(),
+            )))
+        }
+        ArrowDataType::Struct(fields) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .ok_or_else(|| anyhow!("expected StructArray while materializing Void columns"))?;
+            let children = fields
+                .iter()
+                .enumerate()
+                .map(|(i, field)| materialize_void_array(values.column(i), field.data_type()))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Arc::new(StructArray::try_new(
+                fields
+                    .iter()
+                    .map(|field| Arc::new(materialize_void_field(field)))
+                    .collect(),
+                children,
+                values.nulls().cloned(),
+            )?))
+        }
+        ArrowDataType::Map(entries, sorted) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<MapArray>()
+                .ok_or_else(|| anyhow!("expected MapArray while materializing Void columns"))?;
+            let entries_array = materialize_void_array(
+                &(Arc::new(values.entries().clone()) as ArrayRef),
+                entries.data_type(),
+            )?;
+            let entries_array = entries_array
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .ok_or_else(|| anyhow!("materialized map entries must remain a struct"))?
+                .clone();
+            Ok(Arc::new(MapArray::new(
+                Arc::new(materialize_void_field(entries)),
+                values.offsets().clone(),
+                entries_array,
+                values.nulls().cloned(),
+                *sorted,
+            )))
+        }
+        _ => Ok(array.clone()),
+    }
 }
 
 /// Convert Arrow fields to Paimon [`DataField`]s with auto-assigned IDs starting from 0.
@@ -1548,6 +1689,78 @@ mod tests {
         // Same "logical" content, different variant -> not equal.
         assert_ne!(i(1), PrimitiveValue::Bool(true));
         assert_ne!(s("1"), i(1));
+    }
+
+    #[test]
+    fn materialize_void_columns_rewrites_nested_null_types() {
+        let void = Arc::new(NullArray::new(2)) as ArrayRef;
+        let iterable = iterable_values_to_array(
+            &[
+                IterableValue::from_records(vec![BeamRecord::PRIMITIVE(PrimitiveValue::Void)]),
+                IterableValue::from_records(Vec::new()),
+            ],
+            &ArrowDataType::Null,
+        )
+        .unwrap();
+        let struct_fields = vec![
+            Arc::new(ArrowField::new("void", ArrowDataType::Null, true)),
+            Arc::new(ArrowField::new("flag", ArrowDataType::Boolean, true)),
+        ];
+        let struct_values = StructArray::try_new(
+            struct_fields.into(),
+            vec![
+                void.clone(),
+                Arc::new(BooleanArray::from(vec![Some(true), None])),
+            ],
+            None,
+        )
+        .unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            ArrowField::new("void", ArrowDataType::Null, false),
+            ArrowField::new(
+                "iterable",
+                ArrowDataType::List(Arc::new(ArrowField::new("item", ArrowDataType::Null, true))),
+                true,
+            ),
+            ArrowField::new("nested", struct_values.data_type().clone(), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![void, iterable, Arc::new(struct_values) as ArrayRef],
+        )
+        .unwrap();
+
+        let batch = materialize_void_columns(batch).unwrap();
+        assert_eq!(
+            batch.schema().field_with_name("void").unwrap().data_type(),
+            &ArrowDataType::Boolean
+        );
+        assert!(
+            batch
+                .schema()
+                .field_with_name("void")
+                .unwrap()
+                .is_nullable()
+        );
+        let materialized_schema = batch.schema();
+        let ArrowDataType::List(item) = materialized_schema
+            .field_with_name("iterable")
+            .unwrap()
+            .data_type()
+        else {
+            panic!("expected list");
+        };
+        assert_eq!(item.data_type(), &ArrowDataType::Boolean);
+        let ArrowDataType::Struct(fields) = materialized_schema
+            .field_with_name("nested")
+            .unwrap()
+            .data_type()
+        else {
+            panic!("expected struct");
+        };
+        assert_eq!(fields[0].data_type(), &ArrowDataType::Boolean);
+        assert!(fields[0].is_nullable());
+        assert_eq!(batch.column_by_name("void").unwrap().null_count(), 2);
     }
 
     // TableType

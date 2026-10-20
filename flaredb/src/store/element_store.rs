@@ -2,12 +2,13 @@ use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{Result, anyhow};
 use arrow_array::{
-    Array, BinaryArray, RecordBatch,
-    builder::{ListBuilder, StringBuilder},
+    Array, BinaryArray, BooleanArray, Int8Array, Int16Array, Int64Array, ListArray, RecordBatch,
+    builder::{BinaryBuilder, ListBuilder},
 };
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use dashmap::DashMap;
 use paimon::spec::Schema as PaimonSchema;
+use paimon::spec::{Datum, Predicate, PredicateBuilder};
 use paimon::{
     Catalog, CatalogOptions, FileSystemCatalog, IncrementalScanMode, Options, Table, TableWrite,
     catalog::Identifier, table::ArrowRecordBatchStream,
@@ -15,7 +16,7 @@ use paimon::{
 use tokio_stream::StreamExt;
 
 use crate::{
-    coders::primitives::WindowedValue,
+    coders::primitives::{BeamWindow, PaneInfo, PaneTiming, WindowedValue},
     engine::kv::{KvStore, SlateKvStore},
     store::record::{
         BeamRecord, RecordTableSchema, WindowMetadata, arrow_fields_to_paimon,
@@ -138,26 +139,24 @@ impl FlareElementStore {
     /// The table schema is derived from the first batch written to a PCollection
     /// and cached in the registry.
     pub async fn write_beamrecord_batch(&self, req: NewCollectionRequest) -> Result<()> {
-        let table_schema = match self.registry.get(&req.pcollection_id) {
-            Some(ts) => ts,
-            None => {
-                let ts = Arc::new(derive_table_schema(&req.pcollection_id, &req.elements)?);
-                self.registry.register(&req.pcollection_id, ts.clone());
-                ts
-            }
-        };
-
-        let batch = beamrecords_to_record_batch(&req.elements, &table_schema)?;
-
+        let logical_schema = derive_table_schema(&req.pcollection_id, &req.elements)?;
+        let batch = beamrecords_to_record_batch(&req.elements, &logical_schema)?;
+        let batch = materialize_void_columns(batch)?;
+        let table_schema = Arc::new(RecordTableSchema {
+            table_type: logical_schema.table_type,
+            arrow_schema: batch.schema(),
+            has_windowed_metadata: false,
+        });
+        self.registry
+            .register_if_absent(&req.pcollection_id, table_schema.clone());
         self.ingest_batch(&req.pcollection_id, table_schema, batch)
             .await
     }
 
     /// Persists decoded [`WindowedValue`]s, writing each element's logical payload
-    /// and its Beam window metadata (timestamp, windows, pane) into the same row.
-    /// Metadata is stored in the reserved `__flare_window_metadata` column, so
-    /// [`scan_windowed_values`](Self::scan_windowed_values) can restore the full
-    /// `WindowedValue`; row `i` of the metadata always belongs to element `i`.
+    /// and its Beam window metadata into typed reserved columns in the same row.
+    /// [`scan_windowed_values`](Self::scan_windowed_values) reconstructs the full
+    /// `WindowedValue`; every metadata field in row `i` belongs to element `i`.
     ///
     /// No-op for empty input, which also avoids deriving a schema from zero rows.
     /// When the PCollection was written before, its cached schema is reused with
@@ -190,26 +189,10 @@ impl FlareElementStore {
         values: &[WindowedValue],
     ) -> Result<(RecordBatch, Arc<RecordTableSchema>)> {
         let records: Vec<BeamRecord> = values.iter().map(|value| value.value.clone()).collect();
-        let base_schema = match self.registry.get(pcollection_id) {
-            Some(schema) if schema.has_windowed_metadata => RecordTableSchema {
-                table_type: schema.table_type,
-                arrow_schema: Arc::new(ArrowSchema::new(
-                    schema
-                        .arrow_schema
-                        .fields()
-                        .iter()
-                        .filter(|field| !is_reserved_window_column(field.name()))
-                        .map(|field| field.as_ref().clone())
-                        .collect::<Vec<_>>(),
-                )),
-                has_windowed_metadata: false,
-            },
-            Some(schema) => (*schema).clone(),
-            None => derive_table_schema(pcollection_id, &records)?,
-        };
+        let base_schema = derive_table_schema(pcollection_id, &records)?;
         let base_batch = beamrecords_to_record_batch(&records, &base_schema)?;
         let metadata: Vec<WindowMetadata> = values.iter().map(WindowMetadata::from).collect();
-        let batch = append_window_metadata(base_batch, &metadata)?;
+        let batch = materialize_void_columns(append_window_metadata(base_batch, &metadata)?)?;
         let schema = Arc::new(RecordTableSchema {
             table_type: base_schema.table_type,
             arrow_schema: batch.schema(),
@@ -245,33 +228,14 @@ impl FlareElementStore {
             ));
         }
         let metadata: Vec<WindowMetadata> = metadata.iter().map(WindowMetadata::from).collect();
-        let base_schema = match self.registry.get(pcollection_id) {
-            Some(schema) if schema.has_windowed_metadata => RecordTableSchema {
-                table_type: schema.table_type,
-                arrow_schema: Arc::new(ArrowSchema::new(
-                    schema
-                        .arrow_schema
-                        .fields()
-                        .iter()
-                        .filter(|field| !is_reserved_window_column(field.name()))
-                        .map(|field| field.as_ref().clone())
-                        .collect::<Vec<_>>(),
-                )),
-                has_windowed_metadata: false,
-            },
-            _ => (*table_schema).clone(),
-        };
-        let batch = if batch
-            .schema()
-            .field_with_name(WINDOW_METADATA_COLUMN)
-            .is_ok()
-        {
+        let batch = if has_typed_window_metadata(&batch.schema()) {
             batch
         } else {
             append_window_metadata(batch, &metadata)?
         };
+        let batch = materialize_void_columns(batch)?;
         let schema = Arc::new(RecordTableSchema {
-            table_type: base_schema.table_type,
+            table_type: table_schema.table_type,
             arrow_schema: batch.schema(),
             has_windowed_metadata: true,
         });
@@ -317,27 +281,7 @@ impl FlareElementStore {
         let mut values = Vec::new();
         while let Some(batch) = stream.next().await {
             let batch = batch?;
-            let records = record_batch_to_beamrecords(&batch, &table_schema)?;
-            if !table_schema.has_windowed_metadata {
-                values.extend(records.into_iter().map(WindowedValue::global));
-                continue;
-            }
-            let column = batch
-                .column_by_name(WINDOW_METADATA_COLUMN)
-                .ok_or_else(|| anyhow!("missing {WINDOW_METADATA_COLUMN} column"))?;
-            let encoded = column
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .ok_or_else(|| anyhow!("{WINDOW_METADATA_COLUMN} must be a binary column"))?;
-            for (row, value) in records.into_iter().enumerate() {
-                let metadata: WindowMetadata = serde_json::from_slice(encoded.value(row))?;
-                values.push(WindowedValue {
-                    value,
-                    timestamp_millis: metadata.timestamp_millis,
-                    windows: metadata.windows,
-                    pane: metadata.pane,
-                });
-            }
+            values.extend(windowed_values_from_batch(&batch, &table_schema)?);
         }
         Ok(values)
     }
@@ -454,10 +398,58 @@ impl FlareElementStore {
     /// Shared by [`Self::read_incremental_batches`] (which collects) and
     /// [`Self::stream_windowed_values_since`] (which streams), so both follow
     /// identical snapshot-range planning.
-    async fn open_incremental_arrow(
+    pub(crate) async fn open_incremental_arrow(
         &self,
         pcollection_id: &str,
         cursor: Option<i64>,
+    ) -> Result<(Option<ArrowRecordBatchStream>, Option<i64>)> {
+        self.open_incremental_arrow_projected(pcollection_id, cursor, None)
+            .await
+    }
+
+    /// Open an incremental read with an optional pushed-down column projection.
+    ///
+    /// Paimon applies the projection while planning and reading Parquet, so
+    /// consumers such as GroupByKey avoid loading metadata columns they do not
+    /// need. Output column order follows `projection`.
+    pub(crate) async fn open_incremental_arrow_projected(
+        &self,
+        pcollection_id: &str,
+        cursor: Option<i64>,
+        projection: Option<&[&str]>,
+    ) -> Result<(Option<ArrowRecordBatchStream>, Option<i64>)> {
+        self.open_incremental_arrow_planned(pcollection_id, cursor, projection, None)
+            .await
+    }
+
+    /// Open an incremental read while pruning elements whose finite windows all
+    /// ended at or before `window_prune_before`.
+    ///
+    /// Rows with an unknown bound, including opaque SDK windows, are retained.
+    /// Callers must separately prove that the supplied watermark/lateness
+    /// horizon makes this pruning valid for their trigger and accumulation mode.
+    pub(crate) async fn open_incremental_arrow_pruned_before(
+        &self,
+        pcollection_id: &str,
+        cursor: Option<i64>,
+        projection: Option<&[&str]>,
+        window_prune_before: i64,
+    ) -> Result<(Option<ArrowRecordBatchStream>, Option<i64>)> {
+        self.open_incremental_arrow_planned(
+            pcollection_id,
+            cursor,
+            projection,
+            Some(window_prune_before),
+        )
+        .await
+    }
+
+    async fn open_incremental_arrow_planned(
+        &self,
+        pcollection_id: &str,
+        cursor: Option<i64>,
+        projection: Option<&[&str]>,
+        window_prune_before: Option<i64>,
     ) -> Result<(Option<ArrowRecordBatchStream>, Option<i64>)> {
         let identifier = self.table_identifier(pcollection_id);
         let table = match self.catalog.get_table(&identifier).await {
@@ -478,7 +470,17 @@ impl FlareElementStore {
             return Ok((None, Some(latest)));
         }
 
-        let read_builder = table.new_read_builder();
+        let mut read_builder = table.new_read_builder();
+        if let Some(projection) = projection {
+            read_builder.with_projection(projection)?;
+        }
+        if let Some(cutoff) = window_prune_before {
+            let predicate_builder = PredicateBuilder::new(table.schema().fields());
+            let finite_after =
+                predicate_builder.greater_than(WINDOW_MAX_END_COLUMN, Datum::Long(cutoff))?;
+            let unknown_end = predicate_builder.is_null(WINDOW_MAX_END_COLUMN)?;
+            read_builder.with_filter(Predicate::or(vec![finite_after, unknown_end]));
+        }
         let plan = read_builder
             .new_incremental_scan(IncrementalScanMode::Auto, start, latest)
             .plan()
@@ -903,36 +905,48 @@ impl WindowedValueStream {
     }
 }
 
-/// Reserved Paimon column holding a JSON-encoded [`WindowMetadata`] per row.
+/// Reserved typed Arrow columns holding Beam timestamp and pane metadata.
 ///
-/// The column is appended to every windowed PCollection's Arrow schema as a
-/// non-null `Binary` column and lives alongside the logical element columns, so
-/// an element's Beam execution metadata travels with its payload. The name is
-/// namespaced with a `__flare_` prefix to avoid colliding with user Beam field
-/// names.
-const WINDOW_METADATA_COLUMN: &str = "__flare_window_metadata";
+/// These fields used to be packed into one JSON binary column. Storing them as
+/// native Arrow values makes them visible to Parquet encodings, DataFusion
+/// predicates, and column projection while preserving one row per element.
+pub(crate) const WINDOW_TIMESTAMP_COLUMN: &str = "flare_timestamp_millis";
+pub(crate) const WINDOW_MAX_END_COLUMN: &str = "flare_max_window_end_millis";
+pub(crate) const WINDOW_PANE_TIMING_COLUMN: &str = "flare_pane_timing";
+pub(crate) const WINDOW_PANE_INDEX_COLUMN: &str = "flare_pane_index";
+pub(crate) const WINDOW_PANE_NON_SPECULATIVE_INDEX_COLUMN: &str =
+    "flare_pane_non_speculative_index";
+pub(crate) const WINDOW_PANE_IS_FIRST_COLUMN: &str = "flare_pane_is_first";
+pub(crate) const WINDOW_PANE_IS_LAST_COLUMN: &str = "flare_pane_is_last";
 
-/// Reserved Paimon column holding one canonical window key per element window.
+/// Reserved Paimon column holding the element's first window identity.
 ///
-/// Stored as a `List<Utf8>` so a runner-native transform can `unnest` it and
-/// group by `(key, window)` inside the query engine (see
-/// [`BeamWindow::canonical_key`](crate::coders::primitives::BeamWindow::canonical_key))
-/// rather than decoding every element's JSON metadata in memory. The column is
-/// written together with [`WINDOW_METADATA_COLUMN`] and carries the same window
-/// information in a form that is directly groupable.
-pub(crate) const WINDOW_KEY_COLUMN: &str = "__flare_window_key";
+/// Most Beam elements have one window. Keeping that identity as a scalar avoids
+/// list expansion on the GBK hot path while preserving exact window bytes.
+pub(crate) const WINDOW_KEY_COLUMN: &str = "flare_window_key";
+/// Remaining window identities after [`WINDOW_KEY_COLUMN`], in original order.
+pub(crate) const WINDOW_EXTRA_KEYS_COLUMN: &str = "flare_extra_window_keys";
+/// Number of windows carried by the element.
+pub(crate) const WINDOW_COUNT_COLUMN: &str = "flare_window_count";
 
-/// True for the reserved columns the store appends to windowed PCollections.
-///
-/// Used to strip them when reconstructing the logical element schema so they are
-/// never treated as user fields and never duplicated across successive writes.
-fn is_reserved_window_column(name: &str) -> bool {
-    name == WINDOW_METADATA_COLUMN || name == WINDOW_KEY_COLUMN
+fn has_typed_window_metadata(schema: &ArrowSchema) -> bool {
+    [
+        WINDOW_TIMESTAMP_COLUMN,
+        WINDOW_MAX_END_COLUMN,
+        WINDOW_PANE_TIMING_COLUMN,
+        WINDOW_PANE_INDEX_COLUMN,
+        WINDOW_PANE_NON_SPECULATIVE_INDEX_COLUMN,
+        WINDOW_PANE_IS_FIRST_COLUMN,
+        WINDOW_PANE_IS_LAST_COLUMN,
+        WINDOW_KEY_COLUMN,
+        WINDOW_EXTRA_KEYS_COLUMN,
+        WINDOW_COUNT_COLUMN,
+    ]
+    .into_iter()
+    .all(|name| schema.field_with_name(name).is_ok())
 }
 
-/// Appends the reserved [`WINDOW_METADATA_COLUMN`] and [`WINDOW_KEY_COLUMN`] to
-/// `batch`, encoding one [`WindowMetadata`] per row and one canonical window key
-/// per element window.
+/// Appends typed window metadata and canonical window keys to `batch`.
 ///
 /// Fails when `metadata` does not have exactly one entry per batch row, so a
 /// caller can never persist a batch whose metadata columns are misaligned.
@@ -944,24 +958,52 @@ fn append_window_metadata(batch: RecordBatch, metadata: &[WindowMetadata]) -> Re
             batch.num_rows()
         ));
     }
-    let encoded = metadata
-        .iter()
-        .map(serde_json::to_vec)
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let metadata_array = BinaryArray::from_iter_values(encoded.iter().map(Vec::as_slice));
 
-    // One canonical key per element window, as a `List<Utf8>` column the query
-    // engine can `unnest` and group on without decoding the JSON per element.
-    let mut window_key_builder = ListBuilder::new(StringBuilder::new());
+    let mut first_window_keys = BinaryBuilder::new();
+    let mut extra_window_keys = ListBuilder::new(BinaryBuilder::new());
+    let mut window_counts = Vec::with_capacity(metadata.len());
     for entry in metadata {
-        for window in &entry.windows {
-            window_key_builder
-                .values()
-                .append_value(window.canonical_key());
+        let count = i16::try_from(entry.windows.len())
+            .map_err(|_| anyhow!("element window count exceeds i16"))?;
+        window_counts.push(count);
+        match entry.windows.split_first() {
+            Some((first, extra)) => {
+                first_window_keys.append_value(first.to_binary_key());
+                for window in extra {
+                    extra_window_keys
+                        .values()
+                        .append_value(window.to_binary_key());
+                }
+                extra_window_keys.append(true);
+            }
+            None => {
+                first_window_keys.append_null();
+                extra_window_keys.append(true);
+            }
         }
-        window_key_builder.append(true);
     }
-    let window_key_array = window_key_builder.finish();
+    let first_window_key_array = first_window_keys.finish();
+    let extra_window_key_array = extra_window_keys.finish();
+    let window_count_array = Int16Array::from_iter_values(window_counts);
+
+    let timestamps =
+        Int64Array::from_iter_values(metadata.iter().map(|entry| entry.timestamp_millis));
+    let max_window_ends = Int64Array::from(
+        metadata
+            .iter()
+            .map(WindowMetadata::max_finite_window_end_millis)
+            .collect::<Vec<_>>(),
+    );
+    let pane_timings =
+        Int8Array::from_iter_values(metadata.iter().map(|entry| entry.pane.timing.bits() as i8));
+    let pane_indices = Int64Array::from_iter_values(metadata.iter().map(|entry| entry.pane.index));
+    let pane_non_speculative_indices = Int64Array::from_iter_values(
+        metadata
+            .iter()
+            .map(|entry| entry.pane.non_speculative_index),
+    );
+    let pane_is_first = BooleanArray::from_iter(metadata.iter().map(|entry| entry.pane.is_first));
+    let pane_is_last = BooleanArray::from_iter(metadata.iter().map(|entry| entry.pane.is_last));
 
     let mut fields: Vec<ArrowField> = batch
         .schema()
@@ -970,19 +1012,59 @@ fn append_window_metadata(batch: RecordBatch, metadata: &[WindowMetadata]) -> Re
         .map(|field| field.as_ref().clone())
         .collect();
     fields.push(ArrowField::new(
-        WINDOW_METADATA_COLUMN,
-        DataType::Binary,
+        WINDOW_TIMESTAMP_COLUMN,
+        DataType::Int64,
         false,
     ));
     fields.push(ArrowField::new(
-        WINDOW_KEY_COLUMN,
-        DataType::List(Arc::new(ArrowField::new("item", DataType::Utf8, true))),
+        WINDOW_MAX_END_COLUMN,
+        DataType::Int64,
         true,
     ));
+    fields.push(ArrowField::new(
+        WINDOW_PANE_TIMING_COLUMN,
+        DataType::Int8,
+        false,
+    ));
+    fields.push(ArrowField::new(
+        WINDOW_PANE_INDEX_COLUMN,
+        DataType::Int64,
+        false,
+    ));
+    fields.push(ArrowField::new(
+        WINDOW_PANE_NON_SPECULATIVE_INDEX_COLUMN,
+        DataType::Int64,
+        false,
+    ));
+    fields.push(ArrowField::new(
+        WINDOW_PANE_IS_FIRST_COLUMN,
+        DataType::Boolean,
+        false,
+    ));
+    fields.push(ArrowField::new(
+        WINDOW_PANE_IS_LAST_COLUMN,
+        DataType::Boolean,
+        false,
+    ));
+    fields.push(ArrowField::new(WINDOW_KEY_COLUMN, DataType::Binary, true));
+    fields.push(ArrowField::new(
+        WINDOW_EXTRA_KEYS_COLUMN,
+        DataType::List(Arc::new(ArrowField::new("item", DataType::Binary, true))),
+        false,
+    ));
+    fields.push(ArrowField::new(WINDOW_COUNT_COLUMN, DataType::Int16, false));
 
     let mut columns = batch.columns().to_vec();
-    columns.push(Arc::new(metadata_array));
-    columns.push(Arc::new(window_key_array));
+    columns.push(Arc::new(timestamps));
+    columns.push(Arc::new(max_window_ends));
+    columns.push(Arc::new(pane_timings));
+    columns.push(Arc::new(pane_indices));
+    columns.push(Arc::new(pane_non_speculative_indices));
+    columns.push(Arc::new(pane_is_first));
+    columns.push(Arc::new(pane_is_last));
+    columns.push(Arc::new(first_window_key_array));
+    columns.push(Arc::new(extra_window_key_array));
+    columns.push(Arc::new(window_count_array));
 
     Ok(RecordBatch::try_new(
         Arc::new(ArrowSchema::new(fields)),
@@ -1042,8 +1124,8 @@ fn decode_snapshot(bytes: &[u8]) -> Result<i64> {
 }
 
 /// Decode one Arrow [`RecordBatch`] of a windowed PCollection back into
-/// [`WindowedValue`]s, restoring timestamp/windows/pane from the reserved
-/// metadata column when the rows carry it.
+/// [`WindowedValue`]s, restoring timestamp, windows, and pane from typed
+/// reserved columns when the rows carry them.
 fn windowed_values_from_batch(
     batch: &RecordBatch,
     table_schema: &RecordTableSchema,
@@ -1052,21 +1134,126 @@ fn windowed_values_from_batch(
     if !table_schema.has_windowed_metadata {
         return Ok(records.into_iter().map(WindowedValue::global).collect());
     }
-    let column = batch
-        .column_by_name(WINDOW_METADATA_COLUMN)
-        .ok_or_else(|| anyhow!("missing {WINDOW_METADATA_COLUMN} column"))?;
-    let encoded = column
+    let timestamps = batch
+        .column_by_name(WINDOW_TIMESTAMP_COLUMN)
+        .ok_or_else(|| anyhow!("missing {WINDOW_TIMESTAMP_COLUMN} column"))?
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| anyhow!("{WINDOW_TIMESTAMP_COLUMN} must be an Int64 column"))?;
+    let pane_timings = batch
+        .column_by_name(WINDOW_PANE_TIMING_COLUMN)
+        .ok_or_else(|| anyhow!("missing {WINDOW_PANE_TIMING_COLUMN} column"))?
+        .as_any()
+        .downcast_ref::<Int8Array>()
+        .ok_or_else(|| anyhow!("{WINDOW_PANE_TIMING_COLUMN} must be an Int8 column"))?;
+    let pane_indices = batch
+        .column_by_name(WINDOW_PANE_INDEX_COLUMN)
+        .ok_or_else(|| anyhow!("missing {WINDOW_PANE_INDEX_COLUMN} column"))?
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| anyhow!("{WINDOW_PANE_INDEX_COLUMN} must be an Int64 column"))?;
+    let pane_non_speculative_indices = batch
+        .column_by_name(WINDOW_PANE_NON_SPECULATIVE_INDEX_COLUMN)
+        .ok_or_else(|| anyhow!("missing {WINDOW_PANE_NON_SPECULATIVE_INDEX_COLUMN} column"))?
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| {
+            anyhow!("{WINDOW_PANE_NON_SPECULATIVE_INDEX_COLUMN} must be an Int64 column")
+        })?;
+    let pane_is_first = batch
+        .column_by_name(WINDOW_PANE_IS_FIRST_COLUMN)
+        .ok_or_else(|| anyhow!("missing {WINDOW_PANE_IS_FIRST_COLUMN} column"))?
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .ok_or_else(|| anyhow!("{WINDOW_PANE_IS_FIRST_COLUMN} must be a Boolean column"))?;
+    let pane_is_last = batch
+        .column_by_name(WINDOW_PANE_IS_LAST_COLUMN)
+        .ok_or_else(|| anyhow!("missing {WINDOW_PANE_IS_LAST_COLUMN} column"))?
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .ok_or_else(|| anyhow!("{WINDOW_PANE_IS_LAST_COLUMN} must be a Boolean column"))?;
+    let first_window_keys = batch
+        .column_by_name(WINDOW_KEY_COLUMN)
+        .ok_or_else(|| anyhow!("missing {WINDOW_KEY_COLUMN} column"))?
         .as_any()
         .downcast_ref::<BinaryArray>()
-        .ok_or_else(|| anyhow!("{WINDOW_METADATA_COLUMN} must be a binary column"))?;
+        .ok_or_else(|| anyhow!("{WINDOW_KEY_COLUMN} must be a Binary column"))?;
+    let extra_window_keys = batch
+        .column_by_name(WINDOW_EXTRA_KEYS_COLUMN)
+        .ok_or_else(|| anyhow!("missing {WINDOW_EXTRA_KEYS_COLUMN} column"))?
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .ok_or_else(|| anyhow!("{WINDOW_EXTRA_KEYS_COLUMN} must be a List column"))?;
+    let extra_window_key_values = extra_window_keys
+        .values()
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .ok_or_else(|| anyhow!("{WINDOW_EXTRA_KEYS_COLUMN} must contain binary keys"))?;
+    let window_counts = batch
+        .column_by_name(WINDOW_COUNT_COLUMN)
+        .ok_or_else(|| anyhow!("missing {WINDOW_COUNT_COLUMN} column"))?
+        .as_any()
+        .downcast_ref::<Int16Array>()
+        .ok_or_else(|| anyhow!("{WINDOW_COUNT_COLUMN} must be an Int16 column"))?;
+    let offsets = extra_window_keys.value_offsets();
     let mut values = Vec::with_capacity(records.len());
     for (row, value) in records.into_iter().enumerate() {
-        let metadata: WindowMetadata = serde_json::from_slice(encoded.value(row))?;
+        let start = usize::try_from(offsets[row])
+            .map_err(|_| anyhow!("negative {WINDOW_EXTRA_KEYS_COLUMN} offset at row {row}"))?;
+        let end = usize::try_from(offsets[row + 1]).map_err(|_| {
+            anyhow!(
+                "negative {WINDOW_EXTRA_KEYS_COLUMN} offset at row {}",
+                row + 1
+            )
+        })?;
+        let extra_count = end.saturating_sub(start);
+        let declared_count = usize::try_from(window_counts.value(row)).map_err(|_| {
+            anyhow!(
+                "{WINDOW_COUNT_COLUMN} is negative at row {row}: {}",
+                window_counts.value(row)
+            )
+        })?;
+        if declared_count != extra_count + usize::from(!first_window_keys.is_null(row)) {
+            return Err(anyhow!(
+                "{WINDOW_COUNT_COLUMN} does not match stored window keys at row {row}"
+            ));
+        }
+        let mut windows = Vec::with_capacity(end.saturating_sub(start));
+        if declared_count > 0 {
+            if first_window_keys.is_null(row) {
+                return Err(anyhow!(
+                    "{WINDOW_KEY_COLUMN} is null for non-empty window set at row {row}"
+                ));
+            }
+            let key = first_window_keys.value(row);
+            windows.push(BeamWindow::from_binary_key(key).ok_or_else(|| {
+                anyhow!("{WINDOW_KEY_COLUMN} contains malformed binary window key at row {row}")
+            })?);
+        }
+        for index in start..end {
+            if extra_window_key_values.is_null(index) {
+                return Err(anyhow!(
+                    "{WINDOW_EXTRA_KEYS_COLUMN} contains a null window at row {row}"
+                ));
+            }
+            let key = extra_window_key_values.value(index);
+            windows.push(BeamWindow::from_binary_key(key).ok_or_else(|| {
+                anyhow!(
+                    "{WINDOW_EXTRA_KEYS_COLUMN} contains malformed binary window key at row {row}"
+                )
+            })?);
+        }
         values.push(WindowedValue {
             value,
-            timestamp_millis: metadata.timestamp_millis,
-            windows: metadata.windows,
-            pane: metadata.pane,
+            timestamp_millis: timestamps.value(row),
+            windows,
+            pane: PaneInfo {
+                is_first: pane_is_first.value(row),
+                is_last: pane_is_last.value(row),
+                timing: PaneTiming::from_bits(pane_timings.value(row) as u8),
+                index: pane_indices.value(row),
+                non_speculative_index: pane_non_speculative_indices.value(row),
+            },
         });
     }
     Ok(values)
@@ -1108,8 +1295,10 @@ pub struct ScanCollectionRequest {
 #[cfg(test)]
 mod element_store_tests {
     use super::*;
-    use crate::store::VALUE_COLUMN;
-    use crate::store::record::{BeamGbk, BeamKV, IterableValue, PrimitiveValue};
+    use crate::store::record::{
+        BeamGbk, BeamKV, IterableValue, PrimitiveValue, primitive_value_from_array_row,
+    };
+    use crate::store::{KEY_COLUMN, VALUE_COLUMN};
     use std::collections::HashMap;
     use tempfile::tempdir;
 
@@ -1337,6 +1526,195 @@ mod element_store_tests {
         assert_eq!(scanned[1].value, values[0].value);
         assert_eq!(scanned[1].timestamp_millis, 43);
         assert_eq!(scanned[1].windows, values[0].windows);
+    }
+
+    #[tokio::test]
+    async fn typed_window_metadata_roundtrips_all_window_variants() {
+        let (_dir, store) = make_store().await;
+        let values = vec![
+            WindowedValue {
+                value: int_primitive(1),
+                timestamp_millis: 42,
+                windows: vec![BeamWindow::Global],
+                pane: PaneInfo {
+                    is_first: false,
+                    is_last: true,
+                    timing: PaneTiming::Late,
+                    index: 7,
+                    non_speculative_index: 4,
+                },
+            },
+            WindowedValue {
+                value: int_primitive(2),
+                timestamp_millis: 84,
+                windows: vec![
+                    BeamWindow::Interval {
+                        start_millis: 0,
+                        end_millis: 60_000,
+                    },
+                    BeamWindow::Interval {
+                        start_millis: 30_000,
+                        end_millis: 90_000,
+                    },
+                ],
+                pane: PaneInfo::on_time_firing(),
+            },
+            WindowedValue {
+                value: int_primitive(3),
+                timestamp_millis: 126,
+                windows: vec![BeamWindow::Opaque {
+                    coder_id: "AuctionWindowCoder".to_string(),
+                    bytes: vec![0, 1, 2, 255],
+                }],
+                pane: PaneInfo::no_firing(),
+            },
+        ];
+
+        store
+            .write_windowed_value_batch("pc-typed-windowed", values.clone())
+            .await
+            .unwrap();
+
+        let schema = store.registry.get("pc-typed-windowed").unwrap();
+        for column in [
+            WINDOW_TIMESTAMP_COLUMN,
+            WINDOW_MAX_END_COLUMN,
+            WINDOW_PANE_TIMING_COLUMN,
+            WINDOW_PANE_INDEX_COLUMN,
+            WINDOW_PANE_NON_SPECULATIVE_INDEX_COLUMN,
+            WINDOW_PANE_IS_FIRST_COLUMN,
+            WINDOW_PANE_IS_LAST_COLUMN,
+            WINDOW_KEY_COLUMN,
+            WINDOW_EXTRA_KEYS_COLUMN,
+            WINDOW_COUNT_COLUMN,
+        ] {
+            assert!(
+                schema.arrow_schema.field_with_name(column).is_ok(),
+                "missing typed metadata column {column}"
+            );
+        }
+        assert!(
+            schema
+                .arrow_schema
+                .field_with_name("flare_window_metadata")
+                .is_err(),
+            "legacy JSON metadata column must not be written"
+        );
+
+        let metadata: Vec<WindowMetadata> = values.iter().map(WindowMetadata::from).collect();
+        assert_eq!(metadata[1].max_finite_window_end_millis(), Some(89_999));
+        assert_eq!(metadata[2].max_finite_window_end_millis(), None);
+
+        let scanned = store
+            .scan_windowed_values(ScanCollectionRequest {
+                pcollection_id: "pc-typed-windowed".to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(scanned.len(), values.len());
+        for (actual, expected) in scanned.iter().zip(&values) {
+            assert_eq!(actual.value, expected.value);
+            assert_eq!(actual.timestamp_millis, expected.timestamp_millis);
+            assert_eq!(actual.windows, expected.windows);
+            assert_eq!(actual.pane, expected.pane);
+        }
+    }
+
+    #[tokio::test]
+    async fn incremental_projection_exposes_only_requested_columns() {
+        let (_dir, store) = make_store().await;
+        store
+            .write_windowed_value_batch("pc-projected", vec![windowed_int(9, 100)])
+            .await
+            .unwrap();
+
+        let (mut stream, _) = store
+            .open_incremental_arrow_projected(
+                "pc-projected",
+                None,
+                Some(&[VALUE_COLUMN, WINDOW_KEY_COLUMN]),
+            )
+            .await
+            .unwrap();
+        let batch = stream.as_mut().unwrap().next().await.unwrap().unwrap();
+        assert_eq!(
+            batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>(),
+            vec![VALUE_COLUMN, WINDOW_KEY_COLUMN]
+        );
+    }
+
+    #[tokio::test]
+    async fn incremental_filter_prunes_finite_windows_and_keeps_unknown_bounds() {
+        let (_dir, store) = make_store().await;
+        let values = vec![
+            WindowedValue {
+                value: int_primitive(1),
+                timestamp_millis: 1,
+                windows: vec![BeamWindow::Interval {
+                    start_millis: 0,
+                    end_millis: 60_000,
+                }],
+                pane: PaneInfo::no_firing(),
+            },
+            WindowedValue {
+                value: int_primitive(2),
+                timestamp_millis: 2,
+                windows: vec![BeamWindow::Interval {
+                    start_millis: 30_000,
+                    end_millis: 90_000,
+                }],
+                pane: PaneInfo::no_firing(),
+            },
+            WindowedValue {
+                value: int_primitive(3),
+                timestamp_millis: 3,
+                windows: vec![BeamWindow::Opaque {
+                    coder_id: "OpaqueWindow".to_string(),
+                    bytes: vec![9, 8, 7],
+                }],
+                pane: PaneInfo::no_firing(),
+            },
+        ];
+        store
+            .write_windowed_value_batch("pc-pruned", values)
+            .await
+            .unwrap();
+
+        let (stream, _) = store
+            .open_incremental_arrow_pruned_before(
+                "pc-pruned",
+                None,
+                Some(&[VALUE_COLUMN, WINDOW_MAX_END_COLUMN]),
+                70_000,
+            )
+            .await
+            .unwrap();
+        let mut values = Vec::new();
+        let mut stream = stream.unwrap();
+        while let Some(batch) = stream.next().await {
+            let batch = batch.unwrap();
+            let value_column = batch.column_by_name(VALUE_COLUMN).unwrap();
+            for row in 0..batch.num_rows() {
+                values.push(
+                    primitive_value_from_array_row(
+                        value_column.as_ref(),
+                        value_column.data_type(),
+                        row,
+                    )
+                    .unwrap(),
+                );
+            }
+        }
+
+        assert_eq!(
+            values,
+            vec![PrimitiveValue::Int64(2), PrimitiveValue::Int64(3)]
+        );
     }
 
     fn windowed_int(value: i64, timestamp: i64) -> WindowedValue {
@@ -1638,6 +2016,41 @@ mod element_store_tests {
     }
 
     #[tokio::test]
+    async fn write_and_scan_kv_void_roundtrip() {
+        let (_dir, store) = make_store().await;
+        store
+            .write_beamrecord_batch(NewCollectionRequest {
+                pcollection_id: "pc-kv-void".to_string(),
+                elements: vec![BeamRecord::KV(BeamKV {
+                    key: PrimitiveValue::String("a".into()),
+                    value: Box::new(BeamRecord::PRIMITIVE(PrimitiveValue::Void)),
+                })],
+            })
+            .await
+            .unwrap();
+
+        let schema = store.registry.get("pc-kv-void").unwrap();
+        assert_eq!(
+            schema
+                .arrow_schema
+                .field_with_name(VALUE_COLUMN)
+                .unwrap()
+                .data_type(),
+            &DataType::Boolean
+        );
+        let scanned = store
+            .scan_collection(ScanCollectionRequest {
+                pcollection_id: "pc-kv-void".to_string(),
+            })
+            .await
+            .unwrap();
+        let BeamRecord::KV(kv) = &scanned[0] else {
+            panic!("expected KV");
+        };
+        assert_eq!(*kv.value, BeamRecord::PRIMITIVE(PrimitiveValue::Void));
+    }
+
+    #[tokio::test]
     async fn write_and_scan_gbk_roundtrip() {
         let (_dir, store) = make_store().await;
 
@@ -1675,6 +2088,94 @@ mod element_store_tests {
         expected.insert("k1".to_string(), vec![1, 2, 3]);
         expected.insert("k2".to_string(), vec![]);
         assert_eq!(map, expected);
+    }
+
+    #[tokio::test]
+    async fn write_and_scan_gbk_void_roundtrip() {
+        let (_dir, store) = make_store().await;
+        store
+            .write_beamrecord_batch(NewCollectionRequest {
+                pcollection_id: "pc-gbk-void".to_string(),
+                elements: vec![
+                    BeamRecord::GBK(BeamGbk {
+                        key: PrimitiveValue::String("k1".into()),
+                        value: IterableValue::new(vec![PrimitiveValue::Void, PrimitiveValue::Void]),
+                    }),
+                    BeamRecord::GBK(BeamGbk {
+                        key: PrimitiveValue::String("k2".into()),
+                        value: IterableValue::new(vec![]),
+                    }),
+                ],
+            })
+            .await
+            .unwrap();
+
+        let schema = store.registry.get("pc-gbk-void").unwrap();
+        let DataType::List(item) = schema
+            .arrow_schema
+            .field_with_name(VALUE_COLUMN)
+            .unwrap()
+            .data_type()
+        else {
+            panic!("expected list value");
+        };
+        assert_eq!(item.data_type(), &DataType::Boolean);
+
+        let scanned = store
+            .scan_collection(ScanCollectionRequest {
+                pcollection_id: "pc-gbk-void".to_string(),
+            })
+            .await
+            .unwrap();
+        let BeamRecord::GBK(k1) = &scanned[0] else {
+            panic!("expected GBK");
+        };
+        assert_eq!(
+            k1.value.list,
+            vec![
+                BeamRecord::PRIMITIVE(PrimitiveValue::Void),
+                BeamRecord::PRIMITIVE(PrimitiveValue::Void)
+            ]
+        );
+        let BeamRecord::GBK(k2) = &scanned[1] else {
+            panic!("expected GBK");
+        };
+        assert!(k2.value.list.is_empty());
+    }
+
+    #[tokio::test]
+    async fn write_and_scan_gbk_with_void_key_roundtrip() {
+        let (_dir, store) = make_store().await;
+        store
+            .write_beamrecord_batch(NewCollectionRequest {
+                pcollection_id: "pc-gbk-void-key".to_string(),
+                elements: vec![BeamRecord::GBK(BeamGbk {
+                    key: PrimitiveValue::Void,
+                    value: IterableValue::new(vec![PrimitiveValue::Bytes(vec![1, 2, 3])]),
+                })],
+            })
+            .await
+            .unwrap();
+
+        let schema = store.registry.get("pc-gbk-void-key").unwrap();
+        let key = schema.arrow_schema.field_with_name(KEY_COLUMN).unwrap();
+        assert_eq!(key.data_type(), &DataType::Boolean);
+        assert!(key.is_nullable());
+
+        let scanned = store
+            .scan_collection(ScanCollectionRequest {
+                pcollection_id: "pc-gbk-void-key".to_string(),
+            })
+            .await
+            .unwrap();
+        let BeamRecord::GBK(gbk) = &scanned[0] else {
+            panic!("expected GBK");
+        };
+        assert_eq!(gbk.key, PrimitiveValue::Void);
+        assert_eq!(
+            gbk.value.list,
+            vec![BeamRecord::PRIMITIVE(PrimitiveValue::Bytes(vec![1, 2, 3]))]
+        );
     }
 
     #[tokio::test]
