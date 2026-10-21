@@ -15,6 +15,7 @@ const SUM_INT64_TYPE: &str = "beam:metrics:sum_int64:v1";
 const DISTRIBUTION_INT64_TYPE: &str = "beam:metrics:distribution_int64:v1";
 const LATEST_INT64_TYPE: &str = "beam:metrics:latest_int64:v1";
 const SET_STRING_TYPE: &str = "beam:metrics:set_string:v1";
+const BOUNDED_TRIE_TYPE: &str = "beam:metrics:bounded_trie:v1";
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct MetricKey {
@@ -62,6 +63,12 @@ impl JobMetrics {
 
         let mut metrics = self.metrics.lock().expect("job metrics lock not poisoned");
         for info in monitoring_infos {
+            // Beam's bounded-trie metric type does not have a portable Beam job
+            // metric representation exposed by FlareDB yet. Treat it as a no-op
+            // rather than warning on every bundle.
+            if info.r#type == BOUNDED_TRIE_TYPE {
+                continue;
+            }
             if info.payload.is_empty() {
                 warn!(
                     "skipping metric {} ({}) without an embedded payload",
@@ -347,6 +354,13 @@ mod tests {
         let values = metrics.snapshot();
         assert_eq!(values.len(), 1);
         assert_eq!(decode_single_i64(&values[0].payload).unwrap(), 5);
+    }
+
+    #[test]
+    fn bounded_trie_metrics_are_ignored_without_being_recorded() {
+        let metrics = JobMetrics::default();
+        metrics.record(&[metric(BOUNDED_TRIE_TYPE, &[], vec![1, 2, 3])]);
+        assert!(metrics.snapshot().is_empty());
     }
 
     #[test]
