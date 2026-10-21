@@ -293,6 +293,14 @@ impl StageState {
         {
             return false;
         }
+        // A stage's first run is a single bundle. Additional concurrent bundles
+        // are only valid for declared work items (SDF residuals), so with a
+        // concurrency ceiling above one the scheduler must not start a second
+        // copy of the first run when it is polled again before that bundle
+        // completes.
+        if !self.completed && self.in_flight > 0 && self.queued == 0 {
+            return false;
+        }
         // A stage that has never run starts once its inputs are produced; a
         // stage that has already run runs again when it is re-armed (a fired
         // timer), has declared bundle work (queued, e.g. SDF residuals), has
@@ -775,6 +783,14 @@ impl WatermarkManager {
             .ok_or_else(|| anyhow!("unknown stage '{stage}'"))?;
         if stage_state.in_flight >= stage_state.max_in_flight {
             bail!("stage '{stage}' already has its maximum number of bundles in flight");
+        }
+        // The first run is one bundle; further bundles must come from declared
+        // work items (e.g. SDF residuals). Without this, a stage with a
+        // concurrency ceiling above one could start duplicate first-run bundles.
+        if !stage_state.completed && stage_state.in_flight > 0 && stage_state.queued == 0 {
+            bail!(
+                "stage '{stage}' already has its first bundle in flight and no queued work items"
+            );
         }
         let watermark_rerun = stage_state.kind == StageKind::WatermarkGated
             && stage_state.input > stage_state.watermark_at_last_run;

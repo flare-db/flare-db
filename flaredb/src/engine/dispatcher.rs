@@ -231,11 +231,19 @@ impl ExecutorDispatcher {
                 let (sdf_seed, sdf_initialized, sdf_registered, sdf_progress_tick) = match &node {
                     ExecutableNode::Splittable(_) => {
                         let queue = sdf_queues.entry(stage_id.clone()).or_default();
-                        let seed = if queue.initialized {
+                        let initialized = queue.initialized;
+                        let seed = if initialized {
                             queue.items.pop_front()
                         } else {
                             None
                         };
+                        log::info!(
+                            "SDF stage '{stage_id}': starting bundle, initialized={initialized}, \
+                             queue_depth={}, in_flight={}, seed_bytes={}",
+                            queue.items.len(),
+                            scheduler.watermarks().in_flight_bundles(&stage_id),
+                            seed.as_ref().map_or(0, |item| item.seed.len())
+                        );
                         (
                             seed,
                             queue.initialized,
@@ -386,9 +394,15 @@ impl ExecutorDispatcher {
                     scheduler
                         .watermarks_mut()
                         .set_residual_holds(&residual_holds);
-                    log::debug!(
-                        "SDF stage '{}' residual holds after split: {:?}",
-                        stage_id,
+                    log::info!(
+                        "SDF stage '{stage_id}': queued {count} work item(s), queue_depth={}, \
+                         in_flight={}, holds={:?}",
+                        queue.items.len(),
+                        // This bundle has not been marked complete yet.
+                        scheduler
+                            .watermarks()
+                            .in_flight_bundles(&stage_id)
+                            .saturating_sub(1),
                         residual_holds.get(&stage_id)
                     );
                     if count > 0 {

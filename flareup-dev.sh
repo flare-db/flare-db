@@ -30,6 +30,9 @@ The RUST_LOG environment variable is honoured when --log-level is not given.
 Environment:
   FLAREDB_BASE_DIR  Base directory (default: ~/.flaredb). Use an isolated
                     directory for test runs to avoid Paimon table collisions.
+  FLAREDB_SDF_MAX_IN_FLIGHT
+                    Concurrent residual bundles per Splittable DoFn stage
+                    (default: min(4, available CPUs); 1 disables concurrency).
 EOF
 }
 

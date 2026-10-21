@@ -96,6 +96,12 @@ struct SplitMonitor {
     handed_back_from: Option<i64>,
     /// Whether at least one `progress + split_evaluation` run has happened for this bundle.
     ticked: bool,
+    /// Number of progress polls made for this bundle.
+    polls: u64,
+    /// Number of `ProcessBundleSplit` requests sent for this bundle.
+    split_requests: u64,
+    /// Number of split responses that actually produced new work items.
+    splits: u64,
 }
 
 impl SplitMonitor {
@@ -109,6 +115,9 @@ impl SplitMonitor {
             tick: clamp_progress_tick(progress_tick.unwrap_or(MIN_PROGRESS_TICK)),
             handed_back_from: None,
             ticked: false,
+            polls: 0,
+            split_requests: 0,
+            splits: 0,
         }
     }
 }
@@ -537,6 +546,18 @@ impl SplittableStageExecutor {
         match control_response {
             ControlResponse::ProcessBundleSuccess(response) => {
                 let next_tick = next_shared_tick(monitor.ticked, monitor.tick);
+                info!(
+                    "SDF bundle summary: instruction_id={instruction_id}, \
+                     estimated_input_elements={estimated_input_elements}, polls={}, \
+                     split_requests={}, splits={}, residual_roots={}, channel_items={}, \
+                     next_tick_ms={}",
+                    monitor.polls,
+                    monitor.split_requests,
+                    monitor.splits,
+                    split_residual_roots.len(),
+                    channel_items.len(),
+                    next_tick.as_millis()
+                );
                 Ok((response, split_residual_roots, channel_items, next_tick))
             }
             ControlResponse::ProcessBundleError(err) => {
@@ -668,6 +689,7 @@ async fn poll_progress_and_maybe_split(
     channel_items: &mut Vec<SdfWorkItem>,
 ) -> anyhow::Result<()> {
     monitor.ticked = true;
+    monitor.polls += 1;
 
     let progress = control
         .send_process_bundle_progress_request(bundle_instruction_id)
@@ -676,6 +698,32 @@ async fn poll_progress_and_maybe_split(
 
     let slow = monitor.prev_index == index && monitor.prev_total_count == total_count;
     let should_try_split = slow && monitor.can_split && monitor.estimated_input_elements > 0;
+    let action = if !slow {
+        "poll"
+    } else if !monitor.can_split {
+        "skip-splitting-disabled"
+    } else if monitor.estimated_input_elements <= 0 {
+        "skip-no-input-elements"
+    } else {
+        "request-split"
+    };
+    let poll_message = format!(
+        "SDF progress: instruction_id={bundle_instruction_id}, read_index={index}, \
+         element_count={total_count}, stalled={slow}, action={action}, polls={}, \
+         can_split={}, estimated_input_elements={}, tick_ms={}",
+        monitor.polls,
+        monitor.can_split,
+        monitor.estimated_input_elements,
+        monitor.tick.as_millis()
+    );
+    // Repeated stalled polls that cannot split are only useful when debugging;
+    // progress changes and split decisions are operator-visible at INFO.
+    if slow && !should_try_split {
+        debug!("{poll_message}");
+    } else {
+        info!("{poll_message}");
+    }
+
     if !should_try_split {
         monitor.prev_index = index;
         monitor.prev_total_count = total_count;
@@ -710,20 +758,32 @@ async fn poll_progress_and_maybe_split(
         },
     );
 
+    monitor.split_requests += 1;
     let split = control
         .send_process_bundle_split_request(bundle_instruction_id, desired_splits)
         .await?;
+    let channel_splits = split.channel_splits.len();
+    let reported_roots = split.residual_roots.len();
+    let residual_roots_before = split_residual_roots.len();
+    let channel_items_before = channel_items.len();
 
     if split.channel_splits.is_empty() {
-        // SDK cannot split (nothing left, or unsupported)
+        // SDK cannot split (nothing left, or unsupported). Note that any
+        // `residual_roots` in this response are not scheduled.
         monitor.can_split = false;
+        info!(
+            "SDF split response: instruction_id={bundle_instruction_id}, \
+             residual_roots={reported_roots}, channel_splits=0, action=disable-splitting, \
+             split_requests={}, splits={}",
+            monitor.split_requests, monitor.splits
+        );
         return Ok(());
     }
 
-    if split.channel_splits.len() != 1 {
+    if channel_splits != 1 {
         warn!(
             "SDF split returned {} channel splits; expected exactly one for the single input PCollection",
-            split.channel_splits.len()
+            channel_splits
         );
     }
 
@@ -789,6 +849,22 @@ async fn poll_progress_and_maybe_split(
 
     // Increase interval to avoid over-split.
     monitor.tick = clamp_progress_tick(monitor.tick * 4);
+
+    let new_residual_roots = split_residual_roots.len() - residual_roots_before;
+    let new_channel_items = channel_items.len() - channel_items_before;
+    if new_residual_roots + new_channel_items > 0 {
+        monitor.splits += 1;
+    }
+    info!(
+        "SDF split response: instruction_id={bundle_instruction_id}, \
+         residual_roots={new_residual_roots}, channel_splits={channel_splits}, \
+         channel_items={new_channel_items}, new_work_items={}, \
+         split_requests={}, splits={}, next_tick_ms={}",
+        new_residual_roots + new_channel_items,
+        monitor.split_requests,
+        monitor.splits,
+        monitor.tick.as_millis()
+    );
     Ok(())
 }
 
