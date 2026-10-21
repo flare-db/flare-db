@@ -846,10 +846,25 @@ fn residual_items(
 /// The output-watermark holds a single residual imposes on its stage's output.
 ///
 /// A residual's `output_watermarks` is a lower bound on the timestamps of elements
-/// the owning PTransform will still produce when the residual runs. Only entries
-/// naming an output PCollection that *leaves* the stage are considered — internal
-/// PCollections are not tracked by the runner — and a `MIN_TIMESTAMP` or absent
-/// entry imposes no hold (a hold at `MIN_TIMESTAMP` would stall the stage forever).
+/// the owning PTransform will still produce when the residual runs. The Fn API
+/// specifies `MIN_TIMESTAMP` for an output the `RestrictionTracker` did not
+/// report (`beam_fn_api.proto`, `BundleApplication.output_watermarks`), so every
+/// boundary output of the residual's transform imposes **some** hold:
+///
+/// - a boundary output with a reported watermark holds at that watermark,
+/// - a boundary output with no reported watermark (the entry is absent, or the
+///   residual names a different local output) holds at [`MIN_TIMESTAMP`].
+///
+/// The second case is what covers intra-element residuals: the SDK's residual
+/// root often reports an empty map, and ignoring it let the stage's output
+/// watermark advance to `+inf` while deferred work was still outstanding. The
+/// hold is released when the residual bundle that consumed the item completes.
+///
+/// Only outputs that leave the stage are tracked; internal PCollections are
+/// consumed inside the fused stage and do not map to a watermark. Because a
+/// residual can only influence its own stage, and SDF stages are isolated from
+/// unrelated transforms by the fuser, defaulting *every* boundary output to
+/// `MIN_TIMESTAMP` is conservative but sound.
 fn residual_item_holds(
     application: &BundleApplication,
     outputs_by_transform: &HashMap<String, HashMap<String, String>>,
@@ -864,7 +879,10 @@ fn residual_item_holds(
         return Vec::new();
     };
 
-    let mut holds = Vec::new();
+    // Resolve the boundary outputs this residual directly reports a watermark
+    // for. Local outputs that are internal, unknown, or absent fall through to
+    // the `MIN_TIMESTAMP` default below.
+    let mut reported: HashMap<&str, Timestamp> = HashMap::new();
     for (local_name, watermark) in &application.output_watermarks {
         let Some(pcollection) = outputs.get(local_name) else {
             continue;
@@ -876,11 +894,16 @@ fn residual_item_holds(
             .seconds
             .saturating_mul(1_000)
             .saturating_add(i64::from(watermark.nanos) / 1_000_000);
-        if hold > MIN_TIMESTAMP {
-            holds.push(hold);
-        }
+        reported
+            .entry(pcollection.as_str())
+            .and_modify(|current| *current = (*current).min(hold))
+            .or_insert(hold);
     }
-    holds
+
+    boundary
+        .iter()
+        .map(|pcollection| reported.get(pcollection).copied().unwrap_or(MIN_TIMESTAMP))
+        .collect()
 }
 
 /// Extract the event timestamps of the input elements a whole-element channel
@@ -1119,7 +1142,7 @@ mod tests {
     }
 
     #[test]
-    fn residual_items_only_hold_boundary_output_watermarks() {
+    fn residual_items_default_unreported_boundary_outputs_to_min_timestamp() {
         let stage = splittable_stage(
             &["pcol-out"],
             "process",
@@ -1131,19 +1154,22 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].holds, vec![5_000]);
 
-        // An internal output is not tracked by the runner: the item still exists,
-        // but imposes no hold.
+        // An internal output is not tracked by the runner, so the residual
+        // reports no usable watermark for the boundary output: the Fn API's
+        // MIN_TIMESTAMP default applies (it may still produce anything).
         let items = residual_items(&stage, &[residual("process", "internal", 5_000)]);
         assert_eq!(items.len(), 1);
-        assert!(items[0].holds.is_empty());
+        assert_eq!(items[0].holds, vec![MIN_TIMESTAMP]);
 
-        // A local output name not declared on the transform, or a transform not in
-        // the process stage, impose no hold.
-        assert!(
-            residual_items(&stage, &[residual("process", "missing", 5_000)])[0]
-                .holds
-                .is_empty()
+        // The same default covers a local output name not declared on the
+        // transform: the boundary output was not reported.
+        assert_eq!(
+            residual_items(&stage, &[residual("process", "missing", 5_000)])[0].holds,
+            vec![MIN_TIMESTAMP]
         );
+
+        // A transform that is not part of the process stage cannot be mapped to
+        // an output at all; the existing warning path imposes no hold.
         assert!(
             residual_items(&stage, &[residual("elsewhere", "out", 5_000)])[0]
                 .holds
@@ -1152,6 +1178,54 @@ mod tests {
 
         // No residuals: no items.
         assert!(residual_items(&stage, &[]).is_empty());
+    }
+
+    #[test]
+    fn residual_items_hold_explicit_min_timestamp_reports() {
+        let stage = splittable_stage(&["pcol-out"], "process", &[("out", "pcol-out")]);
+
+        // A tracker that reports "no progress" as MIN_TIMESTAMP is held at MIN,
+        // not treated as "no hold".
+        let items = residual_items(&stage, &[residual("process", "out", MIN_TIMESTAMP)]);
+        assert_eq!(items[0].holds, vec![MIN_TIMESTAMP]);
+    }
+
+    #[test]
+    fn residual_items_hold_every_boundary_output() {
+        let stage = splittable_stage(
+            &["pcol-a", "pcol-b"],
+            "process",
+            &[("a", "pcol-a"), ("b", "pcol-b")],
+        );
+
+        let mut application = residual("process", "a", 5_000);
+        application
+            .application
+            .as_mut()
+            .unwrap()
+            .output_watermarks
+            .remove("a");
+        // Nothing reported: both boundary outputs hold at MIN.
+        let items = residual_items(&stage, &[application.clone()]);
+        assert_eq!(items[0].holds.len(), 2);
+        assert!(items[0].holds.iter().all(|hold| *hold == MIN_TIMESTAMP));
+
+        // Reporting one output holds that one at 5000 and the other at MIN.
+        application
+            .application
+            .as_mut()
+            .unwrap()
+            .output_watermarks
+            .insert(
+                "a".to_string(),
+                prost_types::Timestamp {
+                    seconds: 5,
+                    nanos: 0,
+                },
+            );
+        let mut holds = residual_items(&stage, &[application])[0].holds.clone();
+        holds.sort_unstable();
+        assert_eq!(holds, vec![MIN_TIMESTAMP, 5_000]);
     }
 
     #[test]
