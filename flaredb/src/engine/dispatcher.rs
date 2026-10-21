@@ -3,14 +3,14 @@ use crate::engine::sdf::{SdfBundleOutcome, SdfWorkItem, SplittableStageExecutor}
 use crate::engine::window::WindowMergeService;
 use crate::transforms::SourceProgress;
 use crate::{
-    engine::timer::{build_timer_store, TimerEntry},
+    engine::timer::{TimerEntry, build_timer_store},
     engine::{
         executor::StageExecutor,
-        harness::{control::ControlResponse, state::SideInputRegistry, Channels},
+        harness::{Channels, control::ControlResponse, state::SideInputRegistry},
         runtime::BundleRuntime,
         scheduler::NodeScheduler,
         timer::TimerService,
-        watermark::{format_timestamp, Timestamp, MIN_TIMESTAMP},
+        watermark::{MIN_TIMESTAMP, Timestamp, format_timestamp},
     },
     fusion::pipeline::{ExecutableGraph, ExecutableNode},
     store::element_store::FlareElementStore,

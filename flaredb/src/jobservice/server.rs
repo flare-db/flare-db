@@ -1,17 +1,16 @@
 use std::{sync::Arc, time::Duration};
 
 use beam_model_rs::v1::{
-    job_service_server::JobService, job_state::Enum as JobStateEnum, ApiServiceDescriptor,
-    CancelJobRequest, CancelJobResponse, DescribePipelineOptionsRequest,
+    ApiServiceDescriptor, CancelJobRequest, CancelJobResponse, DescribePipelineOptionsRequest,
     DescribePipelineOptionsResponse, DrainJobRequest, DrainJobResponse, GetJobMetricsRequest,
     GetJobMetricsResponse, GetJobPipelineRequest, GetJobPipelineResponse, GetJobStateRequest,
     GetJobsRequest, GetJobsResponse, JobMessagesRequest, JobMessagesResponse, JobStateEvent,
     MetricResults, PrepareJobRequest, PrepareJobResponse, ProcessPayload, RunJobRequest,
-    RunJobResponse,
+    RunJobResponse, job_service_server::JobService, job_state::Enum as JobStateEnum,
 };
 use dashmap::{DashMap, DashSet};
 use prost::Message;
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{Mutex, watch};
 use tokio::time::timeout;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Response;
@@ -678,7 +677,7 @@ fn truncate_grpc_error(message: String) -> String {
 
 #[cfg(test)]
 mod metrics_tests {
-    use super::{build_job_metrics_response, JobMetrics};
+    use super::{JobMetrics, build_job_metrics_response};
     use beam_model_rs::v1::MonitoringInfo;
     use std::sync::Arc;
 

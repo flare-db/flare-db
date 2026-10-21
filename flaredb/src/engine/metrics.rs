@@ -3,7 +3,7 @@ use std::{
     sync::Mutex,
 };
 
-use anyhow::{anyhow, ensure, Context};
+use anyhow::{Context, anyhow, ensure};
 use beam_model_rs::v1::MonitoringInfo;
 use bytes::{Buf, BufMut};
 use log::warn;

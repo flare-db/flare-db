@@ -1,5 +1,10 @@
 use std::collections::{HashMap, HashSet};
 
+use std::io::Cursor;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+
+use std::time::Duration;
+
 use anyhow::anyhow;
 use beam_model_rs::v1::process_bundle_split_request::DesiredSplit;
 use beam_model_rs::v1::{
@@ -397,91 +402,96 @@ impl SplittableStageExecutor {
         let mut monitor = SplitMonitor::new(estimated_input_elements, progress_tick);
         let monitor_enabled = allow_split && estimated_input_elements > 0;
 
-        let process_future = async {
-            tokio::pin!(response_future);
+        let control_response = {
+            let process_future = async {
+                tokio::pin!(response_future);
 
-            let response = loop {
-                let ticker = tokio::time::sleep(monitor.tick);
-                tokio::pin!(ticker);
+                let response = loop {
+                    let ticker = tokio::time::sleep(monitor.tick);
+                    tokio::pin!(ticker);
 
-                tokio::select! {
-                    biased;
-                    bundle_response = &mut response_future => break bundle_response,
-                    _ = &mut ticker, if monitor_enabled => {
-                        if let Err(err) = poll_progress_and_maybe_split(
-                            &control,
-                            &instruction_id,
-                            &source_transform_id,
-                            &mut monitor,
-                            &seed,
-                            &input_spans,
-                            &mut split_residual_roots,
-                            &mut channel_items
-                        ).await {
-                            // Progress error stops further splitting.
-                            warn!(
-                                "SDF `progress + split_evaluation` run failed for bundle {}, \
-                                disabling further splits for this bundle: {}",
-                                instruction_id,
-                                err
-                            );
-                            monitor.unsplit = false;
+                    tokio::select! {
+                        biased;
+                        bundle_response = &mut response_future => break bundle_response,
+                        _ = &mut ticker, if monitor_enabled => {
+                            if let Err(err) = poll_progress_and_maybe_split(
+                                &control,
+                                &instruction_id,
+                                &source_transform_id,
+                                &mut monitor,
+                                &seed,
+                                &input_spans,
+                                &mut split_residual_roots,
+                                &mut channel_items
+                            ).await {
+                                // Progress error stops further splitting.
+                                warn!(
+                                    "SDF `progress + split_evaluation` run failed for bundle {}, \
+                                    disabling further splits for this bundle: {}",
+                                    instruction_id,
+                                    err
+                                );
+                                monitor.unsplit = false;
+                            }
                         }
                     }
-                }
-            }?;
+                }?;
 
-            Ok::<_, anyhow::Error>(response)
-        };
-
-        let control_response = if let Some(output_meta_data) = output_edge_metadata {
-            let data_key = DataKey {
-                instruction_id: instruction_id.clone(),
-                transform_id: stage_sink_transform_id(stage, &output_meta_data.produced_pcol_id),
+                Ok::<_, anyhow::Error>(response)
             };
-            let receiver = self.runtime.data_receiver(data_key);
-            let output_runtime = self.runtime.clone();
 
-            let decode_task = tokio::spawn(async move {
-                output_runtime
-                    .process_output_elements(receiver, output_meta_data)
-                    .await
-            });
+            if let Some(output_meta_data) = output_edge_metadata {
+                let data_key = DataKey {
+                    instruction_id: instruction_id.clone(),
+                    transform_id: stage_sink_transform_id(
+                        stage,
+                        &output_meta_data.produced_pcol_id,
+                    ),
+                };
+                let receiver = self.runtime.data_receiver(data_key);
+                let output_runtime = self.runtime.clone();
 
-            let timeout_id = instruction_id.clone();
-            crate::engine::guard::idle_guard(
-                async {
-                    match process_future.await {
-                        Ok(response) => {
-                            decode_task
-                                .await
-                                .map_err(|err| anyhow!("output decode task failed: {}", err))??;
-                            Ok(response)
+                let decode_task = tokio::spawn(async move {
+                    output_runtime
+                        .process_output_elements(receiver, output_meta_data)
+                        .await
+                });
+
+                let timeout_id = instruction_id.clone();
+                crate::engine::guard::idle_guard(
+                    async {
+                        match process_future.await {
+                            Ok(response) => {
+                                decode_task.await.map_err(|err| {
+                                    anyhow!("output decode task failed: {}", err)
+                                })??;
+                                Ok(response)
+                            }
+                            Err(err) => {
+                                decode_task.abort();
+                                Err(err)
+                            }
                         }
-                        Err(err) => {
-                            decode_task.abort();
-                            Err(err)
-                        }
-                    }
-                },
-                crate::engine::guard::worker_idle_timeout(),
-                &format!(
-                    "waiting for SDF process bundle {} output data and control response",
-                    timeout_id
-                ),
-            )
-            .await?
-        } else {
-            let timeout_id = instruction_id.clone();
-            crate::engine::guard::idle_guard(
-                response_future,
-                crate::engine::guard::worker_idle_timeout(),
-                &format!(
-                    "waiting for SDF process bundle {} control response",
-                    timeout_id
-                ),
-            )
-            .await?
+                    },
+                    crate::engine::guard::worker_idle_timeout(),
+                    &format!(
+                        "waiting for SDF process bundle {} output data and control response",
+                        timeout_id
+                    ),
+                )
+                .await?
+            } else {
+                let timeout_id = instruction_id.clone();
+                crate::engine::guard::idle_guard(
+                    process_future,
+                    crate::engine::guard::worker_idle_timeout(),
+                    &format!(
+                        "waiting for SDF process bundle {} control response",
+                        timeout_id
+                    ),
+                )
+                .await?
+            }
         };
 
         match control_response {

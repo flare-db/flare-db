@@ -752,11 +752,13 @@ mod timer_store_tests {
             db_dir.display()
         );
         // The element store holds no timer table.
-        assert!(store
-            .get_existing_table("__flare_timer")
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            store
+                .get_existing_table("__flare_timer")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
