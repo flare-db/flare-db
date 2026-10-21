@@ -4,15 +4,17 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use beam_model_rs::v1::{
-    beam_fn_control_server::BeamFnControl, instruction_request, GetProcessBundleDescriptorRequest,
-    InstructionRequest, InstructionResponse, ProcessBundleDescriptor, ProcessBundleRequest,
-    ProcessBundleResponse, RegisterRequest,
+    GetProcessBundleDescriptorRequest, InstructionRequest, InstructionResponse,
+    ProcessBundleDescriptor, ProcessBundleProgressRequest, ProcessBundleProgressResponse,
+    ProcessBundleRequest, ProcessBundleResponse, ProcessBundleSplitRequest,
+    ProcessBundleSplitResponse, RegisterRequest, beam_fn_control_server::BeamFnControl,
+    instruction_request, instruction_response, process_bundle_split_request,
 };
 use dashmap::DashMap;
 use log::{debug, info, warn};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Response, Status};
 
@@ -401,6 +403,86 @@ impl ControlChannel {
         }
     }
 
+    /// Ask the worker for progress on a running bundle.
+    pub async fn send_process_bundle_progress_request(
+        &self,
+        bundle_instruction_id: &str,
+    ) -> Result<ProcessBundleProgressResponse> {
+        let request =
+            instruction_request::Request::ProcessBundleProgress(ProcessBundleProgressRequest {
+                instruction_id: bundle_instruction_id.to_string(),
+            });
+        let response = self.send_instruction(request).await?;
+
+        if !response.error.is_empty() {
+            return Err(anyhow!(
+                "progress request for bundle {} failed at worker {}",
+                bundle_instruction_id,
+                response.error
+            ));
+        }
+
+        match response.response {
+            Some(instruction_response::Response::ProcessBundleProgress(res)) => Ok(res),
+            other => Err(anyhow!("unexpected progress response: {:?}", other)),
+        }
+    }
+
+    /// Ask the worker to split a running bundle.
+    pub async fn send_process_bundle_split_request(
+        &self,
+        bundle_instruction_id: &str,
+        desired_splits: HashMap<String, process_bundle_split_request::DesiredSplit>,
+    ) -> Result<ProcessBundleSplitResponse> {
+        let request = instruction_request::Request::ProcessBundleSplit(ProcessBundleSplitRequest {
+            instruction_id: bundle_instruction_id.to_string(),
+            desired_splits,
+        });
+        let response = self.send_instruction(request).await?;
+
+        if !response.error.is_empty() {
+            return Err(anyhow!(
+                "split request for bundle {} failed at worker {}",
+                bundle_instruction_id,
+                response.error
+            ));
+        }
+
+        match response.response {
+            Some(instruction_response::Response::ProcessBundleSplit(res)) => Ok(res),
+            other => Err(anyhow!("unexpected split response: {:?}", other)),
+        }
+    }
+
+    /// Send an arbitary instruction and await its matching response.
+    async fn send_instruction(
+        &self,
+        request: instruction_request::Request,
+    ) -> Result<InstructionResponse> {
+        let id = self.next_id();
+        let response_rx = self.insert_pending_response(id.clone());
+
+        let sender = self.stream.sender().await?;
+        let send_result = sender
+            .send(Ok(InstructionRequest {
+                instruction_id: id.clone(),
+                request: Some(request),
+            }))
+            .await;
+
+        if let Err(e) = send_result {
+            self.stream.pending.remove(&id);
+            return Err(anyhow!("failed to send instruction: {}", e));
+        }
+
+        response_rx.await.map_err(|_| {
+            anyhow!(
+                "control dispatcher reset or worker disconnected while awaiting instruction {}",
+                id
+            )
+        })
+    }
+
     fn insert_pending_response(&self, id: String) -> oneshot::Receiver<InstructionResponse> {
         let (sender, receiver) = oneshot::channel();
         self.stream.pending.insert(id, sender);
@@ -466,7 +548,7 @@ impl ControlChannel {
     }
 
     // generate unique instruction ids
-    fn next_id(&mut self) -> String {
+    fn next_id(&self) -> String {
         uuid::Uuid::new_v4().to_string()
     }
 }
@@ -474,7 +556,7 @@ impl ControlChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use beam_model_rs::v1::{instruction_response, ProcessBundleResponse};
+    use beam_model_rs::v1::{ProcessBundleResponse, instruction_response};
 
     fn counter_info() -> beam_model_rs::v1::MonitoringInfo {
         beam_model_rs::v1::MonitoringInfo {

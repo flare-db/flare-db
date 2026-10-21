@@ -142,6 +142,8 @@ pub mod beam_urns {
     pub const SPLITTABLE_PROCESS_ELEMENTS_URN: &str = "beam:transform:sdf_process_elements:v1";
     pub const SPLITTABLE_PROCESS_SIZED_ELEMENTS_AND_RESTRICTIONS_URN: &str =
         "beam:transform:sdf_process_sized_element_and_restrictions:v1";
+    pub const DATA_CHANNEL_READ_INDEX_METRIC: &str = "beam:metric:data_channel:read_index:v1";
+    pub const ELEMENT_COUNT_METRIC: &str = "beam:metric:element_count:v1";
 
     //Deprecated
     pub const SPLITTABLE_PROCESS_KEYED_URN: &str = "beam:transform:sdf_process_keyed_elements:v1";

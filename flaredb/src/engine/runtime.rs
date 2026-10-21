@@ -151,7 +151,7 @@ impl BundleRuntime {
         self.data.get_receiver(data_key)
     }
 
-    fn window_coder_for_pcollection(&self, pcollection_id: &str) -> WindowCoder {
+    pub(crate) fn window_coder_for_pcollection(&self, pcollection_id: &str) -> WindowCoder {
         resolve_window_coder(
             self.pipeline_components.as_ref(),
             self.pipeline_coders.as_ref(),

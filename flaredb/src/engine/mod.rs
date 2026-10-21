@@ -1,8 +1,8 @@
 pub mod dispatcher;
 pub mod executor;
+pub mod guard;
 pub mod harness;
 pub mod kv;
-pub mod guard;
 pub mod metrics;
 pub mod runtime;
 pub mod scheduler;
