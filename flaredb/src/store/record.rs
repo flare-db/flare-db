@@ -2,8 +2,9 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use arrow_array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Float64Array, Int64Array, ListArray, NullArray,
-    RecordBatch, StringArray, StructArray, builder::BooleanBuilder,
+    Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, FixedSizeListArray, Float64Array,
+    Int64Array, LargeBinaryArray, LargeListArray, LargeStringArray, ListArray, MapArray, NullArray,
+    RecordBatch, StringArray, StringViewArray, StructArray, builder::BooleanBuilder,
 };
 use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema, TimeUnit};
@@ -19,7 +20,10 @@ use paimon::spec::{
 use super::{KEY_COLUMN, VALUE_COLUMN};
 
 use crate::{
-    coders::schema::{BeamField, BeamFieldType, BeamSchema, BeamTypeKind},
+    coders::{
+        primitives::{BeamWindow, PaneInfo, WindowedValue},
+        schema::{BeamField, BeamFieldType, BeamSchema, BeamTypeKind},
+    },
     jobservice::urns,
 };
 
@@ -258,6 +262,55 @@ fn table_type_of(record: &BeamRecord) -> TableType {
 pub struct RecordTableSchema {
     pub table_type: TableType,
     pub arrow_schema: Arc<Schema>,
+    /// True when each row includes persisted Beam WindowedValue metadata.
+    pub has_windowed_metadata: bool,
+}
+
+/// The persisted form of Beam window metadata, independent of an element's logical coder.
+///
+/// The element store persists these fields as typed Arrow columns. This keeps
+/// Beam execution metadata distinguishable from logical element columns while
+/// allowing Parquet and DataFusion to operate on timestamps, pane fields, and
+/// window identities without parsing a per-row JSON document.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WindowMetadata {
+    /// Event timestamp in milliseconds since the Unix epoch.
+    pub timestamp_millis: i64,
+    /// Beam windows assigned to the element.
+    pub windows: Vec<BeamWindow>,
+    /// Beam pane timing and firing indices.
+    pub pane: PaneInfo,
+}
+
+impl WindowMetadata {
+    /// The latest finite window boundary, or `None` when any window is opaque.
+    ///
+    /// This is the element-level upper bound used by optional window pruning:
+    /// an element cannot belong to a wholly finite window range beyond this
+    /// timestamp. Opaque SDK windows deliberately have no inferred bound.
+    pub fn max_finite_window_end_millis(&self) -> Option<i64> {
+        if self.windows.is_empty() {
+            return None;
+        }
+        self.windows
+            .iter()
+            .try_fold(i64::MIN, |latest, window| match window {
+                BeamWindow::Opaque { .. } => None,
+                BeamWindow::Global | BeamWindow::Interval { .. } => {
+                    Some(latest.max(window.max_timestamp_millis()))
+                }
+            })
+    }
+}
+
+impl From<&WindowedValue> for WindowMetadata {
+    fn from(value: &WindowedValue) -> Self {
+        Self {
+            timestamp_millis: value.timestamp_millis,
+            windows: value.windows.clone(),
+            pane: value.pane.clone(),
+        }
+    }
 }
 
 impl RecordTableSchema {
@@ -266,6 +319,7 @@ impl RecordTableSchema {
         Self {
             table_type: TableType::Row,
             arrow_schema,
+            has_windowed_metadata: false,
         }
     }
 }
@@ -437,7 +491,18 @@ pub fn iterable_values_to_array(
     Ok(Arc::new(ListArray::new(item_field, offsets, child, None)))
 }
 
-fn primitive_value_from_array_row(
+/// Decodes one primitive cell from an Arrow array at `row`.
+///
+/// Accepts every concrete Arrow storage type that DataFusion and Paimon may
+/// produce for the same logical Beam primitive. Beyond the canonical `Utf8` and
+/// `Binary`, the large-offset and view variants (`LargeUtf8`, `Utf8View`,
+/// `LargeBinary`, `BinaryView`) decode to the same [`PrimitiveValue::String`] or
+/// [`PrimitiveValue::Bytes`], because DataFusion can read a Paimon `Utf8`/`Binary`
+/// column back as a view or large-offset array.
+///
+/// A null cell decodes to [`PrimitiveValue::Void`]; any other storage type is
+/// rejected as an unsupported primitive storage type.
+pub(crate) fn primitive_value_from_array_row(
     array: &dyn Array,
     data_type: &ArrowDataType,
     row: usize,
@@ -454,11 +519,41 @@ fn primitive_value_from_array_row(
                 .ok_or_else(|| anyhow!("expected StringArray for Utf8 primitive column"))?;
             Ok(PrimitiveValue::String(array.value(row).to_string()))
         }
+        ArrowDataType::LargeUtf8 => {
+            let array = array
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .ok_or_else(|| {
+                    anyhow!("expected LargeStringArray for LargeUtf8 primitive column")
+                })?;
+            Ok(PrimitiveValue::String(array.value(row).to_string()))
+        }
+        ArrowDataType::Utf8View => {
+            let array = array
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .ok_or_else(|| anyhow!("expected StringViewArray for Utf8View primitive column"))?;
+            Ok(PrimitiveValue::String(array.value(row).to_string()))
+        }
         ArrowDataType::Binary => {
             let array = array
                 .as_any()
                 .downcast_ref::<BinaryArray>()
                 .ok_or_else(|| anyhow!("expected BinaryArray for Binary primitive column"))?;
+            Ok(PrimitiveValue::Bytes(array.value(row).to_vec()))
+        }
+        ArrowDataType::LargeBinary => {
+            let array = array
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .ok_or_else(|| anyhow!("expected LargeBinaryArray for LargeBinary column"))?;
+            Ok(PrimitiveValue::Bytes(array.value(row).to_vec()))
+        }
+        ArrowDataType::BinaryView => {
+            let array = array
+                .as_any()
+                .downcast_ref::<BinaryViewArray>()
+                .ok_or_else(|| anyhow!("expected BinaryViewArray for BinaryView column"))?;
             Ok(PrimitiveValue::Bytes(array.value(row).to_vec()))
         }
         ArrowDataType::Int64 => {
@@ -487,7 +582,7 @@ fn primitive_value_from_array_row(
     }
 }
 
-fn iterable_value_from_array_row(
+pub(crate) fn iterable_value_from_array_row(
     array: &dyn Array,
     data_type: &ArrowDataType,
     row: usize,
@@ -550,11 +645,26 @@ fn tuple_storage_type(tuple: &TupleValue) -> ArrowDataType {
     ArrowDataType::Struct(fields.into())
 }
 
-/// Arrow storage type for a nested value that is either a primitive or a tuple.
+/// Arrow storage type for a nested value that is a primitive, tuple, or KV.
 fn nested_value_storage_type(record: &BeamRecord) -> Result<ArrowDataType> {
     match record {
         BeamRecord::PRIMITIVE(value) => Ok(primitive_data_type(value)),
         BeamRecord::TUPLE(tuple) => Ok(tuple_storage_type(tuple)),
+        BeamRecord::KV(kv) => {
+            let key_data_type = tuple_component_data_type(&kv.key);
+            let value_data_type = nested_value_storage_type(&kv.value)?;
+            let value_data_type = match value_data_type {
+                ArrowDataType::Null => ArrowDataType::Boolean,
+                other => other,
+            };
+            Ok(ArrowDataType::Struct(
+                vec![
+                    ArrowField::new("key", key_data_type, true),
+                    ArrowField::new("value", value_data_type, true),
+                ]
+                .into(),
+            ))
+        }
         other => Err(anyhow!(
             "unsupported nested value record type: {:?}",
             other.record_type()
@@ -562,26 +672,44 @@ fn nested_value_storage_type(record: &BeamRecord) -> Result<ArrowDataType> {
     }
 }
 
+fn is_nested_kv_struct(fields: &arrow_schema::Fields) -> bool {
+    fields.len() == 2 && fields[0].name() == "key" && fields[1].name() == "value"
+}
+
 /// Build an Arrow array for a nested value column whose elements are primitives
-/// or tuples.
+/// or recursively nested tuples/KVs.
 fn nested_values_to_array(records: &[BeamRecord], data_type: &ArrowDataType) -> Result<ArrayRef> {
     match data_type {
         ArrowDataType::Struct(fields) => {
             let arity = fields.len();
             let mut children: Vec<ArrayRef> = Vec::with_capacity(arity);
-            for index in 0..arity {
-                let child_type = fields[index].data_type();
-                let mut child_values = Vec::with_capacity(records.len());
+            if is_nested_kv_struct(fields) {
+                let mut keys = Vec::with_capacity(records.len());
+                let mut values = Vec::with_capacity(records.len());
                 for record in records {
-                    let BeamRecord::TUPLE(tuple) = record else {
-                        return Err(anyhow!("expected tuple record"));
+                    let BeamRecord::KV(kv) = record else {
+                        return Err(anyhow!("expected nested KV record"));
                     };
-                    let value = tuple.values.get(index).ok_or_else(|| {
-                        anyhow!("tuple component count mismatch: expected at least {arity}")
-                    })?;
-                    child_values.push(value.clone());
+                    keys.push(kv.key.clone());
+                    values.push((*kv.value).clone());
                 }
-                children.push(primitive_values_to_array(&child_values, child_type)?);
+                children.push(primitive_values_to_array(&keys, fields[0].data_type())?);
+                children.push(nested_values_to_array(&values, fields[1].data_type())?);
+            } else {
+                for index in 0..arity {
+                    let child_type = fields[index].data_type();
+                    let mut child_values = Vec::with_capacity(records.len());
+                    for record in records {
+                        let BeamRecord::TUPLE(tuple) = record else {
+                            return Err(anyhow!("expected tuple record"));
+                        };
+                        let value = tuple.values.get(index).ok_or_else(|| {
+                            anyhow!("tuple component count mismatch: expected at least {arity}")
+                        })?;
+                        child_values.push(value.clone());
+                    }
+                    children.push(primitive_values_to_array(&child_values, child_type)?);
+                }
             }
             Ok(Arc::new(StructArray::try_new(
                 fields.clone(),
@@ -614,6 +742,22 @@ fn nested_value_from_array_row(
                 .as_any()
                 .downcast_ref::<StructArray>()
                 .ok_or_else(|| anyhow!("expected StructArray for tuple column"))?;
+            if is_nested_kv_struct(fields) {
+                let key = primitive_value_from_array_row(
+                    struct_array.column(0).as_ref(),
+                    fields[0].data_type(),
+                    row,
+                )?;
+                let value = nested_value_from_array_row(
+                    struct_array.column(1).as_ref(),
+                    fields[1].data_type(),
+                    row,
+                )?;
+                return Ok(BeamRecord::KV(BeamKV {
+                    key,
+                    value: Box::new(value),
+                }));
+            }
             let mut values = Vec::with_capacity(fields.len());
             for index in 0..fields.len() {
                 values.push(primitive_value_from_array_row(
@@ -836,6 +980,7 @@ pub fn derive_table_schema(
     Ok(RecordTableSchema {
         table_type,
         arrow_schema,
+        has_windowed_metadata: false,
     })
 }
 
@@ -1061,39 +1206,163 @@ pub fn record_batch_to_beamrecords(
     Ok(records)
 }
 
-/// Paimon cannot store Arrow `Null`. Rewrite top-level `Null` columns as
-/// nullable `Boolean` columns where every value is null. This is a lossless
-/// surrogate for `PrimitiveValue::Void`.
+/// Rewrites logical Arrow `Null` types to the nullable Boolean surrogate Paimon
+/// uses for `PrimitiveValue::Void`, including nested list, struct, map, and
+/// fixed-size-list children.
+pub fn materialize_void_schema(schema: &Schema) -> Schema {
+    Schema::new_with_metadata(
+        schema
+            .fields()
+            .iter()
+            .map(|field| Arc::new(materialize_void_field(field)))
+            .collect::<Vec<_>>(),
+        schema.metadata().clone(),
+    )
+}
+
+/// Paimon cannot store Arrow `Null`. Rewrite every logical `Null` array,
+/// including nested children, as all-null nullable `Boolean` values. Null cells
+/// decode back to `PrimitiveValue::Void`.
 pub fn materialize_void_columns(batch: RecordBatch) -> Result<RecordBatch> {
     let schema = batch.schema();
-    let mut new_fields = Vec::new();
-    let mut new_columns: Vec<ArrayRef> = Vec::new();
-    let mut modified = false;
-
-    for (i, field) in schema.fields().iter().enumerate() {
-        if field.data_type() == &ArrowDataType::Null {
-            modified = true;
-            new_fields.push(Arc::new(ArrowField::new(
-                field.name(),
-                ArrowDataType::Boolean,
-                true,
-            )));
-            let nulls = Some(NullBuffer::new_null(batch.num_rows()));
-            let values = BooleanBuffer::new_unset(batch.num_rows());
-            new_columns.push(Arc::new(BooleanArray::new(values, nulls)));
-        } else {
-            new_fields.push(field.clone());
-            new_columns.push(batch.column(i).clone());
-        }
-    }
-
-    if !modified {
+    let new_schema = Arc::new(materialize_void_schema(&schema));
+    if new_schema == schema {
         return Ok(batch);
     }
-
-    let new_schema = Arc::new(Schema::new(new_fields));
+    let new_columns = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, field)| materialize_void_array(batch.column(i), field.data_type()))
+        .collect::<Result<Vec<_>>>()?;
     RecordBatch::try_new(new_schema, new_columns)
-        .context("failed to materialize Null columns for Paimon storage")
+        .map_err(|error| anyhow!("failed to materialize Null columns for Paimon storage: {error}"))
+}
+
+fn materialize_void_field(field: &ArrowField) -> ArrowField {
+    let nullable = field.is_nullable() || field.data_type() == &ArrowDataType::Null;
+    field
+        .clone()
+        .with_data_type(materialize_void_type(field.data_type()))
+        .with_nullable(nullable)
+}
+
+fn materialize_void_type(data_type: &ArrowDataType) -> ArrowDataType {
+    match data_type {
+        ArrowDataType::Null => ArrowDataType::Boolean,
+        ArrowDataType::List(field) => ArrowDataType::List(Arc::new(materialize_void_field(field))),
+        ArrowDataType::LargeList(field) => {
+            ArrowDataType::LargeList(Arc::new(materialize_void_field(field)))
+        }
+        ArrowDataType::FixedSizeList(field, size) => {
+            ArrowDataType::FixedSizeList(Arc::new(materialize_void_field(field)), *size)
+        }
+        ArrowDataType::Struct(fields) => ArrowDataType::Struct(
+            fields
+                .iter()
+                .map(|field| Arc::new(materialize_void_field(field)))
+                .collect(),
+        ),
+        ArrowDataType::Map(entries, sorted) => {
+            ArrowDataType::Map(Arc::new(materialize_void_field(entries)), *sorted)
+        }
+        other => other.clone(),
+    }
+}
+
+fn materialize_void_array(array: &ArrayRef, data_type: &ArrowDataType) -> Result<ArrayRef> {
+    match data_type {
+        ArrowDataType::Null => {
+            let values = BooleanBuffer::new_unset(array.len());
+            let nulls = Some(NullBuffer::new_null(array.len()));
+            Ok(Arc::new(BooleanArray::new(values, nulls)))
+        }
+        ArrowDataType::List(field) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .ok_or_else(|| anyhow!("expected ListArray while materializing Void columns"))?;
+            let child = materialize_void_array(values.values(), field.data_type())?;
+            Ok(Arc::new(ListArray::new(
+                Arc::new(materialize_void_field(field)),
+                values.offsets().clone(),
+                child,
+                values.nulls().cloned(),
+            )))
+        }
+        ArrowDataType::LargeList(field) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<LargeListArray>()
+                .ok_or_else(|| {
+                    anyhow!("expected LargeListArray while materializing Void columns")
+                })?;
+            let child = materialize_void_array(values.values(), field.data_type())?;
+            Ok(Arc::new(LargeListArray::new(
+                Arc::new(materialize_void_field(field)),
+                values.offsets().clone(),
+                child,
+                values.nulls().cloned(),
+            )))
+        }
+        ArrowDataType::FixedSizeList(field, size) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .ok_or_else(|| {
+                    anyhow!("expected FixedSizeListArray while materializing Void columns")
+                })?;
+            let child = materialize_void_array(values.values(), field.data_type())?;
+            Ok(Arc::new(FixedSizeListArray::new(
+                Arc::new(materialize_void_field(field)),
+                *size,
+                child,
+                values.nulls().cloned(),
+            )))
+        }
+        ArrowDataType::Struct(fields) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .ok_or_else(|| anyhow!("expected StructArray while materializing Void columns"))?;
+            let children = fields
+                .iter()
+                .enumerate()
+                .map(|(i, field)| materialize_void_array(values.column(i), field.data_type()))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Arc::new(StructArray::try_new(
+                fields
+                    .iter()
+                    .map(|field| Arc::new(materialize_void_field(field)))
+                    .collect(),
+                children,
+                values.nulls().cloned(),
+            )?))
+        }
+        ArrowDataType::Map(entries, sorted) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<MapArray>()
+                .ok_or_else(|| anyhow!("expected MapArray while materializing Void columns"))?;
+            let entries_array = materialize_void_array(
+                &(Arc::new(values.entries().clone()) as ArrayRef),
+                entries.data_type(),
+            )?;
+            let entries_array = entries_array
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .ok_or_else(|| anyhow!("materialized map entries must remain a struct"))?
+                .clone();
+            Ok(Arc::new(MapArray::new(
+                Arc::new(materialize_void_field(entries)),
+                values.offsets().clone(),
+                entries_array,
+                values.nulls().cloned(),
+                *sorted,
+            )))
+        }
+        _ => Ok(array.clone()),
+    }
 }
 
 /// Convert Arrow fields to Paimon [`DataField`]s with auto-assigned IDs starting from 0.
@@ -1422,6 +1691,78 @@ mod tests {
         assert_ne!(s("1"), i(1));
     }
 
+    #[test]
+    fn materialize_void_columns_rewrites_nested_null_types() {
+        let void = Arc::new(NullArray::new(2)) as ArrayRef;
+        let iterable = iterable_values_to_array(
+            &[
+                IterableValue::from_records(vec![BeamRecord::PRIMITIVE(PrimitiveValue::Void)]),
+                IterableValue::from_records(Vec::new()),
+            ],
+            &ArrowDataType::Null,
+        )
+        .unwrap();
+        let struct_fields = vec![
+            Arc::new(ArrowField::new("void", ArrowDataType::Null, true)),
+            Arc::new(ArrowField::new("flag", ArrowDataType::Boolean, true)),
+        ];
+        let struct_values = StructArray::try_new(
+            struct_fields.into(),
+            vec![
+                void.clone(),
+                Arc::new(BooleanArray::from(vec![Some(true), None])),
+            ],
+            None,
+        )
+        .unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            ArrowField::new("void", ArrowDataType::Null, false),
+            ArrowField::new(
+                "iterable",
+                ArrowDataType::List(Arc::new(ArrowField::new("item", ArrowDataType::Null, true))),
+                true,
+            ),
+            ArrowField::new("nested", struct_values.data_type().clone(), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![void, iterable, Arc::new(struct_values) as ArrayRef],
+        )
+        .unwrap();
+
+        let batch = materialize_void_columns(batch).unwrap();
+        assert_eq!(
+            batch.schema().field_with_name("void").unwrap().data_type(),
+            &ArrowDataType::Boolean
+        );
+        assert!(
+            batch
+                .schema()
+                .field_with_name("void")
+                .unwrap()
+                .is_nullable()
+        );
+        let materialized_schema = batch.schema();
+        let ArrowDataType::List(item) = materialized_schema
+            .field_with_name("iterable")
+            .unwrap()
+            .data_type()
+        else {
+            panic!("expected list");
+        };
+        assert_eq!(item.data_type(), &ArrowDataType::Boolean);
+        let ArrowDataType::Struct(fields) = materialized_schema
+            .field_with_name("nested")
+            .unwrap()
+            .data_type()
+        else {
+            panic!("expected struct");
+        };
+        assert_eq!(fields[0].data_type(), &ArrowDataType::Boolean);
+        assert!(fields[0].is_nullable());
+        assert_eq!(batch.column_by_name("void").unwrap().null_count(), 2);
+    }
+
     // TableType
 
     #[test]
@@ -1637,6 +1978,12 @@ mod tests {
         assert_eq!(
             primitive_value_from_array_row(&strings, &DataType::Utf8, 1).unwrap(),
             s("y")
+        );
+
+        let string_views = StringViewArray::from(vec!["key-a", "key-b"]);
+        assert_eq!(
+            primitive_value_from_array_row(&string_views, &DataType::Utf8View, 1).unwrap(),
+            s("key-b")
         );
 
         let ints = Int64Array::from(vec![10, 20]);
@@ -1992,6 +2339,28 @@ mod tests {
     }
 
     #[test]
+    fn roundtrip_kv_with_opaque_composite_key() {
+        // A composite KV/GBK key is carried as its opaque nested encoding (see the
+        // coder fix for Q7); it must survive the schema/batch round-trip as bytes.
+        let key = bytes(&[0x01, b'a', 0x01, b'b']);
+        let records = vec![
+            BeamRecord::KV(BeamKV {
+                key: key.clone(),
+                value: Box::new(BeamRecord::PRIMITIVE(i(1))),
+            }),
+            BeamRecord::KV(BeamKV {
+                key: key.clone(),
+                value: Box::new(BeamRecord::PRIMITIVE(i(2))),
+            }),
+        ];
+        let schema = derive_table_schema("pc", &records).unwrap();
+        let batch = beamrecords_to_record_batch(&records, &schema).unwrap();
+        let back = record_batch_to_beamrecords(&batch, &schema).unwrap();
+        assert_kv(&back[0], &key, &i(1));
+        assert_kv(&back[1], &key, &i(2));
+    }
+
+    #[test]
     fn roundtrip_iterable() {
         let records = vec![
             BeamRecord::ITERABLE(IterableValue::new(vec![i(1), i(2)])),
@@ -2063,6 +2432,44 @@ mod tests {
             };
             assert_eq!(kv.key, expected_key);
             assert_tuple(&kv.value, &expected_value);
+        }
+    }
+
+    #[test]
+    fn roundtrip_kv_with_nested_kv_value() {
+        let records = vec![
+            BeamRecord::KV(BeamKV {
+                key: i(1),
+                value: Box::new(BeamRecord::KV(BeamKV {
+                    key: s("auction-a"),
+                    value: Box::new(BeamRecord::PRIMITIVE(i(7))),
+                })),
+            }),
+            BeamRecord::KV(BeamKV {
+                key: i(2),
+                value: Box::new(BeamRecord::KV(BeamKV {
+                    key: s("auction-b"),
+                    value: Box::new(BeamRecord::PRIMITIVE(i(8))),
+                })),
+            }),
+        ];
+        let schema = derive_table_schema("pc", &records).unwrap();
+        let batch = beamrecords_to_record_batch(&records, &schema).unwrap();
+        let back = record_batch_to_beamrecords(&batch, &schema).unwrap();
+
+        for (record, expected_key, expected_inner_key, expected_value) in [
+            (&back[0], i(1), s("auction-a"), i(7)),
+            (&back[1], i(2), s("auction-b"), i(8)),
+        ] {
+            let BeamRecord::KV(outer) = record else {
+                panic!("expected outer KV, got {record:?}");
+            };
+            assert_eq!(outer.key, expected_key);
+            let BeamRecord::KV(inner) = outer.value.as_ref() else {
+                panic!("expected nested KV, got {:?}", outer.value);
+            };
+            assert_eq!(inner.key, expected_inner_key);
+            assert_primitive(&inner.value, &expected_value);
         }
     }
 

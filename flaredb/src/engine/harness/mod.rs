@@ -45,6 +45,11 @@ impl Channels {
         self.data.clone()
     }
 
+    /// Clone the state channel so the executor can service state requests.
+    pub fn state(&self) -> StateChannel {
+        self.state.clone()
+    }
+
     /// Wait for the worker to connect its control stream.
     pub async fn wait_connected(&self) -> Result<()> {
         self.control.wait_connected().await
@@ -68,6 +73,12 @@ impl Channels {
         self.state.reset().await;
         //self.store.reset();
         info!("stage executor channels reset");
+    }
+
+    /// Route SDK worker log entries for a job into that job's per-job
+    /// `flare-worker.log`.
+    pub async fn set_log_target(&self, instance_id: &str, job_id: &str) -> Result<()> {
+        self.log.set_target(instance_id, job_id).await
     }
 }
 

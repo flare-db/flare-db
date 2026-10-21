@@ -1,7 +1,7 @@
 use beam_model_rs::v1::{
-    ArtifactRequestWrapper, ArtifactResponseWrapper, ArtifactStagingToRolePayload, GetArtifactRequest,
-    ResolveArtifactsRequest, artifact_request_wrapper, artifact_response_wrapper,
-    artifact_staging_service_server::ArtifactStagingService,
+    ArtifactRequestWrapper, ArtifactResponseWrapper, ArtifactStagingToRolePayload,
+    GetArtifactRequest, ResolveArtifactsRequest, artifact_request_wrapper,
+    artifact_response_wrapper, artifact_staging_service_server::ArtifactStagingService,
 };
 use dashmap::DashSet;
 use log::info;
@@ -84,7 +84,10 @@ impl ArtifactStagingService for FlareArtifactStagingService {
                                 ),
                             ) = response.response
                             {
-                                info!("Received resolve response from client with {} artifact(s)", resolve_response.replacements.len());
+                                info!(
+                                    "Received resolve response from client with {} artifact(s)",
+                                    resolve_response.replacements.len()
+                                );
 
                                 for artifact_info in resolve_response.replacements {
                                     info!("Fetched artifact info");
@@ -105,7 +108,10 @@ impl ArtifactStagingService for FlareArtifactStagingService {
 
                                     info!("Staging artifact to relative path: {}", staged_name);
                                     if let Err(e) = store.begin_file(&staged_name).await {
-                                        eprintln!("failed to begin file for {}: {}", staged_name, e);
+                                        eprintln!(
+                                            "failed to begin file for {}: {}",
+                                            staged_name, e
+                                        );
                                         return;
                                     }
 
@@ -234,7 +240,7 @@ impl ArtifactStore {
             fs::create_dir_all(parent).await?;
         }
 
-        println!("staging artifact file: {}", full_path.display());
+        info!("staging artifact file: {}", full_path.display());
         let file = File::create(&full_path).await?;
 
         let mut file_guard = self.current_file.lock().await;
@@ -272,4 +278,3 @@ impl ArtifactStore {
         &self.default_file_name
     }
 }
-

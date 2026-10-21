@@ -4,10 +4,22 @@ use crate::{
     utils::errors::CodersError,
 };
 
+use beam_model_rs::v1::Coder;
 use bytes::{Buf, BufMut};
+use std::collections::HashMap;
 
 /// Beam's minimum timestamp in millis (`BoundedWindow.TIMESTAMP_MIN_VALUE`).
 pub const BEAM_MIN_TIMESTAMP_MILLIS: i64 = -9_223_372_036_854_775;
+
+/// Beam's maximum timestamp in millis (`BoundedWindow.TIMESTAMP_MAX_VALUE`).
+pub const BEAM_MAX_TIMESTAMP_MILLIS: i64 = 9_223_372_036_854_775;
+
+/// Max timestamp of Beam's global window in millis
+/// (`BeamConstants.Constants.GLOBAL_WINDOW_MAX_TIMESTAMP_MILLIS`).
+///
+/// One standard day is subtracted from [`BEAM_MAX_TIMESTAMP_MILLIS`] so the value
+/// stays below the absolute maximum even after rounding up to coarser units.
+pub const GLOBAL_WINDOW_MAX_TIMESTAMP_MILLIS: i64 = 9_223_371_950_454_775;
 
 #[derive(Debug, Clone)]
 pub struct StringUtf8Coder;
@@ -271,6 +283,12 @@ impl NullableCoder {
             value_coder: Box::new(value_coder),
         }
     }
+
+    /// The wrapped coder, for classifying the coder (e.g. whether it decodes to a
+    /// primitive).
+    pub fn inner(&self) -> &StandardBeamCoders {
+        &self.value_coder
+    }
 }
 
 const NULLABLE_ENCODE_NULL: u8 = 0;
@@ -337,15 +355,21 @@ impl BeamCoder<()> for VoidCoder {
     }
 }
 
+/// A Beam element together with its event-time and window metadata.
 #[derive(Debug, Clone)]
 pub struct WindowedValue {
+    /// The logical element payload.
     pub value: BeamRecord,
+    /// Event timestamp in milliseconds since the Unix epoch.
     pub timestamp_millis: i64,
+    /// Windows assigned to the element by the SDK.
     pub windows: Vec<BeamWindow>,
+    /// Beam trigger/pane metadata.
     pub pane: PaneInfo,
 }
 
 impl WindowedValue {
+    /// Creates a value in the global window with Beam's minimum timestamp.
     pub fn global(value: BeamRecord) -> Self {
         Self {
             value,
@@ -356,12 +380,188 @@ impl WindowedValue {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A Beam window carried by a [`WindowedValue`].
+///
+/// Interval bounds are expressed in milliseconds since the Unix epoch and use
+/// Beam's half-open interval convention: `[start_millis, end_millis)`.
+///
+/// Derives `Hash`/`Eq` so a window can participate in a grouping key (for
+/// example `GroupByKey`'s `(key, window)` identity). The `serde` derives remain
+/// available to callers but are no longer used for PCollection window storage.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum BeamWindow {
+    /// The single global window.
     Global,
+    /// A half-open interval window.
+    Interval { start_millis: i64, end_millis: i64 },
+    /// A window encoded by an SDK-specific custom window coder.
+    Opaque {
+        /// Coder id used to interpret and re-encode the window.
+        coder_id: String,
+        /// The custom window bytes inside the coder's outer framing.
+        bytes: Vec<u8>,
+    },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+impl BeamWindow {
+    /// The maximum timestamp this window can hold, in milliseconds since the Unix
+    /// epoch, mirroring Beam's `BoundedWindow.maxTimestamp()`.
+    ///
+    /// Interval bounds are half-open `[start, end)`, so the last instant inside the
+    /// window is `end - 1`. The global window's max timestamp is the Beam constant
+    /// `GLOBAL_WINDOW_MAX_TIMESTAMP_MILLIS`, which is deliberately smaller than
+    /// [`BEAM_MAX_TIMESTAMP_MILLIS`].
+    pub fn max_timestamp_millis(&self) -> i64 {
+        match self {
+            BeamWindow::Global => GLOBAL_WINDOW_MAX_TIMESTAMP_MILLIS,
+            BeamWindow::Interval { end_millis, .. } => end_millis - 1,
+            // Custom windows are opaque to the runner. Batch pipelines with a
+            // finished source use MAX_TIMESTAMP and therefore still close them.
+            BeamWindow::Opaque { .. } => BEAM_MAX_TIMESTAMP_MILLIS,
+        }
+    }
+
+    /// A deterministic, human-readable string identity for this window.
+    ///
+    /// The element store uses `to_binary_key` for its hot path. These
+    /// string helpers remain as a stable diagnostic and compatibility API.
+    pub fn canonical_key(&self) -> String {
+        match self {
+            BeamWindow::Global => "global".to_string(),
+            BeamWindow::Interval {
+                start_millis,
+                end_millis,
+            } => format!("interval:{start_millis}:{end_millis}"),
+            BeamWindow::Opaque { coder_id, bytes } => {
+                format!("opaque:{coder_id}:{}", hex_encode(bytes))
+            }
+        }
+    }
+
+    /// Parses a key produced by [`Self::canonical_key`] back into a window.
+    ///
+    /// Returns `None` for an unrecognized key rather than guessing, so callers
+    /// surface malformed stored metadata instead of silently mis-grouping.
+    pub fn from_canonical_key(key: &str) -> Option<Self> {
+        if key == "global" {
+            return Some(BeamWindow::Global);
+        }
+        if let Some(rest) = key.strip_prefix("opaque:") {
+            let (coder_id, encoded) = rest.rsplit_once(':')?;
+            return Some(BeamWindow::Opaque {
+                coder_id: coder_id.to_string(),
+                bytes: hex_decode(encoded)?,
+            });
+        }
+        let bounds = key.strip_prefix("interval:")?;
+        let (start, end) = bounds.split_once(':')?;
+        Some(BeamWindow::Interval {
+            start_millis: start.parse().ok()?,
+            end_millis: end.parse().ok()?,
+        })
+    }
+
+    /// Encodes this window as a compact, deterministic binary identity.
+    ///
+    /// Interval bounds are encoded in lexicographically ordered form so
+    /// DataFusion can sort binary window keys without decoding them. Opaque
+    /// custom-window bytes are retained verbatim and are not interpreted by the
+    /// runner.
+    pub(crate) fn to_binary_key(&self) -> Vec<u8> {
+        match self {
+            BeamWindow::Global => vec![0],
+            BeamWindow::Interval {
+                start_millis,
+                end_millis,
+            } => {
+                let mut encoded = Vec::with_capacity(17);
+                encoded.push(1);
+                encoded.extend_from_slice(&ordered_i64_bytes(*start_millis));
+                encoded.extend_from_slice(&ordered_i64_bytes(*end_millis));
+                encoded
+            }
+            BeamWindow::Opaque { coder_id, bytes } => {
+                let coder_id = coder_id.as_bytes();
+                let coder_len =
+                    u32::try_from(coder_id.len()).expect("Beam window coder id exceeds u32 length");
+                let mut encoded = Vec::with_capacity(
+                    1 + std::mem::size_of::<u32>() + coder_id.len() + bytes.len(),
+                );
+                encoded.push(2);
+                encoded.extend_from_slice(&coder_len.to_be_bytes());
+                encoded.extend_from_slice(coder_id);
+                encoded.extend_from_slice(bytes);
+                encoded
+            }
+        }
+    }
+
+    /// Decodes a key produced by [`Self::to_binary_key`].
+    ///
+    /// Malformed input is rejected rather than guessed so stored metadata cannot
+    /// silently change Beam grouping semantics.
+    pub(crate) fn from_binary_key(key: &[u8]) -> Option<Self> {
+        match key.split_first() {
+            Some((0, [])) => Some(BeamWindow::Global),
+            Some((1, bounds)) if bounds.len() == 16 => {
+                let start = ordered_i64_from_bytes(&bounds[..8])?;
+                let end = ordered_i64_from_bytes(&bounds[8..])?;
+                Some(BeamWindow::Interval {
+                    start_millis: start,
+                    end_millis: end,
+                })
+            }
+            Some((2, opaque)) if opaque.len() >= 4 => {
+                let coder_len = u32::from_be_bytes(opaque[..4].try_into().ok()?) as usize;
+                let coder_end = 4usize.checked_add(coder_len)?;
+                if coder_end > opaque.len() {
+                    return None;
+                }
+                let coder_id = std::str::from_utf8(&opaque[4..coder_end]).ok()?;
+                Some(BeamWindow::Opaque {
+                    coder_id: coder_id.to_string(),
+                    bytes: opaque[coder_end..].to_vec(),
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+fn ordered_i64_bytes(value: i64) -> [u8; 8] {
+    ((value as u64) ^ (1u64 << 63)).to_be_bytes()
+}
+
+fn ordered_i64_from_bytes(bytes: &[u8]) -> Option<i64> {
+    let encoded = u64::from_be_bytes(bytes.try_into().ok()?);
+    Some((encoded ^ (1u64 << 63)) as i64)
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+fn hex_decode(encoded: &str) -> Option<Vec<u8>> {
+    if !encoded.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut decoded = Vec::with_capacity(encoded.len() / 2);
+    for pair in encoded.as_bytes().as_chunks::<2>().0 {
+        let high = (pair[0] as char).to_digit(16)?;
+        let low = (pair[1] as char).to_digit(16)?;
+        decoded.push(((high << 4) | low) as u8);
+    }
+    Some(decoded)
+}
+
+/// Beam pane timing, mirroring the portable `PaneInfo` timing enumeration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PaneTiming {
     Early = 0,
     OnTime = 1,
@@ -370,7 +570,7 @@ pub enum PaneTiming {
 }
 
 impl PaneTiming {
-    fn from_bits(bits: u8) -> Self {
+    pub(crate) fn from_bits(bits: u8) -> Self {
         match bits {
             0 => PaneTiming::Early,
             1 => PaneTiming::OnTime,
@@ -378,9 +578,24 @@ impl PaneTiming {
             _ => PaneTiming::Unknown,
         }
     }
+
+    pub(crate) fn bits(self) -> u8 {
+        match self {
+            PaneTiming::Early => 0,
+            PaneTiming::OnTime => 1,
+            PaneTiming::Late => 2,
+            PaneTiming::Unknown => 3,
+        }
+    }
 }
 
-#[derive(Debug, Clone)]
+/// Beam pane information carried by a [`WindowedValue`].
+///
+/// Fields mirror the portable `PaneInfo` message and describe how a particular
+/// firing of a window relates to the whole (first/last, timing, and indices).
+/// The `serde` derives remain available to callers but are no longer used for
+/// PCollection window storage.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PaneInfo {
     pub is_first: bool,
     pub is_last: bool,
@@ -399,18 +614,177 @@ impl PaneInfo {
             non_speculative_index: 0,
         }
     }
+
+    /// A single on-time firing that both opens and closes the window's triggering.
+    ///
+    /// Used when a runner-native transform (for example `GroupByKey`) emits exactly
+    /// one aggregated pane per window: the output is the first and last pane and is
+    /// produced on time rather than speculatively.
+    pub fn on_time_firing() -> Self {
+        Self {
+            is_first: true,
+            is_last: true,
+            timing: PaneTiming::OnTime,
+            index: 0,
+            non_speculative_index: 0,
+        }
+    }
 }
 
+/// The Beam window coder selected from a PCollection's coder graph.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WindowCoder {
+    /// `beam:coder:global_window:v1`.
+    Global,
+    /// `beam:coder:interval_window:v1`.
+    Interval,
+    /// `beam:coder:length_prefix:v1` wrapping an SDK-specific window coder.
+    OpaqueLengthPrefixed {
+        /// The custom coder nested under the length-prefix wrapper.
+        inner_coder_id: String,
+    },
+}
+
+impl WindowCoder {
+    /// Resolves a Beam window-coder URN.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the URN is not a supported Beam window coder.
+    pub fn from_urn(urn: &str) -> Self {
+        match urn {
+            crate::jobservice::urns::beam_urns::GLOBAL_WINDOW_CODER => Self::Global,
+            crate::jobservice::urns::beam_urns::INTERVAL_WINDOW_CODER => Self::Interval,
+            _ => panic!("Unsupported Beam window coder: {urn}"),
+        }
+    }
+
+    pub fn from_coder(coder_id: &str, coders: &HashMap<String, Coder>) -> Self {
+        Self::try_from_coder(coder_id, coders).unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Fallible form of [`Self::from_coder`], used on execution paths that can
+    /// report an unsupported coder back to the job instead of panicking.
+    pub fn try_from_coder(coder_id: &str, coders: &HashMap<String, Coder>) -> anyhow::Result<Self> {
+        let Some(coder) = coders.get(coder_id) else {
+            return match Self::from_urn_known(coder_id) {
+                Some(coder) => Ok(coder),
+                None => Err(anyhow::anyhow!(
+                    "unsupported Beam window coder id/URN: {coder_id}"
+                )),
+            };
+        };
+        let urn = coder
+            .spec
+            .as_ref()
+            .map(|spec| spec.urn.as_str())
+            .unwrap_or(coder_id);
+        if urn == crate::jobservice::urns::beam_urns::LENGTH_PREFIX_CODER
+            && coder.component_coder_ids.len() == 1
+        {
+            return Ok(Self::OpaqueLengthPrefixed {
+                inner_coder_id: coder.component_coder_ids[0].clone(),
+            });
+        }
+        Self::from_urn_known(urn)
+            .ok_or_else(|| anyhow::anyhow!("unsupported Beam window coder URN: {urn}"))
+    }
+
+    fn from_urn_known(urn: &str) -> Option<Self> {
+        match urn {
+            crate::jobservice::urns::beam_urns::GLOBAL_WINDOW_CODER => Some(Self::Global),
+            crate::jobservice::urns::beam_urns::INTERVAL_WINDOW_CODER => Some(Self::Interval),
+            _ => None,
+        }
+    }
+
+    /// Encode one window in the top-level context used by Fn State side-input
+    /// keys.
+    pub fn encode_window(&self, window: &BeamWindow, buf: &mut impl BufMut) {
+        match (self, window) {
+            (WindowCoder::Global, BeamWindow::Global) => {}
+            (
+                WindowCoder::Interval,
+                BeamWindow::Interval {
+                    start_millis,
+                    end_millis,
+                },
+            ) => {
+                encode_timestamp_millis(*end_millis, buf);
+                encode_varint((*end_millis - *start_millis) as u64, buf);
+            }
+            (
+                WindowCoder::OpaqueLengthPrefixed { inner_coder_id },
+                BeamWindow::Opaque { coder_id, bytes },
+            ) if coder_id == inner_coder_id => {
+                encode_varint(bytes.len() as u64, buf);
+                buf.put_slice(bytes);
+            }
+            _ => panic!("Window value does not match the configured Beam window coder"),
+        }
+    }
+
+    /// Decode a window from the top-level byte representation carried by an
+    /// iterable side-input state key.
+    pub fn decode_window(&self, bytes: &[u8]) -> Result<BeamWindow, CodersError> {
+        let mut buf = bytes;
+        let window = match self {
+            WindowCoder::OpaqueLengthPrefixed { inner_coder_id } => {
+                let len = decode_varint(&mut buf) as usize;
+                if buf.remaining() < len {
+                    return Err(CodersError::WhileDecoding(
+                        "opaque window coder: insufficient bytes".to_string(),
+                    ));
+                }
+                let mut custom = vec![0u8; len];
+                buf.copy_to_slice(&mut custom);
+                BeamWindow::Opaque {
+                    coder_id: inner_coder_id.clone(),
+                    bytes: custom,
+                }
+            }
+            _ => decode_one_window(&mut buf, self),
+        };
+        if buf.has_remaining() {
+            return Err(CodersError::WhileDecoding(format!(
+                "window coder left {} trailing byte(s)",
+                buf.remaining()
+            )));
+        }
+        Ok(window)
+    }
+}
+
+/// Encodes and decodes Beam `WindowedValue` framing around an element coder.
+///
+/// The window coder is part of the Beam `windowed_value:v1` coder graph and
+/// must match the windows carried by each value. Use [`Self::new`] when FlareDB
+/// intentionally creates global-window values, or [`Self::with_window_coder`]
+/// when resolving an existing PCollection boundary.
 #[derive(Debug, Clone)]
 pub struct WindowedValueCoder {
     element_coder: StandardBeamCoders,
+    window_coder: WindowCoder,
 }
 
 impl WindowedValueCoder {
+    /// Creates a coder for values that FlareDB creates in the global window.
     pub fn new(element_coder: StandardBeamCoders) -> Self {
-        Self { element_coder }
+        Self::with_window_coder(element_coder, WindowCoder::Global)
     }
 
+    /// Creates a coder using the window coder resolved from the Beam graph.
+    pub fn with_window_coder(element_coder: StandardBeamCoders, window_coder: WindowCoder) -> Self {
+        Self {
+            element_coder,
+            window_coder,
+        }
+    }
+
+    /// Encodes a new element as a global-window `WindowedValue`.
+    ///
+    /// This helper is for newly created FlareDB values. Existing window,
+    /// timestamp, and pane metadata must be encoded with [`Self::encode`].
     pub fn encode_value(&self, value: BeamRecord, buf: &mut impl BufMut) {
         let windowed_value = WindowedValue::global(value.clone());
         self.encode(windowed_value, buf);
@@ -419,16 +793,19 @@ impl WindowedValueCoder {
 
 impl BeamCoder<WindowedValue> for WindowedValueCoder {
     fn encode(&self, val: WindowedValue, buf: &mut impl BufMut) {
-        encode_timestamp_millis(val.timestamp_millis, buf);
-        encode_global_windows(&val.windows, buf);
-        encode_pane_info(&val.pane, buf);
+        encode_windowed_value_header(
+            val.timestamp_millis,
+            &val.windows,
+            &self.window_coder,
+            &val.pane,
+            buf,
+        );
         self.element_coder.encode(val.value, buf);
     }
 
     fn decode(&self, buf: &mut impl Buf) -> Result<WindowedValue, CodersError> {
-        let timestamp_millis = decode_timestamp_millis(buf);
-        let windows = decode_global_windows(buf);
-        let pane = decode_pane_info(buf);
+        let (timestamp_millis, windows, pane) =
+            decode_windowed_value_header(buf, &self.window_coder);
         let value = self.element_coder.decode_nested(buf)?;
 
         Ok(WindowedValue {
@@ -437,6 +814,99 @@ impl BeamCoder<WindowedValue> for WindowedValueCoder {
             windows,
             pane,
         })
+    }
+}
+
+/// A decoded Beam user timer (`beam:coder:timer:v1`).
+///
+/// The key is kept as raw encoded bytes so it can be re-emitted verbatim when
+/// the timer fires; the windows are decoded so the runner can reason about
+/// event-time expiry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Timer {
+    pub user_key: Vec<u8>,
+    pub tag: String,
+    pub windows: Vec<BeamWindow>,
+    pub clear: bool,
+    pub fire_timestamp: i64,
+    pub hold_timestamp: i64,
+    pub pane: PaneInfo,
+}
+
+/// Encodes and decodes `beam:coder:timer:v1`.
+///
+/// Wire form: `key (key coder), tag (nested string), windows (window coder),
+/// clear bit (1 byte)`, then, when set, `fire timestamp, hold timestamp, pane`.
+/// `key_coder` is the timer family's key coder and `window_coder` its window
+/// coder, resolved from the pipeline's `TimerFamilySpec`.
+#[derive(Debug, Clone)]
+pub struct TimerCoder {
+    key_coder: StandardBeamCoders,
+    window_coder: WindowCoder,
+}
+
+impl TimerCoder {
+    pub fn new(key_coder: StandardBeamCoders, window_coder: WindowCoder) -> Self {
+        Self {
+            key_coder,
+            window_coder,
+        }
+    }
+
+    /// Decode one timer from `buf`, advancing it past the timer.
+    pub fn decode(&self, buf: &mut impl Buf) -> Result<Timer, CodersError> {
+        // Decode the key, then re-encode it in nested form: the timer's own
+        // framing stores the key bytes verbatim, so a fired timer can emit them
+        // without the decoder needing to track reader positions.
+        let key = self
+            .key_coder
+            .decode(buf)
+            .map_err(|e| CodersError::WhileDecoding(format!("timer key: {e}")))?;
+        let mut user_key = Vec::new();
+        self.key_coder.encode(key, &mut user_key);
+
+        let tag_len = decode_varint(buf) as usize;
+        let mut tag_bytes = vec![0u8; tag_len];
+        buf.copy_to_slice(&mut tag_bytes);
+        let tag = String::from_utf8(tag_bytes)
+            .map_err(|e| CodersError::WhileDecoding(format!("timer tag: {e}")))?;
+
+        let windows = decode_windows(buf, &self.window_coder);
+        let clear = buf.get_u8() != 0;
+
+        let (fire_timestamp, hold_timestamp, pane) = if clear {
+            (0, 0, PaneInfo::no_firing())
+        } else {
+            (
+                decode_timestamp_millis(buf),
+                decode_timestamp_millis(buf),
+                decode_pane_info(buf),
+            )
+        };
+
+        Ok(Timer {
+            user_key,
+            tag,
+            windows,
+            clear,
+            fire_timestamp,
+            hold_timestamp,
+            pane,
+        })
+    }
+
+    /// Encode a timer in the `beam:coder:timer:v1` wire form.
+    pub fn encode_into(&self, timer: &Timer, buf: &mut impl BufMut) {
+        buf.put_slice(&timer.user_key);
+        encode_varint(timer.tag.len() as u64, buf);
+        buf.put_slice(timer.tag.as_bytes());
+        encode_windows(&timer.windows, &self.window_coder, buf);
+        buf.put_u8(u8::from(timer.clear));
+        if !timer.clear {
+            encode_timestamp_millis(timer.fire_timestamp, buf);
+            encode_timestamp_millis(timer.hold_timestamp, buf);
+            encode_pane_info(&timer.pane, buf);
+        }
     }
 }
 
@@ -450,25 +920,52 @@ fn decode_timestamp_millis(buf: &mut impl Buf) -> i64 {
     (shifted ^ 0x8000_0000_0000_0000) as i64
 }
 
-fn encode_global_windows(windows: &[BeamWindow], buf: &mut impl BufMut) {
+/// Encode the timestamp/windows/pane prefix of a Beam `WindowedValue`.
+///
+/// Runner infrastructure occasionally constructs an element payload with a
+/// coder graph that is not represented by [`StandardBeamCoders`], such as the
+/// synthetic `MergeWindows` bundle. Keeping the prefix framing here ensures
+/// those callers use exactly the same wire representation as SDK boundaries.
+pub(crate) fn encode_windowed_value_header(
+    timestamp_millis: i64,
+    windows: &[BeamWindow],
+    coder: &WindowCoder,
+    pane: &PaneInfo,
+    buf: &mut impl BufMut,
+) {
+    encode_timestamp_millis(timestamp_millis, buf);
+    encode_windows(windows, coder, buf);
+    encode_pane_info(pane, buf);
+}
+
+/// Decode the timestamp/windows/pane prefix of a Beam `WindowedValue`, leaving
+/// the buffer positioned at the element payload.
+pub(crate) fn decode_windowed_value_header(
+    buf: &mut impl Buf,
+    coder: &WindowCoder,
+) -> (i64, Vec<BeamWindow>, PaneInfo) {
+    (
+        decode_timestamp_millis(buf),
+        decode_windows(buf, coder),
+        decode_pane_info(buf),
+    )
+}
+
+fn encode_windows(windows: &[BeamWindow], coder: &WindowCoder, buf: &mut impl BufMut) {
     buf.put_i32(windows.len() as i32);
 
     for window in windows {
-        match window {
-            BeamWindow::Global => {
-                // GlobalWindowCoder has an empty payload.
-            }
-        }
+        coder.encode_window(window, buf);
     }
 }
 
-fn decode_global_windows(buf: &mut impl Buf) -> Vec<BeamWindow> {
+fn decode_windows(buf: &mut impl Buf, coder: &WindowCoder) -> Vec<BeamWindow> {
     let count = buf.get_i32();
     let mut windows = Vec::new();
 
     if count >= 0 {
         for _ in 0..count {
-            windows.push(BeamWindow::Global);
+            windows.push(decode_one_window(buf, coder));
         }
         return windows;
     }
@@ -482,11 +979,38 @@ fn decode_global_windows(buf: &mut impl Buf) -> Vec<BeamWindow> {
         }
 
         for _ in 0..chunk_count {
-            windows.push(BeamWindow::Global);
+            windows.push(decode_one_window(buf, coder));
         }
     }
 
     windows
+}
+
+pub(crate) fn decode_window_from(buf: &mut impl Buf, coder: &WindowCoder) -> BeamWindow {
+    decode_one_window(buf, coder)
+}
+
+fn decode_one_window(buf: &mut impl Buf, coder: &WindowCoder) -> BeamWindow {
+    match coder {
+        WindowCoder::Global => BeamWindow::Global,
+        WindowCoder::Interval => {
+            let end_millis = decode_timestamp_millis(buf);
+            let span_millis = decode_varint(buf) as i64;
+            BeamWindow::Interval {
+                start_millis: end_millis - span_millis,
+                end_millis,
+            }
+        }
+        WindowCoder::OpaqueLengthPrefixed { inner_coder_id } => {
+            let len = decode_varint(buf) as usize;
+            let mut bytes = vec![0u8; len];
+            buf.copy_to_slice(&mut bytes);
+            BeamWindow::Opaque {
+                coder_id: inner_coder_id.clone(),
+                bytes,
+            }
+        }
+    }
 }
 
 fn encode_pane_info(pane: &PaneInfo, buf: &mut impl BufMut) {
@@ -1081,6 +1605,114 @@ mod tests {
     }
 
     #[test]
+    fn interval_window_roundtrip_preserves_windowed_value_metadata() {
+        let coder = WindowedValueCoder::with_window_coder(
+            StandardBeamCoders::VarInt(VarIntCoder),
+            WindowCoder::Interval,
+        );
+        let original = WindowedValue {
+            value: BeamRecord::PRIMITIVE(PrimitiveValue::Int64(12345)),
+            timestamp_millis: 17_000,
+            windows: vec![BeamWindow::Interval {
+                start_millis: 0,
+                end_millis: 60_000,
+            }],
+            pane: PaneInfo {
+                is_first: false,
+                is_last: true,
+                timing: PaneTiming::OnTime,
+                index: 3,
+                non_speculative_index: 3,
+            },
+        };
+
+        let mut buf = BytesMut::new();
+        coder.encode(original.clone(), &mut buf);
+        // IntervalWindowCoder is end timestamp followed by unsigned span.
+        assert_eq!(
+            &buf[8..23],
+            &[
+                0, 0, 0, 1, 0x80, 0, 0, 0, 0, 0, 0xea, 0x60, 0xe0, 0xd4, 0x03,
+            ]
+        );
+
+        let mut bytes = buf.freeze();
+        let decoded = coder.decode(&mut bytes).unwrap();
+        assert_eq!(decoded.timestamp_millis, original.timestamp_millis);
+        assert_eq!(decoded.windows, original.windows);
+        assert_eq!(decoded.pane, original.pane);
+        assert_eq!(decoded.value, original.value);
+    }
+
+    #[test]
+    fn interval_window_matches_standard_coders_yaml_wire_example() {
+        let mut encoded = BytesMut::new();
+        encode_windows(
+            &[BeamWindow::Interval {
+                start_millis: 1454293425000 - 3_600_000,
+                end_millis: 1454293425000,
+            }],
+            &WindowCoder::Interval,
+            &mut encoded,
+        );
+        assert_eq!(
+            encoded.as_ref(),
+            &[
+                0, 0, 0, 1, 0x80, 0x00, 0x01, 0x52, 0x9a, 0xa4, 0x9b, 0x68, 0x80, 0xdd, 0xdb, 0x01,
+            ]
+        );
+
+        let mut bytes = encoded.freeze();
+        assert_eq!(
+            decode_windows(&mut bytes, &WindowCoder::Interval),
+            vec![BeamWindow::Interval {
+                start_millis: 1454293425000 - 3_600_000,
+                end_millis: 1454293425000,
+            }]
+        );
+    }
+
+    #[test]
+    fn interval_window_coder_resolves_from_beam_urn() {
+        assert_eq!(
+            WindowCoder::from_urn(crate::jobservice::urns::beam_urns::INTERVAL_WINDOW_CODER),
+            WindowCoder::Interval
+        );
+        assert_eq!(
+            WindowCoder::from_urn(crate::jobservice::urns::beam_urns::GLOBAL_WINDOW_CODER),
+            WindowCoder::Global
+        );
+    }
+
+    #[test]
+    fn multiple_interval_windows_roundtrip() {
+        let coder = WindowedValueCoder::with_window_coder(
+            StandardBeamCoders::VarInt(VarIntCoder),
+            WindowCoder::Interval,
+        );
+        let original = WindowedValue {
+            value: BeamRecord::PRIMITIVE(PrimitiveValue::Int64(1)),
+            timestamp_millis: 1,
+            windows: vec![
+                BeamWindow::Interval {
+                    start_millis: 0,
+                    end_millis: 60_000,
+                },
+                BeamWindow::Interval {
+                    start_millis: 120_000,
+                    end_millis: 180_000,
+                },
+            ],
+            pane: PaneInfo::no_firing(),
+        };
+        let mut buf = BytesMut::new();
+        coder.encode(original.clone(), &mut buf);
+        let mut bytes = buf.freeze();
+        let decoded = coder.decode(&mut bytes).unwrap();
+        assert_eq!(decoded.windows, original.windows);
+    }
+
+    #[test]
     fn encode_value_helper() {
         let coder = WindowedValueCoder::new(StandardBeamCoders::StringUtf8(StringUtf8Coder));
 
@@ -1327,5 +1959,195 @@ mod beam_wire_tests {
                 PrimitiveValue::Int64(1000),
             ])
         );
+    }
+
+    fn test_coder(urn: &str, components: &[&str]) -> Coder {
+        Coder {
+            spec: Some(beam_model_rs::v1::FunctionSpec {
+                urn: urn.to_string(),
+                payload: Vec::new(),
+            }),
+            component_coder_ids: components.iter().map(|id| id.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn opaque_custom_window_roundtrips_through_windowed_value() {
+        let coders = HashMap::from([
+            (
+                "outer".to_string(),
+                test_coder(
+                    crate::jobservice::urns::beam_urns::LENGTH_PREFIX_CODER,
+                    &["middle"],
+                ),
+            ),
+            (
+                "middle".to_string(),
+                test_coder(
+                    crate::jobservice::urns::beam_urns::LENGTH_PREFIX_CODER,
+                    &["inner"],
+                ),
+            ),
+            (
+                "inner".to_string(),
+                test_coder(crate::jobservice::urns::beam_urns::JAVA_SDK_CODER, &[]),
+            ),
+        ]);
+
+        let window_coder = WindowCoder::from_coder("outer", &coders);
+        assert_eq!(
+            window_coder,
+            WindowCoder::OpaqueLengthPrefixed {
+                inner_coder_id: "middle".to_string()
+            }
+        );
+
+        let window = BeamWindow::Opaque {
+            coder_id: "middle".to_string(),
+            bytes: vec![0x05, 0xDE, 0xAD, 0xBE, 0xEF, 0x01],
+        };
+        assert_eq!(
+            BeamWindow::from_canonical_key(&window.canonical_key()),
+            Some(window.clone())
+        );
+
+        let coder = WindowedValueCoder::with_window_coder(
+            StandardBeamCoders::Bytes(BytesCoder),
+            window_coder,
+        );
+        let value = WindowedValue {
+            value: BeamRecord::PRIMITIVE(PrimitiveValue::Bytes(vec![9, 8, 7])),
+            timestamp_millis: 1234,
+            windows: vec![window.clone()],
+            pane: PaneInfo::on_time_firing(),
+        };
+
+        let mut buf = BytesMut::new();
+        coder.encode(value.clone(), &mut buf);
+        let mut bytes = buf.freeze();
+        let decoded = coder.decode(&mut bytes).expect("decode custom window");
+
+        assert!(bytes.is_empty());
+        assert_eq!(decoded.timestamp_millis, value.timestamp_millis);
+        assert_eq!(decoded.windows, vec![window]);
+        assert_eq!(decoded.pane, value.pane);
+        assert_eq!(decoded.value, value.value);
+    }
+
+    #[test]
+    fn binary_window_keys_roundtrip_and_order_intervals() {
+        let windows = vec![
+            BeamWindow::Global,
+            BeamWindow::Interval {
+                start_millis: -10,
+                end_millis: 5,
+            },
+            BeamWindow::Interval {
+                start_millis: 0,
+                end_millis: 5,
+            },
+            BeamWindow::Interval {
+                start_millis: 0,
+                end_millis: 10,
+            },
+            BeamWindow::Opaque {
+                coder_id: "CustomWindowCoder".to_string(),
+                bytes: vec![0, 255, 16, 32],
+            },
+        ];
+
+        let encoded = windows
+            .iter()
+            .map(BeamWindow::to_binary_key)
+            .collect::<Vec<_>>();
+        for (window, key) in windows.iter().zip(&encoded) {
+            assert_eq!(BeamWindow::from_binary_key(key), Some(window.clone()));
+        }
+
+        assert!(encoded[1] < encoded[2]);
+        assert!(encoded[2] < encoded[3]);
+        assert_eq!(
+            windows[4].to_binary_key()[1..5],
+            ("CustomWindowCoder".len() as u32).to_be_bytes()
+        );
+        assert!(windows[4].to_binary_key().ends_with(&[0, 255, 16, 32]));
+    }
+
+    #[test]
+    fn malformed_binary_window_keys_are_rejected() {
+        for key in [
+            vec![],
+            vec![0, 1],
+            vec![1],
+            vec![1; 16],
+            vec![2],
+            vec![2, 0, 0],
+            vec![2, 0, 0, 0, 2, b'x'],
+            vec![9],
+        ] {
+            assert_eq!(BeamWindow::from_binary_key(&key), None);
+        }
+    }
+}
+
+#[cfg(test)]
+mod timer_coder_tests {
+    use super::*;
+
+    fn coder() -> TimerCoder {
+        TimerCoder::new(
+            StandardBeamCoders::StringUtf8(StringUtf8Coder),
+            WindowCoder::Global,
+        )
+    }
+
+    /// The set-timer example from Beam's `standard_coders.yaml`.
+    fn set_timer_bytes() -> Vec<u8> {
+        vec![
+            3, b'k', b'e', b'y', 3, b't', b'a', b'g', 0, 0, 0, 1, 0, 0x80, 0, 0, 0, 0, 0, 0x04,
+            0xd2, 0x80, 0, 0, 0, 0, 0, 0x16, 0x2e, 0x0f,
+        ]
+    }
+
+    #[test]
+    fn decodes_a_set_timer() {
+        let bytes = set_timer_bytes();
+        let mut buf: &[u8] = &bytes;
+        let timer = coder().decode(&mut buf).unwrap();
+
+        assert!(!timer.clear);
+        assert_eq!(timer.tag, "tag");
+        assert_eq!(timer.user_key, vec![3, b'k', b'e', b'y']);
+        assert_eq!(timer.windows, vec![BeamWindow::Global]);
+        assert_eq!(timer.fire_timestamp, 1234);
+        assert_eq!(timer.hold_timestamp, 5678);
+        assert_eq!(timer.pane.timing, PaneTiming::Unknown);
+        assert!(timer.pane.is_first && timer.pane.is_last);
+        assert!(
+            buf.is_empty(),
+            "decoder must consume exactly the timer bytes"
+        );
+    }
+
+    #[test]
+    fn decodes_a_clear_timer() {
+        let bytes: Vec<u8> = vec![3, b'k', b'e', b'y', 3, b't', b'a', b'g', 0, 0, 0, 1, 1];
+        let mut buf: &[u8] = &bytes;
+        let timer = coder().decode(&mut buf).unwrap();
+
+        assert!(timer.clear);
+        assert_eq!(timer.tag, "tag");
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn encode_round_trips_the_wire_bytes() {
+        let bytes = set_timer_bytes();
+        let mut buf: &[u8] = &bytes;
+        let timer = coder().decode(&mut buf).unwrap();
+
+        let mut out = Vec::new();
+        coder().encode_into(&timer, &mut out);
+        assert_eq!(out, bytes);
     }
 }

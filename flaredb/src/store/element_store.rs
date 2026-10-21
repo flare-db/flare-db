@@ -1,16 +1,28 @@
 use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{Result, anyhow};
-use arrow_array::RecordBatch;
-use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+use arrow_array::{
+    Array, BinaryArray, BooleanArray, Int8Array, Int16Array, Int64Array, ListArray, RecordBatch,
+    builder::{BinaryBuilder, ListBuilder},
+};
+use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use dashmap::DashMap;
 use paimon::spec::Schema as PaimonSchema;
-use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options, Table, catalog::Identifier};
+use paimon::spec::{Datum, Predicate, PredicateBuilder};
+use paimon::{
+    Catalog, CatalogOptions, FileSystemCatalog, IncrementalScanMode, Options, Table, TableWrite,
+    catalog::Identifier, table::ArrowRecordBatchStream,
+};
 use tokio_stream::StreamExt;
 
-use crate::store::record::{
-    BeamRecord, RecordTableSchema, arrow_fields_to_paimon, beamrecords_to_record_batch,
-    derive_table_schema, materialize_void_columns, record_batch_to_beamrecords,
+use crate::{
+    coders::primitives::{BeamWindow, PaneInfo, PaneTiming, WindowedValue},
+    engine::kv::{KvStore, SlateKvStore},
+    store::record::{
+        BeamRecord, RecordTableSchema, WindowMetadata, arrow_fields_to_paimon,
+        beamrecords_to_record_batch, derive_table_schema, materialize_void_columns,
+        record_batch_to_beamrecords,
+    },
 };
 
 /// In-memory cache of [`RecordTableSchema`] per PCollection id.
@@ -52,6 +64,26 @@ pub struct FlareElementStore {
     pub(crate) registry: FlareSchemaRegistry,
     pub(crate) catalog: Arc<FileSystemCatalog>,
     pub(crate) db_name: String,
+    /// Per-reader incremental read cursor: the id of the last Paimon snapshot a
+    /// reader has consumed from a PCollection. Keyed by
+    /// `(reader_id, pcollection_id)` and cached here for the process; the
+    /// authoritative value is the SlateDB `cursors` database (write-through in
+    /// [`FlareElementStore::set_cursor`], read-through in
+    /// [`FlareElementStore::cursor`]). See
+    /// [`FlareElementStore::scan_windowed_values_since`].
+    cursors: Arc<DashMap<String, i64>>,
+    /// Durable per-reader cursor positions, in SlateDB under
+    /// `<warehouse>/.slate_state/<db>/cursors`. The in-memory `cursors` map is a
+    /// write-through cache; this store is authoritative.
+    cursor_store: Arc<dyn KvStore>,
+    /// Running minimum event-time among rows committed to a PCollection since the
+    /// producer last reported. Read and cleared by the driver after each producer
+    /// bundle via [`FlareElementStore::take_commit_min_timestamp`], so a consumer
+    /// can clamp its input watermark by the oldest unconsumed input.
+    commit_min_ts: Arc<DashMap<String, i64>>,
+    /// Per-table-name locks that serialize table resolution and creation, so
+    /// `get_table`/`get_or_create_table` are safe to call concurrently.
+    table_create_locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl FlareElementStore {
@@ -64,10 +96,19 @@ impl FlareElementStore {
             Some(catalog) => catalog,
             None => Arc::new(create_catalog(warehouse, db_name.clone()).await?),
         };
+        let cursor_dir = std::path::Path::new(catalog.warehouse())
+            .join(".slate_state")
+            .join(&db_name);
+        let cursor_store: Arc<dyn KvStore> =
+            Arc::new(SlateKvStore::open(&cursor_dir, "cursors").await?);
         Ok(Self {
             registry: FlareSchemaRegistry::new(),
             catalog,
             db_name,
+            cursors: Arc::new(DashMap::new()),
+            cursor_store,
+            commit_min_ts: Arc::new(DashMap::new()),
+            table_create_locks: Arc::new(DashMap::new()),
         })
     }
 
@@ -98,19 +139,447 @@ impl FlareElementStore {
     /// The table schema is derived from the first batch written to a PCollection
     /// and cached in the registry.
     pub async fn write_beamrecord_batch(&self, req: NewCollectionRequest) -> Result<()> {
-        let table_schema = match self.registry.get(&req.pcollection_id) {
-            Some(ts) => ts,
-            None => {
-                let ts = Arc::new(derive_table_schema(&req.pcollection_id, &req.elements)?);
-                self.registry.register(&req.pcollection_id, ts.clone());
-                ts
-            }
-        };
-
-        let batch = beamrecords_to_record_batch(&req.elements, &table_schema)?;
-
+        let logical_schema = derive_table_schema(&req.pcollection_id, &req.elements)?;
+        let batch = beamrecords_to_record_batch(&req.elements, &logical_schema)?;
+        let batch = materialize_void_columns(batch)?;
+        let table_schema = Arc::new(RecordTableSchema {
+            table_type: logical_schema.table_type,
+            arrow_schema: batch.schema(),
+            has_windowed_metadata: false,
+        });
+        self.registry
+            .register_if_absent(&req.pcollection_id, table_schema.clone());
         self.ingest_batch(&req.pcollection_id, table_schema, batch)
             .await
+    }
+
+    /// Persists decoded [`WindowedValue`]s, writing each element's logical payload
+    /// and its Beam window metadata into typed reserved columns in the same row.
+    /// [`scan_windowed_values`](Self::scan_windowed_values) reconstructs the full
+    /// `WindowedValue`; every metadata field in row `i` belongs to element `i`.
+    ///
+    /// No-op for empty input, which also avoids deriving a schema from zero rows.
+    /// When the PCollection was written before, its cached schema is reused with
+    /// the metadata column stripped and re-appended so it is never duplicated;
+    /// otherwise the schema is derived from the decoded records.
+    pub async fn write_windowed_value_batch(
+        &self,
+        pcollection_id: &str,
+        values: Vec<WindowedValue>,
+    ) -> Result<()> {
+        if values.is_empty() {
+            return Ok(());
+        }
+        let (batch, schema) = self.build_windowed_batch(pcollection_id, &values)?;
+        let min_ts = values.iter().map(|value| value.timestamp_millis).min();
+        self.ingest_batch(pcollection_id, schema, batch).await?;
+        if let Some(min_ts) = min_ts {
+            self.record_commit_min_ts(pcollection_id, min_ts);
+        }
+        Ok(())
+    }
+
+    /// Build the Arrow batch (logical payload + window metadata) for a decoded
+    /// windowed-value batch, deriving and caching the PCollection schema on first
+    /// use. Shared by the one-shot [`Self::write_windowed_value_batch`] and the
+    /// per-bundle [`PCollectionWriter`].
+    fn build_windowed_batch(
+        &self,
+        pcollection_id: &str,
+        values: &[WindowedValue],
+    ) -> Result<(RecordBatch, Arc<RecordTableSchema>)> {
+        let records: Vec<BeamRecord> = values.iter().map(|value| value.value.clone()).collect();
+        let base_schema = derive_table_schema(pcollection_id, &records)?;
+        let base_batch = beamrecords_to_record_batch(&records, &base_schema)?;
+        let metadata: Vec<WindowMetadata> = values.iter().map(WindowMetadata::from).collect();
+        let batch = materialize_void_columns(append_window_metadata(base_batch, &metadata)?)?;
+        let schema = Arc::new(RecordTableSchema {
+            table_type: base_schema.table_type,
+            arrow_schema: batch.schema(),
+            has_windowed_metadata: true,
+        });
+        self.registry
+            .register_if_absent(pcollection_id, schema.clone());
+        Ok((batch, schema))
+    }
+
+    /// Persists a runner-built [`RecordBatch`] together with one [`WindowedValue`]
+    /// of Beam window metadata per output row.
+    ///
+    /// For runner-native transforms (e.g. `GroupByKey`) that build the logical
+    /// output directly in Arrow but must still carry Beam window metadata forward.
+    /// `metadata` must have exactly one entry per row of `batch`, in the same row
+    /// order; a count mismatch is rejected rather than silently misaligning rows.
+    /// If `batch` already carries the reserved metadata column it is stored as-is
+    /// and `metadata` is not appended. The table schema is cached for future scans.
+    pub async fn write_record_batch_with_windowed_metadata(
+        &self,
+        pcollection_id: &str,
+        batch: RecordBatch,
+        table_schema: Arc<RecordTableSchema>,
+        metadata: Vec<WindowedValue>,
+    ) -> Result<()> {
+        if batch.num_rows() != metadata.len() {
+            return Err(anyhow!(
+                "WindowedValue metadata count {} does not match output row count {} for {}",
+                metadata.len(),
+                batch.num_rows(),
+                pcollection_id
+            ));
+        }
+        let metadata: Vec<WindowMetadata> = metadata.iter().map(WindowMetadata::from).collect();
+        let batch = if has_typed_window_metadata(&batch.schema()) {
+            batch
+        } else {
+            append_window_metadata(batch, &metadata)?
+        };
+        let batch = materialize_void_columns(batch)?;
+        let schema = Arc::new(RecordTableSchema {
+            table_type: table_schema.table_type,
+            arrow_schema: batch.schema(),
+            has_windowed_metadata: true,
+        });
+        self.registry
+            .register_if_absent(pcollection_id, schema.clone());
+        let min_ts = metadata.iter().map(|value| value.timestamp_millis).min();
+        self.ingest_batch(pcollection_id, schema, batch).await?;
+        if let Some(min_ts) = min_ts {
+            self.record_commit_min_ts(pcollection_id, min_ts);
+        }
+        Ok(())
+    }
+
+    /// Reads every element of a PCollection together with its stored Beam window
+    /// metadata.
+    ///
+    /// Logical values and metadata are decoded from the same Arrow batches, so row
+    /// alignment is guaranteed. Rows written before window metadata was tracked (a
+    /// schema whose `has_windowed_metadata` is `false`) are surfaced through
+    /// [`WindowedValue::global`], which preserves the logical value while using the
+    /// global window; rows written through the windowed writers restore their
+    /// original timestamp, windows, and pane.
+    ///
+    /// Returns an empty `Vec` when no schema is registered for the PCollection or
+    /// when the backing Paimon table was never created (zero committed elements).
+    pub async fn scan_windowed_values(
+        &self,
+        req: ScanCollectionRequest,
+    ) -> Result<Vec<WindowedValue>> {
+        let Some(table_schema) = self.registry.get(&req.pcollection_id) else {
+            return Ok(Vec::new());
+        };
+        let identifier = self.table_identifier(&req.pcollection_id);
+        let table = match self.catalog.get_table(&identifier).await {
+            Ok(table) => table,
+            Err(paimon::Error::TableNotExist { .. }) => return Ok(Vec::new()),
+            Err(err) => return Err(err.into()),
+        };
+        let read_builder = table.new_read_builder();
+        let plan = read_builder.new_scan().plan().await?;
+        let read = read_builder.new_read()?;
+        let mut stream = read.to_arrow(plan.splits())?;
+        let mut values = Vec::new();
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            values.extend(windowed_values_from_batch(&batch, &table_schema)?);
+        }
+        Ok(values)
+    }
+
+    /// Fold a commit's minimum event-time into the running minimum for a
+    /// PCollection, until the driver takes it.
+    fn record_commit_min_ts(&self, pcollection_id: &str, timestamp: i64) {
+        self.commit_min_ts
+            .entry(pcollection_id.to_string())
+            .and_modify(|current| *current = (*current).min(timestamp))
+            .or_insert(timestamp);
+    }
+
+    /// Take (and clear) the running minimum event-time committed to a PCollection
+    /// since the last take, or `None` when nothing with a timestamp was written.
+    pub fn take_commit_min_timestamp(&self, pcollection_id: &str) -> Option<i64> {
+        self.commit_min_ts
+            .remove(pcollection_id)
+            .map(|(_, timestamp)| timestamp)
+    }
+
+    /// The cursor key for a reader's position in a PCollection's changelog.
+    fn cursor_key(reader_id: &str, pcollection_id: &str) -> String {
+        format!("{reader_id}\u{1}{pcollection_id}")
+    }
+
+    /// The last snapshot id `reader_id` has consumed from `pcollection_id`, or
+    /// `None` if it has never read it.
+    ///
+    /// Durable: read through the in-memory cache, falling back to the SlateDB
+    /// `cursors` database so a reader's position survives a restart.
+    pub async fn cursor(&self, reader_id: &str, pcollection_id: &str) -> Result<Option<i64>> {
+        let key = Self::cursor_key(reader_id, pcollection_id);
+        if let Some(value) = self.cursors.get(&key) {
+            return Ok(Some(*value));
+        }
+        match self.cursor_store.get(key.as_bytes()).await? {
+            Some(bytes) => {
+                let snapshot_id = decode_snapshot(&bytes)?;
+                self.cursors.insert(key, snapshot_id);
+                Ok(Some(snapshot_id))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Advance `reader_id`'s read cursor for `pcollection_id`.
+    ///
+    /// The SlateDB write completes before the in-memory cache is updated, so a
+    /// durable-write failure cannot leave the process serving an unpersisted
+    /// cursor.
+    pub async fn set_cursor(
+        &self,
+        reader_id: &str,
+        pcollection_id: &str,
+        snapshot_id: i64,
+    ) -> Result<()> {
+        let key = Self::cursor_key(reader_id, pcollection_id);
+        let value = encode_snapshot(snapshot_id);
+        self.cursor_store
+            .apply(&[(key.as_bytes().to_vec(), Some(value))])
+            .await?;
+        self.cursors.insert(key, snapshot_id);
+        Ok(())
+    }
+
+    /// The latest committed snapshot id of a PCollection's Paimon table, or `None`
+    /// when the table does not exist (zero committed elements).
+    pub async fn latest_snapshot_id(&self, pcollection_id: &str) -> Result<Option<i64>> {
+        let identifier = self.table_identifier(pcollection_id);
+        match self.catalog.get_table(&identifier).await {
+            Ok(table) => Ok(table.snapshot_manager().get_latest_snapshot_id().await?),
+            Err(paimon::Error::TableNotExist { .. }) => Ok(None),
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    /// Read the rows appended to `pcollection_id` in the snapshot range
+    /// `(cursor, latest]`, returning them with the new cursor.
+    ///
+    /// This is the streams-tables "table -> stream" read: the PCollection's
+    /// Paimon changelog is consumed as the stream of deltas since the reader's
+    /// last position. `cursor = None` reads from the earliest available snapshot;
+    /// a cursor older than the earliest retained snapshot is clamped forward
+    /// (re-reading from the earliest, i.e. at-least-once).
+    ///
+    /// PCollection tables are append-only with no primary key, so `Auto` resolves
+    /// to [`IncrementalScanMode::Delta`], which plans exactly the data files added
+    /// by the `APPEND` snapshots in range.
+    pub async fn read_incremental_batches(
+        &self,
+        pcollection_id: &str,
+        cursor: Option<i64>,
+    ) -> Result<(Vec<RecordBatch>, Option<i64>)> {
+        let (mut stream, latest) = self.open_incremental_arrow(pcollection_id, cursor).await?;
+        let mut batches = Vec::new();
+        if let Some(stream) = stream.as_mut() {
+            while let Some(batch) = stream.next().await {
+                batches.push(batch?);
+            }
+        }
+        Ok((batches, latest))
+    }
+
+    /// Open a lazy incremental read of `pcollection_id` in the snapshot range
+    /// `(cursor, latest]`, returning the unconsumed Arrow batch stream and the
+    /// snapshot id to advance the reader's cursor to once the stream is drained.
+    ///
+    /// Returns `Ok((None, _))` when there is nothing to read (table absent, no
+    /// committed snapshot, or the cursor is already at/after `latest`): the
+    /// stream is `None` and the second element is the cursor value to record
+    /// (`None` when the table was never committed).
+    ///
+    /// Shared by [`Self::read_incremental_batches`] (which collects) and
+    /// [`Self::stream_windowed_values_since`] (which streams), so both follow
+    /// identical snapshot-range planning.
+    pub(crate) async fn open_incremental_arrow(
+        &self,
+        pcollection_id: &str,
+        cursor: Option<i64>,
+    ) -> Result<(Option<ArrowRecordBatchStream>, Option<i64>)> {
+        self.open_incremental_arrow_projected(pcollection_id, cursor, None)
+            .await
+    }
+
+    /// Open an incremental read with an optional pushed-down column projection.
+    ///
+    /// Paimon applies the projection while planning and reading Parquet, so
+    /// consumers such as GroupByKey avoid loading metadata columns they do not
+    /// need. Output column order follows `projection`.
+    pub(crate) async fn open_incremental_arrow_projected(
+        &self,
+        pcollection_id: &str,
+        cursor: Option<i64>,
+        projection: Option<&[&str]>,
+    ) -> Result<(Option<ArrowRecordBatchStream>, Option<i64>)> {
+        self.open_incremental_arrow_planned(pcollection_id, cursor, projection, None)
+            .await
+    }
+
+    /// Open an incremental read while pruning elements whose finite windows all
+    /// ended at or before `window_prune_before`.
+    ///
+    /// Rows with an unknown bound, including opaque SDK windows, are retained.
+    /// Callers must separately prove that the supplied watermark/lateness
+    /// horizon makes this pruning valid for their trigger and accumulation mode.
+    pub(crate) async fn open_incremental_arrow_pruned_before(
+        &self,
+        pcollection_id: &str,
+        cursor: Option<i64>,
+        projection: Option<&[&str]>,
+        window_prune_before: i64,
+    ) -> Result<(Option<ArrowRecordBatchStream>, Option<i64>)> {
+        self.open_incremental_arrow_planned(
+            pcollection_id,
+            cursor,
+            projection,
+            Some(window_prune_before),
+        )
+        .await
+    }
+
+    async fn open_incremental_arrow_planned(
+        &self,
+        pcollection_id: &str,
+        cursor: Option<i64>,
+        projection: Option<&[&str]>,
+        window_prune_before: Option<i64>,
+    ) -> Result<(Option<ArrowRecordBatchStream>, Option<i64>)> {
+        let identifier = self.table_identifier(pcollection_id);
+        let table = match self.catalog.get_table(&identifier).await {
+            Ok(table) => table,
+            Err(paimon::Error::TableNotExist { .. }) => return Ok((None, cursor)),
+            Err(err) => return Err(err.into()),
+        };
+
+        let manager = table.snapshot_manager();
+        let Some(latest) = manager.get_latest_snapshot_id().await? else {
+            // The table exists but nothing has been committed yet.
+            return Ok((None, cursor));
+        };
+        let earliest = manager.earliest_snapshot_id().await?.unwrap_or(latest);
+        let floor = earliest - 1;
+        let start = cursor.map(|cursor| cursor.max(floor)).unwrap_or(floor);
+        if start >= latest {
+            return Ok((None, Some(latest)));
+        }
+
+        let mut read_builder = table.new_read_builder();
+        if let Some(projection) = projection {
+            read_builder.with_projection(projection)?;
+        }
+        if let Some(cutoff) = window_prune_before {
+            let predicate_builder = PredicateBuilder::new(table.schema().fields());
+            let finite_after =
+                predicate_builder.greater_than(WINDOW_MAX_END_COLUMN, Datum::Long(cutoff))?;
+            let unknown_end = predicate_builder.is_null(WINDOW_MAX_END_COLUMN)?;
+            read_builder.with_filter(Predicate::or(vec![finite_after, unknown_end]));
+        }
+        let plan = read_builder
+            .new_incremental_scan(IncrementalScanMode::Auto, start, latest)
+            .plan()
+            .await?;
+        let read = read_builder.new_read()?;
+        let stream = read.to_incremental_arrow(&plan)?;
+        Ok((Some(stream), Some(latest)))
+    }
+
+    /// Read the [`WindowedValue`]s appended to `pcollection_id` since `reader_id`
+    /// last read it, advancing `reader_id`'s cursor to the latest snapshot.
+    ///
+    /// A reader's first read is the full table (cursor `None`); each subsequent
+    /// read returns only the newly committed rows. This is how a consumer stage's
+    /// re-run picks up its upstream's later output without being re-delivered what
+    /// it already saw.
+    pub async fn scan_windowed_values_since(
+        &self,
+        reader_id: &str,
+        pcollection_id: &str,
+    ) -> Result<Vec<WindowedValue>> {
+        let Some(table_schema) = self.registry.get(pcollection_id) else {
+            return Ok(Vec::new());
+        };
+        let cursor = self.cursor(reader_id, pcollection_id).await?;
+        let (batches, latest) = self
+            .read_incremental_batches(pcollection_id, cursor)
+            .await?;
+        let mut values = Vec::new();
+        for batch in &batches {
+            values.extend(windowed_values_from_batch(batch, &table_schema)?);
+        }
+        if let Some(latest) = latest {
+            self.set_cursor(reader_id, pcollection_id, latest).await?;
+        }
+        Ok(values)
+    }
+
+    /// [`BeamRecord`]-returning counterpart of
+    /// [`scan_windowed_values_since`](Self::scan_windowed_values_since).
+    pub async fn scan_collection_since(
+        &self,
+        reader_id: &str,
+        pcollection_id: &str,
+    ) -> Result<Vec<BeamRecord>> {
+        let Some(table_schema) = self.registry.get(pcollection_id) else {
+            return Ok(Vec::new());
+        };
+        let cursor = self.cursor(reader_id, pcollection_id).await?;
+        let (batches, latest) = self
+            .read_incremental_batches(pcollection_id, cursor)
+            .await?;
+        let mut records = Vec::new();
+        for batch in &batches {
+            records.extend(record_batch_to_beamrecords(batch, &table_schema)?);
+        }
+        if let Some(latest) = latest {
+            self.set_cursor(reader_id, pcollection_id, latest).await?;
+        }
+        Ok(records)
+    }
+
+    /// Stream the [`WindowedValue`]s appended to `pcollection_id` since
+    /// `reader_id` last read it, yielding values lazily (one Arrow batch at a
+    /// time) instead of materializing the whole PCollection into a single `Vec`.
+    ///
+    /// The reader's cursor advances to the latest snapshot once the stream is
+    /// exhausted (see [`WindowedValueStream::next_batch`]). Prefer this over
+    /// [`scan_windowed_values_since`](Self::scan_windowed_values_since) when the
+    /// caller processes values incrementally (e.g. encoding them out to a worker
+    /// harness), so a large PCollection never has to be fully decoded in memory.
+    pub async fn stream_windowed_values_since(
+        self: &Arc<Self>,
+        reader_id: String,
+        pcollection_id: String,
+    ) -> Result<WindowedValueStream> {
+        let table_schema = self.registry.get(&pcollection_id);
+        let Some(table_schema) = table_schema else {
+            return Ok(WindowedValueStream {
+                store: Arc::clone(self),
+                reader_id,
+                pcollection_id,
+                table_schema: None,
+                inner: None,
+                latest: None,
+                advanced: false,
+            });
+        };
+        let cursor = self.cursor(&reader_id, &pcollection_id).await?;
+        let (inner, latest) = self.open_incremental_arrow(&pcollection_id, cursor).await?;
+        Ok(WindowedValueStream {
+            store: Arc::clone(self),
+            reader_id,
+            pcollection_id,
+            table_schema: Some(table_schema),
+            inner,
+            latest,
+            advanced: false,
+        })
     }
 
     /// Ingest a pre-built [`RecordBatch`] with its known table schema.
@@ -186,26 +655,57 @@ impl FlareElementStore {
         Ok(records)
     }
 
+    /// Resolve a table by identifier, distinguishing "absent" from a real error.
+    async fn resolve_existing_table(&self, identifier: &Identifier) -> Result<Option<Table>> {
+        match self.catalog.get_table(identifier).await {
+            Ok(table) => Ok(Some(table)),
+            Err(paimon::Error::TableNotExist { .. }) => Ok(None),
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    /// The per-table-name lock for table resolution and creation.
+    fn creation_lock(&self, table_name: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.table_create_locks
+            .entry(table_name.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .value()
+            .clone()
+    }
+
     /// Resolve (or create) the Paimon table backing a PCollection.
     pub async fn get_table(
         &self,
         pcollection_id: &str,
         table_schema: &RecordTableSchema,
     ) -> Result<Table> {
-        let identifier = self.table_identifier(pcollection_id);
+        let table_name = Self::sanitize_pcollection_id(pcollection_id);
+        let identifier = Identifier::new(self.db_name.as_str(), &table_name);
 
-        match self.catalog.get_table(&identifier).await {
-            Ok(table) => Ok(table),
-            Err(paimon::Error::TableNotExist { .. }) => {
-                let paimon_schema = arrow_schema_to_paimon(&table_schema.arrow_schema)?;
-                self.catalog
-                    .create_table(&identifier, paimon_schema, false)
-                    .await?;
-                let table = self.catalog.get_table(&identifier).await?;
-                Ok(table)
-            }
-            Err(err) => Err(err.into()),
+        // Serialize per table name so concurrent callers do not race creation.
+        let lock = self.creation_lock(&table_name);
+        let _guard = lock.lock().await;
+
+        if let Some(table) = self.resolve_existing_table(&identifier).await? {
+            return Ok(table);
         }
+
+        let paimon_schema = arrow_schema_to_paimon(&table_schema.arrow_schema)?;
+        self.catalog
+            .create_table(&identifier, paimon_schema, true)
+            .await?;
+        Ok(self.catalog.get_table(&identifier).await?)
+    }
+
+    /// Resolve an already-created Paimon table for a PCollection without
+    /// creating it when absent.
+    ///
+    /// Returns `Ok(None)` when the PCollection has never been committed to, so a
+    /// transform can distinguish "no input" from a read error without the
+    /// side effect of materializing an empty table.
+    pub async fn get_existing_table(&self, pcollection_id: &str) -> Result<Option<Table>> {
+        let identifier = self.table_identifier(pcollection_id);
+        self.resolve_existing_table(&identifier).await
     }
 
     pub(crate) fn table_identifier(&self, pcollection_id: &str) -> Identifier {
@@ -218,17 +718,547 @@ impl FlareElementStore {
     fn sanitize_pcollection_id(id: &str) -> String {
         id.replace(['/', '.', ' ', '(', ')'], "_")
     }
+
+    // Generic table operations
+    //
+    // Name-addressed Paimon primitives that operate on an explicit schema/table
+    // rather than a PCollection. Other storage layers (e.g. user state) build on
+    // these instead of reaching into the catalog directly.
+
+    /// Resolve a table by its raw (unsanitized) name, creating it from `schema`
+    /// when it does not yet exist.
+    pub async fn get_or_create_table(
+        &self,
+        table_name: &str,
+        schema: PaimonSchema,
+    ) -> Result<Table> {
+        let identifier = Identifier::new(self.db_name.as_str(), table_name);
+
+        // Serialize per table name so concurrent callers do not race creation.
+        let lock = self.creation_lock(table_name);
+        let _guard = lock.lock().await;
+
+        if let Some(table) = self.resolve_existing_table(&identifier).await? {
+            return Ok(table);
+        }
+
+        self.catalog.create_table(&identifier, schema, true).await?;
+        Ok(self.catalog.get_table(&identifier).await?)
+    }
+
+    /// Commit a single Arrow [`RecordBatch`] to `table`.
+    pub async fn write_table_batch(&self, table: &Table, batch: &RecordBatch) -> Result<()> {
+        let builder = table.new_write_builder();
+        let mut writer = builder.new_write()?;
+        writer.write_arrow_batch(batch).await?;
+        let messages = writer.prepare_commit().await?;
+        builder.new_commit().commit(messages).await?;
+        Ok(())
+    }
+
+    /// Read all committed batches of `table_name`, or an empty `Vec` when the
+    /// table does not exist (zero committed rows).
+    pub async fn read_table_batches(&self, table_name: &str) -> Result<Vec<RecordBatch>> {
+        let identifier = Identifier::new(self.db_name.as_str(), table_name);
+        let table = match self.catalog.get_table(&identifier).await {
+            Ok(table) => table,
+            Err(paimon::Error::TableNotExist { .. }) => return Ok(Vec::new()),
+            Err(err) => return Err(err.into()),
+        };
+
+        let read_builder = table.new_read_builder();
+        let plan = read_builder.new_scan().plan().await?;
+        let read = read_builder.new_read()?;
+        let mut stream = read.to_arrow(plan.splits())?;
+        let mut batches = Vec::new();
+        while let Some(batch) = stream.next().await {
+            batches.push(batch?);
+        }
+        Ok(batches)
+    }
+}
+
+/// A Paimon writer opened for a single bundle's output.
+///
+/// Many batches are appended to one table and committed once, instead of
+/// creating a writer + committing per batch. This keeps Paimon snapshots and
+/// data files proportional to *bundles* rather than *batches* (fewer commits =
+/// cheaper downstream incremental reads), and makes a bundle's output atomic:
+/// a failed bundle writes nothing.
+pub struct PCollectionWriter {
+    store: Arc<FlareElementStore>,
+    pcollection_id: String,
+    table: Option<Table>,
+    writer: Option<TableWrite>,
+    /// Running minimum event-time across all batches written so far.
+    min_ts: Option<i64>,
+}
+
+impl PCollectionWriter {
+    /// Begin writing `pcollection_id`'s output for one bundle.
+    pub fn new(store: Arc<FlareElementStore>, pcollection_id: String) -> Self {
+        Self {
+            store,
+            pcollection_id,
+            table: None,
+            writer: None,
+            min_ts: None,
+        }
+    }
+
+    /// Append one decoded windowed-value batch. The writer is opened lazily on
+    /// the first non-empty batch, once the PCollection schema is known.
+    pub async fn write(&mut self, values: Vec<WindowedValue>) -> Result<()> {
+        if values.is_empty() {
+            return Ok(());
+        }
+        let (batch, schema) = self
+            .store
+            .build_windowed_batch(&self.pcollection_id, &values)?;
+        if let Some(ts) = values.iter().map(|value| value.timestamp_millis).min() {
+            self.min_ts = Some(self.min_ts.map_or(ts, |current| current.min(ts)));
+        }
+
+        if self.writer.is_none() {
+            let table = self.store.get_table(&self.pcollection_id, &schema).await?;
+            let writer = table.new_write_builder().new_write()?;
+            self.table = Some(table);
+            self.writer = Some(writer);
+        }
+
+        let batch = materialize_void_columns(batch)?;
+        self.writer
+            .as_mut()
+            .expect("writer initialized above")
+            .write_arrow_batch(&batch)
+            .await?;
+        Ok(())
+    }
+
+    /// Commit all appended batches and fold the bundle's minimum event-time
+    /// into the store's running minimum.
+    pub async fn commit(mut self) -> Result<()> {
+        if let (Some(mut writer), Some(table)) = (self.writer.take(), self.table.take()) {
+            let messages = writer.prepare_commit().await?;
+            table
+                .new_write_builder()
+                .new_commit()
+                .commit(messages)
+                .await?;
+        }
+        if let Some(min_ts) = self.min_ts {
+            self.store
+                .record_commit_min_ts(&self.pcollection_id, min_ts);
+        }
+        Ok(())
+    }
+}
+
+/// A lazy, streaming read of a PCollection's appended windowed values.
+///
+/// Produced by [`FlareElementStore::stream_windowed_values_since`]. Values are
+/// yielded one Arrow batch at a time via [`Self::next_batch`] so the caller can
+/// process them incrementally (encode, send, drop) without materializing the
+/// whole PCollection in memory. The reader's cursor is advanced once, to the
+/// latest snapshot, when the stream is exhausted.
+pub struct WindowedValueStream {
+    store: Arc<FlareElementStore>,
+    reader_id: String,
+    pcollection_id: String,
+    table_schema: Option<Arc<RecordTableSchema>>,
+    inner: Option<ArrowRecordBatchStream>,
+    latest: Option<i64>,
+    advanced: bool,
+}
+
+impl WindowedValueStream {
+    /// The next batch of windowed values, or `None` when the stream is
+    /// exhausted. On exhaustion the reader's cursor is advanced once (to the
+    /// latest snapshot, when one is known); subsequent calls keep returning
+    /// `None` without re-advancing.
+    pub async fn next_batch(&mut self) -> Result<Option<Vec<WindowedValue>>> {
+        if let Some(inner) = self.inner.as_mut() {
+            match inner.next().await {
+                Some(Ok(batch)) => {
+                    let schema = self
+                        .table_schema
+                        .as_ref()
+                        .expect("schema is present whenever the stream has data");
+                    return Ok(Some(windowed_values_from_batch(&batch, schema)?));
+                }
+                Some(Err(err)) => return Err(err.into()),
+                None => self.inner = None,
+            }
+        }
+
+        // Either the stream never had data, or it just drained. Advance the
+        // cursor exactly once, then report exhaustion.
+        if !self.advanced {
+            if let Some(latest) = self.latest {
+                self.store
+                    .set_cursor(&self.reader_id, &self.pcollection_id, latest)
+                    .await?;
+            }
+            self.advanced = true;
+        }
+        Ok(None)
+    }
+}
+
+/// Reserved typed Arrow columns holding Beam timestamp and pane metadata.
+///
+/// These fields used to be packed into one JSON binary column. Storing them as
+/// native Arrow values makes them visible to Parquet encodings, DataFusion
+/// predicates, and column projection while preserving one row per element.
+pub(crate) const WINDOW_TIMESTAMP_COLUMN: &str = "flare_timestamp_millis";
+pub(crate) const WINDOW_MAX_END_COLUMN: &str = "flare_max_window_end_millis";
+pub(crate) const WINDOW_PANE_TIMING_COLUMN: &str = "flare_pane_timing";
+pub(crate) const WINDOW_PANE_INDEX_COLUMN: &str = "flare_pane_index";
+pub(crate) const WINDOW_PANE_NON_SPECULATIVE_INDEX_COLUMN: &str =
+    "flare_pane_non_speculative_index";
+pub(crate) const WINDOW_PANE_IS_FIRST_COLUMN: &str = "flare_pane_is_first";
+pub(crate) const WINDOW_PANE_IS_LAST_COLUMN: &str = "flare_pane_is_last";
+
+/// Reserved Paimon column holding the element's first window identity.
+///
+/// Most Beam elements have one window. Keeping that identity as a scalar avoids
+/// list expansion on the GBK hot path while preserving exact window bytes.
+pub(crate) const WINDOW_KEY_COLUMN: &str = "flare_window_key";
+/// Remaining window identities after [`WINDOW_KEY_COLUMN`], in original order.
+pub(crate) const WINDOW_EXTRA_KEYS_COLUMN: &str = "flare_extra_window_keys";
+/// Number of windows carried by the element.
+pub(crate) const WINDOW_COUNT_COLUMN: &str = "flare_window_count";
+
+fn has_typed_window_metadata(schema: &ArrowSchema) -> bool {
+    [
+        WINDOW_TIMESTAMP_COLUMN,
+        WINDOW_MAX_END_COLUMN,
+        WINDOW_PANE_TIMING_COLUMN,
+        WINDOW_PANE_INDEX_COLUMN,
+        WINDOW_PANE_NON_SPECULATIVE_INDEX_COLUMN,
+        WINDOW_PANE_IS_FIRST_COLUMN,
+        WINDOW_PANE_IS_LAST_COLUMN,
+        WINDOW_KEY_COLUMN,
+        WINDOW_EXTRA_KEYS_COLUMN,
+        WINDOW_COUNT_COLUMN,
+    ]
+    .into_iter()
+    .all(|name| schema.field_with_name(name).is_ok())
+}
+
+/// Appends typed window metadata and canonical window keys to `batch`.
+///
+/// Fails when `metadata` does not have exactly one entry per batch row, so a
+/// caller can never persist a batch whose metadata columns are misaligned.
+fn append_window_metadata(batch: RecordBatch, metadata: &[WindowMetadata]) -> Result<RecordBatch> {
+    if batch.num_rows() != metadata.len() {
+        return Err(anyhow!(
+            "WindowedValue metadata count {} does not match batch row count {}",
+            metadata.len(),
+            batch.num_rows()
+        ));
+    }
+
+    let mut first_window_keys = BinaryBuilder::new();
+    let mut extra_window_keys = ListBuilder::new(BinaryBuilder::new());
+    let mut window_counts = Vec::with_capacity(metadata.len());
+    for entry in metadata {
+        let count = i16::try_from(entry.windows.len())
+            .map_err(|_| anyhow!("element window count exceeds i16"))?;
+        window_counts.push(count);
+        match entry.windows.split_first() {
+            Some((first, extra)) => {
+                first_window_keys.append_value(first.to_binary_key());
+                for window in extra {
+                    extra_window_keys
+                        .values()
+                        .append_value(window.to_binary_key());
+                }
+                extra_window_keys.append(true);
+            }
+            None => {
+                first_window_keys.append_null();
+                extra_window_keys.append(true);
+            }
+        }
+    }
+    let first_window_key_array = first_window_keys.finish();
+    let extra_window_key_array = extra_window_keys.finish();
+    let window_count_array = Int16Array::from_iter_values(window_counts);
+
+    let timestamps =
+        Int64Array::from_iter_values(metadata.iter().map(|entry| entry.timestamp_millis));
+    let max_window_ends = Int64Array::from(
+        metadata
+            .iter()
+            .map(WindowMetadata::max_finite_window_end_millis)
+            .collect::<Vec<_>>(),
+    );
+    let pane_timings =
+        Int8Array::from_iter_values(metadata.iter().map(|entry| entry.pane.timing.bits() as i8));
+    let pane_indices = Int64Array::from_iter_values(metadata.iter().map(|entry| entry.pane.index));
+    let pane_non_speculative_indices = Int64Array::from_iter_values(
+        metadata
+            .iter()
+            .map(|entry| entry.pane.non_speculative_index),
+    );
+    let pane_is_first = BooleanArray::from_iter(metadata.iter().map(|entry| entry.pane.is_first));
+    let pane_is_last = BooleanArray::from_iter(metadata.iter().map(|entry| entry.pane.is_last));
+
+    let mut fields: Vec<ArrowField> = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| field.as_ref().clone())
+        .collect();
+    fields.push(ArrowField::new(
+        WINDOW_TIMESTAMP_COLUMN,
+        DataType::Int64,
+        false,
+    ));
+    fields.push(ArrowField::new(
+        WINDOW_MAX_END_COLUMN,
+        DataType::Int64,
+        true,
+    ));
+    fields.push(ArrowField::new(
+        WINDOW_PANE_TIMING_COLUMN,
+        DataType::Int8,
+        false,
+    ));
+    fields.push(ArrowField::new(
+        WINDOW_PANE_INDEX_COLUMN,
+        DataType::Int64,
+        false,
+    ));
+    fields.push(ArrowField::new(
+        WINDOW_PANE_NON_SPECULATIVE_INDEX_COLUMN,
+        DataType::Int64,
+        false,
+    ));
+    fields.push(ArrowField::new(
+        WINDOW_PANE_IS_FIRST_COLUMN,
+        DataType::Boolean,
+        false,
+    ));
+    fields.push(ArrowField::new(
+        WINDOW_PANE_IS_LAST_COLUMN,
+        DataType::Boolean,
+        false,
+    ));
+    fields.push(ArrowField::new(WINDOW_KEY_COLUMN, DataType::Binary, true));
+    fields.push(ArrowField::new(
+        WINDOW_EXTRA_KEYS_COLUMN,
+        DataType::List(Arc::new(ArrowField::new("item", DataType::Binary, true))),
+        false,
+    ));
+    fields.push(ArrowField::new(WINDOW_COUNT_COLUMN, DataType::Int16, false));
+
+    let mut columns = batch.columns().to_vec();
+    columns.push(Arc::new(timestamps));
+    columns.push(Arc::new(max_window_ends));
+    columns.push(Arc::new(pane_timings));
+    columns.push(Arc::new(pane_indices));
+    columns.push(Arc::new(pane_non_speculative_indices));
+    columns.push(Arc::new(pane_is_first));
+    columns.push(Arc::new(pane_is_last));
+    columns.push(Arc::new(first_window_key_array));
+    columns.push(Arc::new(extra_window_key_array));
+    columns.push(Arc::new(window_count_array));
+
+    Ok(RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(fields)),
+        columns,
+    )?)
 }
 
 pub async fn create_catalog(warehouse: String, db_name: String) -> Result<FileSystemCatalog> {
     let mut options = Options::new();
     options.set(CatalogOptions::WAREHOUSE, warehouse.as_str());
+
+    // Cache immutable table metadata and index blocks on local disk. Every scan
+    // plan and commit re-reads the latest schema, snapshot, and manifests; a
+    // stateful bundle issues enough of those that re-reading them from storage
+    // adds up on the hot path (N3). The cache is fail-open, so storage remains
+    // the source of truth. It lives under the warehouse, which is a local path
+    // for this single-node runner.
+    let cache_dir = std::path::Path::new(&warehouse).join(".paimon-cache");
+    if let Some(cache_dir) = cache_dir.to_str() {
+        options.set(CatalogOptions::LOCAL_CACHE_ENABLED, "true");
+        options.set(CatalogOptions::LOCAL_CACHE_DIR, cache_dir);
+        options.set(CatalogOptions::LOCAL_CACHE_MAX_SIZE, "1 GiB");
+        options.set(
+            CatalogOptions::LOCAL_CACHE_WHITELIST,
+            "meta,global-index,bucket-index",
+        );
+    }
+
     let catalog = FileSystemCatalog::new(options)?;
     catalog
         .create_database(&db_name, true, HashMap::new())
         .await?;
     Ok(catalog)
 }
+
+/// Local directory SlateDB uses for a job's cursors, user state, and user timers.
+///
+/// Derived from the store's warehouse and database so each job gets an isolated
+/// embedded state database, alongside the Paimon tables.
+pub fn slate_state_dir(store: &FlareElementStore) -> std::path::PathBuf {
+    std::path::Path::new(store.catalog.warehouse())
+        .join(".slate_state")
+        .join(&store.db_name)
+}
+
+/// Encode a Paimon snapshot id for a SlateDB cursor value.
+fn encode_snapshot(snapshot_id: i64) -> Vec<u8> {
+    snapshot_id.to_be_bytes().to_vec()
+}
+
+/// Decode a Paimon snapshot id from its fixed-width SlateDB cursor value.
+fn decode_snapshot(bytes: &[u8]) -> Result<i64> {
+    let bytes: [u8; 8] = bytes
+        .try_into()
+        .map_err(|_| anyhow!("invalid cursor value length {}", bytes.len()))?;
+    Ok(i64::from_be_bytes(bytes))
+}
+
+/// Decode one Arrow [`RecordBatch`] of a windowed PCollection back into
+/// [`WindowedValue`]s, restoring timestamp, windows, and pane from typed
+/// reserved columns when the rows carry them.
+fn windowed_values_from_batch(
+    batch: &RecordBatch,
+    table_schema: &RecordTableSchema,
+) -> Result<Vec<WindowedValue>> {
+    let records = record_batch_to_beamrecords(batch, table_schema)?;
+    if !table_schema.has_windowed_metadata {
+        return Ok(records.into_iter().map(WindowedValue::global).collect());
+    }
+    let timestamps = batch
+        .column_by_name(WINDOW_TIMESTAMP_COLUMN)
+        .ok_or_else(|| anyhow!("missing {WINDOW_TIMESTAMP_COLUMN} column"))?
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| anyhow!("{WINDOW_TIMESTAMP_COLUMN} must be an Int64 column"))?;
+    let pane_timings = batch
+        .column_by_name(WINDOW_PANE_TIMING_COLUMN)
+        .ok_or_else(|| anyhow!("missing {WINDOW_PANE_TIMING_COLUMN} column"))?
+        .as_any()
+        .downcast_ref::<Int8Array>()
+        .ok_or_else(|| anyhow!("{WINDOW_PANE_TIMING_COLUMN} must be an Int8 column"))?;
+    let pane_indices = batch
+        .column_by_name(WINDOW_PANE_INDEX_COLUMN)
+        .ok_or_else(|| anyhow!("missing {WINDOW_PANE_INDEX_COLUMN} column"))?
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| anyhow!("{WINDOW_PANE_INDEX_COLUMN} must be an Int64 column"))?;
+    let pane_non_speculative_indices = batch
+        .column_by_name(WINDOW_PANE_NON_SPECULATIVE_INDEX_COLUMN)
+        .ok_or_else(|| anyhow!("missing {WINDOW_PANE_NON_SPECULATIVE_INDEX_COLUMN} column"))?
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| {
+            anyhow!("{WINDOW_PANE_NON_SPECULATIVE_INDEX_COLUMN} must be an Int64 column")
+        })?;
+    let pane_is_first = batch
+        .column_by_name(WINDOW_PANE_IS_FIRST_COLUMN)
+        .ok_or_else(|| anyhow!("missing {WINDOW_PANE_IS_FIRST_COLUMN} column"))?
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .ok_or_else(|| anyhow!("{WINDOW_PANE_IS_FIRST_COLUMN} must be a Boolean column"))?;
+    let pane_is_last = batch
+        .column_by_name(WINDOW_PANE_IS_LAST_COLUMN)
+        .ok_or_else(|| anyhow!("missing {WINDOW_PANE_IS_LAST_COLUMN} column"))?
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .ok_or_else(|| anyhow!("{WINDOW_PANE_IS_LAST_COLUMN} must be a Boolean column"))?;
+    let first_window_keys = batch
+        .column_by_name(WINDOW_KEY_COLUMN)
+        .ok_or_else(|| anyhow!("missing {WINDOW_KEY_COLUMN} column"))?
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .ok_or_else(|| anyhow!("{WINDOW_KEY_COLUMN} must be a Binary column"))?;
+    let extra_window_keys = batch
+        .column_by_name(WINDOW_EXTRA_KEYS_COLUMN)
+        .ok_or_else(|| anyhow!("missing {WINDOW_EXTRA_KEYS_COLUMN} column"))?
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .ok_or_else(|| anyhow!("{WINDOW_EXTRA_KEYS_COLUMN} must be a List column"))?;
+    let extra_window_key_values = extra_window_keys
+        .values()
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .ok_or_else(|| anyhow!("{WINDOW_EXTRA_KEYS_COLUMN} must contain binary keys"))?;
+    let window_counts = batch
+        .column_by_name(WINDOW_COUNT_COLUMN)
+        .ok_or_else(|| anyhow!("missing {WINDOW_COUNT_COLUMN} column"))?
+        .as_any()
+        .downcast_ref::<Int16Array>()
+        .ok_or_else(|| anyhow!("{WINDOW_COUNT_COLUMN} must be an Int16 column"))?;
+    let offsets = extra_window_keys.value_offsets();
+    let mut values = Vec::with_capacity(records.len());
+    for (row, value) in records.into_iter().enumerate() {
+        let start = usize::try_from(offsets[row])
+            .map_err(|_| anyhow!("negative {WINDOW_EXTRA_KEYS_COLUMN} offset at row {row}"))?;
+        let end = usize::try_from(offsets[row + 1]).map_err(|_| {
+            anyhow!(
+                "negative {WINDOW_EXTRA_KEYS_COLUMN} offset at row {}",
+                row + 1
+            )
+        })?;
+        let extra_count = end.saturating_sub(start);
+        let declared_count = usize::try_from(window_counts.value(row)).map_err(|_| {
+            anyhow!(
+                "{WINDOW_COUNT_COLUMN} is negative at row {row}: {}",
+                window_counts.value(row)
+            )
+        })?;
+        if declared_count != extra_count + usize::from(!first_window_keys.is_null(row)) {
+            return Err(anyhow!(
+                "{WINDOW_COUNT_COLUMN} does not match stored window keys at row {row}"
+            ));
+        }
+        let mut windows = Vec::with_capacity(end.saturating_sub(start));
+        if declared_count > 0 {
+            if first_window_keys.is_null(row) {
+                return Err(anyhow!(
+                    "{WINDOW_KEY_COLUMN} is null for non-empty window set at row {row}"
+                ));
+            }
+            let key = first_window_keys.value(row);
+            windows.push(BeamWindow::from_binary_key(key).ok_or_else(|| {
+                anyhow!("{WINDOW_KEY_COLUMN} contains malformed binary window key at row {row}")
+            })?);
+        }
+        for index in start..end {
+            if extra_window_key_values.is_null(index) {
+                return Err(anyhow!(
+                    "{WINDOW_EXTRA_KEYS_COLUMN} contains a null window at row {row}"
+                ));
+            }
+            let key = extra_window_key_values.value(index);
+            windows.push(BeamWindow::from_binary_key(key).ok_or_else(|| {
+                anyhow!(
+                    "{WINDOW_EXTRA_KEYS_COLUMN} contains malformed binary window key at row {row}"
+                )
+            })?);
+        }
+        values.push(WindowedValue {
+            value,
+            timestamp_millis: timestamps.value(row),
+            windows,
+            pane: PaneInfo {
+                is_first: pane_is_first.value(row),
+                is_last: pane_is_last.value(row),
+                timing: PaneTiming::from_bits(pane_timings.value(row) as u8),
+                index: pane_indices.value(row),
+                non_speculative_index: pane_non_speculative_indices.value(row),
+            },
+        });
+    }
+    Ok(values)
+}
+
 /// Convert an Arrow [`Schema`](ArrowSchema) into a Paimon [`Schema`](PaimonSchema).
 ///
 /// The resulting schema preserves Arrow field names and converted data types,
@@ -246,22 +1276,29 @@ pub fn arrow_schema_to_paimon(schema: &ArrowSchema) -> Result<PaimonSchema> {
     Ok(schema)
 }
 
+/// Request to append logical [`BeamRecord`]s to a PCollection.
 #[derive(Debug)]
 pub struct NewCollectionRequest {
+    /// Target PCollection id.
     pub(crate) pcollection_id: String,
+    /// Elements to append, in order.
     pub(crate) elements: Vec<BeamRecord>,
 }
 
-#[derive(Debug)]
+/// Request to read all elements of a PCollection.
+#[derive(Debug, Clone)]
 pub struct ScanCollectionRequest {
+    /// PCollection id to scan.
     pub(crate) pcollection_id: String,
 }
 
 #[cfg(test)]
 mod element_store_tests {
     use super::*;
-    use crate::store::VALUE_COLUMN;
-    use crate::store::record::{BeamGbk, BeamKV, IterableValue, PrimitiveValue};
+    use crate::store::record::{
+        BeamGbk, BeamKV, IterableValue, PrimitiveValue, primitive_value_from_array_row,
+    };
+    use crate::store::{KEY_COLUMN, VALUE_COLUMN};
     use std::collections::HashMap;
     use tempfile::tempdir;
 
@@ -452,6 +1489,454 @@ mod element_store_tests {
     }
 
     #[tokio::test]
+    async fn write_and_scan_windowed_values_preserves_interval_metadata() {
+        let (_dir, store) = make_store().await;
+        let values = vec![WindowedValue {
+            value: int_primitive(7),
+            timestamp_millis: 42,
+            windows: vec![crate::coders::primitives::BeamWindow::Interval {
+                start_millis: 0,
+                end_millis: 60_000,
+            }],
+            pane: crate::coders::primitives::PaneInfo::no_firing(),
+        }];
+
+        store
+            .write_windowed_value_batch("pc-windowed", values.clone())
+            .await
+            .unwrap();
+        let mut second = values[0].clone();
+        second.timestamp_millis = 43;
+        store
+            .write_windowed_value_batch("pc-windowed", vec![second])
+            .await
+            .unwrap();
+        let scanned = store
+            .scan_windowed_values(ScanCollectionRequest {
+                pcollection_id: "pc-windowed".to_string(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(scanned.len(), 2);
+        assert_eq!(scanned[0].value, values[0].value);
+        assert_eq!(scanned[0].timestamp_millis, 42);
+        assert_eq!(scanned[0].windows, values[0].windows);
+        assert_eq!(scanned[0].pane, values[0].pane);
+        assert_eq!(scanned[1].value, values[0].value);
+        assert_eq!(scanned[1].timestamp_millis, 43);
+        assert_eq!(scanned[1].windows, values[0].windows);
+    }
+
+    #[tokio::test]
+    async fn typed_window_metadata_roundtrips_all_window_variants() {
+        let (_dir, store) = make_store().await;
+        let values = vec![
+            WindowedValue {
+                value: int_primitive(1),
+                timestamp_millis: 42,
+                windows: vec![BeamWindow::Global],
+                pane: PaneInfo {
+                    is_first: false,
+                    is_last: true,
+                    timing: PaneTiming::Late,
+                    index: 7,
+                    non_speculative_index: 4,
+                },
+            },
+            WindowedValue {
+                value: int_primitive(2),
+                timestamp_millis: 84,
+                windows: vec![
+                    BeamWindow::Interval {
+                        start_millis: 0,
+                        end_millis: 60_000,
+                    },
+                    BeamWindow::Interval {
+                        start_millis: 30_000,
+                        end_millis: 90_000,
+                    },
+                ],
+                pane: PaneInfo::on_time_firing(),
+            },
+            WindowedValue {
+                value: int_primitive(3),
+                timestamp_millis: 126,
+                windows: vec![BeamWindow::Opaque {
+                    coder_id: "AuctionWindowCoder".to_string(),
+                    bytes: vec![0, 1, 2, 255],
+                }],
+                pane: PaneInfo::no_firing(),
+            },
+        ];
+
+        store
+            .write_windowed_value_batch("pc-typed-windowed", values.clone())
+            .await
+            .unwrap();
+
+        let schema = store.registry.get("pc-typed-windowed").unwrap();
+        for column in [
+            WINDOW_TIMESTAMP_COLUMN,
+            WINDOW_MAX_END_COLUMN,
+            WINDOW_PANE_TIMING_COLUMN,
+            WINDOW_PANE_INDEX_COLUMN,
+            WINDOW_PANE_NON_SPECULATIVE_INDEX_COLUMN,
+            WINDOW_PANE_IS_FIRST_COLUMN,
+            WINDOW_PANE_IS_LAST_COLUMN,
+            WINDOW_KEY_COLUMN,
+            WINDOW_EXTRA_KEYS_COLUMN,
+            WINDOW_COUNT_COLUMN,
+        ] {
+            assert!(
+                schema.arrow_schema.field_with_name(column).is_ok(),
+                "missing typed metadata column {column}"
+            );
+        }
+        assert!(
+            schema
+                .arrow_schema
+                .field_with_name("flare_window_metadata")
+                .is_err(),
+            "legacy JSON metadata column must not be written"
+        );
+
+        let metadata: Vec<WindowMetadata> = values.iter().map(WindowMetadata::from).collect();
+        assert_eq!(metadata[1].max_finite_window_end_millis(), Some(89_999));
+        assert_eq!(metadata[2].max_finite_window_end_millis(), None);
+
+        let scanned = store
+            .scan_windowed_values(ScanCollectionRequest {
+                pcollection_id: "pc-typed-windowed".to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(scanned.len(), values.len());
+        for (actual, expected) in scanned.iter().zip(&values) {
+            assert_eq!(actual.value, expected.value);
+            assert_eq!(actual.timestamp_millis, expected.timestamp_millis);
+            assert_eq!(actual.windows, expected.windows);
+            assert_eq!(actual.pane, expected.pane);
+        }
+    }
+
+    #[tokio::test]
+    async fn incremental_projection_exposes_only_requested_columns() {
+        let (_dir, store) = make_store().await;
+        store
+            .write_windowed_value_batch("pc-projected", vec![windowed_int(9, 100)])
+            .await
+            .unwrap();
+
+        let (mut stream, _) = store
+            .open_incremental_arrow_projected(
+                "pc-projected",
+                None,
+                Some(&[VALUE_COLUMN, WINDOW_KEY_COLUMN]),
+            )
+            .await
+            .unwrap();
+        let batch = stream.as_mut().unwrap().next().await.unwrap().unwrap();
+        assert_eq!(
+            batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>(),
+            vec![VALUE_COLUMN, WINDOW_KEY_COLUMN]
+        );
+    }
+
+    #[tokio::test]
+    async fn incremental_filter_prunes_finite_windows_and_keeps_unknown_bounds() {
+        let (_dir, store) = make_store().await;
+        let values = vec![
+            WindowedValue {
+                value: int_primitive(1),
+                timestamp_millis: 1,
+                windows: vec![BeamWindow::Interval {
+                    start_millis: 0,
+                    end_millis: 60_000,
+                }],
+                pane: PaneInfo::no_firing(),
+            },
+            WindowedValue {
+                value: int_primitive(2),
+                timestamp_millis: 2,
+                windows: vec![BeamWindow::Interval {
+                    start_millis: 30_000,
+                    end_millis: 90_000,
+                }],
+                pane: PaneInfo::no_firing(),
+            },
+            WindowedValue {
+                value: int_primitive(3),
+                timestamp_millis: 3,
+                windows: vec![BeamWindow::Opaque {
+                    coder_id: "OpaqueWindow".to_string(),
+                    bytes: vec![9, 8, 7],
+                }],
+                pane: PaneInfo::no_firing(),
+            },
+        ];
+        store
+            .write_windowed_value_batch("pc-pruned", values)
+            .await
+            .unwrap();
+
+        let (stream, _) = store
+            .open_incremental_arrow_pruned_before(
+                "pc-pruned",
+                None,
+                Some(&[VALUE_COLUMN, WINDOW_MAX_END_COLUMN]),
+                70_000,
+            )
+            .await
+            .unwrap();
+        let mut values = Vec::new();
+        let mut stream = stream.unwrap();
+        while let Some(batch) = stream.next().await {
+            let batch = batch.unwrap();
+            let value_column = batch.column_by_name(VALUE_COLUMN).unwrap();
+            for row in 0..batch.num_rows() {
+                values.push(
+                    primitive_value_from_array_row(
+                        value_column.as_ref(),
+                        value_column.data_type(),
+                        row,
+                    )
+                    .unwrap(),
+                );
+            }
+        }
+
+        assert_eq!(
+            values,
+            vec![PrimitiveValue::Int64(2), PrimitiveValue::Int64(3)]
+        );
+    }
+
+    fn windowed_int(value: i64, timestamp: i64) -> WindowedValue {
+        WindowedValue {
+            value: int_primitive(value),
+            timestamp_millis: timestamp,
+            windows: vec![crate::coders::primitives::BeamWindow::Global],
+            pane: crate::coders::primitives::PaneInfo::no_firing(),
+        }
+    }
+
+    #[tokio::test]
+    async fn pcollection_writer_commits_once_across_batches_and_folds_min_ts() {
+        let (_dir, store) = make_store().await;
+        let store = Arc::new(store);
+        let pc = "pc-bundled";
+
+        // One bundle writing three batches should append the same rows as three
+        // one-shot writes, but through a single Paimon commit.
+        let mut writer = PCollectionWriter::new(store.clone(), pc.to_string());
+        writer.write(vec![windowed_int(1, 30)]).await.unwrap();
+        writer.write(vec![windowed_int(2, 10)]).await.unwrap();
+        writer.write(vec![windowed_int(3, 20)]).await.unwrap();
+        writer.commit().await.unwrap();
+
+        let scanned = store
+            .scan_windowed_values(ScanCollectionRequest {
+                pcollection_id: pc.to_string(),
+            })
+            .await
+            .unwrap();
+        let mut ints: Vec<i64> = scanned
+            .iter()
+            .map(|v| match &v.value {
+                BeamRecord::PRIMITIVE(PrimitiveValue::Int64(n)) => *n,
+                other => panic!("expected int64 primitive, got {other:?}"),
+            })
+            .collect();
+        ints.sort_unstable();
+        assert_eq!(ints, vec![1, 2, 3]);
+
+        // The bundle's minimum event-time is folded across all its batches.
+        assert_eq!(store.take_commit_min_timestamp(pc), Some(10));
+
+        // An empty bundle is a no-op: no table created, no commit, no min-ts.
+        let mut empty = PCollectionWriter::new(store.clone(), "pc-never".to_string());
+        empty.write(Vec::new()).await.unwrap();
+        empty.commit().await.unwrap();
+        assert_eq!(store.take_commit_min_timestamp("pc-never"), None);
+        let never = store
+            .scan_windowed_values(ScanCollectionRequest {
+                pcollection_id: "pc-never".to_string(),
+            })
+            .await
+            .unwrap();
+        assert!(never.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stream_windowed_values_since_yields_all_rows_and_advances_cursor() {
+        let (_dir, store) = make_store().await;
+        let store = Arc::new(store);
+        let pc = "pc-stream";
+
+        store
+            .write_windowed_value_batch(
+                pc,
+                vec![
+                    windowed_int(1, 10),
+                    windowed_int(2, 20),
+                    windowed_int(3, 30),
+                ],
+            )
+            .await
+            .unwrap();
+
+        // The streaming read yields the same values as a full scan, and its
+        // cursor advances once the stream is exhausted.
+        let mut stream = store
+            .stream_windowed_values_since("reader-s".to_string(), pc.to_string())
+            .await
+            .unwrap();
+        let mut ints = Vec::new();
+        while let Some(values) = stream.next_batch().await.unwrap() {
+            for value in values {
+                match value.value {
+                    BeamRecord::PRIMITIVE(PrimitiveValue::Int64(n)) => ints.push(n),
+                    other => panic!("expected int64 primitive, got {other:?}"),
+                }
+            }
+        }
+        ints.sort_unstable();
+        assert_eq!(ints, vec![1, 2, 3]);
+
+        // Cursor advanced: a second stream over the same reader drains empty.
+        let mut second = store
+            .stream_windowed_values_since("reader-s".to_string(), pc.to_string())
+            .await
+            .unwrap();
+        assert!(second.next_batch().await.unwrap().is_none());
+
+        // A stream over a never-written PCollection drains empty without error.
+        let mut empty = store
+            .stream_windowed_values_since("reader-s".to_string(), "pc-never".to_string())
+            .await
+            .unwrap();
+        assert!(empty.next_batch().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn incremental_scan_delivers_only_rows_appended_since_the_last_read() {
+        let (_dir, store) = make_store().await;
+        let pc = "pc-incremental";
+
+        store
+            .write_windowed_value_batch(pc, vec![windowed_int(1, 10)])
+            .await
+            .unwrap();
+
+        // A reader's first read is the whole table.
+        let first = store
+            .scan_windowed_values_since("reader-a", pc)
+            .await
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].value, int_primitive(1));
+        let cursor = store.cursor("reader-a", pc).await.unwrap();
+        assert!(cursor.is_some(), "reading advances the cursor");
+
+        // Nothing appended: a re-read is empty and the cursor does not move.
+        let again = store
+            .scan_windowed_values_since("reader-a", pc)
+            .await
+            .unwrap();
+        assert!(again.is_empty());
+        assert_eq!(store.cursor("reader-a", pc).await.unwrap(), cursor);
+
+        // A new commit is the only thing a re-read returns.
+        store
+            .write_windowed_value_batch(pc, vec![windowed_int(2, 20)])
+            .await
+            .unwrap();
+        let newly = store
+            .scan_windowed_values_since("reader-a", pc)
+            .await
+            .unwrap();
+        assert_eq!(newly.len(), 1);
+        assert_eq!(newly[0].value, int_primitive(2));
+        assert!(store.cursor("reader-a", pc).await.unwrap() > cursor);
+
+        // An independent reader keeps its own cursor and sees the whole table.
+        let other = store
+            .scan_windowed_values_since("reader-b", pc)
+            .await
+            .unwrap();
+        assert_eq!(other.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn read_cursor_survives_store_recreation() {
+        let dir = tempdir().expect("tempdir");
+        let warehouse = dir.path().to_str().expect("utf8").to_string();
+
+        let store = FlareElementStore::new(warehouse.clone(), "testdb".to_string(), None)
+            .await
+            .expect("store");
+        store
+            .write_windowed_value_batch("pc-durable", vec![windowed_int(1, 10)])
+            .await
+            .unwrap();
+        // Reading advances (and durably records) the cursor.
+        store
+            .scan_windowed_values_since("reader", "pc-durable")
+            .await
+            .unwrap();
+        let cursor = store.cursor("reader", "pc-durable").await.unwrap();
+        assert!(cursor.is_some());
+        assert!(
+            store
+                .get_existing_table("__flare_cursor")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let cursor_dir = slate_state_dir(&store).join("cursors");
+        assert!(
+            cursor_dir.is_dir(),
+            "expected the SlateDB cursor store at {}",
+            cursor_dir.display()
+        );
+        assert!(
+            std::fs::read_dir(&cursor_dir)
+                .expect("failed to list the SlateDB cursor store")
+                .next()
+                .is_some(),
+            "SlateDB wrote nothing under {}",
+            cursor_dir.display()
+        );
+        drop(store);
+
+        // A fresh store over the same warehouse sees the same cursor, so a
+        // re-run does not re-read from the beginning.
+        let reopened = FlareElementStore::new(warehouse, "testdb".to_string(), None)
+            .await
+            .expect("store");
+        assert_eq!(
+            reopened.cursor("reader", "pc-durable").await.unwrap(),
+            cursor
+        );
+    }
+
+    #[test]
+    fn cursor_snapshot_encoding_is_fixed_width_big_endian() {
+        let snapshot_id = 0x0102_0304_0506_0708;
+        let encoded = encode_snapshot(snapshot_id);
+        assert_eq!(encoded, snapshot_id.to_be_bytes());
+        assert_eq!(decode_snapshot(&encoded).unwrap(), snapshot_id);
+        assert!(decode_snapshot(&encoded[..7]).is_err());
+    }
+
+    #[tokio::test]
     async fn write_and_scan_opaque_bytes_roundtrip_preserves_wire_bytes() {
         let (_dir, store) = make_store().await;
 
@@ -531,6 +2016,41 @@ mod element_store_tests {
     }
 
     #[tokio::test]
+    async fn write_and_scan_kv_void_roundtrip() {
+        let (_dir, store) = make_store().await;
+        store
+            .write_beamrecord_batch(NewCollectionRequest {
+                pcollection_id: "pc-kv-void".to_string(),
+                elements: vec![BeamRecord::KV(BeamKV {
+                    key: PrimitiveValue::String("a".into()),
+                    value: Box::new(BeamRecord::PRIMITIVE(PrimitiveValue::Void)),
+                })],
+            })
+            .await
+            .unwrap();
+
+        let schema = store.registry.get("pc-kv-void").unwrap();
+        assert_eq!(
+            schema
+                .arrow_schema
+                .field_with_name(VALUE_COLUMN)
+                .unwrap()
+                .data_type(),
+            &DataType::Boolean
+        );
+        let scanned = store
+            .scan_collection(ScanCollectionRequest {
+                pcollection_id: "pc-kv-void".to_string(),
+            })
+            .await
+            .unwrap();
+        let BeamRecord::KV(kv) = &scanned[0] else {
+            panic!("expected KV");
+        };
+        assert_eq!(*kv.value, BeamRecord::PRIMITIVE(PrimitiveValue::Void));
+    }
+
+    #[tokio::test]
     async fn write_and_scan_gbk_roundtrip() {
         let (_dir, store) = make_store().await;
 
@@ -568,6 +2088,94 @@ mod element_store_tests {
         expected.insert("k1".to_string(), vec![1, 2, 3]);
         expected.insert("k2".to_string(), vec![]);
         assert_eq!(map, expected);
+    }
+
+    #[tokio::test]
+    async fn write_and_scan_gbk_void_roundtrip() {
+        let (_dir, store) = make_store().await;
+        store
+            .write_beamrecord_batch(NewCollectionRequest {
+                pcollection_id: "pc-gbk-void".to_string(),
+                elements: vec![
+                    BeamRecord::GBK(BeamGbk {
+                        key: PrimitiveValue::String("k1".into()),
+                        value: IterableValue::new(vec![PrimitiveValue::Void, PrimitiveValue::Void]),
+                    }),
+                    BeamRecord::GBK(BeamGbk {
+                        key: PrimitiveValue::String("k2".into()),
+                        value: IterableValue::new(vec![]),
+                    }),
+                ],
+            })
+            .await
+            .unwrap();
+
+        let schema = store.registry.get("pc-gbk-void").unwrap();
+        let DataType::List(item) = schema
+            .arrow_schema
+            .field_with_name(VALUE_COLUMN)
+            .unwrap()
+            .data_type()
+        else {
+            panic!("expected list value");
+        };
+        assert_eq!(item.data_type(), &DataType::Boolean);
+
+        let scanned = store
+            .scan_collection(ScanCollectionRequest {
+                pcollection_id: "pc-gbk-void".to_string(),
+            })
+            .await
+            .unwrap();
+        let BeamRecord::GBK(k1) = &scanned[0] else {
+            panic!("expected GBK");
+        };
+        assert_eq!(
+            k1.value.list,
+            vec![
+                BeamRecord::PRIMITIVE(PrimitiveValue::Void),
+                BeamRecord::PRIMITIVE(PrimitiveValue::Void)
+            ]
+        );
+        let BeamRecord::GBK(k2) = &scanned[1] else {
+            panic!("expected GBK");
+        };
+        assert!(k2.value.list.is_empty());
+    }
+
+    #[tokio::test]
+    async fn write_and_scan_gbk_with_void_key_roundtrip() {
+        let (_dir, store) = make_store().await;
+        store
+            .write_beamrecord_batch(NewCollectionRequest {
+                pcollection_id: "pc-gbk-void-key".to_string(),
+                elements: vec![BeamRecord::GBK(BeamGbk {
+                    key: PrimitiveValue::Void,
+                    value: IterableValue::new(vec![PrimitiveValue::Bytes(vec![1, 2, 3])]),
+                })],
+            })
+            .await
+            .unwrap();
+
+        let schema = store.registry.get("pc-gbk-void-key").unwrap();
+        let key = schema.arrow_schema.field_with_name(KEY_COLUMN).unwrap();
+        assert_eq!(key.data_type(), &DataType::Boolean);
+        assert!(key.is_nullable());
+
+        let scanned = store
+            .scan_collection(ScanCollectionRequest {
+                pcollection_id: "pc-gbk-void-key".to_string(),
+            })
+            .await
+            .unwrap();
+        let BeamRecord::GBK(gbk) = &scanned[0] else {
+            panic!("expected GBK");
+        };
+        assert_eq!(gbk.key, PrimitiveValue::Void);
+        assert_eq!(
+            gbk.value.list,
+            vec![BeamRecord::PRIMITIVE(PrimitiveValue::Bytes(vec![1, 2, 3]))]
+        );
     }
 
     #[tokio::test]
@@ -787,6 +2395,37 @@ mod element_store_tests {
         // Second call: table now exists -> must resolve without erroring
         // (exercises the `Ok(table)` branch instead of `TableNotExist`).
         store.get_table("pc-get-table", &schema).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_get_or_create_table_is_idempotent() {
+        let (_dir, store) = make_store().await;
+        let store = Arc::new(store);
+
+        // Many callers racing to resolve and create the same table must all succeed.
+        for round in 0..50 {
+            let name = format!("stress_table_{round}");
+            let mut handles = Vec::new();
+            for _ in 0..8 {
+                let store = Arc::clone(&store);
+                let name = name.clone();
+                handles.push(tokio::spawn(async move {
+                    let schema = arrow_schema_to_paimon(&ArrowSchema::new(vec![ArrowField::new(
+                        "value",
+                        DataType::Int64,
+                        false,
+                    )]))
+                    .unwrap();
+                    store.get_or_create_table(&name, schema).await.map(|_| ())
+                }));
+            }
+            for handle in handles {
+                handle
+                    .await
+                    .expect("task panicked")
+                    .expect("concurrent table creation must not fail");
+            }
+        }
     }
 
     //  arrow_schema_to_paimon

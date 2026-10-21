@@ -4,7 +4,11 @@ use std::sync::Arc;
 use tokio::process::{Child, Command};
 use tonic::Status;
 
-use crate::utils::path::logs_dir;
+use crate::{jobservice::urns::beam_urns, utils::path::logs_dir};
+
+fn runner_capabilities() -> &'static str {
+    beam_urns::MULTIMAP_KEYS_VALUES_SIDE_INPUT_PROTOCOL
+}
 
 #[derive(Clone, Debug)]
 pub struct WorkerLaunchConfig {
@@ -91,11 +95,15 @@ impl WorkerManager {
                     )));
                 }
 
-                let classpath = format!("{}:{}", worker_jar, staged_jar);
+                // Java uses ';' as the classpath separator on Windows and ':' elsewhere.
+                let classpath_sep = if cfg!(windows) { ";" } else { ":" };
+                let classpath = format!("{}{}{}", worker_jar, classpath_sep, staged_jar);
                 let mut cmd = Command::new("java");
 
                 cmd.arg("--add-opens=java.base/java.nio=org.apache.arrow.memory.core,ALL-UNNAMED") // arrow vector needs it
                     .arg("-Dio.netty.tryReflectionSetAccessible=true")
+                    .arg("-Dorg.slf4j.simpleLogger.defaultLogLevel=info") //debug logs
+                    //.arg("-Dorg.slf4j.simpleLogger.log.org.apache.beam.fn.harness.state=debug")
                     .arg("-cp")
                     .arg(&classpath)
                     .arg("org.apache.beam.fn.harness.FnHarness")
@@ -117,6 +125,7 @@ impl WorkerManager {
                         format!(r#"url: "{}""#, self.config.control_url),
                     )
                     .env("PIPELINE_OPTIONS", &self.config.pipeline_options)
+                    .env("RUNNER_CAPABILITIES", runner_capabilities())
                     .stdout(Stdio::from(stdout_file))
                     .stderr(Stdio::from(stderr_file));
 
@@ -162,6 +171,7 @@ impl WorkerManager {
                     )
                     .env("SEMI_PERSISTENT_DIRECTORY", staging_dir)
                     .env("PIPELINE_OPTIONS", &self.config.pipeline_options)
+                    .env("RUNNER_CAPABILITIES", runner_capabilities())
                     .env("PYTHONUNBUFFERED", "1")
                     .stdout(Stdio::from(stdout_file))
                     .stderr(Stdio::from(stderr_file));
@@ -238,5 +248,18 @@ impl WorkerManager {
                 let _ = child.kill().await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn advertises_multimap_keys_values_protocol() {
+        assert_eq!(
+            runner_capabilities(),
+            "beam:protocol:multimap_keys_values_side_input:v1"
+        );
     }
 }

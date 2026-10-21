@@ -14,7 +14,8 @@ public interface WritePipelineOptions extends FlarePipelineOptions {
   /**
    * Applies the standard FlareDB example defaults: run on {@link FlareRunner}, target the local
    * FlareDB job service, and auto-detect the shadow (uber) JAR produced by this module's {@code
-   * shadowJar} task. An explicitly configured {@code --uberJar} takes precedence.
+   * shadowJar} task, and auto-detect the bundled sample input file. Explicitly configured {@code
+   * --uberJar} and {@code --csvFile} values take precedence.
    *
    * @return the same options, for fluent use
    */
@@ -25,6 +26,12 @@ public interface WritePipelineOptions extends FlarePipelineOptions {
       File shadowJar = findShadowJar();
       if (shadowJar != null) {
         options.setUberJar(shadowJar.getAbsolutePath());
+      }
+    }
+    if (options.getCsvFile() == null || options.getCsvFile().isEmpty()) {
+      File csvFile = findSampleInput();
+      if (csvFile != null) {
+        options.setCsvFile(csvFile.getAbsolutePath());
       }
     }
     return options;
@@ -46,8 +53,26 @@ public interface WritePipelineOptions extends FlarePipelineOptions {
     return null;
   }
 
+  /**
+   * Locates the bundled sample input file, probing paths relative to both the module directory
+   * (when run via {@code :flareio-write:run}) and the repository root.
+   */
+  private static File findSampleInput() {
+    String[] candidates = {"test-data/scores.csv", "../../test-data/scores.csv"};
+    for (String candidate : candidates) {
+      File file = new File(candidate);
+      if (file.isFile()) {
+        return file;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Returns the CSV file to load into FlareDB. Defaults to the bundled sample ({@code
+   * test-data/scores.csv}) when not set; override with {@code --csvFile=/path/to/file}.
+   */
   @Description("Path to the CSV file to load into FlareDB")
-  @Default.String("/home/ganesh/flare-db/flareio/flare-db/test-data/scores.csv")
   String getCsvFile();
 
   void setCsvFile(String csvFile);

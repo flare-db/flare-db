@@ -29,8 +29,15 @@ pub mod beam_urns {
     pub const NULLABLE_CODER: &str = "beam:coder:nullable:v1";
     pub const LENGTH_PREFIX_CODER: &str = "beam:coder:length_prefix:v1";
     pub const GLOBAL_WINDOW_CODER: &str = "beam:coder:global_window:v1";
+    pub const INTERVAL_WINDOW_CODER: &str = "beam:coder:interval_window:v1";
     pub const WINDOWED_VALUE_CODER: &str = "beam:coder:windowed_value:v1";
+    pub const TIMER_CODER: &str = "beam:coder:timer:v1";
     pub const ROW_CODER: &str = "beam:coder:row:v1";
+
+    // window fns
+    pub const GLOBAL_WINDOWS_FN: &str = "beam:window_fn:global_windows:v1";
+    pub const FIXED_WINDOWS_FN: &str = "beam:window_fn:fixed_windows:v1";
+    pub const SLIDING_WINDOWS_FN: &str = "beam:window_fn:sliding_windows:v1";
     pub const JAVA_SDK_CODER: &str = "beam:coders:javasdk:0.1";
     pub const PYTHON_PICKLE_CODER: &str = "beam:coder:pickled_python:v1";
     pub const TUPLE_CODER: &str = "beam:coder:tuple:v1";
@@ -64,7 +71,12 @@ pub mod beam_urns {
         SPLITTABLE_PROCESS_SIZED_ELEMENTS_AND_RESTRICTIONS_URN,
     ];
 
-    pub const FLARE: &[&str] = &[GROUP_BY_KEY_TRANSFORM, IMPULSE_TRANSFORM, FLATTEN_TRANSFORM];
+    pub const FLARE: &[&str] = &[
+        GROUP_BY_KEY_TRANSFORM,
+        IMPULSE_TRANSFORM,
+        FLATTEN_TRANSFORM,
+        TEST_STREAM_TRANSFORM,
+    ];
 
     // Composites
     pub const COMBINE_PER_KEY_TRANSFORM_URN: &str = "beam:transform:combine_per_key:v1";
@@ -149,6 +161,11 @@ pub mod beam_urns {
         SPLITTABLE_SPLIT_AND_SIZE_RESTRICTIONS_URN,
         SPLITTABLE_PROCESS_SIZED_ELEMENTS_AND_RESTRICTIONS_URN,
     ];
+
+    pub const ITERABLE_SIDE_INPUT_ACCESS: &str = "beam:side_input:iterable:v1";
+    pub const MULTIMAP_SIDE_INPUT_ACCESS: &str = "beam:side_input:multimap:v1";
+    pub const MULTIMAP_KEYS_VALUES_SIDE_INPUT_PROTOCOL: &str =
+        "beam:protocol:multimap_keys_values_side_input:v1";
 
     pub const LOGICAL_TYPE_MICROS_INSTANT: &str = "beam:logical_type:micros_instant:v1";
     pub const LOGICAL_TYPE_MILLIS_INSTANT: &str = "beam:logical_type:millis_instant:v1";

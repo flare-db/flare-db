@@ -1,0 +1,30 @@
+// Build the pipeline:    ./gradlew :sliding-window:shadowJar
+// Run with:   ./gradlew :sliding-window:run
+
+
+plugins {
+    id 'java'
+    id 'application'
+    alias(libs.plugins.shadow)
+}
+
+application {
+    mainClass = 'com.flaredb.example.SlidingWindowExample'
+}
+
+dependencies {
+    implementation project(':flaredb-runner')
+    implementation libs.beam.core
+    runtimeOnly libs.slf4j.simple
+}
+
+shadowJar {
+    mergeServiceFiles()
+    zip64 = true
+}
+
+run {
+    // The FlareRunner stages the shadow (uber) JAR to the FlareDB workers, so it must exist
+    // before the example starts.
+    dependsOn tasks.named('shadowJar')
+}

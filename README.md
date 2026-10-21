@@ -23,21 +23,14 @@ For a deeper dive into FlareDB's design and execution model, check out this post
 
 ### 1. Install the FlareDB CLI
 
-The FlareDB CLI provides commands to initialize, start, and manage FlareDB instances, as well as run Apache Beam pipelines on FlareDB.
-
-If you are on **Linux or macOS** , please run the following command to install the CLI:
+If you are on **Linux or macOS**, please run the following command to install the CLI:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/flare-db/flare-db/releases/download/flare-cli-v0.2.1/flare-cli-installer.sh | sh
+curl -sSL https://install.flare-db.com | bash
 ```
 
-For **Windows** run the following command in PowerShell:
+The script automatically detects your platform, downloads and installs the latest version of CLI, If you are on **Windows** use WSL.
 
-```bash
-powershell -ExecutionPolicy Bypass -c "irm https://github.com/flare-db/flare-db/releases/download/flare-cli-v0.2.1/flare-cli-installer.ps1 | iex"
-```
-
-Alternatively, you can download the CLI binary directly from the GitHub Releases page by selecting the appropriate binary for your platform.
 
 ### 2. Initialize FlareDB
 
@@ -117,4 +110,4 @@ Upcoming releases will focus on expanding FlareDB's streaming execution capabili
 
 ## License
 
-FlareDB is licensed under the Apache License 2.0 
+FlareDB is licensed under the Apache License 2.0

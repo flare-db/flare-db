@@ -7,16 +7,15 @@ use log::info;
 use std::collections::{HashMap, HashSet};
 
 use crate::{
+    coders::primitives::WindowedValue,
     jobservice::urns::beam_urns,
-    store::element_store::{NewCollectionRequest, ScanCollectionRequest},
     transforms::{ExecutionContext, FlareTransform},
 };
 
 /// Merges multiple input PCollections into a single output PCollection.
 ///
 /// Flatten is a pure concatenation: every element from every input is emitted,
-/// unchanged, into the single output. Each input PCollection has already been
-/// materialized into the element store by its upstream (worker or runner)
+/// unchanged, into the single output, preserving each element's window metadata.
 #[derive(Clone)]
 pub struct Flatten {
     name: String,
@@ -49,17 +48,18 @@ impl FlareTransform for Flatten {
     }
 
     async fn execute(&self, ctx: ExecutionContext) -> Result<(), Error> {
-        let mut merged = Vec::new();
+        // Pure union: read every input as WindowedValues and re-emit unchanged,
+        // preserving each element's window metadata. Inputs are read
+        // incrementally from this stage's cursor, so a re-run emits only the rows
+        // appended by its upstream since the previous run.
+        let mut merged: Vec<WindowedValue> = Vec::new();
 
-        // Read every input collection from the store.
         for input_id in &ctx.input_pcollection_ids {
-            let records = ctx
+            let values = ctx
                 .store
-                .scan_collection(ScanCollectionRequest {
-                    pcollection_id: input_id.clone(),
-                })
+                .scan_windowed_values_since(&ctx.stage_id, input_id)
                 .await?;
-            merged.extend(records);
+            merged.extend(values);
         }
 
         info!(
@@ -74,10 +74,7 @@ impl FlareTransform for Flatten {
         }
 
         ctx.store
-            .write_beamrecord_batch(NewCollectionRequest {
-                pcollection_id: ctx.output_pcollection_id.clone(),
-                elements: merged,
-            })
+            .write_windowed_value_batch(&ctx.output_pcollection_id, merged)
             .await?;
 
         Ok(())
@@ -140,5 +137,99 @@ impl FlareTransform for Flatten {
 
     fn id(&self) -> String {
         self.id.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::coders::primitives::{BeamWindow, PaneInfo};
+    use crate::store::element_store::{FlareElementStore, ScanCollectionRequest};
+    use crate::store::record::{BeamKV, BeamRecord, PrimitiveValue};
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    async fn make_store() -> (tempfile::TempDir, Arc<FlareElementStore>) {
+        let dir = tempdir().expect("failed to create tempdir warehouse");
+        let warehouse = dir.path().to_str().expect("tempdir path utf8").to_string();
+        let store = FlareElementStore::new(warehouse, "testdb".to_string(), None)
+            .await
+            .expect("failed to construct FlareElementStore");
+        (dir, Arc::new(store))
+    }
+
+    fn kv(key: &str, value: i64, start: i64, end: i64) -> WindowedValue {
+        WindowedValue {
+            value: BeamRecord::KV(BeamKV {
+                key: PrimitiveValue::String(key.to_string()),
+                value: Box::new(BeamRecord::PRIMITIVE(PrimitiveValue::Int64(value))),
+            }),
+            timestamp_millis: start,
+            windows: vec![BeamWindow::Interval {
+                start_millis: start,
+                end_millis: end,
+            }],
+            pane: PaneInfo::on_time_firing(),
+        }
+    }
+
+    #[tokio::test]
+    async fn flatten_preserves_window_metadata() {
+        let (_dir, store) = make_store().await;
+
+        store
+            .write_windowed_value_batch("in-0", vec![kv("a", 1, 0, 60_000)])
+            .await
+            .unwrap();
+        store
+            .write_windowed_value_batch("in-1", vec![kv("b", 2, 60_000, 120_000)])
+            .await
+            .unwrap();
+
+        let transform = Flatten::with(
+            "flatten-test".to_string(),
+            HashMap::from([("in0".to_string(), "in-0".to_string())]),
+            HashMap::from([("out".to_string(), "out".to_string())]),
+            "Flatten".to_string(),
+        );
+
+        transform
+            .execute(ExecutionContext {
+                store: store.clone(),
+                input_pcollection_ids: vec!["in-0".to_string(), "in-1".to_string()],
+                output_pcollection_id: "out".to_string(),
+                consumer_transfrom_id: "consumer".to_string(),
+                stage_id: "flatten-test".to_string(),
+                windowing_strategy: None,
+                processing_time: 0,
+                input_watermark: i64::MAX,
+                output_coder: None,
+                window_merger: None,
+                source_reports: None,
+            })
+            .await
+            .expect("flatten failed");
+
+        let output = store
+            .scan_windowed_values(ScanCollectionRequest {
+                pcollection_id: "out".to_string(),
+            })
+            .await
+            .expect("scan output");
+
+        assert_eq!(output.len(), 2);
+        let windows: Vec<_> = output.iter().map(|v| v.windows.clone()).collect();
+        assert!(windows.iter().any(|w| {
+            *w == vec![BeamWindow::Interval {
+                start_millis: 0,
+                end_millis: 60_000,
+            }]
+        }));
+        assert!(windows.iter().any(|w| {
+            *w == vec![BeamWindow::Interval {
+                start_millis: 60_000,
+                end_millis: 120_000,
+            }]
+        }));
     }
 }

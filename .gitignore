@@ -17,6 +17,11 @@ __pycache__/
 *.pyc
 *.egg-info/
 
+**/.venv/
+**/dist/
+**/build/
+**/*.egg-info/
+
 # IDE
 .idea/
 *.iml
@@ -28,3 +33,6 @@ __pycache__/
 
 
 .venv
+
+graphify-out
+.codex

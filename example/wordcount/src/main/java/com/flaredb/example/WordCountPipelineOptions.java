@@ -5,13 +5,25 @@ import com.flaredb.runner.FlareRunner;
 import java.io.File;
 import java.util.Arrays;
 import java.util.Comparator;
+import org.apache.beam.sdk.options.Description;
 
 public interface WordCountPipelineOptions extends FlarePipelineOptions {
 
   /**
+   * Returns the text file to count words in. Defaults to the bundled sample ({@code
+   * test-data/thirukkural.txt}) when not set; override with {@code --inputFile=/path/to/file}.
+   */
+  @Description("Path to the text file to count words in")
+  String getInputFile();
+
+  /** Sets the text file to count words in. */
+  void setInputFile(String path);
+
+  /**
    * Applies the standard FlareDB example defaults: run on {@link FlareRunner}, target the local
-   * FlareDB job service, and auto-detect the shadow (uber) JAR produced by this module's {@code
-   * shadowJar} task. An explicitly configured {@code --uberJar} takes precedence.
+   * FlareDB job service, auto-detect the shadow (uber) JAR produced by this module's {@code
+   * shadowJar} task, and auto-detect the bundled sample input file. Explicitly configured {@code
+   * --uberJar} and {@code --inputFile} take precedence.
    *
    * @return the same options, for fluent use
    */
@@ -24,7 +36,28 @@ public interface WordCountPipelineOptions extends FlarePipelineOptions {
         options.setUberJar(shadowJar.getAbsolutePath());
       }
     }
+    if (options.getInputFile() == null || options.getInputFile().isEmpty()) {
+      File inputFile = findSampleInput();
+      if (inputFile != null) {
+        options.setInputFile(inputFile.getAbsolutePath());
+      }
+    }
     return options;
+  }
+
+  /**
+   * Locates the bundled sample input file, probing paths relative to both the module directory
+   * (when run via {@code :wordcount:run}) and the repository root.
+   */
+  private static File findSampleInput() {
+    String[] candidates = {"test-data/thirukkural.txt", "../../test-data/thirukkural.txt"};
+    for (String candidate : candidates) {
+      File file = new File(candidate);
+      if (file.isFile()) {
+        return file;
+      }
+    }
+    return null;
   }
 
   /** Locates the shadow (uber) JAR produced by this module's {@code shadowJar} task. */

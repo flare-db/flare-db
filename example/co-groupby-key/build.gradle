@@ -1,5 +1,5 @@
+// Build the pipeline:    ./gradlew :co-groupby-key:shadowJar
 // Run with:   ./gradlew :co-groupby-key:run
-// Fat jar:    ./gradlew :co-groupby-key:shadowJar  (build/libs/co-groupby-key-0.2.0-all.jar)
 
 
 plugins {

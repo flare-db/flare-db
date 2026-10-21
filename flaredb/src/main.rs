@@ -49,7 +49,7 @@ async fn flare_up() -> Result<(), Box<dyn std::error::Error>> {
 
     let worker_jar = std::env::var("WORKER_JAR_PATH").unwrap_or_else(|_| {
         format!(
-            "{}/bin/beam-sdks-java-harness-2.72.0-flare-bundled.jar",
+            "{}/bin/beam-sdks-java-harness-2.76.0-flare-bundled.jar",
             std::env::args().nth(1).unwrap_or_else(|| ".".to_string())
         )
     });

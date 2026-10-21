@@ -98,7 +98,7 @@ public class FlareRunner extends PipelineRunner<FlarePipelineJob> {
     RunnerApi.Pipeline pipelineProto = PipelineTranslation.toProto(pipeline);
 
     // proto overrides
-    pipelineProto = PortableCoderRewrites.wrapJoinCoders(pipelineProto);
+    pipelineProto = PortableCoderRewrites.wrapOpaqueCoders(pipelineProto);
 
     PrepareJobRequest prepareJobRequest =
         PrepareJobRequest.newBuilder()

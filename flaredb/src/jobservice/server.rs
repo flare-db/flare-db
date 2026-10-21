@@ -1,16 +1,17 @@
 use std::{sync::Arc, time::Duration};
 
 use beam_model_rs::v1::{
-    ApiServiceDescriptor, CancelJobRequest, CancelJobResponse, DescribePipelineOptionsRequest,
+    job_service_server::JobService, job_state::Enum as JobStateEnum, ApiServiceDescriptor,
+    CancelJobRequest, CancelJobResponse, DescribePipelineOptionsRequest,
     DescribePipelineOptionsResponse, DrainJobRequest, DrainJobResponse, GetJobMetricsRequest,
     GetJobMetricsResponse, GetJobPipelineRequest, GetJobPipelineResponse, GetJobStateRequest,
     GetJobsRequest, GetJobsResponse, JobMessagesRequest, JobMessagesResponse, JobStateEvent,
-    PrepareJobRequest, PrepareJobResponse, ProcessPayload, RunJobRequest, RunJobResponse,
-    job_service_server::JobService, job_state::Enum as JobStateEnum,
+    MetricResults, PrepareJobRequest, PrepareJobResponse, ProcessPayload, RunJobRequest,
+    RunJobResponse,
 };
 use dashmap::{DashMap, DashSet};
 use prost::Message;
-use tokio::sync::{Mutex, watch};
+use tokio::sync::{watch, Mutex};
 use tokio::time::timeout;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Response;
@@ -18,6 +19,7 @@ use tonic::Status;
 use uuid::Uuid;
 
 use crate::engine::dispatcher::ExecutorDispatcher;
+use crate::engine::metrics::JobMetrics;
 use crate::engine::scheduler::NodeScheduler;
 use crate::fusion::pipeline::ExecutableGraph;
 use crate::jobservice::artifact::ArtifactStore;
@@ -36,6 +38,8 @@ pub struct FlareJobService {
     /// Per-job state, published to `GetStateStream` subscribers. FlareDB runs a
     /// job synchronously inside `Run`
     job_states: Arc<DashMap<String, watch::Sender<JobStateEnum>>>,
+    /// Per-job Beam metrics aggregated from completed SDK bundles.
+    job_metrics: Arc<DashMap<String, Arc<JobMetrics>>>,
 }
 
 impl FlareJobService {
@@ -53,6 +57,7 @@ impl FlareJobService {
             instance_id,
             dispatcher,
             job_states: Arc::new(DashMap::new()),
+            job_metrics: Arc::new(DashMap::new()),
         }
     }
 
@@ -154,6 +159,8 @@ impl JobService for FlareJobService {
 
             self.staging_tokens.insert(new_token);
             self.init_job_state(&job_id);
+            self.job_metrics
+                .insert(job_id.clone(), Arc::new(JobMetrics::default()));
 
             log::info!("prepare request succeeded: preparation_id={}", job_id);
             Ok(Response::new(response))
@@ -196,6 +203,14 @@ impl JobService for FlareJobService {
                 );
                 Status::not_found(format!("unknown preparation_id: {}", preparation_id))
             })?;
+            let job_metrics = self
+                .job_metrics
+                .get(&preparation_id)
+                .map(|entry| Arc::clone(entry.value()))
+                .ok_or_else(|| {
+                    Status::not_found(format!("unknown preparation_id: {}", preparation_id))
+                })?;
+            job_metrics.clear();
 
             self.set_job_state(&preparation_id, JobStateEnum::Running);
 
@@ -224,8 +239,29 @@ impl JobService for FlareJobService {
                 log::warn!("failed to record job state for {}: {}", preparation_id, e);
             }
 
-            // Reset channels so the new harness can connect on fresh streams.
-            self.dispatcher.lock().await.reset_channels().await;
+            // Reset channels so the new harness can connect on fresh streams, then
+            // install the accumulator that completed bundles will report into.
+            {
+                let dispatcher = self.dispatcher.lock().await;
+                dispatcher.reset_channels().await;
+                dispatcher.set_job_metrics(job_metrics);
+            }
+
+            // Route SDK worker log entries into this job's flare-worker.log
+            // before the harness starts, so early startup logs are captured.
+            if let Err(e) = self
+                .dispatcher
+                .lock()
+                .await
+                .set_log_target(&self.instance_id, &preparation_id)
+                .await
+            {
+                log::warn!(
+                    "failed to set worker log target for {}: {}",
+                    preparation_id,
+                    e
+                );
+            }
 
             self.worker_manager
                 .spawn_worker(&preparation_id, &runtime, staging_dir, &self.instance_id)
@@ -236,7 +272,12 @@ impl JobService for FlareJobService {
                 .await
                 .set_job_store(&preparation_id)
                 .await
-                .map_err(|e| Status::internal(format!("failed to set job store: {}", e)))?;
+                .map_err(|e| {
+                    Status::internal(truncate_grpc_error(format!(
+                        "failed to set job store: {}",
+                        e
+                    )))
+                })?;
 
             let connect_timeout_secs = self.worker_manager.config().connect_timeout_secs;
             timeout(Duration::from_secs(connect_timeout_secs), async {
@@ -251,21 +292,28 @@ impl JobService for FlareJobService {
                 ))
             })?
             .map_err(|e| {
-                Status::internal(format!(
+                Status::internal(truncate_grpc_error(format!(
                     "failed waiting for harness connection for job {}: {}",
                     preparation_id, e
-                ))
+                )))
             })?;
 
             let mut dispatcher = self.dispatcher.lock().await;
-            dispatcher.prepare_pipeline(job_graph.as_ref());
+            dispatcher
+                .prepare_pipeline(job_graph.as_ref())
+                .map_err(|e| {
+                    Status::internal(truncate_grpc_error(format!(
+                        "failed to prepare pipeline for job {}: {}",
+                        preparation_id, e
+                    )))
+                })?;
 
             let mut scheduler = NodeScheduler::new((*job_graph).clone());
             dispatcher.run_pipeline(&mut scheduler).await.map_err(|e| {
-                Status::internal(format!(
+                Status::internal(truncate_grpc_error(format!(
                     "failed to execute pipeline for job {}: {}",
                     preparation_id, e
-                ))
+                )))
             })?;
 
             // stop worker, next job will get a fresh one.
@@ -537,7 +585,17 @@ impl JobService for FlareJobService {
         'life0: 'async_trait,
         Self: 'async_trait,
     {
-        todo!()
+        Box::pin(async move {
+            let job_id = request.into_inner().job_id;
+            let job_metrics = self
+                .job_metrics
+                .get(&job_id)
+                .map(|entry| Arc::clone(entry.value()));
+            Ok(Response::new(build_job_metrics_response(
+                &job_id,
+                job_metrics,
+            )?))
+        })
     }
 
     #[doc = " Get the supported pipeline options of the runner"]
@@ -578,4 +636,108 @@ impl JobService for FlareJobService {
 
     #[doc = " Server streaming response type for the GetMessageStream method."]
     type GetMessageStreamStream = ReceiverStream<Result<JobMessagesResponse, tonic::Status>>;
+}
+
+fn build_job_metrics_response(
+    job_id: &str,
+    job_metrics: Option<Arc<JobMetrics>>,
+) -> Result<GetJobMetricsResponse, Status> {
+    let job_metrics =
+        job_metrics.ok_or_else(|| Status::not_found(format!("unknown job_id: {job_id}")))?;
+    let attempted = job_metrics.snapshot();
+    Ok(GetJobMetricsResponse {
+        metrics: Some(MetricResults {
+            committed: attempted.clone(),
+            attempted,
+        }),
+    })
+}
+
+/// Bound the length of an error string carried back to the client.
+///
+/// gRPC errors travel in the HTTP/2 `grpc-message` trailer, and the JVM runner's
+/// gRPC client defaults to an 8 KiB inbound-metadata limit. A long message (for
+/// example a chained coder or panic error) exceeds it, and the *real* failure is
+/// replaced by a `HeaderListSizeException`, hiding the cause. Truncate on a UTF-8
+/// char boundary so the trailer stays small and the useful prefix survives.
+fn truncate_grpc_error(message: String) -> String {
+    const MAX_BYTES: usize = 2_048;
+    if message.len() <= MAX_BYTES {
+        return message;
+    }
+    let mut end = MAX_BYTES;
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}… [truncated, {} bytes total]",
+        &message[..end],
+        message.len()
+    )
+}
+
+#[cfg(test)]
+mod metrics_tests {
+    use super::{build_job_metrics_response, JobMetrics};
+    use beam_model_rs::v1::MonitoringInfo;
+    use std::sync::Arc;
+
+    fn counter() -> MonitoringInfo {
+        MonitoringInfo {
+            urn: "beam:metric:user:sum_int64:v1".to_string(),
+            r#type: "beam:metrics:sum_int64:v1".to_string(),
+            payload: vec![7],
+            labels: [
+                ("NAMESPACE".to_string(), "test".to_string()),
+                ("NAME".to_string(), "count".to_string()),
+                ("PTRANSFORM".to_string(), "step".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            start_time: None,
+        }
+    }
+
+    #[test]
+    fn known_jobs_return_attempted_and_committed_metrics() {
+        let metrics = Arc::new(JobMetrics::default());
+        metrics.record(&[counter()]);
+
+        let response = build_job_metrics_response("job-1", Some(metrics)).unwrap();
+        let results = response.metrics.expect("metrics must be populated");
+
+        assert_eq!(results.attempted.len(), 1);
+        assert_eq!(results.committed, results.attempted);
+    }
+
+    #[test]
+    fn unknown_jobs_return_not_found() {
+        let error = build_job_metrics_response("missing", None).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::NotFound);
+    }
+}
+
+#[cfg(test)]
+mod truncate_tests {
+    use super::truncate_grpc_error;
+
+    #[test]
+    fn keeps_short_messages_intact() {
+        assert_eq!(truncate_grpc_error("boom".to_string()), "boom");
+    }
+
+    #[test]
+    fn truncates_long_messages() {
+        let truncated = truncate_grpc_error("a".repeat(10_000));
+        assert!(truncated.len() < 3_000);
+        assert!(truncated.starts_with('a'));
+        assert!(truncated.contains("truncated"));
+    }
+
+    #[test]
+    fn truncation_is_utf8_safe() {
+        // 'é' is two bytes; cutting mid-codepoint would panic without the boundary check.
+        let truncated = truncate_grpc_error("é".repeat(5_000));
+        assert!(truncated.contains("truncated"));
+    }
 }

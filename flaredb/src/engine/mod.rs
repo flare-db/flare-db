@@ -1,6 +1,14 @@
 pub mod dispatcher;
 pub mod executor;
 pub mod harness;
+pub mod kv;
+pub mod guard;
+pub mod metrics;
 pub mod runtime;
 pub mod scheduler;
 pub mod sdf;
+pub mod state;
+pub mod timer;
+pub mod trigger;
+pub mod watermark;
+pub mod window;

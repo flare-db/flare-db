@@ -1,3 +1,6 @@
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::PathBuf;
 use std::{sync::Arc, time::Duration};
 
 use anyhow::{Result, anyhow};
@@ -9,10 +12,60 @@ use tokio::sync::{
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Response, Status};
 
+use crate::utils::path;
+
+/// Destination for SDK worker log entries flowing in over the Beam Fn Logging
+/// API. Entries are appended to a per-job `flare-worker.log`, the same file the
+/// harness process writes its stdout/stderr to, so a single file captures the
+/// whole worker log for a job.
+#[derive(Default)]
+struct LogSink {
+    path: Option<PathBuf>,
+    file: Option<std::fs::File>,
+}
+
+impl LogSink {
+    /// Point the sink at `path`, opening it for appending. No-op when the sink
+    /// is already writing to the same file.
+    fn set_target(&mut self, path: PathBuf) -> std::io::Result<()> {
+        if self.file.is_some() && self.path.as_deref() == Some(path.as_path()) {
+            return Ok(());
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        self.path = Some(path);
+        self.file = Some(file);
+        Ok(())
+    }
+
+    /// Append a line to the configured log file. Returns `false` when no target
+    /// has been configured yet, so the caller can fall back to the server log.
+    fn write_line(&mut self, line: &str) -> bool {
+        match self.file.as_mut() {
+            Some(file) => {
+                let _ = file.write_all(line.as_bytes());
+                let _ = file.flush();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Forget the current target so entries fall back to the server log until a
+    /// new job sets its own target.
+    fn clear(&mut self) {
+        self.path = None;
+        self.file = None;
+    }
+}
+
 pub struct LogInner {
     outgoing_tx: Mutex<Option<mpsc::Sender<Result<LogControl, Status>>>>,
     outgoing_rx: Mutex<Option<mpsc::Receiver<Result<LogControl, Status>>>>,
     incoming: Mutex<Option<tonic::Streaming<log_entry::List>>>,
+    sink: Mutex<LogSink>,
 }
 
 impl LogInner {
@@ -32,6 +85,7 @@ pub async fn start_log_server() -> Result<(LogChannel, FlareLogService)> {
         outgoing_tx: Mutex::new(Some(tx)),
         outgoing_rx: Mutex::new(Some(rx)),
         incoming: Mutex::new(None),
+        sink: Mutex::new(LogSink::default()),
     });
 
     let service = FlareLogService {
@@ -70,14 +124,20 @@ impl BeamFnLogging for FlareLogService {
     {
         Box::pin(async move {
             let mut stream = request.into_inner();
+            let inner = self.inner.clone();
             tokio::spawn(async move {
                 while let Ok(Some(list)) = stream.message().await {
+                    let mut sink = inner.sink.lock().await;
                     for entry in list.log_entries {
-                        log::info!(
-                            "[SDK WORKER LOG] level={:?} message={}",
-                            entry.severity,
-                            entry.message
+                        let line = format!(
+                            "[FLARE WORKER LOG] level={:?} message={}\n",
+                            entry.severity, entry.message
                         );
+                        if !sink.write_line(&line) {
+                            // No per-job target configured yet; keep the entry in
+                            // the server log rather than dropping it.
+                            log::info!("{}", line.trim_end());
+                        }
                     }
                 }
             });
@@ -123,8 +183,27 @@ impl LogChannel {
         *self.stream.outgoing_tx.lock().await = Some(tx);
         *self.stream.outgoing_rx.lock().await = Some(rx);
         *self.stream.incoming.lock().await = None;
+        self.stream.sink.lock().await.clear();
 
         log::info!("log channel reset for next harness");
+    }
+
+    /// Route SDK worker log entries for `job_id` into that job's
+    /// `flare-worker.log`, alongside the harness process stdout/stderr.
+    pub async fn set_target(&self, instance_id: &str, job_id: &str) -> Result<()> {
+        let path = path::logs_dir(instance_id, job_id).join("flare-worker.log");
+        self.stream
+            .sink
+            .lock()
+            .await
+            .set_target(path.clone())
+            .map_err(|e| anyhow!("failed to open worker log {}: {}", path.display(), e))?;
+        log::info!(
+            "routing SDK worker logs for job {} to {}",
+            job_id,
+            path.display()
+        );
+        Ok(())
     }
 
     pub async fn send_control(&self, control: LogControl) -> Result<()> {

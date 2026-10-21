@@ -7,7 +7,7 @@ plugins {
 
 allprojects {
     group = 'com.flare-db'
-    version = '0.2.0'
+    version = '0.3.2'
 }
 
 subprojects {
