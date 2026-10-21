@@ -338,14 +338,18 @@ impl GreedyCollectionFuser {
     ) -> bool {
         let urn = get_urn(node);
 
+        // Splittable ParDo sub-transforms must not sibling-fuse. PairWithRestriction
+        // and SplitAndSize fuse *downstream* into the initialization stage, and
+        // ProcessSizedElementsAndRestrictions is a process-stage root. Sibling-fusing
+        // any of them with an unrelated transform would fold foreign work into the
+        // SDF's single initialization/process plan.
+        if urns::beam_urns::SPLITTABLE_PARDO_COMPONENTS.contains(&urn) {
+            return false;
+        }
+
         match urn {
             // ParDo family: compatible if no side-inputs/state/timers + same env.
-            urns::beam_urns::PAR_DO_TRANSFORM
-            | urns::beam_urns::SPLITTABLE_PAIR_WITH_RESTRICTION_URN
-            | urns::beam_urns::SPLITTABLE_SPLIT_AND_SIZE_RESTRICTIONS_URN
-            | urns::beam_urns::SPLITTABLE_PROCESS_SIZED_ELEMENTS_AND_RESTRICTIONS_URN => {
-                Self::par_do_compatibility(node, other, pipeline)
-            }
+            urns::beam_urns::PAR_DO_TRANSFORM => Self::par_do_compatibility(node, other, pipeline),
 
             // Combine sub-components + window assignment: compatible if same env.
             u if COMBINE_FUSIBLE.contains(&u) || u == urns::beam_urns::ASSIGN_WINDOWS_TRANSFORM => {
@@ -2290,10 +2294,11 @@ mod tests {
 
     /// A PCollection with two consumers: one plain PAR_DO_TRANSFORM and one
     /// SPLITTABLE_PAIR_WITH_RESTRICTION_URN (both side-input/state/timer-free,
-    /// same env). Check whether GreedyCollectionFuser::is_compatible returns
-    /// true — they share the par_do_compatibility branch.
+    /// same env). Splittable ParDo sub-transforms must not sibling-fuse with an
+    /// unrelated transform, so `is_compatible` returns false and they become
+    /// separate stages.
     #[test]
-    fn pair_with_restriction_can_sibling_with_plain_pardo() {
+    fn pair_with_restriction_does_not_sibling_with_plain_pardo() {
         let env = make_env("env1");
 
         let plain = make_transform(
@@ -2318,13 +2323,10 @@ mod tests {
         let pipeline = build_pipeline(transforms, pcols, envs);
 
         let result = GreedyCollectionFuser::is_compatible(&pair, &plain, &pipeline);
-        // Both hit the par_do_compatibility branch (line 327-331). Since neither
-        // has side inputs, state, or timers, and they share the same environment,
-        // the current code returns true.
         assert!(
-            result,
-            "current behavior: PairWithRestriction IS compatible with plain ParDo for sibling fusion.\
-             REVIEW: is this intended for FlareDB's SDF model?"
+            !result,
+            "PairWithRestriction must not sibling-fuse with a plain ParDo; fusing it \
+             would fold the ParDo into the SDF initialization stage"
         );
     }
 

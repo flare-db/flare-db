@@ -246,11 +246,22 @@ impl SplittableStageExecutor {
         });
 
         // Collect initialization output elements as raw wire bytes in memory.
-        let output_pcol = stage
-            .output_pcols()
+        // The initialization stage is `PairWithRestriction → SplitAndSize`, which
+        // has exactly one output; anything else indicates incorrect fusion of an
+        // unrelated transform into the SDF initialization stage.
+        let outputs = stage.output_pcols();
+        if outputs.len() != 1 {
+            return Err(anyhow!(
+                "SDF initialization stage has {} output PCollections, expected exactly 1 \
+                 (PairWithRestriction → SplitAndSize); this indicates the initialization \
+                 stage was fused with an unrelated transform",
+                outputs.len()
+            ));
+        }
+        let output_pcol = outputs
             .iter()
             .next()
-            .ok_or_else(|| anyhow!("SDF initialization stage missing output PCollection"))?
+            .expect("initialization stage has exactly one output")
             .clone();
         let output_pcol_id = output_pcol.id().clone();
         let sink_transform_id = stage_sink_transform_id(stage, &output_pcol_id);
@@ -364,7 +375,38 @@ impl SplittableStageExecutor {
         let input_pcol = stage.input_pcol();
         let input_pcol_id = input_pcol.id().clone();
         let input_coder_id = input_pcol.node().coder_id.clone();
-        let estimated_input_elements = if seed.is_empty() { 0 } else { 1 };
+
+        // Decode the input spans up front so `estimated_input_elements` is the
+        // exact number of elements in this bundle rather than a placeholder. The
+        // split loop reuses these spans instead of re-decoding. On a decode error
+        // we leave the spans unset (so `poll_progress_and_maybe_split` can retry)
+        // and fall back to a single-element estimate.
+        let mut input_spans: Option<Vec<SdfInputSpan>> = if seed.is_empty() {
+            Some(Vec::new())
+        } else {
+            match decode_windowed_value_spans(&self.runtime, &input_pcol_id, &input_coder_id, &seed)
+            {
+                Ok(spans) => Some(spans),
+                Err(err) => {
+                    warn!(
+                        "failed to decode SDF process input spans up front ({}); \
+                         falling back to a single-element estimate",
+                        err
+                    );
+                    None
+                }
+            }
+        };
+        let estimated_input_elements = match &input_spans {
+            Some(spans) if !spans.is_empty() => spans.len() as i64,
+            _ => {
+                if seed.is_empty() {
+                    0
+                } else {
+                    1
+                }
+            }
+        };
 
         let (instruction_id, bundle_response_rx) = self
             .runtime
@@ -393,7 +435,6 @@ impl SplittableStageExecutor {
 
         let mut split_residual_roots: Vec<DelayedBundleApplication> = Vec::new();
         let mut channel_items: Vec<SdfWorkItem> = Vec::new();
-        let mut input_spans: Option<Vec<SdfInputSpan>> = None;
         let mut monitor = SplitMonitor::new(estimated_input_elements, progress_tick);
         let monitor_enabled = allow_split && estimated_input_elements > 0;
 
@@ -679,29 +720,59 @@ async fn poll_progress_and_maybe_split(
         return Ok(());
     }
 
+    if split.channel_splits.len() != 1 {
+        warn!(
+            "SDF split returned {} channel splits; expected exactly one for the single input PCollection",
+            split.channel_splits.len()
+        );
+    }
+
     // Intra-element remainders (of one or more elements that are partially
     // processed): process in future.
     split_residual_roots.extend(split.residual_roots);
 
     // Whole elements that are entirely unprocessed: process in future.
+    let input_element_count = input_spans.len() as i64;
     for channel_split in &split.channel_splits {
-        if let Some((start, end, count)) = channel_split_range(
-            channel_split.first_residual_element,
-            monitor.handed_back_from,
-            input_spans,
-        ) {
-            let timestamps = channel_item_timestamps(
-                input_spans,
-                monitor.handed_back_from,
-                channel_split.first_residual_element,
+        let first = channel_split.first_residual_element;
+
+        // A boundary at (or before the start of) the decoded input is the normal
+        // case for an intra-element split: no whole elements remain, and the
+        // residual is carried by `residual_roots`. Only a boundary outside
+        // [0, len] or one that moves past an already-handed-back boundary is
+        // invalid.
+        if first < 0 || first > input_element_count {
+            warn!(
+                "ignoring out-of-range channel split: first_residual_element={}, \
+                 decoded_input_elements={}",
+                first, input_element_count
             );
+            continue;
+        }
+        if let Some(previous) = monitor.handed_back_from
+            && first > previous
+        {
+            warn!(
+                "ignoring regressed channel split: first_residual_element={} is after \
+                 already-handed-back boundary {}",
+                first, previous
+            );
+            continue;
+        }
+
+        if let Some((start, end, count)) =
+            channel_split_range(first, monitor.handed_back_from, input_spans)
+        {
+            let timestamps = channel_item_timestamps(input_spans, monitor.handed_back_from, first);
             channel_items.push(SdfWorkItem {
                 seed: input_bytes[start..end].to_vec(),
                 holds: channel_item_holds(splittable_stage, &timestamps),
             });
-            monitor.handed_back_from = Some(channel_split.first_residual_element);
+            monitor.handed_back_from = Some(first);
             debug_assert!(count > 0);
         }
+        // Otherwise `first == input_element_count` (no whole elements) or
+        // `first == handed_back_from` (nothing newly relinquished): no item.
     }
 
     if let Some(channel_split) = split.channel_splits.first()
@@ -739,6 +810,19 @@ fn residual_items(
     residuals
         .iter()
         .filter_map(|residual| residual.application.as_ref())
+        .filter_map(|application| {
+            if application.element.is_empty() {
+                // An empty residual element would re-run the bundle with no input
+                // and can loop forever; drop it rather than schedule a no-op.
+                warn!(
+                    "ignoring SDF residual for transform '{}': empty residual element",
+                    application.transform_id
+                );
+                None
+            } else {
+                Some(application)
+            }
+        })
         .map(|application| SdfWorkItem {
             seed: application.element.clone(),
             holds: residual_item_holds(application, &outputs_by_transform, &boundary),
@@ -759,6 +843,11 @@ fn residual_item_holds(
     boundary: &HashSet<&str>,
 ) -> Vec<Timestamp> {
     let Some(outputs) = outputs_by_transform.get(&application.transform_id) else {
+        warn!(
+            "SDF residual names an unknown transform '{}'; its output watermarks \
+             will not hold the stage watermark",
+            application.transform_id
+        );
         return Vec::new();
     };
 
@@ -982,6 +1071,9 @@ mod tests {
         DelayedBundleApplication {
             application: Some(BundleApplication {
                 transform_id: transform_id.to_string(),
+                // Non-empty element so the residual is not dropped as invalid; the
+                // holds tests are independent of the encoded element bytes.
+                element: b"element".to_vec(),
                 output_watermarks: HashMap::from([(
                     local_output.to_string(),
                     prost_types::Timestamp {
@@ -1048,6 +1140,21 @@ mod tests {
         assert_eq!(items[0].holds, vec![5_000]);
         assert_eq!(items[1].seed, b"second".to_vec());
         assert_eq!(items[1].holds, vec![2_000]);
+    }
+
+    #[test]
+    fn residual_items_skip_empty_element_applications() {
+        let stage = splittable_stage(&["pcol-out"], "process", &[("out", "pcol-out")]);
+
+        let mut empty_element = residual("process", "out", 5_000);
+        empty_element.application.as_mut().unwrap().element = Vec::new();
+        let mut valid = residual("process", "out", 2_000);
+        valid.application.as_mut().unwrap().element = b"valid".to_vec();
+
+        let items = residual_items(&stage, &[empty_element, valid]);
+        assert_eq!(items.len(), 1, "empty-element residuals must be dropped");
+        assert_eq!(items[0].seed, b"valid".to_vec());
+        assert_eq!(items[0].holds, vec![2_000]);
     }
 
     #[test]

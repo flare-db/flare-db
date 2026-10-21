@@ -20,6 +20,16 @@ elif [[ "${1:-}" == "--debug" ]]; then
     shift
 fi
 
+# Log level: an explicit RUST_LOG wins. Debug builds default to debug logs;
+# release builds default to info.
+if [[ -n "${RUST_LOG:-}" ]]; then
+    SERVER_RUST_LOG="${RUST_LOG}"
+elif [[ "${BUILD_TYPE}" == "debug" ]]; then
+    SERVER_RUST_LOG="debug"
+else
+    SERVER_RUST_LOG="info"
+fi
+
 if ! command -v java >/dev/null 2>&1; then
     echo "java is required but was not found on PATH."
     exit 1
@@ -100,6 +110,7 @@ case "${BUILD_TYPE}" in
 esac
 
 echo "Using ${BUILD_TYPE} build: ${FLAREDB_BINARY}"
+echo "Server log level: ${SERVER_RUST_LOG}"
 
 # generate a new instance id every time the script runs
 if command -v uuidgen >/dev/null 2>&1; then
@@ -115,7 +126,7 @@ mkdir -p "${INSTANCE_LOG_DIR}"
 FLARE_LOG="${INSTANCE_LOG_DIR}/flare-server.log"
 
 # launch flaredb binary with the base dir arg and set FLAREDB_INSTANCE_ID and WORKER_JAR_PATH for the server process
-RUST_LOG=info FLAREDB_INSTANCE_ID="${INSTANCE_ID}" WORKER_JAR_PATH="${WORKER_JAR}" "${FLAREDB_BINARY}" "${BASE_DIR}" >"${FLARE_LOG}" 2>&1 &
+RUST_LOG="${SERVER_RUST_LOG}" FLAREDB_INSTANCE_ID="${INSTANCE_ID}" WORKER_JAR_PATH="${WORKER_JAR}" "${FLAREDB_BINARY}" "${BASE_DIR}" >"${FLARE_LOG}" 2>&1 &
 SERVER_PID=$!
 
 port_ready() {
