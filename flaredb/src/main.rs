@@ -74,15 +74,46 @@ async fn flare_up() -> Result<(), Box<dyn std::error::Error>> {
         FlareArtifactStagingService::new(artifact_store, job_service.get_staging_tokens());
 
     let flare_io = FlareIO::new().await?;
+    let grpc_max_message_size = flaredb::grpc_max_message_size_bytes();
+    log::info!("gRPC message size limit: {} bytes", grpc_max_message_size);
 
     Server::builder()
-        .add_service(JobServiceServer::new(job_service))
-        .add_service(ArtifactStagingServiceServer::new(artifact_service))
-        .add_service(BeamFnControlServer::new(services.control))
-        .add_service(BeamFnDataServer::new(services.data))
-        .add_service(BeamFnLoggingServer::new(services.log))
-        .add_service(BeamFnStateServer::new(services.state))
-        .add_service(flare_io.into_server())
+        .add_service(
+            JobServiceServer::new(job_service)
+                .max_decoding_message_size(grpc_max_message_size)
+                .max_encoding_message_size(grpc_max_message_size),
+        )
+        .add_service(
+            ArtifactStagingServiceServer::new(artifact_service)
+                .max_decoding_message_size(grpc_max_message_size)
+                .max_encoding_message_size(grpc_max_message_size),
+        )
+        .add_service(
+            BeamFnControlServer::new(services.control)
+                .max_decoding_message_size(grpc_max_message_size)
+                .max_encoding_message_size(grpc_max_message_size),
+        )
+        .add_service(
+            BeamFnDataServer::new(services.data)
+                .max_decoding_message_size(grpc_max_message_size)
+                .max_encoding_message_size(grpc_max_message_size),
+        )
+        .add_service(
+            BeamFnLoggingServer::new(services.log)
+                .max_decoding_message_size(grpc_max_message_size)
+                .max_encoding_message_size(grpc_max_message_size),
+        )
+        .add_service(
+            BeamFnStateServer::new(services.state)
+                .max_decoding_message_size(grpc_max_message_size)
+                .max_encoding_message_size(grpc_max_message_size),
+        )
+        .add_service(
+            flare_io
+                .into_server()
+                .max_decoding_message_size(grpc_max_message_size)
+                .max_encoding_message_size(grpc_max_message_size),
+        )
         .serve(addr)
         .await?;
 

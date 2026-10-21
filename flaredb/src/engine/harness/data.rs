@@ -397,6 +397,9 @@ pub struct TimerChunk {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use beam_model_rs::v1::beam_fn_data_client::BeamFnDataClient;
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::transport::{Endpoint, Server};
 
     fn timers_chunk(
         instruction_id: &str,
@@ -520,5 +523,104 @@ mod tests {
             ElementStreamPayload::Timers(chunk) => assert_eq!(chunk.timers.timers, vec![4]),
             ElementStreamPayload::Data(_) => panic!("expected a timer payload"),
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ten_mib_data_round_trips_through_grpc_in_both_directions() {
+        const LIMIT: usize = 16 * 1024 * 1024;
+        const PAYLOAD_LEN: usize = 10 * 1024 * 1024;
+
+        let (channel, service) = start_data_server().await.expect("start data server");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server_task = tokio::spawn(
+            Server::builder()
+                .add_service(
+                    beam_model_rs::v1::beam_fn_data_server::BeamFnDataServer::new(service)
+                        .max_decoding_message_size(LIMIT)
+                        .max_encoding_message_size(LIMIT),
+                )
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                    let _ = shutdown_rx.await;
+                }),
+        );
+
+        let grpc_channel = Endpoint::from_shared(format!("http://{address}"))
+            .expect("valid endpoint")
+            .connect()
+            .await
+            .expect("connect to test server");
+        let mut client = BeamFnDataClient::new(grpc_channel)
+            .max_decoding_message_size(LIMIT)
+            .max_encoding_message_size(LIMIT);
+        let (request_tx, request_rx) = mpsc::channel::<Elements>(1);
+        let mut response_stream = client
+            .data(ReceiverStream::new(request_rx))
+            .await
+            .expect("open data stream")
+            .into_inner();
+        channel.stream_elements();
+
+        let request_data = vec![7; PAYLOAD_LEN];
+        request_tx
+            .send(Elements {
+                data: vec![Data {
+                    instruction_id: "large-request".to_string(),
+                    transform_id: "source".to_string(),
+                    data: request_data.clone(),
+                    is_last: false,
+                }],
+                timers: Vec::new(),
+            })
+            .await
+            .expect("send large request");
+
+        let receiver = channel.get_receiver(DataKey {
+            instruction_id: "large-request".to_string(),
+            transform_id: "source".to_string(),
+        });
+        let routed = tokio::time::timeout(Duration::from_secs(5), async {
+            receiver.lock().await.recv().await
+        })
+        .await
+        .expect("server decoded large request before timeout")
+        .expect("server routed large request");
+        match routed {
+            ElementStreamPayload::Data(chunk) => assert_eq!(chunk.data.data, request_data),
+            ElementStreamPayload::Timers(_) => panic!("expected a data payload"),
+        }
+
+        let response_data = vec![9; PAYLOAD_LEN];
+        channel
+            .send_elements(Elements {
+                data: vec![Data {
+                    instruction_id: "large-response".to_string(),
+                    transform_id: "sink".to_string(),
+                    data: response_data.clone(),
+                    is_last: false,
+                }],
+                timers: Vec::new(),
+            })
+            .await
+            .expect("send large response");
+        let response = tokio::time::timeout(Duration::from_secs(5), response_stream.message())
+            .await
+            .expect("client decoded large response before timeout")
+            .expect("large response stream")
+            .expect("large response message");
+        assert_eq!(response.data[0].data, response_data);
+
+        drop(response_stream);
+        drop(client);
+        drop(request_tx);
+        shutdown_tx.send(()).expect("request server shutdown");
+        tokio::time::timeout(Duration::from_secs(5), server_task)
+            .await
+            .expect("server shutdown before timeout")
+            .expect("server task")
+            .expect("server shutdown");
     }
 }

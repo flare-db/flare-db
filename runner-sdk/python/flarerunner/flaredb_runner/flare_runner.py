@@ -58,6 +58,7 @@ from apache_beam.portability import common_urns
 from apache_beam.portability import python_urns
 from apache_beam.portability.api import beam_artifact_api_pb2_grpc
 from apache_beam.portability.api import beam_job_api_pb2
+from apache_beam.portability.api import beam_job_api_pb2_grpc
 from apache_beam.portability.api import beam_runner_api_pb2
 from apache_beam.runners import runner
 from apache_beam.runners.job import utils as job_utils
@@ -88,6 +89,29 @@ TERMINAL_STATES = [
 ]
 
 _LOGGER = logging.getLogger(__name__)
+
+_GRPC_MAX_MESSAGE_SIZE_BYTES = 64 * 1024 * 1024
+_GRPC_CHANNEL_OPTIONS = [
+    ('grpc.max_receive_message_length', _GRPC_MAX_MESSAGE_SIZE_BYTES),
+    ('grpc.max_send_message_length', _GRPC_MAX_MESSAGE_SIZE_BYTES),
+]
+
+
+class _FlareExternalJobServer(job_server.JobServer):
+  """External Job Service client with Beam-sized data-message limits."""
+
+  def __init__(self, endpoint, timeout=None):
+    self._endpoint = endpoint
+    self._timeout = timeout
+
+  def start(self):
+    channel = grpc.insecure_channel(
+        self._endpoint, options=_GRPC_CHANNEL_OPTIONS)
+    grpc.channel_ready_future(channel).result(timeout=self._timeout)
+    return beam_job_api_pb2_grpc.JobServiceStub(channel)
+
+  def stop(self):
+    pass
 
 
 def _resolve_job_name(options: PipelineOptions) -> str:
@@ -248,7 +272,8 @@ class JobServiceHandle(object):
       _LOGGER.info('Staging artifacts to %s', artifact_staging_endpoint)
       artifact_service.offer_artifacts(
           beam_artifact_api_pb2_grpc.ArtifactStagingServiceStub(
-              channel=grpc.insecure_channel(artifact_staging_endpoint)),
+              channel=grpc.insecure_channel(
+                artifact_staging_endpoint, options=_GRPC_CHANNEL_OPTIONS)),
           artifact_service.ArtifactRetrievalService(
               artifact_service.BeamFilesystemHandler(None).file_reader),
           staging_session_token)
@@ -352,7 +377,7 @@ class FlareRunner(runner.PipelineRunner):
         server: job_server.JobServer = job_server.EmbeddedJobServer()
       else:
         job_server_timeout = options.view_as(PortableOptions).job_server_timeout
-        server = job_server.ExternalJobServer(job_endpoint, job_server_timeout)
+        server = _FlareExternalJobServer(job_endpoint, job_server_timeout)
     else:
       server = self.default_job_server(options)
     return self.create_job_service_handle(server.start(), options)

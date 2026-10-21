@@ -19,6 +19,7 @@ from apache_beam.runners.runner import create_runner
 from flaredb_runner.flare_runner import FlareRunner
 from flaredb_runner.flare_runner import JobServiceHandle
 from flaredb_runner.flare_runner import PipelineResult
+from flaredb_runner.flare_runner import _FlareExternalJobServer
 
 
 class _FakeJobService(object):
@@ -62,6 +63,22 @@ class FlareRunnerTest(unittest.TestCase):
   def test_resolvable_via_fully_qualified_runner_name(self):
     runner_ = create_runner('flaredb_runner.flare_runner.FlareRunner')
     self.assertIsInstance(runner_, FlareRunner)
+
+  def test_job_service_client_uses_large_grpc_message_limit(self):
+    channel = mock.MagicMock()
+    with mock.patch(
+        'flaredb_runner.flare_runner.grpc.insecure_channel',
+        return_value=channel) as insecure_channel, mock.patch(
+            'flaredb_runner.flare_runner.grpc.channel_ready_future') as ready:
+      _FlareExternalJobServer('127.0.0.1:8099', timeout=10).start()
+
+    insecure_channel.assert_called_once()
+    options = dict(insecure_channel.call_args.kwargs['options'])
+    self.assertEqual(
+        options['grpc.max_receive_message_length'], 64 * 1024 * 1024)
+    self.assertEqual(
+        options['grpc.max_send_message_length'], 64 * 1024 * 1024)
+    ready.assert_called_once_with(channel)
 
   def test_default_environment_uses_running_interpreter(self):
     # FlareDB starts the SDK harness with the very interpreter running this pipeline

@@ -69,3 +69,53 @@ pub mod utils;
 pub mod worker;
 
 pub const DEFAULT_API_SERVICE_URL: &str = "127.0.0.1:8099";
+
+/// Default maximum size for one gRPC message in either direction.
+///
+/// Beam element batches can legitimately exceed tonic's 4 MiB default. Keep the
+/// limit configurable because bundle/output sizes depend on the SDK and workload.
+pub const DEFAULT_GRPC_MAX_MESSAGE_SIZE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Resolve the process-wide gRPC message limit.
+///
+/// `FLAREDB_GRPC_MAX_MESSAGE_SIZE_BYTES` overrides the 64 MiB default. Invalid or
+/// zero values are ignored so a typo cannot make the service unusable.
+pub fn grpc_max_message_size_bytes() -> usize {
+    grpc_max_message_size_bytes_from(
+        std::env::var("FLAREDB_GRPC_MAX_MESSAGE_SIZE_BYTES")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn grpc_max_message_size_bytes_from(configured: Option<&str>) -> usize {
+    configured
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_GRPC_MAX_MESSAGE_SIZE_BYTES)
+}
+
+#[cfg(test)]
+mod grpc_limits_tests {
+    use super::*;
+
+    #[test]
+    fn grpc_message_limit_defaults_and_honors_a_positive_override() {
+        assert_eq!(
+            grpc_max_message_size_bytes_from(None),
+            DEFAULT_GRPC_MAX_MESSAGE_SIZE_BYTES
+        );
+        assert_eq!(
+            grpc_max_message_size_bytes_from(Some(" 16777216 ")),
+            16 * 1024 * 1024
+        );
+        assert_eq!(
+            grpc_max_message_size_bytes_from(Some("0")),
+            DEFAULT_GRPC_MAX_MESSAGE_SIZE_BYTES
+        );
+        assert_eq!(
+            grpc_max_message_size_bytes_from(Some("not-a-number")),
+            DEFAULT_GRPC_MAX_MESSAGE_SIZE_BYTES
+        );
+    }
+}
