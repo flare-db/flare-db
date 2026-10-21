@@ -69,6 +69,36 @@ fn remove_holds(map: &mut HashMap<String, Vec<Timestamp>>, stage: &str, holds: &
     }
 }
 
+fn enqueue_sdf_items(
+    scheduler: &mut NodeScheduler,
+    sdf_queues: &mut HashMap<String, SdfQueue>,
+    residual_holds: &mut HashMap<String, Vec<Timestamp>>,
+    stage_id: &str,
+    items: impl IntoIterator<Item = SdfWorkItem>,
+) -> anyhow::Result<usize> {
+    let queue = sdf_queues.entry(stage_id.to_string()).or_default();
+    let mut count = 0usize;
+    for item in items {
+        add_holds(residual_holds, stage_id, &item.holds);
+        queue.items.push_back(item);
+        count += 1;
+    }
+    if count > 0 {
+        // Split events can arrive before the parent's final outcome. The parent
+        // had to initialize and register the process descriptor before the SDK
+        // could produce a residual, so these flags are valid immediately.
+        queue.initialized = true;
+        queue.registered = true;
+        scheduler
+            .watermarks_mut()
+            .set_residual_holds(residual_holds);
+        scheduler
+            .watermarks_mut()
+            .enqueue_bundles(stage_id, count)?;
+    }
+    Ok(count)
+}
+
 /// Owns the harness channels and per-job state needed to prepare a pipeline for
 /// execution. A [`StageExecutor`] is built from this prepared state.
 pub struct ExecutorDispatcher {
@@ -201,6 +231,10 @@ impl ExecutorDispatcher {
         // output-watermark holds their deferred work imposes. Both per-run.
         let mut sdf_queues: HashMap<String, SdfQueue> = HashMap::new();
         let mut residual_holds: HashMap<String, Vec<Timestamp>> = HashMap::new();
+        // Split residuals are announced while their parent bundle is still
+        // running so the scheduler can fill the stage's remaining bundle slots.
+        let (immediate_sdf_tx, mut immediate_sdf_rx) =
+            mpsc::unbounded_channel::<(String, SdfWorkItem)>();
         // Drop any stale reports left by a previous job over the same dispatcher.
         while self.source_reports_rx.try_recv().is_ok() {}
 
@@ -259,6 +293,7 @@ impl ExecutorDispatcher {
                     _ => (None, false, false, None),
                 };
 
+                let immediate_sdf_tx = immediate_sdf_tx.clone();
                 in_flight.spawn(async move {
                     if let ExecutableNode::Splittable(stage) = node {
                         let mut executor = SplittableStageExecutor::new(runtime);
@@ -270,6 +305,7 @@ impl ExecutorDispatcher {
                                 sdf_initialized,
                                 sdf_registered,
                                 sdf_progress_tick,
+                                immediate_sdf_tx,
                             )
                             .await
                         {
@@ -371,7 +407,32 @@ impl ExecutorDispatcher {
                 }
             }
 
-            if let Some(joined) = in_flight.join_next().await {
+            let joined = tokio::select! {
+                biased;
+                Some((stage_id, item)) = immediate_sdf_rx.recv() => {
+                    let count = enqueue_sdf_items(
+                        scheduler,
+                        &mut sdf_queues,
+                        &mut residual_holds,
+                        &stage_id,
+                        [item],
+                    )?;
+                    let queue = sdf_queues
+                        .get(&stage_id)
+                        .expect("enqueued SDF stage must have a queue");
+                    log::info!(
+                        "SDF stage '{stage_id}': queued {count} split work item immediately, \
+                         queue_depth={}, in_flight={}, holds={:?}",
+                        queue.items.len(),
+                        scheduler.watermarks().in_flight_bundles(&stage_id),
+                        residual_holds.get(&stage_id)
+                    );
+                    continue;
+                }
+                joined = in_flight.join_next() => joined
+            };
+
+            if let Some(joined) = joined {
                 let (idx, result, run) = joined?;
                 result?;
                 let stage_id = scheduler.stage_id(idx);
@@ -391,14 +452,16 @@ impl ExecutorDispatcher {
                     queue.initialized = outcome.initialized;
                     queue.registered = outcome.registered;
                     queue.progress_tick = Some(outcome.progress_tick);
-                    for item in &outcome.items {
-                        add_holds(&mut residual_holds, &stage_id, &item.holds);
-                    }
-                    let count = outcome.items.len();
-                    queue.items.extend(outcome.items);
-                    scheduler
-                        .watermarks_mut()
-                        .set_residual_holds(&residual_holds);
+                    let count = enqueue_sdf_items(
+                        scheduler,
+                        &mut sdf_queues,
+                        &mut residual_holds,
+                        &stage_id,
+                        outcome.items,
+                    )?;
+                    let queue = sdf_queues
+                        .get(&stage_id)
+                        .expect("SDF completion stage must have a queue");
                     log::info!(
                         "SDF stage '{stage_id}': queued {count} work item(s), queue_depth={}, \
                          in_flight={}, holds={:?}",
@@ -410,10 +473,28 @@ impl ExecutorDispatcher {
                             .saturating_sub(1),
                         residual_holds.get(&stage_id)
                     );
-                    if count > 0 {
-                        scheduler
-                            .watermarks_mut()
-                            .enqueue_bundles(&stage_id, count)?;
+                    // Any split events sent just before the parent response are
+                    // already queued in this channel. Drain them before the parent
+                    // can be marked complete, otherwise an empty in-flight set could
+                    // briefly make the stage look finished.
+                    while let Ok((event_stage, item)) = immediate_sdf_rx.try_recv() {
+                        let count = enqueue_sdf_items(
+                            scheduler,
+                            &mut sdf_queues,
+                            &mut residual_holds,
+                            &event_stage,
+                            [item],
+                        )?;
+                        let queue = sdf_queues
+                            .get(&event_stage)
+                            .expect("drained SDF stage must have a queue");
+                        log::info!(
+                            "SDF stage '{event_stage}': queued {count} split work item before \
+                             parent completion, queue_depth={}, in_flight={}, holds={:?}",
+                            queue.items.len(),
+                            scheduler.watermarks().in_flight_bundles(&event_stage),
+                            residual_holds.get(&event_stage)
+                        );
                     }
                 }
 

@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
 use beam_model_rs::v1::process_bundle_split_request::DesiredSplit;
@@ -11,7 +11,9 @@ use beam_model_rs::v1::{
     BundleApplication, DelayedBundleApplication, ProcessBundleProgressResponse,
     ProcessBundleResponse,
 };
+use bytes::Buf;
 use log::{debug, error, info, warn};
+use tokio::sync::mpsc::UnboundedSender;
 
 use crate::coders::primitives::{VarIntCoder, WindowedValueCoder};
 use crate::coders::{BeamCoder, StandardBeamCoders};
@@ -40,8 +42,53 @@ use crate::{
 const MIN_PROGRESS_TICK: Duration = Duration::from_millis(100);
 /// The maximum duration between two consecutive `progress + split_evaluation` runs.
 const MAX_PROGRESS_TICK: Duration = Duration::from_secs(30);
-/// Fraction of remaining work SDK keeps after a split.
-const SPLIT_FRACTION_OF_REMAINDER: f64 = 0.5;
+/// Default fraction of remaining work the SDK keeps after a split.
+const DEFAULT_SPLIT_FRACTION_OF_REMAINDER: f64 = 0.5;
+/// Default elapsed time after which a still-progressing bundle is split.
+const DEFAULT_SPLIT_AFTER: Duration = Duration::from_secs(2);
+/// Default no-progress window before the fallback stall detector asks to split.
+///
+/// SDK output counters can be buffered for seconds, so this is intentionally
+/// longer than the time-based trigger. SDK work-progress metrics take precedence
+/// whenever the harness reports them.
+const DEFAULT_STALL_AFTER: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy, Debug)]
+struct SdfSplitConfig {
+    split_after: Duration,
+    stall_after: Duration,
+    fraction_of_remainder: f64,
+}
+
+impl Default for SdfSplitConfig {
+    fn default() -> Self {
+        Self {
+            split_after: DEFAULT_SPLIT_AFTER,
+            stall_after: DEFAULT_STALL_AFTER,
+            fraction_of_remainder: DEFAULT_SPLIT_FRACTION_OF_REMAINDER,
+        }
+    }
+}
+
+impl SdfSplitConfig {
+    fn from_env() -> Self {
+        let defaults = Self::default();
+        Self {
+            split_after: duration_from_seconds_env(
+                "FLAREDB_SDF_SPLIT_AFTER_SECS",
+                defaults.split_after,
+            ),
+            stall_after: duration_from_seconds_env(
+                "FLAREDB_SDF_STALL_AFTER_SECS",
+                defaults.stall_after,
+            ),
+            fraction_of_remainder: split_fraction_from_env(
+                "FLAREDB_SDF_SPLIT_FRACTION",
+                defaults.fraction_of_remainder,
+            ),
+        }
+    }
+}
 
 /// One deferred bundle's worth of SDF work.
 ///
@@ -54,6 +101,10 @@ pub struct SdfWorkItem {
     pub seed: Vec<u8>,
     pub holds: Vec<Timestamp>,
 }
+
+/// A split residual routed to the dispatcher while its parent bundle is still
+/// running.
+pub type SdfWorkItemSender = UnboundedSender<(String, SdfWorkItem)>;
 
 /// The byte span of one windowed input element plus the event-time metadata needed
 /// to hold back downstream watermarks while that element is deferred.
@@ -73,7 +124,9 @@ pub struct SdfBundleOutcome {
     pub registered: bool,
     /// Output-watermark holds of the work item this bundle consumed (to release).
     pub consumed_holds: Vec<Timestamp>,
-    /// Residual work items this bundle produced, to be scheduled later.
+    /// Residual work items reported with the final bundle response. Split
+    /// residuals are sent directly to the dispatcher as soon as they are
+    /// produced rather than waiting for this outcome.
     pub items: Vec<SdfWorkItem>,
     /// Duration between two consecutive `progress + split_evaluation` runs, after this bundle.
     pub progress_tick: Duration,
@@ -83,8 +136,13 @@ pub struct SdfBundleOutcome {
 struct SplitMonitor {
     /// `beam:metric:data_channel:read_index:v1` at the previous tick,
     prev_index: i64,
-    /// Sum of `beam:metric:element_count:v1` at the previous tick.
-    prev_total_count: i64,
+    /// Sum of `beam:metric:element_count:v1` across every fused transform
+    /// output at the previous tick.
+    prev_output_element_count_sum: i64,
+    /// SDK-reported completion fraction for the active element.
+    prev_work_completed: Option<f32>,
+    /// SDK-reported remaining fraction for the active element.
+    prev_work_remaining: Option<f32>,
     /// Whether splitting is still allowed for this bundle;
     /// cleared once the SDK declines a split or progress polling fails.
     can_split: bool,
@@ -102,14 +160,34 @@ struct SplitMonitor {
     split_requests: u64,
     /// Number of split responses that actually produced new work items.
     splits: u64,
+    /// Wall-clock start used by the progress/time-based split policy.
+    started: Instant,
+    /// Most recent successful split, used to rate-limit time-based splits.
+    last_split: Option<Instant>,
+    config: SdfSplitConfig,
 }
 
 impl SplitMonitor {
+    #[cfg(test)]
     fn new(estimated_input_elements: i64, progress_tick: Option<Duration>) -> Self {
+        Self::with_config(
+            estimated_input_elements,
+            progress_tick,
+            SdfSplitConfig::default(),
+        )
+    }
+
+    fn with_config(
+        estimated_input_elements: i64,
+        progress_tick: Option<Duration>,
+        config: SdfSplitConfig,
+    ) -> Self {
         Self {
             // Starts at -2 so the first tick only record numbers.
             prev_index: -2,
-            prev_total_count: -2,
+            prev_output_element_count_sum: -2,
+            prev_work_completed: None,
+            prev_work_remaining: None,
             can_split: true,
             estimated_input_elements,
             tick: clamp_progress_tick(progress_tick.unwrap_or(MIN_PROGRESS_TICK)),
@@ -118,7 +196,118 @@ impl SplitMonitor {
             polls: 0,
             split_requests: 0,
             splits: 0,
+            started: Instant::now(),
+            last_split: None,
+            config,
         }
+    }
+}
+
+/// A snapshot of one `ProcessBundleProgressResponse`.
+///
+/// `read_index` is the input-element index of the SDK data-channel processor. It
+/// remains `0` while the first input element is active, even if that one
+/// restriction emits millions of outputs. `output_element_count_sum` is the sum
+/// of `beam:metric:element_count:v1` across every PCollection produced by the
+/// fused transforms, so it counts transform outputs rather than source records.
+#[derive(Debug, Default)]
+struct ProgressMetrics {
+    read_index: i64,
+    output_element_count_sum: i64,
+    work_completed: Option<f32>,
+    work_remaining: Option<f32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SplitDecision {
+    Poll,
+    SkipDisabled,
+    SkipNoInput,
+    SkipNoRemainingWork,
+    WaitForProgress,
+    RequestTime,
+    RequestStall,
+}
+
+impl SplitDecision {
+    fn action(self) -> &'static str {
+        match self {
+            Self::Poll => "poll",
+            Self::SkipDisabled => "skip-splitting-disabled",
+            Self::SkipNoInput => "skip-no-input-elements",
+            Self::SkipNoRemainingWork => "skip-no-remaining-work",
+            Self::WaitForProgress => "wait-for-progress",
+            Self::RequestTime => "request-split-time",
+            Self::RequestStall => "request-split-stall",
+        }
+    }
+
+    fn requests_split(self) -> bool {
+        matches!(self, Self::RequestTime | Self::RequestStall)
+    }
+}
+
+impl SplitMonitor {
+    fn decision(&self, metrics: &ProgressMetrics, now: Instant) -> SplitDecision {
+        if !self.can_split {
+            return SplitDecision::SkipDisabled;
+        }
+        if self.estimated_input_elements <= 0 {
+            return SplitDecision::SkipNoInput;
+        }
+        if metrics
+            .work_remaining
+            .is_some_and(|remaining| remaining <= 0.0)
+        {
+            return SplitDecision::SkipNoRemainingWork;
+        }
+
+        let has_baseline = self.prev_index != -2;
+        if !has_baseline {
+            return SplitDecision::Poll;
+        }
+
+        let counters_changed = metrics.read_index != self.prev_index
+            || metrics.output_element_count_sum != self.prev_output_element_count_sum;
+        let work_changed = !same_float(self.prev_work_completed, metrics.work_completed)
+            || !same_float(self.prev_work_remaining, metrics.work_remaining);
+        let observed_progress = counters_changed || work_changed;
+        let elapsed = now.duration_since(self.started);
+
+        if observed_progress {
+            let time_split_due = match self.last_split {
+                Some(last_split) => now.duration_since(last_split) >= self.config.split_after,
+                None => elapsed >= self.config.split_after,
+            };
+            if time_split_due {
+                SplitDecision::RequestTime
+            } else {
+                SplitDecision::Poll
+            }
+        } else if elapsed >= self.config.stall_after {
+            SplitDecision::RequestStall
+        } else {
+            SplitDecision::WaitForProgress
+        }
+    }
+
+    fn record_poll(&mut self, metrics: &ProgressMetrics) {
+        self.prev_index = metrics.read_index;
+        self.prev_output_element_count_sum = metrics.output_element_count_sum;
+        self.prev_work_completed = metrics.work_completed;
+        self.prev_work_remaining = metrics.work_remaining;
+    }
+
+    fn record_split(&mut self, now: Instant) {
+        self.last_split = Some(now);
+    }
+}
+
+fn same_float(left: Option<f32>, right: Option<f32>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => left.to_bits() == right.to_bits(),
+        (None, None) => true,
+        _ => false,
     }
 }
 
@@ -149,6 +338,7 @@ impl SplittableStageExecutor {
         initialized: bool,
         registered: bool,
         progress_tick: Option<Duration>,
+        immediate_items: SdfWorkItemSender,
     ) -> anyhow::Result<(ProcessBundleResponse, SdfBundleOutcome)> {
         let plan = stage.plan();
 
@@ -172,7 +362,7 @@ impl SplittableStageExecutor {
             SplittableProcessKind::ProcessSizedElementsAndRestrictions
         );
 
-        let (response, split_residual_roots, channel_items, progress_tick) = self
+        let (response, progress_tick) = self
             .run_process_stage(
                 &plan.process_stage,
                 stage,
@@ -181,13 +371,11 @@ impl SplittableStageExecutor {
                 !registered,
                 allow_split,
                 progress_tick,
+                immediate_items,
             )
             .await?;
 
-        let mut all_residual_roots = response.residual_roots.clone();
-        all_residual_roots.extend(split_residual_roots);
-        let mut items = residual_items(stage, &all_residual_roots);
-        items.extend(channel_items);
+        let items = residual_items(stage, &response.residual_roots);
 
         Ok((
             response,
@@ -351,8 +539,8 @@ impl SplittableStageExecutor {
     /// response. `register` is `true` only the first time (the descriptor persists
     /// on the worker across turns). `allow_split` enables dynamic split for this
     /// stage, and `progress_tick` is its progress-poll interval from prior bundles
-    /// (`None` for the first). The returned tuple carries the response, the
-    /// residual roots and whole-element work items a split produced, and the
+    /// (`None` for the first). Split residuals are sent through
+    /// `immediate_items`; the returned tuple carries the final response and the
     /// progress-poll interval to use after this bundle.
     async fn run_process_stage(
         &mut self,
@@ -363,12 +551,8 @@ impl SplittableStageExecutor {
         register: bool,
         allow_split: bool,
         progress_tick: Option<Duration>,
-    ) -> anyhow::Result<(
-        ProcessBundleResponse,
-        Vec<DelayedBundleApplication>,
-        Vec<SdfWorkItem>,
-        Duration,
-    )> {
+        immediate_items: SdfWorkItemSender,
+    ) -> anyhow::Result<(ProcessBundleResponse, Duration)> {
         let descriptor_id = stage.id().to_string();
         if register {
             let bundle_status = self.runtime.register_bundle(stage).await?;
@@ -444,7 +628,15 @@ impl SplittableStageExecutor {
 
         let mut split_residual_roots: Vec<DelayedBundleApplication> = Vec::new();
         let mut channel_items: Vec<SdfWorkItem> = Vec::new();
-        let mut monitor = SplitMonitor::new(estimated_input_elements, progress_tick);
+        let split_config = SdfSplitConfig::from_env();
+        info!(
+            "SDF split policy: split_after_ms={}, stall_after_ms={}, fraction={}",
+            split_config.split_after.as_millis(),
+            split_config.stall_after.as_millis(),
+            split_config.fraction_of_remainder
+        );
+        let mut monitor =
+            SplitMonitor::with_config(estimated_input_elements, progress_tick, split_config);
         let monitor_enabled = allow_split && estimated_input_elements > 0;
 
         let control_response = {
@@ -471,7 +663,8 @@ impl SplittableStageExecutor {
                                 &mut input_spans,
                                 splittable_stage,
                                 &mut split_residual_roots,
-                                &mut channel_items
+                                &mut channel_items,
+                                &immediate_items,
                             ).await {
                                 // Progress error stops further splitting.
                                 warn!(
@@ -558,7 +751,7 @@ impl SplittableStageExecutor {
                     channel_items.len(),
                     next_tick.as_millis()
                 );
-                Ok((response, split_residual_roots, channel_items, next_tick))
+                Ok((response, next_tick))
             }
             ControlResponse::ProcessBundleError(err) => {
                 Err(anyhow!("SDF process bundle failed: {}", err))
@@ -687,6 +880,7 @@ async fn poll_progress_and_maybe_split(
     splittable_stage: &SplittableStage,
     split_residual_roots: &mut Vec<DelayedBundleApplication>,
     channel_items: &mut Vec<SdfWorkItem>,
+    immediate_items: &SdfWorkItemSender,
 ) -> anyhow::Result<()> {
     monitor.ticked = true;
     monitor.polls += 1;
@@ -694,39 +888,35 @@ async fn poll_progress_and_maybe_split(
     let progress = control
         .send_process_bundle_progress_request(bundle_instruction_id)
         .await?;
-    let (index, total_count) = extract_progress_metrics(&progress);
-
-    let slow = monitor.prev_index == index && monitor.prev_total_count == total_count;
-    let should_try_split = slow && monitor.can_split && monitor.estimated_input_elements > 0;
-    let action = if !slow {
-        "poll"
-    } else if !monitor.can_split {
-        "skip-splitting-disabled"
-    } else if monitor.estimated_input_elements <= 0 {
-        "skip-no-input-elements"
-    } else {
-        "request-split"
-    };
+    let metrics = extract_progress_metrics(&progress);
+    let now = Instant::now();
+    let first_poll = monitor.prev_index == -2;
+    let decision = monitor.decision(&metrics, now);
+    monitor.record_poll(&metrics);
+    let action = decision.action();
     let poll_message = format!(
-        "SDF progress: instruction_id={bundle_instruction_id}, read_index={index}, \
-         element_count={total_count}, stalled={slow}, action={action}, polls={}, \
-         can_split={}, estimated_input_elements={}, tick_ms={}",
+        "SDF progress: instruction_id={bundle_instruction_id}, read_index={}, \
+         output_element_count_sum={}, work_completed={:?}, work_remaining={:?}, \
+         action={action}, polls={}, can_split={}, estimated_input_elements={}, \
+         tick_ms={}",
+        metrics.read_index,
+        metrics.output_element_count_sum,
+        metrics.work_completed,
+        metrics.work_remaining,
         monitor.polls,
         monitor.can_split,
         monitor.estimated_input_elements,
         monitor.tick.as_millis()
     );
-    // Repeated stalled polls that cannot split are only useful when debugging;
-    // progress changes and split decisions are operator-visible at INFO.
-    if slow && !should_try_split {
-        debug!("{poll_message}");
-    } else {
+    // Keep routine polls at DEBUG. The first sample and actual split decisions
+    // are operator-visible without enabling a log firehose.
+    if first_poll || decision.requests_split() {
         info!("{poll_message}");
+    } else {
+        debug!("{poll_message}");
     }
 
-    if !should_try_split {
-        monitor.prev_index = index;
-        monitor.prev_total_count = total_count;
+    if !decision.requests_split() {
         return Ok(());
     }
 
@@ -752,7 +942,7 @@ async fn poll_progress_and_maybe_split(
     desired_splits.insert(
         input_transform_id.to_string(),
         DesiredSplit {
-            fraction_of_remainder: SPLIT_FRACTION_OF_REMAINDER,
+            fraction_of_remainder: monitor.config.fraction_of_remainder,
             allowed_split_points: Vec::new(),
             estimated_input_elements: monitor.estimated_input_elements,
         },
@@ -789,6 +979,11 @@ async fn poll_progress_and_maybe_split(
 
     // Intra-element remainders (of one or more elements that are partially
     // processed): process in future.
+    for item in residual_items(splittable_stage, &split.residual_roots) {
+        immediate_items
+            .send((splittable_stage.id().to_string(), item))
+            .map_err(|_| anyhow!("SDF residual dispatcher closed"))?;
+    }
     split_residual_roots.extend(split.residual_roots);
 
     // Whole elements that are entirely unprocessed: process in future.
@@ -830,10 +1025,14 @@ async fn poll_progress_and_maybe_split(
             channel_split_range(first, monitor.handed_back_from, input_spans)
         {
             let timestamps = channel_item_timestamps(input_spans, monitor.handed_back_from, first);
-            channel_items.push(SdfWorkItem {
+            let item = SdfWorkItem {
                 seed: input_bytes[start..end].to_vec(),
                 holds: channel_item_holds(splittable_stage, &timestamps),
-            });
+            };
+            immediate_items
+                .send((splittable_stage.id().to_string(), item.clone()))
+                .map_err(|_| anyhow!("SDF residual dispatcher closed"))?;
+            channel_items.push(item);
             monitor.handed_back_from = Some(first);
             debug_assert!(count > 0);
         }
@@ -854,6 +1053,7 @@ async fn poll_progress_and_maybe_split(
     let new_channel_items = channel_items.len() - channel_items_before;
     if new_residual_roots + new_channel_items > 0 {
         monitor.splits += 1;
+        monitor.record_split(now);
     }
     info!(
         "SDF split response: instruction_id={bundle_instruction_id}, \
@@ -1054,6 +1254,34 @@ fn clamp_progress_tick(tick: Duration) -> Duration {
     tick.max(MIN_PROGRESS_TICK).min(MAX_PROGRESS_TICK)
 }
 
+fn duration_from_seconds_env(name: &str, default: Duration) -> Duration {
+    duration_from_seconds_value(std::env::var(name).ok().as_deref(), default)
+}
+
+fn duration_from_seconds_value(configured: Option<&str>, default: Duration) -> Duration {
+    configured
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .map(Duration::from_secs_f64)
+        .unwrap_or(default)
+}
+
+fn split_fraction_from_env(name: &str, default: f64) -> f64 {
+    split_fraction_from_value(std::env::var(name).ok().as_deref(), default, name)
+}
+
+fn split_fraction_from_value(configured: Option<&str>, default: f64, name: &str) -> f64 {
+    let Some(configured) = configured.and_then(|value| value.trim().parse::<f64>().ok()) else {
+        return default;
+    };
+    if configured.is_finite() && configured > 0.0 && configured < 1.0 {
+        configured
+    } else {
+        warn!("ignoring invalid {name}={configured}; expected a fraction between 0 and 1");
+        default
+    }
+}
+
 /// The stage-shared progress tick to carry forward after a bundle.
 /// A bundle that polled at least once keeps its current tick.
 /// A bundle that finished before its first poll shrinks the tick
@@ -1077,28 +1305,58 @@ fn decode_varint_payload(payload: &[u8]) -> Option<i64> {
     }
 }
 
-/// Extract progress metrics: data-channel read index + sum of emitted
-/// element counts across all PCollections.
-fn extract_progress_metrics(resp: &ProcessBundleProgressResponse) -> (i64, i64) {
-    let mut index = 0i64;
-    let mut total_count = 0i64;
+/// Extract data-channel position, transform-output counts, and SDK work progress.
+fn extract_progress_metrics(resp: &ProcessBundleProgressResponse) -> ProgressMetrics {
+    let mut metrics = ProgressMetrics::default();
 
     for info in &resp.monitoring_infos {
         match info.urn.as_str() {
             beam_urns::DATA_CHANNEL_READ_INDEX_METRIC => {
                 if let Some(value) = decode_varint_payload(&info.payload) {
-                    index = index.max(value);
+                    metrics.read_index = metrics.read_index.max(value);
                 }
             }
             beam_urns::ELEMENT_COUNT_METRIC => {
                 if let Some(value) = decode_varint_payload(&info.payload) {
-                    total_count += value;
+                    metrics.output_element_count_sum += value;
+                }
+            }
+            beam_urns::WORK_COMPLETED_METRIC => {
+                if let Some(value) = decode_progress_payload(&info.payload) {
+                    metrics.work_completed = Some(
+                        metrics
+                            .work_completed
+                            .map_or(value, |current| current.max(value)),
+                    );
+                }
+            }
+            beam_urns::WORK_REMAINING_METRIC => {
+                if let Some(value) = decode_progress_payload(&info.payload) {
+                    metrics.work_remaining = Some(
+                        metrics
+                            .work_remaining
+                            .map_or(value, |current| current.min(value)),
+                    );
                 }
             }
             _ => {}
         }
     }
-    (index, total_count)
+    metrics
+}
+
+/// Decode `beam:metrics:progress:v1` payloads, currently
+/// `IterableCoder(FloatCoder)` with one value for the active element.
+fn decode_progress_payload(payload: &[u8]) -> Option<f32> {
+    let mut buf = payload;
+    if buf.remaining() < 8 {
+        return None;
+    }
+    let count = buf.get_i32();
+    if count < 1 {
+        return None;
+    }
+    Some(buf.get_f32())
 }
 
 /// The byte range and element count a channel split hands back.
@@ -1133,6 +1391,7 @@ mod tests {
     use beam_model_rs::v1::{
         BundleApplication, Components, Environment, MonitoringInfo, PCollection, PTransform,
     };
+    use bytes::BufMut;
     use indexmap::IndexSet;
     use petgraph::Graph;
 
@@ -1491,7 +1750,7 @@ mod tests {
         assert_eq!(monitor.tick, MIN_PROGRESS_TICK);
         assert_eq!(monitor.estimated_input_elements, 7);
         assert_eq!(monitor.prev_index, -2);
-        assert_eq!(monitor.prev_total_count, -2);
+        assert_eq!(monitor.prev_output_element_count_sum, -2);
         assert!(monitor.can_split);
         assert!(!monitor.ticked);
         assert_eq!(monitor.handed_back_from, None);
@@ -1531,28 +1790,148 @@ mod tests {
             ],
             ..Default::default()
         };
-        assert_eq!(extract_progress_metrics(&resp), (5, 6));
+        let metrics = extract_progress_metrics(&resp);
+        assert_eq!(metrics.read_index, 5);
+        assert_eq!(metrics.output_element_count_sum, 6);
+        assert_eq!(metrics.work_completed, None);
+        assert_eq!(metrics.work_remaining, None);
     }
 
     #[test]
-    fn progress_metrics_are_zero_when_absent() {
-        assert_eq!(
-            extract_progress_metrics(&ProcessBundleProgressResponse::default()),
-            (0, 0)
+    fn progress_metrics_are_empty_when_absent() {
+        let metrics = extract_progress_metrics(&ProcessBundleProgressResponse::default());
+        assert_eq!(metrics.read_index, 0);
+        assert_eq!(metrics.output_element_count_sum, 0);
+        assert_eq!(metrics.work_completed, None);
+        assert_eq!(metrics.work_remaining, None);
+    }
+
+    #[test]
+    fn read_index_stays_zero_while_the_first_input_element_is_active() {
+        // The SDK reports read_index = -1 before it reads the first element. The
+        // accumulator starts at 0 and combines with `max`, so -1 is floored to 0.
+        // It stays 0 throughout the first active input element even when fused
+        // transforms emit millions of rows; it is an input index, not output work.
+        let resp = ProcessBundleProgressResponse {
+            monitoring_infos: vec![
+                progress_info(beam_urns::DATA_CHANNEL_READ_INDEX_METRIC, -1),
+                progress_info(beam_urns::ELEMENT_COUNT_METRIC, 8_600_000),
+            ],
+            ..Default::default()
+        };
+        let metrics = extract_progress_metrics(&resp);
+        assert_eq!(metrics.read_index, 0);
+        assert_eq!(metrics.output_element_count_sum, 8_600_000);
+    }
+
+    fn progress_float_info(urn: &str, value: f32) -> MonitoringInfo {
+        let mut payload = Vec::new();
+        payload.put_i32(1);
+        payload.put_f32(value);
+        MonitoringInfo {
+            urn: urn.to_string(),
+            r#type: "beam:metrics:progress:v1".to_string(),
+            payload,
+            labels: HashMap::new(),
+            start_time: None,
+        }
+    }
+
+    fn split_config() -> SdfSplitConfig {
+        SdfSplitConfig {
+            split_after: Duration::from_secs(2),
+            stall_after: Duration::from_secs(5),
+            fraction_of_remainder: 0.5,
+        }
+    }
+
+    #[test]
+    fn progress_metrics_extract_sdk_work_progress() {
+        let resp = ProcessBundleProgressResponse {
+            monitoring_infos: vec![
+                progress_float_info(beam_urns::WORK_COMPLETED_METRIC, 0.25),
+                progress_float_info(beam_urns::WORK_REMAINING_METRIC, 0.75),
+            ],
+            ..Default::default()
+        };
+        let metrics = extract_progress_metrics(&resp);
+        assert_eq!(metrics.work_completed, Some(0.25));
+        assert_eq!(metrics.work_remaining, Some(0.75));
+    }
+
+    #[test]
+    fn sdk_work_progress_prevents_a_false_stall_while_outputs_are_buffered() {
+        let mut monitor = SplitMonitor::with_config(100, None, split_config());
+        let now = Instant::now();
+        monitor.record_poll(&ProgressMetrics {
+            read_index: 0,
+            output_element_count_sum: 0,
+            work_completed: Some(0.1),
+            work_remaining: Some(0.9),
+        });
+        let decision = monitor.decision(
+            &ProgressMetrics {
+                read_index: 0,
+                output_element_count_sum: 0,
+                work_completed: Some(0.2),
+                work_remaining: Some(0.8),
+            },
+            now + Duration::from_secs(3),
+        );
+        assert_eq!(decision, SplitDecision::RequestTime);
+        assert!(
+            !matches!(decision, SplitDecision::RequestStall),
+            "SDK work progress must not be classified as a stall"
         );
     }
 
     #[test]
-    fn progress_metrics_floor_a_lone_negative_read_index_at_zero() {
-        // The SDK reports read_index = -1 before it reads the first element. The
-        // accumulator starts at 0 and combines with `max`, so -1 is floored to 0.
-        // This only affects the value before the first element is read and does
-        // not change the equality-based stall detection.
-        let resp = ProcessBundleProgressResponse {
-            monitoring_infos: vec![progress_info(beam_urns::DATA_CHANNEL_READ_INDEX_METRIC, -1)],
-            ..Default::default()
-        };
-        assert_eq!(extract_progress_metrics(&resp), (0, 0));
+    fn fallback_stall_detection_waits_for_the_configured_quiet_window() {
+        let mut monitor = SplitMonitor::with_config(100, None, split_config());
+        monitor.record_poll(&ProgressMetrics::default());
+        let now = Instant::now();
+        assert_eq!(
+            monitor.decision(&ProgressMetrics::default(), now + Duration::from_secs(1)),
+            SplitDecision::WaitForProgress
+        );
+        assert_eq!(
+            monitor.decision(&ProgressMetrics::default(), now + Duration::from_secs(6)),
+            SplitDecision::RequestStall
+        );
+    }
+
+    #[test]
+    fn completed_sdk_work_skips_a_redundant_split_request() {
+        let monitor = SplitMonitor::with_config(1, None, split_config());
+        let decision = monitor.decision(
+            &ProgressMetrics {
+                work_completed: Some(1.0),
+                work_remaining: Some(0.0),
+                ..Default::default()
+            },
+            Instant::now() + Duration::from_secs(10),
+        );
+        assert_eq!(decision, SplitDecision::SkipNoRemainingWork);
+    }
+
+    #[test]
+    fn split_delay_and_fraction_are_configurable() {
+        assert_eq!(
+            duration_from_seconds_value(Some("0.75"), Duration::from_secs(2)),
+            Duration::from_millis(750)
+        );
+        assert_eq!(
+            duration_from_seconds_value(Some("0"), Duration::from_secs(2)),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            split_fraction_from_value(Some("0.25"), 0.5, "FLAREDB_SDF_SPLIT_FRACTION"),
+            0.25
+        );
+        assert_eq!(
+            split_fraction_from_value(Some("1.0"), 0.5, "FLAREDB_SDF_SPLIT_FRACTION"),
+            0.5
+        );
     }
 
     #[test]

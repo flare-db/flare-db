@@ -319,7 +319,9 @@ impl NodeScheduler {
         // dependency-ready ordinary stage must be first-run ready.
         for index in &new {
             let stage = graph[*index].id();
-            if !self.watermarks.is_stage_completed(&stage) {
+            if !self.watermarks.is_stage_completed(&stage)
+                && !self.watermarks.is_stage_in_flight(&stage)
+            {
                 assert!(
                     legacy.contains(index),
                     "first-run stage '{stage}' is not dependency-ready"
@@ -1184,6 +1186,33 @@ mod tests {
             scheduler.next_nodes().is_empty(),
             "no duplicate first-run bundles"
         );
+    }
+
+    #[test]
+    fn residuals_start_while_the_parent_bundle_is_still_in_flight() {
+        let (mut scheduler, _source, stateful, _source_id, stateful_id) = source_and_stateful();
+
+        let first = scheduler.next_nodes();
+        scheduler.mark_complete(first[0].0);
+        scheduler
+            .watermarks_mut()
+            .set_max_in_flight(&stateful_id, 4)
+            .unwrap();
+
+        let parent = scheduler.next_nodes();
+        assert_eq!(parent.len(), 1, "one initialization/parent bundle");
+        assert_eq!(scheduler.watermarks().in_flight_bundles(&stateful_id), 1);
+
+        // A split can enqueue residuals before the parent returns. They must be
+        // schedulable immediately, up to the stage ceiling.
+        scheduler
+            .watermarks_mut()
+            .enqueue_bundles(&stateful_id, 3)
+            .unwrap();
+        let residuals = scheduler.next_nodes();
+        assert_eq!(residuals.len(), 3);
+        assert!(residuals.iter().all(|(idx, _)| *idx == stateful));
+        assert_eq!(scheduler.watermarks().in_flight_bundles(&stateful_id), 4);
     }
 
     #[test]
