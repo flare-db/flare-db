@@ -1,20 +1,22 @@
+use crate::engine::metrics::JobMetrics;
 use crate::engine::sdf::{SdfBundleOutcome, SdfWorkItem, SplittableStageExecutor};
+use crate::engine::window::WindowMergeService;
 use crate::transforms::SourceProgress;
 use crate::{
-    engine::timer::{TimerEntry, build_timer_store},
+    engine::timer::{build_timer_store, TimerEntry},
     engine::{
         executor::StageExecutor,
-        harness::{Channels, control::ControlResponse},
+        harness::{control::ControlResponse, state::SideInputRegistry, Channels},
         runtime::BundleRuntime,
         scheduler::NodeScheduler,
         timer::TimerService,
-        watermark::{MIN_TIMESTAMP, Timestamp, format_timestamp},
+        watermark::{format_timestamp, Timestamp, MIN_TIMESTAMP},
     },
     fusion::pipeline::{ExecutableGraph, ExecutableNode},
     store::element_store::FlareElementStore,
 };
 use anyhow::anyhow;
-use beam_model_rs::v1::{Coder, Components};
+use beam_model_rs::v1::{ApiServiceDescriptor, Coder, Components};
 use std::{collections::HashMap, collections::VecDeque, sync::Arc, time::Duration};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -74,6 +76,7 @@ pub struct ExecutorDispatcher {
     store: Arc<FlareElementStore>,
     pipeline_coders: Arc<HashMap<String, Coder>>,
     pipeline_components: Arc<Components>,
+    window_merger: Option<Arc<WindowMergeService>>,
     timer_service: Arc<TimerService>,
     /// Runner-source progress reports (TestStream) sent from bundle execution.
     source_reports_tx: mpsc::UnboundedSender<SourceProgress>,
@@ -93,6 +96,7 @@ impl ExecutorDispatcher {
             store,
             pipeline_coders: Arc::new(HashMap::new()),
             pipeline_components: Arc::new(Components::default()),
+            window_merger: None,
             timer_service,
             source_reports_tx,
             source_reports_rx,
@@ -108,6 +112,11 @@ impl ExecutorDispatcher {
     /// `flare-worker.log`.
     pub async fn set_log_target(&self, instance_id: &str, job_id: &str) -> anyhow::Result<()> {
         self.channels.set_log_target(instance_id, job_id).await
+    }
+
+    /// Install the metrics accumulator for the job that is about to run.
+    pub(crate) fn set_job_metrics(&self, metrics: Arc<JobMetrics>) {
+        self.channels.control().set_job_metrics(metrics);
     }
 
     /// Point the element store (and timer store) at the job's warehouse database.
@@ -127,20 +136,35 @@ impl ExecutorDispatcher {
 
     /// Start dispatcher tasks and cache the pipeline coders/components used to
     /// build a [`StageExecutor`].
-    pub fn prepare_pipeline(&mut self, pipeline_graph: &ExecutableGraph) {
-        // Start data channel dispatcher to listen and demux incoming elements.
-        self.channels.stream_elements();
-        // Start control channel dispatcher to route responses to waiting futures.
-        self.channels.stream_responses();
-        // Start state channel dispatcher to service Fn State requests against the
-        // job's element store (bag user state).
-        self.channels.state().stream_requests(self.store.clone());
+    pub fn prepare_pipeline(&mut self, pipeline_graph: &ExecutableGraph) -> anyhow::Result<()> {
         // Resolve `pickled_python` leaves through length-prefixed wrappers so the
         // runner's decoder sees the same coder graph the SDK is asked to emit.
         let mut coders = pipeline_graph.components.coders.clone();
         crate::coders::length_prefix_pickled_leaves(&mut coders);
+        let side_inputs = SideInputRegistry::from_executable_graph(pipeline_graph, &coders)?;
+
+        // Start data channel dispatcher to listen and demux incoming elements.
+        self.channels.stream_elements();
+        // Start control channel dispatcher to route responses to waiting futures.
+        self.channels.stream_responses();
+        // Start state channel dispatcher to service user state and materialized
+        // iterable side inputs from the same job store.
+        self.channels
+            .state()
+            .stream_requests(self.store.clone(), side_inputs);
         self.pipeline_coders = Arc::new(coders);
         self.pipeline_components = Arc::new(pipeline_graph.components.clone());
+        self.window_merger = Some(Arc::new(WindowMergeService::new(
+            self.channels.control(),
+            self.channels.data(),
+            self.pipeline_coders.clone(),
+            self.pipeline_components.clone(),
+            ApiServiceDescriptor {
+                url: crate::DEFAULT_API_SERVICE_URL.to_string(),
+                ..Default::default()
+            },
+        )));
+        Ok(())
     }
 
     /// Build a [`StageExecutor`] from the currently prepared state.
@@ -464,6 +488,7 @@ impl ExecutorDispatcher {
             self.store.clone(),
             self.pipeline_coders.clone(),
             self.pipeline_components.clone(),
+            self.window_merger.clone(),
             self.timer_service.clone(),
             self.source_reports_tx.clone(),
         )

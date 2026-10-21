@@ -164,6 +164,11 @@ pub mod beam_urns {
         SPLITTABLE_PROCESS_SIZED_ELEMENTS_AND_RESTRICTIONS_URN,
     ];
 
+    pub const ITERABLE_SIDE_INPUT_ACCESS: &str = "beam:side_input:iterable:v1";
+    pub const MULTIMAP_SIDE_INPUT_ACCESS: &str = "beam:side_input:multimap:v1";
+    pub const MULTIMAP_KEYS_VALUES_SIDE_INPUT_PROTOCOL: &str =
+        "beam:protocol:multimap_keys_values_side_input:v1";
+
     pub const LOGICAL_TYPE_MICROS_INSTANT: &str = "beam:logical_type:micros_instant:v1";
     pub const LOGICAL_TYPE_MILLIS_INSTANT: &str = "beam:logical_type:millis_instant:v1";
     pub const LOGICAL_TYPE_NANOS_INSTANT: &str = "beam:logical_type:nanos_instant:v1";

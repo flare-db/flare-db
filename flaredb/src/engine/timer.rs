@@ -17,7 +17,8 @@
 //! `(transform, family, tag, window, key)` identity plus its fire and hold
 //! timestamps. Setting the same identity again replaces it, clearing deletes it,
 //! and firing deletes it before delivering, so it can never fire twice. Storage
-//! is [`TimerStore`] over a `__flare_timer` Paimon table.
+//! is [`TimerStore`], one durable key/value cell per timer in the job's embedded
+//! SlateDB store (`<warehouse>/.slate_state/<db>/`).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -32,7 +33,7 @@ use tokio::sync::{Notify, mpsc};
 use tokio::time::Instant;
 
 use crate::{
-    engine::kv::{KvStore, PaimonKvStore, SlateKvStore},
+    engine::kv::{KvStore, SlateKvStore},
     store::element_store::FlareElementStore,
 };
 
@@ -114,10 +115,10 @@ impl TimerService {
 
     /// Apply many timer sets/clears in one durable commit.
     ///
-    /// `pending` maps a timer's storage key to `Some(entry)` to set/replace it or
-    /// `None` to delete it. A batch is a single Paimon commit instead of one per
-    /// timer, which is what makes a stateful bundle that sets thousands of timers
-    /// finish in time (see N3).
+    /// `pending` maps a timer's storage key to `Some(entry)` to set or replace it,
+    /// or to `None` to delete it. A batch is one durable commit instead of one for
+    /// every timer. A stateful bundle that sets thousands of timers then finishes
+    /// in time (see N3).
     pub async fn apply(&self, pending: &HashMap<Vec<u8>, Option<TimerEntry>>) -> Result<()> {
         self.store.apply(pending).await?;
         self.notify.notify_waiters();
@@ -260,20 +261,20 @@ impl TimerService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::element_store::FlareElementStore;
     use tempfile::tempdir;
 
     async fn make_store() -> (tempfile::TempDir, TimerStore) {
         let dir = tempdir().expect("failed to create tempdir warehouse");
-        let warehouse = dir
-            .path()
-            .to_str()
-            .expect("tempdir path is not valid utf8")
-            .to_string();
-        let store = FlareElementStore::new(warehouse, "testdb".to_string(), None)
+        let timers = open_timers(dir.path()).await;
+        (dir, timers)
+    }
+
+    /// A SlateDB-backed timer store rooted at `dir`.
+    async fn open_timers(dir: &std::path::Path) -> TimerStore {
+        let kv = SlateKvStore::open(dir, "timers")
             .await
-            .expect("failed to construct FlareElementStore");
-        (dir, TimerStore::new(Arc::new(store)))
+            .expect("failed to open SlateDB timer store");
+        TimerStore::with_store(Arc::new(kv))
     }
 
     fn entry(user_key: &[u8], domain: TimeDomain, fire: Timestamp, hold: Timestamp) -> TimerEntry {
@@ -454,10 +455,6 @@ mod tests {
     }
 }
 
-/// Paimon table backing the Beam user-timer store.
-const TIMER_TABLE: &str = "__flare_timer";
-const TIMER_KEY_COLUMN: &str = "timer_key";
-
 /// Beam's timer time domain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TimeDomain {
@@ -531,16 +528,7 @@ pub struct TimerStore {
 }
 
 impl TimerStore {
-    /// Back timers with the element store's Paimon catalog (default).
-    pub fn new(store: Arc<FlareElementStore>) -> Self {
-        Self::with_store(Arc::new(PaimonKvStore::new(
-            store,
-            TIMER_TABLE,
-            TIMER_KEY_COLUMN,
-        )))
-    }
-
-    /// Back timers with an explicit physical [`KvStore`].
+    /// Store the timers in `kv`.
     pub fn with_store(kv: Arc<dyn KvStore>) -> Self {
         Self { kv }
     }
@@ -597,16 +585,12 @@ impl TimerStore {
     }
 }
 
-/// Construct a job's timer store, honoring the shared backend selection
-/// (SlateDB by default, Paimon via `FLAREDB_STATE_BACKEND=paimon`).
+/// Construct a job's timer store in the `timers` database under
+/// `<warehouse>/.slate_state/<db>/`.
 pub async fn build_timer_store(store: Arc<FlareElementStore>) -> Result<TimerStore> {
-    if crate::engine::kv::use_slatedb() {
-        let dir = crate::store::element_store::slate_state_dir(&store);
-        let kv = SlateKvStore::open(&dir, "timers").await?;
-        Ok(TimerStore::with_store(Arc::new(kv)))
-    } else {
-        Ok(TimerStore::new(store))
-    }
+    let dir = crate::store::element_store::slate_state_dir(&store);
+    let kv = SlateKvStore::open(&dir, "timers").await?;
+    Ok(TimerStore::with_store(Arc::new(kv)))
 }
 
 #[cfg(test)]
@@ -614,17 +598,18 @@ mod timer_store_tests {
     use super::*;
     use tempfile::tempdir;
 
-    async fn make_store() -> (tempfile::TempDir, Arc<FlareElementStore>) {
+    async fn make_store() -> (tempfile::TempDir, TimerStore) {
         let dir = tempdir().expect("failed to create tempdir warehouse");
-        let warehouse = dir
-            .path()
-            .to_str()
-            .expect("tempdir path is not valid utf8")
-            .to_string();
-        let store = FlareElementStore::new(warehouse, "testdb".to_string(), None)
+        let timers = open_timers(dir.path()).await;
+        (dir, timers)
+    }
+
+    /// A SlateDB-backed timer store rooted at `dir`.
+    async fn open_timers(dir: &std::path::Path) -> TimerStore {
+        let kv = SlateKvStore::open(dir, "timers")
             .await
-            .expect("failed to construct FlareElementStore");
-        (dir, Arc::new(store))
+            .expect("failed to open SlateDB timer store");
+        TimerStore::with_store(Arc::new(kv))
     }
 
     fn entry(user_key: &[u8], domain: TimeDomain, fire: i64, hold: i64) -> TimerEntry {
@@ -644,8 +629,7 @@ mod timer_store_tests {
 
     #[tokio::test]
     async fn set_get_replace_and_clear() {
-        let (_dir, store) = make_store().await;
-        let timers = TimerStore::new(store);
+        let (_dir, timers) = make_store().await;
 
         let first = entry(b"k", TimeDomain::ProcessingTime, 100, 100);
         timers.upsert(&first).await.unwrap();
@@ -669,8 +653,7 @@ mod timer_store_tests {
 
     #[tokio::test]
     async fn identities_are_isolated() {
-        let (_dir, store) = make_store().await;
-        let timers = TimerStore::new(store);
+        let (_dir, timers) = make_store().await;
 
         let a = entry(b"a", TimeDomain::ProcessingTime, 10, 10);
         let b = entry(b"b", TimeDomain::ProcessingTime, 20, 20);
@@ -684,8 +667,7 @@ mod timer_store_tests {
 
     #[tokio::test]
     async fn apply_batch_sets_and_deletes_in_one_commit() {
-        let (_dir, store) = make_store().await;
-        let timers = TimerStore::new(store);
+        let (_dir, timers) = make_store().await;
 
         // Seed a timer to replace and one to delete.
         let keep = entry(b"keep", TimeDomain::EventTime, 100, 100);
@@ -717,21 +699,64 @@ mod timer_store_tests {
 
     #[tokio::test]
     async fn entries_survive_a_store_reload() {
-        let (dir, store) = make_store().await;
-        let warehouse = dir.path().to_str().unwrap().to_string();
+        let (dir, timers) = make_store().await;
 
         let original = entry(b"persisted", TimeDomain::EventTime, 555, 555);
-        TimerStore::new(store).upsert(&original).await.unwrap();
+        timers.upsert(&original).await.unwrap();
 
-        // A fresh store over the same warehouse sees the committed timer.
-        let reopened = FlareElementStore::new(warehouse, "testdb".to_string(), None)
-            .await
-            .unwrap();
-        let reloaded = TimerStore::new(Arc::new(reopened));
+        // Drop the handle and reopen the same directory. The committed timer must
+        // survive a restart.
+        drop(timers);
+        let reloaded = open_timers(dir.path()).await;
         assert_eq!(
             reloaded.get(&original.key.storage_key()).await.unwrap(),
             Some(original)
         );
+    }
+
+    #[tokio::test]
+    async fn build_timer_store_uses_the_job_slate_state_directory() {
+        let dir = tempdir().expect("failed to create tempdir warehouse");
+        let warehouse = dir
+            .path()
+            .to_str()
+            .expect("tempdir path is not valid utf8")
+            .to_string();
+        let store = Arc::new(
+            FlareElementStore::new(warehouse, "testdb".to_string(), None)
+                .await
+                .expect("failed to construct FlareElementStore"),
+        );
+
+        let timer = entry(b"k", TimeDomain::EventTime, 42, 42);
+        let timers = build_timer_store(store.clone()).await.unwrap();
+        timers.upsert(&timer).await.unwrap();
+        assert_eq!(
+            timers.get(&timer.key.storage_key()).await.unwrap(),
+            Some(timer)
+        );
+
+        // The timers live in the job's SlateDB store.
+        let db_dir = crate::store::element_store::slate_state_dir(&store).join("timers");
+        assert!(
+            db_dir.is_dir(),
+            "expected the SlateDB timer store at {}",
+            db_dir.display()
+        );
+        assert!(
+            std::fs::read_dir(&db_dir)
+                .expect("failed to list the SlateDB timer store")
+                .next()
+                .is_some(),
+            "SlateDB wrote nothing under {}",
+            db_dir.display()
+        );
+        // The element store holds no timer table.
+        assert!(store
+            .get_existing_table("__flare_timer")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[test]

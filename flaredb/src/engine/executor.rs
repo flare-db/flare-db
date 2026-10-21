@@ -272,7 +272,7 @@ impl StageExecutor {
 
                                 let timeout_id = instruction_id.clone();
                                 let input_error_id = instruction_id.clone();
-                                let proces_bundle_response = crate::engine::liveness::idle_guard(
+                                let proces_bundle_response = crate::engine::guard::idle_guard(
                                     async {
                                         tokio::pin!(bundle_response_future);
                                         let mut watch_input = true;
@@ -314,7 +314,7 @@ impl StageExecutor {
                                             }
                                         }
                                     },
-                                    Duration::from_secs(60),
+                                    crate::engine::guard::worker_idle_timeout(),
                                     &format!(
                                         "waiting for SDK bundle {} output data and control response",
                                         timeout_id
@@ -329,7 +329,7 @@ impl StageExecutor {
 
                             let timeout_id = instruction_id.clone();
                             let input_error_id = instruction_id.clone();
-                            let proces_bundle_response = crate::engine::liveness::idle_guard(
+                            let proces_bundle_response = crate::engine::guard::idle_guard(
                                 async {
                                     tokio::pin!(bundle_response_future);
                                     let mut watch_input = true;
@@ -352,7 +352,7 @@ impl StageExecutor {
                                         }
                                     }
                                 },
-                                Duration::from_secs(60),
+                                crate::engine::guard::worker_idle_timeout(),
                                 &format!("waiting for SDK bundle {} control response", timeout_id),
                             )
                             .await?;
@@ -455,6 +455,7 @@ impl StageExecutor {
                                 processing_time: self.runtime.timer_service().now(),
                                 input_watermark,
                                 output_coder: output_coder.clone(),
+                                window_merger: self.runtime.window_merger(),
                                 source_reports: Some(SourceReportSink(
                                     self.runtime.source_reports().clone(),
                                 )),

@@ -5,14 +5,11 @@ empty words, counts occurrences, formats the results, and logs each result.
 
 Run from the repository root with a FlareDB instance already started:
 
-    Create a python virtual env:
+    Create a python virtual env and install the flaredb dependency (this also
+    installs apache-beam==2.76.0):
 
     python3 -m venv .venv
     source .venv/bin/activate
-
-    and install beam and flaredb depedency:
-
-    pip install apache-beam
     pip install -e runner-sdk/python/flarerunner
 
     run the example:

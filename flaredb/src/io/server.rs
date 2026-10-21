@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use futures::{Stream, StreamExt};
 use log::debug;
-use paimon::{Catalog, FileSystemCatalog};
+use paimon::{FileSystemCatalog, catalog::Catalog};
 use paimon_datafusion::SQLContext;
 use tonic::{Request, Response, Status, Streaming};
 

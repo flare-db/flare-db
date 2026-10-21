@@ -213,7 +213,7 @@ impl NodeScheduler {
                         self.watermarks
                             .is_stage_completed(&graph[edge.source()].id())
                     });
-            if all_predecessors_done {
+            if all_predecessors_done && self.watermarks.side_inputs_produced(&stage) {
                 legacy.insert(index);
             }
         }
@@ -360,11 +360,17 @@ impl NodeScheduler {
 
     /// Returns metadata for the first outgoing edge from `idx`, if any.
     pub fn output_edge_metadata(&self, idx: NodeIndex) -> Option<ConsumerMetaData> {
-        self.graph
-            .get_executable_graph()
+        let graph = self.graph.get_executable_graph();
+        graph
             .edges_directed(idx, Direction::Outgoing)
             .next()
             .map(|edge| edge.weight().clone())
+            .or_else(|| {
+                graph[idx]
+                    .output_pcols()
+                    .into_iter()
+                    .find_map(|pcollection| self.graph.side_input_output_metadata(&pcollection))
+            })
     }
 
     /// Returns the root `ConsumerMetaData` for the graph.
@@ -402,16 +408,39 @@ mod tests {
     /// A minimal SDK (worker) stage with a single transform, so `NodeScheduler`
     /// maps that transform id to this stage (required for timer routing).
     fn worker_stage_node(transform_id: &str) -> ExecutableNode {
+        worker_stage_node_with_side_input(transform_id, None)
+    }
+
+    fn worker_stage_node_with_side_input(
+        transform_id: &str,
+        side_input: Option<(&str, &str)>,
+    ) -> ExecutableNode {
         use beam_model_rs::v1::executable_stage_payload::WireCoderSetting;
-        use beam_model_rs::v1::{Components, Environment, PCollection, PTransform};
+        use beam_model_rs::v1::{
+            Components, Environment, PCollection, PTransform, executable_stage_payload::SideInputId,
+        };
         use indexmap::IndexSet;
 
         use crate::fusion::pipeline::{PCollectionNode, PTransformNode};
+        use crate::fusion::refs::SideInputRef;
         use crate::fusion::stage::ExecutableStage;
 
         let mut components = Components::default();
+        let mut inputs = HashMap::from([("main".to_string(), "stage-in".to_string())]);
+        if let Some((local_name, pcollection_id)) = side_input {
+            inputs.insert(local_name.to_string(), pcollection_id.to_string());
+            components.pcollections.insert(
+                pcollection_id.to_string(),
+                PCollection {
+                    unique_name: pcollection_id.to_string(),
+                    coder_id: "c".to_string(),
+                    ..Default::default()
+                },
+            );
+        }
         let transform = PTransform {
             unique_name: transform_id.to_string(),
+            inputs,
             ..Default::default()
         };
         components
@@ -423,6 +452,19 @@ mod tests {
             id: transform_id.to_string(),
             transform,
         });
+        let side_inputs = side_input
+            .map(|(local_name, _)| {
+                SideInputRef::from_id(
+                    &SideInputId {
+                        transform_id: transform_id.to_string(),
+                        local_name: local_name.to_string(),
+                    },
+                    &components,
+                )
+                .unwrap()
+            })
+            .into_iter()
+            .collect();
 
         ExecutableNode::Worker(ExecutableStage::from(
             components,
@@ -439,11 +481,20 @@ mod tests {
                     ..Default::default()
                 },
             },
-            IndexSet::new(),
+            side_inputs,
             IndexSet::new(),
             IndexSet::new(),
             IndexSet::new(),
             transforms,
+        ))
+    }
+
+    fn source_node(name: &str, pcollection_id: &str) -> ExecutableNode {
+        ExecutableNode::Runner(from_urn(
+            beam_urns::IMPULSE_TRANSFORM,
+            name.to_string(),
+            HashMap::new(),
+            HashMap::from([("out".to_string(), pcollection_id.to_string())]),
         ))
     }
 
@@ -580,6 +631,49 @@ mod tests {
         let ready = scheduler.next_nodes();
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].0, c);
+    }
+
+    #[test]
+    fn side_input_barrier_is_accounted_for_by_the_debug_dependency_check() {
+        let mut graph = Graph::<ExecutableNode, ConsumerMetaData>::new();
+        let main = graph.add_node(source_node("main-source", "main-pc"));
+        let side = graph.add_node(source_node("side-source", "side-pc"));
+        let consumer = graph.add_node(worker_stage_node_with_side_input(
+            "consumer",
+            Some(("side", "side-pc")),
+        ));
+
+        let mut main_edge = dummy_metadata("main-consumer");
+        main_edge.produced_pcol_id = "main-pc".to_string();
+        graph.add_edge(main, consumer, main_edge);
+
+        let executable_graph = graph_for_test(graph, dummy_metadata("root"));
+        let mut scheduler = NodeScheduler::new(executable_graph);
+
+        let ready: HashSet<_> = scheduler
+            .next_nodes()
+            .into_iter()
+            .map(|(idx, _)| idx)
+            .collect();
+        assert_eq!(ready, HashSet::from([main, side]));
+
+        scheduler.mark_complete(main);
+        assert!(
+            scheduler
+                .next_nodes()
+                .iter()
+                .all(|(idx, _)| *idx != consumer),
+            "the consumer must remain blocked by the side-input barrier"
+        );
+
+        scheduler.mark_complete(side);
+        assert!(
+            scheduler
+                .next_nodes()
+                .iter()
+                .any(|(idx, _)| *idx == consumer),
+            "the side-input producer completion must release the consumer"
+        );
     }
 
     #[test]
@@ -886,6 +980,7 @@ mod tests {
                         processing_time: 0,
                         input_watermark: i64::MAX,
                         output_coder: None,
+                        window_merger: None,
                         source_reports: None,
                     })
                     .await

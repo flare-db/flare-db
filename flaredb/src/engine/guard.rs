@@ -1,4 +1,4 @@
-//! Harness-liveness supervision.
+//! Harness worker guard supervision.
 //!
 //! [`idle_guard`] waits for a bundle to finish, but fails if the SDK worker
 //! stops sending traffic. The Fn transport receive loops, the data, control,
@@ -14,6 +14,23 @@ use std::future::Future;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+const DEFAULT_WORKER_IDLE_TIMEOUT_SECS: u64 = 300;
+
+/// Maximum time the SDK worker may be silent before a bundle is considered
+/// stalled.
+///
+/// Stateful SDF stages can legitimately produce no data or state traffic while
+/// processing a large seed. The environment override supports tuning this for
+/// unusually large or unusually constrained workers.
+pub fn worker_idle_timeout() -> Duration {
+    let seconds = std::env::var("FLAREDB_WORKER_IDLE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_WORKER_IDLE_TIMEOUT_SECS);
+    Duration::from_secs(seconds)
+}
 
 /// Monotonic milliseconds since the first call in this process.
 fn now_ms() -> u64 {

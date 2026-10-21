@@ -1,0 +1,143 @@
+# Publishes FlareDB releases (flare-cli and flaredb binaries) and the installer script to R2.
+#
+#
+# Triggers
+#   - After the dist "Release" workflow succeeds for a tag like flare-cli-v0.3.2
+#     or flaredb-v0.3.2
+#     (workflow_run is used because releases created by GITHUB_TOKEN do NOT fire
+#     `on: release`, which is how dist creates them).
+#   - Manually: Actions -> "Publish to R2" -> Run workflow -> enter a tag.
+#   - On pushes to main that change scripts/install.sh.
+#
+# Bucket layout produced
+#   cli/<version>/flare-cli-<target>.tar.xz       (+ .sha256)
+#   cli/latest.txt                                (stable releases only, written last)
+#   flaredb/<version>/flaredb-<target>.tar.xz     (+ .sha256)
+#   flaredb/latest.txt                            (stable releases only, written last)
+#   install.sh
+#
+# Tags that match neither prefix (e.g. beam-worker-2.76.0) are ignored.
+# Each tag is published independently, so cli and flaredb can be released at
+# different times. The workflow file must be on the default branch for the
+# workflow_run trigger to fire.
+
+
+name: Publish to R2
+
+on:
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish (e.g. flare-cli-v0.3.2)"
+        required: true
+  push:
+    branches: [main]
+    paths: ["scripts/install.sh"]
+
+permissions:
+  contents: read
+
+env:
+  BUCKET: flaredb-releases
+  AWS_DEFAULT_REGION: auto
+  # R2 rejects the newer default AWS CLI checksum headers.
+  AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+  AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+  AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+  R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+
+jobs:
+  release:
+    # Only flare-cli / flaredb tags, and only when the dist build succeeded (or on manual run).
+    if: >-
+      (startsWith(github.event.inputs.tag || github.event.workflow_run.head_branch, 'flare-cli-v') ||
+       startsWith(github.event.inputs.tag || github.event.workflow_run.head_branch, 'flaredb-v')) &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event_name == 'workflow_run' &&
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'push'))
+    runs-on: ubuntu-latest
+    # One group per tag: re-runs of the same tag queue up, but different tags
+    # (cli vs flaredb, or two quick releases) never cancel each other.
+    concurrency:
+      group: r2-publish-${{ github.event.inputs.tag || github.event.workflow_run.head_branch }}
+      cancel-in-progress: false
+    env:
+      TAG: ${{ github.event.inputs.tag || github.event.workflow_run.head_branch }}
+    steps:
+      - name: Work out the folder and version
+        id: meta
+        run: |
+          set -euo pipefail
+          case "$TAG" in
+            flare-cli-v*) DIR=cli;    VER="${TAG#flare-cli-v}" ;;
+            flaredb-v*)   DIR=flaredb; VER="${TAG#flaredb-v}" ;;
+            *) echo "Unexpected tag: $TAG"; exit 1 ;;
+          esac
+          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          # Versions with a suffix (0.4.0-rc.1) are prereleases: never move "latest".
+          case "$VER" in
+            *-*) echo "stable=false" >> "$GITHUB_OUTPUT" ;;
+            *)   echo "stable=true"  >> "$GITHUB_OUTPUT" ;;
+          esac
+          echo "Publishing $TAG to $DIR/$VER"
+
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir out \
+            --pattern '*.tar.xz' --pattern '*.tar.xz.sha256'
+          ls -l out
+
+      - name: Verify checksums before uploading
+        run: |
+          set -euo pipefail
+          cd out
+          n=$(ls ./*.tar.xz | wc -l)
+          [ "$n" -ge 1 ] || { echo "no archives found in the release"; exit 1; }
+          echo "found $n archives"
+          sha256sum -c ./*.sha256
+
+      - name: Upload archives (immutable, long cache)
+        run: |
+          set -euo pipefail
+          aws s3 cp out "s3://$BUCKET/${{ steps.meta.outputs.dir }}/${{ steps.meta.outputs.version }}/" \
+            --recursive --endpoint-url "$R2_ENDPOINT" \
+            --cache-control "public, max-age=31536000, immutable"
+
+      - name: Point "latest" at this version (last, so users never see a half-uploaded release)
+        if: steps.meta.outputs.stable == 'true'
+        run: |
+          set -euo pipefail
+          printf '%s' "${{ steps.meta.outputs.version }}" > latest.txt
+          aws s3 cp latest.txt "s3://$BUCKET/${{ steps.meta.outputs.dir }}/latest.txt" \
+            --endpoint-url "$R2_ENDPOINT" \
+            --content-type "text/plain" \
+            --cache-control "public, max-age=60"
+
+      - name: Show what is in the bucket
+        run: aws s3 ls "s3://$BUCKET/${{ steps.meta.outputs.dir }}/${{ steps.meta.outputs.version }}/" --endpoint-url "$R2_ENDPOINT"
+
+  installer:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Syntax check
+        run: bash -n scripts/install.sh
+
+      - name: Upload install.sh
+        run: |
+          set -euo pipefail
+          aws s3 cp scripts/install.sh "s3://$BUCKET/install.sh" \
+            --endpoint-url "$R2_ENDPOINT" \
+            --content-type "application/x-shellscript" \
+            --cache-control "public, max-age=60"

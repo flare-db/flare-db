@@ -1,18 +1,22 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex as StdMutex},
+    time::Duration,
+};
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use beam_model_rs::v1::{
-    GetProcessBundleDescriptorRequest, InstructionRequest, InstructionResponse,
-    ProcessBundleDescriptor, ProcessBundleProgressRequest, ProcessBundleProgressResponse,
-    ProcessBundleRequest, ProcessBundleResponse, ProcessBundleSplitRequest,
-    ProcessBundleSplitResponse, RegisterRequest, beam_fn_control_server::BeamFnControl,
-    instruction_request, instruction_response, process_bundle_split_request,
+    beam_fn_control_server::BeamFnControl, instruction_request, GetProcessBundleDescriptorRequest,
+    InstructionRequest, InstructionResponse, ProcessBundleDescriptor, ProcessBundleRequest,
+    ProcessBundleResponse, RegisterRequest,
 };
 use dashmap::DashMap;
 use log::{debug, info, warn};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Response, Status};
+
+use crate::engine::metrics::JobMetrics;
 
 /// Shared gRPC channel for sending instructions to the worker.
 pub struct ControlInner {
@@ -31,6 +35,9 @@ pub struct ControlInner {
 
     // Pending responses from the worker, keyed by instruction_id.
     pub pending: DashMap<String, oneshot::Sender<InstructionResponse>>,
+
+    // Aggregated metrics reported by completed SDK bundles for the active job.
+    pub(crate) metrics: StdMutex<Option<Arc<JobMetrics>>>,
 }
 
 impl ControlInner {
@@ -55,6 +62,7 @@ pub async fn start_control_server() -> Result<(ControlChannel, FlareControlServi
         incoming: Mutex::new(None),
         descriptors: Mutex::new(HashMap::new()),
         pending: DashMap::new(),
+        metrics: StdMutex::new(None),
     });
 
     let service = FlareControlService {
@@ -233,8 +241,22 @@ impl ControlChannel {
         *self.stream.incoming.lock().await = None;
         self.stream.descriptors.lock().await.clear();
         self.stream.pending.clear();
+        *self
+            .stream
+            .metrics
+            .lock()
+            .expect("control metrics lock not poisoned") = None;
 
         log::info!("control channel reset for next worker");
+    }
+
+    /// Install the per-job metrics accumulator that receives SDK bundle metrics.
+    pub(crate) fn set_job_metrics(&self, metrics: Arc<JobMetrics>) {
+        *self
+            .stream
+            .metrics
+            .lock()
+            .expect("control metrics lock not poisoned") = Some(metrics);
     }
 
     // register stage descriptor with worker
@@ -356,6 +378,15 @@ impl ControlChannel {
 
         match response.response {
             Some(beam_model_rs::v1::instruction_response::Response::ProcessBundle(res)) => {
+                let metrics = self
+                    .stream
+                    .metrics
+                    .lock()
+                    .expect("control metrics lock not poisoned")
+                    .clone();
+                if let Some(metrics) = metrics {
+                    metrics.record(&res.monitoring_infos);
+                }
                 Ok(ControlResponse::ProcessBundleSuccess(res))
             }
             other => {
@@ -476,7 +507,7 @@ impl ControlChannel {
 
                 match response {
                     Ok(Some(response)) => {
-                        crate::engine::liveness::touch();
+                        crate::engine::guard::touch();
                         let instruction_id = response.instruction_id.clone();
                         debug!(
                             "control response received: instruction_id={} error={}",
@@ -517,5 +548,75 @@ impl ControlChannel {
     // generate unique instruction ids
     fn next_id(&self) -> String {
         uuid::Uuid::new_v4().to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use beam_model_rs::v1::{instruction_response, ProcessBundleResponse};
+
+    fn counter_info() -> beam_model_rs::v1::MonitoringInfo {
+        beam_model_rs::v1::MonitoringInfo {
+            urn: "beam:metric:user:sum_int64:v1".to_string(),
+            r#type: "beam:metrics:sum_int64:v1".to_string(),
+            payload: vec![3],
+            labels: [
+                ("NAMESPACE".to_string(), "test".to_string()),
+                ("NAME".to_string(), "count".to_string()),
+                ("PTRANSFORM".to_string(), "step".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            start_time: None,
+        }
+    }
+
+    async fn deliver_bundle_response(
+        channel: &ControlChannel,
+        instruction_id: &str,
+        info: Option<beam_model_rs::v1::MonitoringInfo>,
+    ) -> ControlResponse {
+        let (tx, rx) = oneshot::channel();
+        tx.send(InstructionResponse {
+            instruction_id: instruction_id.to_string(),
+            error: String::new(),
+            response: Some(instruction_response::Response::ProcessBundle(
+                ProcessBundleResponse {
+                    monitoring_infos: info.into_iter().collect(),
+                    ..Default::default()
+                },
+            )),
+        })
+        .unwrap();
+        channel
+            .recv_process_bundle_response(instruction_id, rx)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn process_bundle_metrics_feed_the_active_job_accumulator() {
+        let (channel, _service) = start_control_server().await.unwrap();
+        let metrics = Arc::new(JobMetrics::default());
+        channel.set_job_metrics(metrics.clone());
+
+        deliver_bundle_response(&channel, "bundle-1", Some(counter_info())).await;
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].payload, vec![3]);
+    }
+
+    #[tokio::test]
+    async fn reset_removes_the_active_accumulator() {
+        let (channel, _service) = start_control_server().await.unwrap();
+        let metrics = Arc::new(JobMetrics::default());
+        channel.set_job_metrics(metrics.clone());
+        channel.reset().await;
+
+        deliver_bundle_response(&channel, "bundle-1", Some(counter_info())).await;
+
+        assert!(metrics.snapshot().is_empty());
     }
 }

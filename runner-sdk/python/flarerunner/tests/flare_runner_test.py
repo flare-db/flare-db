@@ -9,6 +9,8 @@ from unittest import mock
 
 from apache_beam.options.pipeline_options import PipelineOptions
 from apache_beam.options.pipeline_options import PortableOptions
+from apache_beam.metrics import metric
+from apache_beam.metrics import monitoring_infos
 from apache_beam.portability.api import beam_job_api_pb2
 from apache_beam.portability.api import beam_runner_api_pb2
 from apache_beam.runners import runner
@@ -16,6 +18,7 @@ from apache_beam.runners.runner import create_runner
 
 from flaredb_runner.flare_runner import FlareRunner
 from flaredb_runner.flare_runner import JobServiceHandle
+from flaredb_runner.flare_runner import PipelineResult
 
 
 class _FakeJobService(object):
@@ -26,6 +29,7 @@ class _FakeJobService(object):
         preparation_id='jobid-1234',
         artifact_staging_endpoint=SimpleNamespace(url='127.0.0.1:8099'),
         staging_session_token='token')
+    self.last_metrics_job_id = None
 
   def DescribePipelineOptions(self, request, timeout=None):
     return SimpleNamespace(options=[])
@@ -41,6 +45,13 @@ class _FakeJobService(object):
 
   def Run(self, request, timeout=None):
     return SimpleNamespace(job_id='jobid-1234')
+
+  def GetJobMetrics(self, request, timeout=None):
+    self.last_metrics_job_id = request.job_id
+    counter = monitoring_infos.int64_user_counter(
+        'test', 'count', 7, ptransform='step')
+    return beam_job_api_pb2.GetJobMetricsResponse(
+        metrics=beam_job_api_pb2.MetricResults(attempted=[counter]))
 
 
 class FlareRunnerTest(unittest.TestCase):
@@ -107,6 +118,19 @@ class FlareRunnerTest(unittest.TestCase):
       handle.prepare(beam_runner_api_pb2.Pipeline())
 
     self.assertEqual(prepare.call_args.args[0].job_name, 'my-job')
+
+  def test_pipeline_result_queries_attempted_metrics(self):
+    job_service = _FakeJobService()
+    pipeline_result = PipelineResult(
+        job_service,
+        'jobid-1234',
+        iter([]),
+        iter([]))
+
+    counters = pipeline_result.metrics().query()[metric.MetricResults.COUNTERS]
+
+    self.assertEqual('jobid-1234', job_service.last_metrics_job_id)
+    self.assertEqual([7], [result.attempted for result in counters])
 
 
 if __name__ == '__main__':

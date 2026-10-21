@@ -1,7 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::io::Cursor;
-use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::time::Duration;
 
 use anyhow::anyhow;
 use beam_model_rs::v1::process_bundle_split_request::DesiredSplit;
@@ -271,7 +268,7 @@ impl SplittableStageExecutor {
         let response_future =
             control.recv_process_bundle_response(&instruction_id, bundle_response_rx);
 
-        let control_response = crate::engine::liveness::idle_guard(
+        let control_response = crate::engine::guard::idle_guard(
             async {
                 tokio::pin!(response_future);
                 tokio::select! {
@@ -298,7 +295,7 @@ impl SplittableStageExecutor {
                     }
                 }
             },
-            Duration::from_secs(60),
+            crate::engine::guard::worker_idle_timeout(),
             "waiting for SDF initialization stage control response/data",
         )
         .await?;
@@ -452,7 +449,7 @@ impl SplittableStageExecutor {
             });
 
             let timeout_id = instruction_id.clone();
-            crate::engine::liveness::idle_guard(
+            crate::engine::guard::idle_guard(
                 async {
                     match process_future.await {
                         Ok(response) => {
@@ -467,7 +464,7 @@ impl SplittableStageExecutor {
                         }
                     }
                 },
-                Duration::from_secs(60),
+                crate::engine::guard::worker_idle_timeout(),
                 &format!(
                     "waiting for SDF process bundle {} output data and control response",
                     timeout_id
@@ -476,9 +473,9 @@ impl SplittableStageExecutor {
             .await?
         } else {
             let timeout_id = instruction_id.clone();
-            crate::engine::liveness::idle_guard(
-                process_future,
-                Duration::from_secs(60),
+            crate::engine::guard::idle_guard(
+                response_future,
+                crate::engine::guard::worker_idle_timeout(),
                 &format!(
                     "waiting for SDF process bundle {} control response",
                     timeout_id

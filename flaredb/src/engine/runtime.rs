@@ -3,7 +3,7 @@ use std::{
     io::Cursor,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use anyhow::anyhow;
@@ -32,6 +32,7 @@ use crate::{
             data::{DataChannel, DataKey, ElementStreamPayload},
         },
         timer::TimerService,
+        window::WindowMergeService,
     },
     fusion::{pipeline::ConsumerMetaData, stage::ExecutableStage},
     jobservice::urns::beam_urns,
@@ -43,6 +44,37 @@ use crate::{
     utils::batch_size_estimator::{BatchConfig, BatchSizeEstimator},
 };
 
+/// Resolve the window coder for a PCollection from its windowing strategy.
+pub(crate) fn resolve_window_coder(
+    pipeline_components: &Components,
+    pipeline_coders: &HashMap<String, Coder>,
+    pcollection_id: &str,
+) -> anyhow::Result<WindowCoder> {
+    let pcollection = pipeline_components
+        .pcollections
+        .get(pcollection_id)
+        .ok_or_else(|| anyhow!("PCollection not found: {pcollection_id}"))?;
+    let strategy = pipeline_components
+        .windowing_strategies
+        .get(&pcollection.windowing_strategy_id);
+    let window_coder_id = strategy
+        .map(|strategy| strategy.window_coder_id.as_str())
+        .filter(|id| !id.is_empty())
+        .or_else(|| {
+            strategy
+                .and_then(|strategy| strategy.window_fn.as_ref())
+                .filter(|window_fn| window_fn.urn == "beam:window_fn:fixed_windows:v1")
+                .and_then(|_| {
+                    pipeline_coders.iter().find_map(|(id, coder)| {
+                        (coder.spec.as_ref()?.urn == beam_urns::INTERVAL_WINDOW_CODER)
+                            .then_some(id.as_str())
+                    })
+                })
+        })
+        .unwrap_or(beam_urns::GLOBAL_WINDOW_CODER);
+    WindowCoder::try_from_coder(window_coder_id, pipeline_coders)
+}
+
 #[derive(Clone)]
 pub struct BundleRuntime {
     control: ControlChannel,
@@ -50,17 +82,20 @@ pub struct BundleRuntime {
     store: Arc<FlareElementStore>,
     pipeline_coders: Arc<HashMap<String, Coder>>,
     pipeline_components: Arc<Components>,
+    window_merger: Option<Arc<WindowMergeService>>,
     timer_service: Arc<TimerService>,
     source_reports: tokio::sync::mpsc::UnboundedSender<SourceProgress>,
 }
 
 impl BundleRuntime {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         control: ControlChannel,
         data: DataChannel,
         store: Arc<FlareElementStore>,
         pipeline_coders: Arc<HashMap<String, Coder>>,
         pipeline_components: Arc<Components>,
+        window_merger: Option<Arc<WindowMergeService>>,
         timer_service: Arc<TimerService>,
         source_reports: tokio::sync::mpsc::UnboundedSender<SourceProgress>,
     ) -> Self {
@@ -70,6 +105,7 @@ impl BundleRuntime {
             store,
             pipeline_coders,
             pipeline_components,
+            window_merger,
             timer_service,
             source_reports,
         }
@@ -104,6 +140,10 @@ impl BundleRuntime {
         &self.pipeline_components
     }
 
+    pub fn window_merger(&self) -> Option<Arc<WindowMergeService>> {
+        self.window_merger.clone()
+    }
+
     pub fn data_receiver(
         &self,
         data_key: DataKey,
@@ -111,38 +151,13 @@ impl BundleRuntime {
         self.data.get_receiver(data_key)
     }
 
-    pub(crate) fn window_coder_for_pcollection(&self, pcollection_id: &str) -> WindowCoder {
-        let pcollection = self
-            .pipeline_components
-            .pcollections
-            .get(pcollection_id)
-            .unwrap_or_else(|| panic!("PCollection not found: {pcollection_id}"));
-        let strategy = self
-            .pipeline_components
-            .windowing_strategies
-            .get(&pcollection.windowing_strategy_id);
-        let window_coder_id = strategy
-            .map(|strategy| strategy.window_coder_id.as_str())
-            .filter(|id| !id.is_empty())
-            .or_else(|| {
-                strategy
-                    .and_then(|strategy| strategy.window_fn.as_ref())
-                    .filter(|window_fn| window_fn.urn == "beam:window_fn:fixed_windows:v1")
-                    .and_then(|_| {
-                        self.pipeline_coders.iter().find_map(|(id, coder)| {
-                            (coder.spec.as_ref()?.urn == beam_urns::INTERVAL_WINDOW_CODER)
-                                .then_some(id.as_str())
-                        })
-                    })
-            })
-            .unwrap_or(beam_urns::GLOBAL_WINDOW_CODER);
-        let urn = self
-            .pipeline_coders
-            .get(window_coder_id)
-            .and_then(|coder| coder.spec.as_ref())
-            .map(|spec| spec.urn.as_str())
-            .unwrap_or(window_coder_id);
-        WindowCoder::from_urn(urn)
+    fn window_coder_for_pcollection(&self, pcollection_id: &str) -> WindowCoder {
+        resolve_window_coder(
+            self.pipeline_components.as_ref(),
+            self.pipeline_coders.as_ref(),
+            pcollection_id,
+        )
+        .unwrap_or_else(|e| panic!("{e}"))
     }
 
     pub async fn register_bundle(
@@ -225,6 +240,10 @@ impl BundleRuntime {
         let pcollection_id = edge_metadata.produced_pcol_id.clone();
         let mut stream_ended = false;
         let mut total_decoded: usize = 0;
+        let progress_started = Instant::now();
+        let mut next_progress = 1_000_000usize;
+        let mut write_time = Duration::ZERO;
+        info!("Receiving output elements for {pcollection_id}");
 
         // One Paimon writer/committer per bundle: every decoded batch is
         // appended to a single table writer and committed exactly once, instead
@@ -285,6 +304,13 @@ impl BundleRuntime {
                                 stream_buffer.advance(consumed);
 
                                 total_decoded += 1;
+                                if total_decoded >= next_progress {
+                                    info!(
+                                        "Decoded {total_decoded} output elements for {pcollection_id} in {:?}",
+                                        progress_started.elapsed()
+                                    );
+                                    next_progress = (total_decoded / 1_000_000 + 1) * 1_000_000;
+                                }
                                 let value = match opaque_element {
                                     Some(raw) => BeamRecord::PRIMITIVE(PrimitiveValue::Bytes(raw)),
                                     None => windowed_value.value.clone(),
@@ -299,7 +325,9 @@ impl BundleRuntime {
                                     let batch_size = batch.len();
                                     let start = Instant::now();
                                     writer.write(std::mem::take(&mut batch)).await?;
-                                    batch_size_estimator.record(batch_size, start.elapsed());
+                                    let elapsed = start.elapsed();
+                                    write_time += elapsed;
+                                    batch_size_estimator.record(batch_size, elapsed);
                                     target_batch_size = batch_size_estimator.next_batch_size();
                                 }
                             }
@@ -346,13 +374,20 @@ impl BundleRuntime {
             let batch_size = batch.len();
             let start = Instant::now();
             writer.write(batch).await?;
-            batch_size_estimator.record(batch_size, start.elapsed());
+            let elapsed = start.elapsed();
+            write_time += elapsed;
+            batch_size_estimator.record(batch_size, elapsed);
         }
+        let commit_started = Instant::now();
         writer.commit().await?;
+        write_time += commit_started.elapsed();
 
         info!(
-            "Finished decoding output elements: {} total elements",
-            total_decoded
+            "Finished decoding output elements: {} total elements for {} in {:?} (paimon_write={:?})",
+            total_decoded,
+            pcollection_id,
+            progress_started.elapsed(),
+            write_time,
         );
 
         Ok(())
@@ -694,14 +729,8 @@ fn resolve_timer_family(
         let key_id = coder.component_coder_ids.first()?;
         let window_id = coder.component_coder_ids.get(1)?;
         let key_coder = StandardBeamCoders::from_urn(key_id, None, Some(coders));
-        let window_urn = coders
-            .get(window_id)
-            .and_then(|c| c.spec.as_ref())
-            .map(|s| s.urn.as_str())?;
-        Some((
-            TimerCoder::new(key_coder, WindowCoder::from_urn(window_urn)),
-            domain,
-        ))
+        let window_coder = WindowCoder::try_from_coder(window_id, coders).ok()?;
+        Some((TimerCoder::new(key_coder, window_coder), domain))
     } else {
         // Some SDKs register the key coder directly; assume a global window.
         let key_coder = StandardBeamCoders::from_urn(
@@ -1112,7 +1141,6 @@ mod timer_tests {
     use crate::coders::primitives::StringUtf8Coder;
     use crate::engine::harness::data::{TimerChunk, TimersKey};
     use crate::engine::timer::TimerStore;
-    use crate::store::element_store::FlareElementStore;
     use beam_model_rs::v1::TimerFamilySpec;
     use prost::Message;
     use tempfile::tempdir;
@@ -1170,15 +1198,10 @@ mod timer_tests {
 
     async fn make_timer_service() -> (tempfile::TempDir, Arc<TimerService>) {
         let dir = tempdir().expect("failed to create tempdir warehouse");
-        let warehouse = dir
-            .path()
-            .to_str()
-            .expect("tempdir path is not valid utf8")
-            .to_string();
-        let store = FlareElementStore::new(warehouse, "timers-test".to_string(), None)
+        let kv = crate::engine::kv::SlateKvStore::open(dir.path(), "timers")
             .await
-            .expect("failed to construct FlareElementStore");
-        let service = Arc::new(TimerService::new(TimerStore::new(Arc::new(store))));
+            .expect("failed to open SlateDB timer store");
+        let service = Arc::new(TimerService::new(TimerStore::with_store(Arc::new(kv))));
         (dir, service)
     }
 
