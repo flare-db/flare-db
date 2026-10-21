@@ -55,6 +55,15 @@ pub struct SdfWorkItem {
     pub holds: Vec<Timestamp>,
 }
 
+/// The byte span of one windowed input element plus the event-time metadata needed
+/// to hold back downstream watermarks while that element is deferred.
+#[derive(Clone, Debug)]
+struct SdfInputSpan {
+    start: usize,
+    end: usize,
+    timestamp_millis: i64,
+}
+
 /// What one executed SDF bundle reports back to the dispatcher.
 #[derive(Debug, Default)]
 pub struct SdfBundleOutcome {
@@ -78,7 +87,7 @@ struct SplitMonitor {
     prev_total_count: i64,
     /// Whether splitting is still allowed for this bundle;
     /// cleared once the SDK declines a split or progress polling fails.
-    unsplit: bool,
+    can_split: bool,
     /// Upper bound on remaining work.
     estimated_input_elements: i64,
     /// Duration between two consecutive `progress + split_evaluation` runs, for this bundle.
@@ -95,7 +104,7 @@ impl SplitMonitor {
             // Starts at -2 so the first tick only record numbers.
             prev_index: -2,
             prev_total_count: -2,
-            unsplit: true,
+            can_split: true,
             estimated_input_elements,
             tick: clamp_progress_tick(progress_tick.unwrap_or(MIN_PROGRESS_TICK)),
             handed_back_from: None,
@@ -157,6 +166,7 @@ impl SplittableStageExecutor {
         let (response, split_residual_roots, channel_items, progress_tick) = self
             .run_process_stage(
                 &plan.process_stage,
+                stage,
                 output_edge_metadata,
                 bytes,
                 !registered,
@@ -327,6 +337,7 @@ impl SplittableStageExecutor {
     async fn run_process_stage(
         &mut self,
         stage: &ExecutableStage,
+        splittable_stage: &SplittableStage,
         output_edge_metadata: Option<ConsumerMetaData>,
         seed: Vec<u8>,
         register: bool,
@@ -351,27 +362,9 @@ impl SplittableStageExecutor {
         }
 
         let input_pcol = stage.input_pcol();
-        let input_spans = self
-            .decode_windowed_value_spans(
-                input_pcol.id().as_str(),
-                input_pcol.node().coder_id.as_str(),
-                &seed,
-            )
-            .unwrap_or_else(|err| {
-                warn!(
-                    "failed to decode SDF process input for counting/split ({}); \
-                    whole-element split re-injection disabled for this bundle",
-                    err
-                );
-                Vec::new()
-            });
-        let estimated_input_elements = if !input_spans.is_empty() {
-            input_spans.len() as i64
-        } else if seed.is_empty() {
-            0
-        } else {
-            1
-        };
+        let input_pcol_id = input_pcol.id().clone();
+        let input_coder_id = input_pcol.node().coder_id.clone();
+        let estimated_input_elements = if seed.is_empty() { 0 } else { 1 };
 
         let (instruction_id, bundle_response_rx) = self
             .runtime
@@ -394,11 +387,13 @@ impl SplittableStageExecutor {
         .await?;
 
         let control = self.runtime.control().clone();
+        let input_runtime = self.runtime.clone();
         let response_future =
             control.recv_process_bundle_response(&instruction_id, bundle_response_rx);
 
         let mut split_residual_roots: Vec<DelayedBundleApplication> = Vec::new();
         let mut channel_items: Vec<SdfWorkItem> = Vec::new();
+        let mut input_spans: Option<Vec<SdfInputSpan>> = None;
         let mut monitor = SplitMonitor::new(estimated_input_elements, progress_tick);
         let monitor_enabled = allow_split && estimated_input_elements > 0;
 
@@ -420,7 +415,11 @@ impl SplittableStageExecutor {
                                 &source_transform_id,
                                 &mut monitor,
                                 &seed,
-                                &input_spans,
+                                &input_runtime,
+                                &input_pcol_id,
+                                &input_coder_id,
+                                &mut input_spans,
+                                splittable_stage,
                                 &mut split_residual_roots,
                                 &mut channel_items
                             ).await {
@@ -431,7 +430,7 @@ impl SplittableStageExecutor {
                                     instruction_id,
                                     err
                                 );
-                                monitor.unsplit = false;
+                                monitor.can_split = false;
                             }
                         }
                     }
@@ -509,45 +508,6 @@ impl SplittableStageExecutor {
         }
     }
 
-    /// Decode the byte span of each `WindowedValue` in an SDF process input.
-    fn decode_windowed_value_spans(
-        &mut self,
-        pcol_id: &str,
-        coder_id: &str,
-        bytes: &[u8],
-    ) -> anyhow::Result<Vec<(usize, usize)>> {
-        if bytes.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let element_coder = StandardBeamCoders::from_urn(
-            coder_id,
-            None,
-            Some(self.runtime.pipeline_coders().as_ref()),
-        );
-        let window_coder = self.runtime.window_coder_for_pcollection(pcol_id);
-        let windowed_value_coder =
-            WindowedValueCoder::with_window_coder(element_coder, window_coder);
-
-        let mut cursor = Cursor::new(bytes);
-        let mut spans = Vec::new();
-        while (cursor.position() as usize) < bytes.len() {
-            let start = cursor.position() as usize;
-            let decoded = catch_unwind(AssertUnwindSafe(|| {
-                windowed_value_coder.decode(&mut cursor)
-            }));
-            match decoded {
-                Ok(Ok(_)) => spans.push((start, cursor.position() as usize)),
-                Ok(Err(err)) => {
-                    return Err(anyhow!("failed to decode SDF input element: {:?}", err));
-                }
-                Err(_) => return Err(anyhow!("panic while decoding SDF input element")),
-            }
-        }
-
-        Ok(spans)
-    }
-
     /// Send raw Beam-encoded bytes to an SDF stage's source transform.
     ///
     /// `timer_endpoints` carries the stage's inbound timer endpoints; each is
@@ -610,6 +570,46 @@ impl SplittableStageExecutor {
     }
 }
 
+/// Decode the byte span and event timestamp of each `WindowedValue` in an SDF
+/// process input.
+fn decode_windowed_value_spans(
+    runtime: &BundleRuntime,
+    pcol_id: &str,
+    coder_id: &str,
+    bytes: &[u8],
+) -> anyhow::Result<Vec<SdfInputSpan>> {
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let element_coder =
+        StandardBeamCoders::from_urn(coder_id, None, Some(runtime.pipeline_coders().as_ref()));
+    let window_coder = runtime.window_coder_for_pcollection(pcol_id);
+    let windowed_value_coder = WindowedValueCoder::with_window_coder(element_coder, window_coder);
+
+    let mut cursor = Cursor::new(bytes);
+    let mut spans = Vec::new();
+    while (cursor.position() as usize) < bytes.len() {
+        let start = cursor.position() as usize;
+        let decoded = catch_unwind(AssertUnwindSafe(|| {
+            windowed_value_coder.decode(&mut cursor)
+        }));
+        match decoded {
+            Ok(Ok(value)) => spans.push(SdfInputSpan {
+                start,
+                end: cursor.position() as usize,
+                timestamp_millis: value.timestamp_millis,
+            }),
+            Ok(Err(err)) => {
+                return Err(anyhow!("failed to decode SDF input element: {:?}", err));
+            }
+            Err(_) => return Err(anyhow!("panic while decoding SDF input element")),
+        }
+    }
+
+    Ok(spans)
+}
+
 /// Read progress and if bundle looks stalled, ask the SDK to split it.
 #[allow(clippy::too_many_arguments)]
 async fn poll_progress_and_maybe_split(
@@ -618,7 +618,11 @@ async fn poll_progress_and_maybe_split(
     input_transform_id: &str,
     monitor: &mut SplitMonitor,
     input_bytes: &[u8],
-    input_spans: &[(usize, usize)],
+    runtime: &BundleRuntime,
+    input_pcol_id: &str,
+    input_coder_id: &str,
+    input_spans: &mut Option<Vec<SdfInputSpan>>,
+    splittable_stage: &SplittableStage,
     split_residual_roots: &mut Vec<DelayedBundleApplication>,
     channel_items: &mut Vec<SdfWorkItem>,
 ) -> anyhow::Result<()> {
@@ -630,12 +634,30 @@ async fn poll_progress_and_maybe_split(
     let (index, total_count) = extract_progress_metrics(&progress);
 
     let slow = monitor.prev_index == index && monitor.prev_total_count == total_count;
-    let should_try_split = slow && monitor.unsplit && monitor.estimated_input_elements > 0;
+    let should_try_split = slow && monitor.can_split && monitor.estimated_input_elements > 0;
     if !should_try_split {
         monitor.prev_index = index;
         monitor.prev_total_count = total_count;
         return Ok(());
     }
+
+    if input_spans.is_none() {
+        let spans =
+            decode_windowed_value_spans(runtime, input_pcol_id, input_coder_id, input_bytes)
+                .unwrap_or_else(|err| {
+                    warn!(
+                        "failed to decode SDF process input for counting/split ({}); \
+                    whole-element split re-injection disabled for this bundle",
+                        err
+                    );
+                    Vec::new()
+                });
+        if !spans.is_empty() {
+            monitor.estimated_input_elements = spans.len() as i64;
+        }
+        *input_spans = Some(spans);
+    }
+    let input_spans = input_spans.as_deref().unwrap_or_default();
 
     let mut desired_splits = HashMap::new();
     desired_splits.insert(
@@ -653,7 +675,7 @@ async fn poll_progress_and_maybe_split(
 
     if split.channel_splits.is_empty() {
         // SDK cannot split (nothing left, or unsupported)
-        monitor.unsplit = false;
+        monitor.can_split = false;
         return Ok(());
     }
 
@@ -668,14 +690,14 @@ async fn poll_progress_and_maybe_split(
             monitor.handed_back_from,
             input_spans,
         ) {
+            let timestamps = channel_item_timestamps(
+                input_spans,
+                monitor.handed_back_from,
+                channel_split.first_residual_element,
+            );
             channel_items.push(SdfWorkItem {
                 seed: input_bytes[start..end].to_vec(),
-                // TODO(SDF event-time): whole-element channel splits carry no SDK
-                // `output_watermarks`, so they impose no output-watermark hold.
-                //  Until this is addressed, a watermark-gated downstream stage may
-                // run before these items complete on event-time pipelines.
-                // Bounded/global-window pipelines (MIN timestamps) are unaffected.
-                holds: Vec::new(),
+                holds: channel_item_holds(splittable_stage, &timestamps),
             });
             monitor.handed_back_from = Some(channel_split.first_residual_element);
             debug_assert!(count > 0);
@@ -759,6 +781,56 @@ fn residual_item_holds(
     holds
 }
 
+/// Extract the event timestamps of the input elements a whole-element channel
+/// split hands back.
+fn channel_item_timestamps(
+    input_spans: &[SdfInputSpan],
+    handed_back_from: Option<i64>,
+    first_residual_element: i64,
+) -> Vec<i64> {
+    let first = first_residual_element as usize;
+    let upper = handed_back_from
+        .map(|value| value as usize)
+        .unwrap_or(input_spans.len());
+
+    if first >= upper {
+        return Vec::new();
+    }
+
+    input_spans[first..upper]
+        .iter()
+        .map(|span| span.timestamp_millis)
+        .collect()
+}
+
+/// Output-watermark holds for whole-element SDF residuals.
+///
+/// Unlike SDK residual roots, channel splits do not carry `output_watermarks`.
+/// The earliest event time of the elements being handed back is therefore used as
+/// the lower bound, and one hold is emitted per boundary output PCollection to
+/// match [`residual_item_holds`]. A hold at or below `MIN_TIMESTAMP` is omitted so
+/// global-window/batch work is not stalled forever.
+fn channel_item_holds(splittable_stage: &SplittableStage, timestamps: &[i64]) -> Vec<Timestamp> {
+    let boundary: HashSet<&str> = splittable_stage
+        .output_pcols()
+        .iter()
+        .map(String::as_str)
+        .collect();
+
+    if boundary.is_empty() {
+        return Vec::new();
+    }
+
+    let Some(min_timestamp) = timestamps.iter().copied().min() else {
+        return Vec::new();
+    };
+    if min_timestamp <= MIN_TIMESTAMP {
+        return Vec::new();
+    }
+
+    boundary.iter().map(|_| min_timestamp).collect()
+}
+
 fn clamp_progress_tick(tick: Duration) -> Duration {
     tick.max(MIN_PROGRESS_TICK).min(MAX_PROGRESS_TICK)
 }
@@ -819,7 +891,7 @@ fn extract_progress_metrics(resp: &ProcessBundleProgressResponse) -> (i64, i64) 
 fn channel_split_range(
     first_residual_element: i64,
     handed_back_from: Option<i64>,
-    input_spans: &[(usize, usize)],
+    input_spans: &[SdfInputSpan],
 ) -> Option<(usize, usize, i64)> {
     let first = first_residual_element as usize;
     let upper = handed_back_from
@@ -827,8 +899,8 @@ fn channel_split_range(
         .unwrap_or(input_spans.len());
 
     if first < upper {
-        let start = input_spans[first].0;
-        let end = input_spans[upper - 1].1;
+        let start = input_spans[first].start;
+        let end = input_spans[upper - 1].end;
         let count = (upper - first) as i64;
         return Some((start, end, count));
     }
@@ -978,6 +1050,59 @@ mod tests {
         assert_eq!(items[1].holds, vec![2_000]);
     }
 
+    #[test]
+    fn channel_item_timestamps_returns_only_the_newly_handed_back_range() {
+        let spans = vec![
+            SdfInputSpan {
+                start: 0,
+                end: 2,
+                timestamp_millis: 10,
+            },
+            SdfInputSpan {
+                start: 2,
+                end: 4,
+                timestamp_millis: 20,
+            },
+            SdfInputSpan {
+                start: 4,
+                end: 6,
+                timestamp_millis: 30,
+            },
+            SdfInputSpan {
+                start: 6,
+                end: 8,
+                timestamp_millis: 40,
+            },
+        ];
+
+        assert_eq!(channel_item_timestamps(&spans, None, 2), vec![30, 40]);
+        assert_eq!(channel_item_timestamps(&spans, Some(3), 1), vec![20, 30]);
+        assert!(channel_item_timestamps(&spans, Some(2), 2).is_empty());
+    }
+
+    #[test]
+    fn channel_item_holds_uses_the_earliest_timestamp_per_boundary_output() {
+        let stage = splittable_stage(
+            &["pcol-a", "pcol-b"],
+            "process",
+            &[("a", "pcol-a"), ("b", "pcol-b")],
+        );
+
+        let mut holds = channel_item_holds(&stage, &[5_000, 2_000, 4_000]);
+        holds.sort_unstable();
+        assert_eq!(holds, vec![2_000, 2_000]);
+    }
+
+    #[test]
+    fn channel_item_holds_skips_empty_min_or_non_boundary_timestamps() {
+        let stage = splittable_stage(&["pcol-out"], "process", &[("out", "pcol-out")]);
+        assert!(channel_item_holds(&stage, &[]).is_empty());
+        assert!(channel_item_holds(&stage, &[MIN_TIMESTAMP, 1_000]).is_empty());
+
+        let no_output = splittable_stage(&[], "process", &[]);
+        assert!(channel_item_holds(&no_output, &[1_000]).is_empty());
+    }
+
     /// Encode a signed varint the way the SDK encodes metric payloads.
     fn varint_payload(value: i64) -> Vec<u8> {
         let mut buf = bytes::BytesMut::new();
@@ -994,8 +1119,14 @@ mod tests {
     }
 
     /// Back-to-back 2-byte elements: element `i` occupies `[2i, 2i + 2)`.
-    fn spans(n: usize) -> Vec<(usize, usize)> {
-        (0..n).map(|i| (2 * i, 2 * i + 2)).collect()
+    fn spans(n: usize) -> Vec<SdfInputSpan> {
+        (0..n)
+            .map(|i| SdfInputSpan {
+                start: 2 * i,
+                end: 2 * i + 2,
+                timestamp_millis: 0,
+            })
+            .collect()
     }
 
     #[test]
@@ -1073,7 +1204,7 @@ mod tests {
         assert_eq!(monitor.estimated_input_elements, 7);
         assert_eq!(monitor.prev_index, -2);
         assert_eq!(monitor.prev_total_count, -2);
-        assert!(monitor.unsplit);
+        assert!(monitor.can_split);
         assert!(!monitor.ticked);
         assert_eq!(monitor.handed_back_from, None);
 
