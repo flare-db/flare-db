@@ -53,6 +53,17 @@ cargo build -p flaredb
 ./flareup-dev.sh --debug
 ```
 
+note:
+
+./flareup-dev.sh                         # debug build, flaredb=debug,info
+./flareup-dev.sh --log-level info        # debug build, info
+./flareup-dev.sh --debug --log-level info
+./flareup-dev.sh --release --log-level debug
+./flareup-dev.sh --log-level trace       # flaredb=trace,info
+./flareup-dev.sh --log-level 'flaredb=debug,slatedb=warn'
+./flareup-dev.sh --help
+
+
 Then, from another terminal, submit a pipeline:
 
 ```sh

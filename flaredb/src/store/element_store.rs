@@ -18,6 +18,7 @@ use tokio_stream::StreamExt;
 use crate::{
     coders::primitives::{BeamWindow, PaneInfo, PaneTiming, WindowedValue},
     engine::kv::{KvStore, SlateKvStore},
+    engine::watermark::MIN_TIMESTAMP,
     store::record::{
         BeamRecord, RecordTableSchema, WindowMetadata, arrow_fields_to_paimon,
         beamrecords_to_record_batch, derive_table_schema, materialize_void_columns,
@@ -138,6 +139,12 @@ impl FlareElementStore {
     ///
     /// The table schema is derived from the first batch written to a PCollection
     /// and cached in the registry.
+    ///
+    /// These records carry no event-time metadata, so their commit minimum is
+    /// [`MIN_TIMESTAMP`] (the global window's lower bound). Recording that is
+    /// what keeps a consumer's input watermark clamped until it has consumed the
+    /// input: without it, a consumer's `pending_min` stays at `+inf` and it can
+    /// believe its source is finished before it has processed anything.
     pub async fn write_beamrecord_batch(&self, req: NewCollectionRequest) -> Result<()> {
         let logical_schema = derive_table_schema(&req.pcollection_id, &req.elements)?;
         let batch = beamrecords_to_record_batch(&req.elements, &logical_schema)?;
@@ -150,7 +157,9 @@ impl FlareElementStore {
         self.registry
             .register_if_absent(&req.pcollection_id, table_schema.clone());
         self.ingest_batch(&req.pcollection_id, table_schema, batch)
-            .await
+            .await?;
+        self.record_commit_min_ts(&req.pcollection_id, MIN_TIMESTAMP);
+        Ok(())
     }
 
     /// Persists decoded [`WindowedValue`]s, writing each element's logical payload
@@ -1486,6 +1495,29 @@ mod element_store_tests {
             .unwrap();
 
         assert_eq!(extract_ints(&scanned), vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn write_beamrecord_batch_records_the_minimum_event_time() {
+        // Runner-native sources such as Impulse write records without event-time
+        // metadata. Their commit minimum must be MIN_TIMESTAMP so a consumer's
+        // input watermark is clamped until it consumes the input, instead of the
+        // consumer seeing `+inf` and evaluating windows before the data exists.
+        let (_dir, store) = make_store().await;
+        store
+            .write_beamrecord_batch(NewCollectionRequest {
+                pcollection_id: "pc-untimed".to_string(),
+                elements: vec![int_primitive(1)],
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.take_commit_min_timestamp("pc-untimed"),
+            Some(crate::engine::watermark::MIN_TIMESTAMP)
+        );
+        // Taking it clears the running minimum.
+        assert_eq!(store.take_commit_min_timestamp("pc-untimed"), None);
     }
 
     #[tokio::test]

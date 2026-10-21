@@ -11,7 +11,7 @@ use beam_model_rs::v1::{
     BundleApplication, DelayedBundleApplication, ProcessBundleProgressResponse,
     ProcessBundleResponse,
 };
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 
 use crate::coders::primitives::{VarIntCoder, WindowedValueCoder};
 use crate::coders::{BeamCoder, StandardBeamCoders};
@@ -760,6 +760,12 @@ async fn poll_progress_and_maybe_split(
             continue;
         }
 
+        debug!(
+            "SDF channel split: first_residual_element={}, handed_back_from={:?}, \
+             decoded_input_elements={}",
+            first, monitor.handed_back_from, input_element_count
+        );
+
         if let Some((start, end, count)) =
             channel_split_range(first, monitor.handed_back_from, input_spans)
         {
@@ -823,9 +829,16 @@ fn residual_items(
                 Some(application)
             }
         })
-        .map(|application| SdfWorkItem {
-            seed: application.element.clone(),
-            holds: residual_item_holds(application, &outputs_by_transform, &boundary),
+        .map(|application| {
+            let holds = residual_item_holds(application, &outputs_by_transform, &boundary);
+            debug!(
+                "SDF residual root: transform='{}', output_watermarks={:?}, holds={:?}",
+                application.transform_id, application.output_watermarks, holds
+            );
+            SdfWorkItem {
+                seed: application.element.clone(),
+                holds,
+            }
         })
         .collect()
 }
@@ -907,16 +920,34 @@ fn channel_item_holds(splittable_stage: &SplittableStage, timestamps: &[i64]) ->
         .collect();
 
     if boundary.is_empty() {
+        debug!(
+            "SDF channel item: no boundary output PCollections; timestamps={:?}; no hold",
+            timestamps
+        );
         return Vec::new();
     }
 
     let Some(min_timestamp) = timestamps.iter().copied().min() else {
+        debug!(
+            "SDF channel item: no timestamps; boundary_outputs={}; no hold",
+            boundary.len()
+        );
         return Vec::new();
     };
     if min_timestamp <= MIN_TIMESTAMP {
+        debug!(
+            "SDF channel item: min timestamp {} <= MIN_TIMESTAMP; timestamps={:?}; no hold",
+            min_timestamp, timestamps
+        );
         return Vec::new();
     }
 
+    debug!(
+        "SDF channel item: hold={} for {} boundary output(s); timestamps={:?}",
+        min_timestamp,
+        boundary.len(),
+        timestamps
+    );
     boundary.iter().map(|_| min_timestamp).collect()
 }
 

@@ -222,7 +222,7 @@ impl ExecutorDispatcher {
                 // windowed aggregation to decide which windows are ready.
                 let input_watermark = scheduler
                     .watermarks()
-                    .input_watermark(&stage_id)
+                    .bundle_input_watermark(&stage_id)
                     .unwrap_or(MIN_TIMESTAMP);
 
                 // A splittable stage runs one bundle per queued work item. Take
@@ -386,6 +386,11 @@ impl ExecutorDispatcher {
                     scheduler
                         .watermarks_mut()
                         .set_residual_holds(&residual_holds);
+                    log::debug!(
+                        "SDF stage '{}' residual holds after split: {:?}",
+                        stage_id,
+                        residual_holds.get(&stage_id)
+                    );
                     if count > 0 {
                         scheduler
                             .watermarks_mut()

@@ -299,12 +299,13 @@ impl StageState {
         // unconsumed upstream output (push-wake), or — for a watermark-gated
         // stage — when its input watermark has advanced past the watermark at its
         // last run.
+        let effective_input = self.input.min(self.pending_min);
         let has_work = if self.completed {
             self.rerun_pending
                 || self.queued > 0
                 || !self.pending.is_empty()
                 || (self.kind == StageKind::WatermarkGated
-                    && self.input > self.watermark_at_last_run)
+                    && effective_input > self.watermark_at_last_run)
         } else {
             true
         };
@@ -618,6 +619,18 @@ impl WatermarkManager {
         self.stages.get(stage).map(|stage| stage.input)
     }
 
+    /// The effective input watermark captured when the stage's current (or most
+    /// recent) wave of bundles started.
+    ///
+    /// This is the watermark a bundle should use to decide which windows are
+    /// ready: it is clamped by the oldest unconsumed input, so the bundle cannot
+    /// fire past data it has not processed yet.
+    pub fn bundle_input_watermark(&self, stage: &str) -> Option<Timestamp> {
+        self.stages
+            .get(stage)
+            .map(|stage| stage.watermark_at_last_run)
+    }
+
     /// The stage's input watermark clamped by the minimum event-time of its
     /// pending (unconsumed) input, or `None` if the stage is unknown.
     ///
@@ -783,11 +796,14 @@ impl WatermarkManager {
         // Anything a producer appends while a bundle is in flight re-populates
         // `pending` and re-arms the stage for another run.
         if stage_state.in_flight == 1 {
+            // Capture the effective input watermark (clamped by unconsumed input)
+            // before the pending input is consumed. A bundle must not fire windows
+            // past the oldest input it is about to process, and this is the value
+            // that re-arms a watermark-gated stage when the clamp is released.
+            let effective_input = stage_state.input.min(stage_state.pending_min);
             stage_state.pending.clear();
             stage_state.pending_min = MAX_TIMESTAMP;
-            // Remember the watermark this wave ran at, so a later advance re-arms
-            // a watermark-gated stage.
-            stage_state.watermark_at_last_run = stage_state.input;
+            stage_state.watermark_at_last_run = effective_input;
         }
         Ok(())
     }
