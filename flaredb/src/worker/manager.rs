@@ -254,12 +254,44 @@ impl WorkerManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn advertises_multimap_keys_values_protocol() {
         assert_eq!(
             runner_capabilities(),
             "beam:protocol:multimap_keys_values_side_input:v1"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_worker_reaps_the_harness_process() {
+        let manager = WorkerManager::new(WorkerLaunchConfig {
+            worker_jar: String::new(),
+            logs_dir: String::new(),
+            control_url: String::new(),
+            pipeline_options: "{}".to_string(),
+            connect_timeout_secs: 1,
+            python_bin: None,
+        });
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 60")
+            .spawn()
+            .expect("spawn test worker");
+        let pid = child.id().expect("test worker pid");
+        manager
+            .active_workers
+            .insert("job-with-broken-stream".to_string(), child);
+
+        assert!(Path::new(&format!("/proc/{pid}")).exists());
+        manager
+            .stop_worker("job-with-broken-stream")
+            .await
+            .expect("stop worker");
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "worker process {pid} remained after cleanup"
         );
     }
 }

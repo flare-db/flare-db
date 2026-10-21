@@ -15,6 +15,8 @@ use tokio::sync::{
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Response, Status};
 
+use super::HarnessStatus;
+
 /// Shared gRPC channel state for data plane communication with the worker.
 /// Holds outgoing (Flare → worker) and incoming (worker → Flare) element streams.
 pub struct DataInner {
@@ -36,7 +38,9 @@ impl DataInner {
     }
 }
 
-pub async fn start_data_server() -> Result<(DataChannel, FlareDataService), anyhow::Error> {
+pub async fn start_data_server(
+    status: HarnessStatus,
+) -> Result<(DataChannel, FlareDataService), anyhow::Error> {
     let (tx, rx) = mpsc::channel::<Result<Elements, Status>>(32);
 
     let stream = Arc::new(DataInner {
@@ -53,6 +57,7 @@ pub async fn start_data_server() -> Result<(DataChannel, FlareDataService), anyh
         worker_stream: stream,
         runner_stream: Arc::new(ElementStreamMultiplexer::new()),
         stream_task: Arc::new(std::sync::Mutex::new(None)),
+        status,
     };
     Ok((channel, service))
 }
@@ -122,6 +127,7 @@ pub struct DataChannel {
     /// Handle to the background dispatcher task.
     /// Aborted on reset to prevent stale task from consuming new worker stream.
     stream_task: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    status: HarnessStatus,
 }
 
 impl DataChannel {
@@ -164,6 +170,7 @@ impl DataChannel {
         let worker_data_stream = self.worker_stream.clone();
         let runner_stream = self.runner_stream.clone();
         let task_slot = self.stream_task.clone();
+        let status = self.status.clone();
         info!("Streaming elements from worker");
 
         let join_handle = tokio::spawn(async move {
@@ -189,17 +196,37 @@ impl DataChannel {
                             route_elements(elements, &runner_stream);
                         }
                         Ok(None) => {
-                            info!("BeamFnData stream from worker closed cleanly");
+                            if status.is_intentional_shutdown() {
+                                debug!(
+                                    "BeamFnData stream closed during intentional worker shutdown"
+                                );
+                            } else {
+                                warn!("BeamFnData stream closed before the job completed");
+                                status.report_failure(
+                                    "BeamFnData",
+                                    "worker closed the stream cleanly",
+                                );
+                            }
                             break;
                         }
                         Err(e) => {
-                            warn!("BeamFnData stream error (worker gone?): {}", e);
+                            if status.is_intentional_shutdown() {
+                                debug!(
+                                    "BeamFnData stream closed during intentional worker shutdown: {}",
+                                    e
+                                );
+                            } else {
+                                warn!("BeamFnData stream error (worker gone?): {}", e);
+                                status.report_failure("BeamFnData", &e);
+                            }
                             break;
                         }
                     }
                 }
 
-                info!("BeamFnData stream from worker closed");
+                if status.is_intentional_shutdown() {
+                    debug!("BeamFnData stream from worker closed");
+                }
                 break;
             }
         });
@@ -427,7 +454,9 @@ mod tests {
 
     #[tokio::test]
     async fn timer_chunks_route_to_their_instruction_transform_and_family() {
-        let (channel, _service) = start_data_server().await.expect("start data server");
+        let (channel, _service) = start_data_server(HarnessStatus::new())
+            .await
+            .expect("start data server");
         let receiver = channel.get_timer_receiver(timers_key("instr", "transform", "flush"));
 
         route_elements(
@@ -461,7 +490,9 @@ mod tests {
 
     #[tokio::test]
     async fn timer_routing_is_keyed_by_the_full_identity() {
-        let (channel, _service) = start_data_server().await.expect("start data server");
+        let (channel, _service) = start_data_server(HarnessStatus::new())
+            .await
+            .expect("start data server");
         let receiver = channel.get_timer_receiver(timers_key("instr", "t", "flush"));
 
         // Same instruction and transform, different timer family: the chunk must
@@ -486,7 +517,9 @@ mod tests {
 
     #[tokio::test]
     async fn data_and_timers_in_one_message_route_independently() {
-        let (channel, _service) = start_data_server().await.expect("start data server");
+        let (channel, _service) = start_data_server(HarnessStatus::new())
+            .await
+            .expect("start data server");
         let data_key = DataKey {
             instruction_id: "instr".to_string(),
             transform_id: "sink".to_string(),
@@ -530,7 +563,10 @@ mod tests {
         const LIMIT: usize = 16 * 1024 * 1024;
         const PAYLOAD_LEN: usize = 10 * 1024 * 1024;
 
-        let (channel, service) = start_data_server().await.expect("start data server");
+        let status = HarnessStatus::new();
+        let (channel, service) = start_data_server(status.clone())
+            .await
+            .expect("start data server");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind test server");
@@ -613,9 +649,14 @@ mod tests {
             .expect("large response message");
         assert_eq!(response.data[0].data, response_data);
 
+        drop(request_tx);
+        let failure = tokio::time::timeout(Duration::from_secs(5), status.wait_for_failure())
+            .await
+            .expect("unexpected data stream close reported before timeout");
+        assert!(failure.contains("BeamFnData"), "failure was: {failure}");
+
         drop(response_stream);
         drop(client);
-        drop(request_tx);
         shutdown_tx.send(()).expect("request server shutdown");
         tokio::time::timeout(Duration::from_secs(5), server_task)
             .await

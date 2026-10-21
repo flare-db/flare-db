@@ -6,7 +6,7 @@ use crate::{
     engine::timer::{TimerEntry, build_timer_store},
     engine::{
         executor::StageExecutor,
-        harness::{Channels, control::ControlResponse, state::SideInputRegistry},
+        harness::{Channels, HarnessStatus, control::ControlResponse, state::SideInputRegistry},
         runtime::BundleRuntime,
         scheduler::NodeScheduler,
         timer::TimerService,
@@ -132,6 +132,11 @@ impl ExecutorDispatcher {
     /// Wait for the worker to connect its control stream.
     pub async fn wait_connected(&self) -> anyhow::Result<()> {
         self.channels.wait_connected().await
+    }
+
+    /// Job-scoped health signal shared with the Fn API stream handlers.
+    pub fn harness_status(&self) -> HarnessStatus {
+        self.channels.status()
     }
 
     /// Start dispatcher tasks and cache the pipeline coders/components used to
