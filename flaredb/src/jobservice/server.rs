@@ -310,7 +310,8 @@ impl JobService for FlareJobService {
                 );
             }
 
-            self.worker_manager
+            let worker_id = self
+                .worker_manager
                 .spawn_worker(&preparation_id, &runtime, staging_dir, &self.instance_id)
                 .await?;
 
@@ -324,7 +325,7 @@ impl JobService for FlareJobService {
                 .await
                 .harness_status()
                 .begin_intentional_shutdown();
-            let stop_result = self.worker_manager.stop_worker(&preparation_id).await;
+            let stop_result = self.worker_manager.stop_worker(&worker_id).await;
 
             if let Err(error) = run_result {
                 let message = match stop_result {
@@ -466,7 +467,7 @@ impl JobService for FlareJobService {
                 .await
                 .harness_status()
                 .begin_intentional_shutdown();
-            self.worker_manager.stop_worker(&job_id).await?;
+            self.worker_manager.stop_job_workers(&job_id).await?;
             self.set_job_state(&job_id, JobStateEnum::Cancelled);
             Ok(Response::new(CancelJobResponse {
                 state: beam_model_rs::v1::job_state::Enum::Cancelled as i32,

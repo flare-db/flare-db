@@ -36,3 +36,10 @@ __pycache__/
 
 graphify-out
 .codex
+
+test-data/scores2
+
+progress.md
+multiwork-progress.md
+
+docs
