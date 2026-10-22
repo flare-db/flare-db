@@ -1,5 +1,5 @@
 use crate::engine::metrics::JobMetrics;
-use crate::engine::sdf::{SdfBundleOutcome, SdfWorkItem, SplittableStageExecutor};
+use crate::engine::sdf::{SdfBundleOutcome, SdfWorkItem, SplitManager, SplittableStageExecutor};
 use crate::transforms::SourceProgress;
 use crate::worker::pool::{WorkerKind, WorkerPool};
 use crate::{
@@ -20,7 +20,7 @@ use beam_model_rs::v1::{Coder, Components};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -225,6 +225,7 @@ impl ExecutorDispatcher {
     pub async fn run_pipeline(&mut self, scheduler: &mut NodeScheduler) -> anyhow::Result<()> {
         let mut in_flight = JoinSet::new();
         let sdf_overdecompose = crate::engine::sdf::sdf_overdecompose_from_env();
+        let split_manager = SplitManager::from_env(self.pool.clone());
         // Timers to deliver the next time each re-armed stage runs.
         let mut pending_timers: HashMap<String, Vec<TimerEntry>> = HashMap::new();
         // Pending residual work items per splittable stage, and the union of the
@@ -251,6 +252,17 @@ impl ExecutorDispatcher {
                 .watermarks_mut()
                 .set_residual_holds(&residual_holds);
 
+            if let Some(pool) = &self.pool {
+                let snapshot = pool.snapshot();
+                split_manager.set_pool_state(
+                    snapshot.idle,
+                    snapshot.max_workers,
+                    snapshot
+                        .spawn_cost_ms
+                        .and_then(|millis| u64::try_from(millis).ok())
+                        .map(Duration::from_millis),
+                );
+            }
             let nodes = scheduler.next_nodes();
             if let Some(pool) = &self.pool {
                 pool.observe_workload(scheduler.outstanding_bundle_count());
@@ -279,6 +291,10 @@ impl ExecutorDispatcher {
                         } else {
                             None
                         };
+                        if let Some(permit_id) = seed.as_ref().and_then(|item| item.permit_id) {
+                            split_manager.note_item_picked(permit_id);
+                        }
+                        split_manager.set_queue_depth(&stage_id, queue.items.len());
                         log::info!(
                             "SDF stage '{stage_id}': starting bundle, initialized={initialized}, \
                              queue_depth={}, in_flight={}, seed_bytes={}",
@@ -302,17 +318,27 @@ impl ExecutorDispatcher {
                 let pipeline_components = self.pipeline_components.clone();
                 let timer_service = self.timer_service.clone();
                 let source_reports = self.source_reports_tx.clone();
+                let split_manager = Arc::clone(&split_manager);
                 in_flight.spawn(async move {
-                    if matches!(&node, ExecutableNode::Runner(_)) {
-                        if let Err(error) = pool.shrink_to(pool.min_workers()).await {
-                            return (idx, Err(error), StageRun::Plain);
-                        }
+                    if matches!(&node, ExecutableNode::Runner(_))
+                        && let Err(error) = pool.shrink_to(pool.min_workers()).await
+                    {
+                        return (idx, Err(error), StageRun::Plain);
                     }
                     let lease = match pool.acquire(WorkerKind::Cpu).await {
                         Ok(lease) => lease,
                         Err(error) => return (idx, Err(error), StageRun::Plain),
                     };
                     let worker_id = lease.id().clone();
+                    let snapshot = pool.snapshot();
+                    split_manager.set_pool_state(
+                        snapshot.idle,
+                        snapshot.max_workers,
+                        snapshot
+                            .spawn_cost_ms
+                            .and_then(|millis| u64::try_from(millis).ok())
+                            .map(Duration::from_millis),
+                    );
                     let worker = lease.worker();
                     let runtime = BundleRuntime::new(
                         worker,
@@ -329,6 +355,10 @@ impl ExecutorDispatcher {
                             .insert((worker_id.as_str().to_string(), descriptor_id.to_string()))
                     };
                     if let ExecutableNode::Splittable(stage) = node {
+                        let split_depth =
+                            sdf_seed.as_ref().map(|item| item.split_depth).unwrap_or(0);
+                        let split_bundle_id =
+                            split_manager.register_bundle(&stage_id, split_depth, Instant::now());
                         if !sdf_initialized {
                             mark_registration(&stage.plan().initialization_stage.id());
                         }
@@ -345,6 +375,9 @@ impl ExecutorDispatcher {
                                 sdf_progress_tick,
                                 max_workers,
                                 sdf_overdecompose,
+                                Arc::clone(&split_manager),
+                                split_bundle_id,
+                                split_depth,
                                 immediate_sdf_tx,
                             )
                             .await
@@ -355,6 +388,7 @@ impl ExecutorDispatcher {
                             ),
                             Err(err) => (Err(err), StageRun::Plain),
                         };
+                        split_manager.finish_bundle(split_bundle_id);
                         if run.0.is_ok() {
                             pool.record_bundle_complete(&worker_id);
                         }

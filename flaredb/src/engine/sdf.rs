@@ -5,6 +5,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use std::{
     ops::Range,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -24,6 +25,7 @@ use crate::engine::harness::control::ControlChannel;
 use crate::fusion::stage::SplittableProcessKind;
 use crate::jobservice::urns::beam_urns;
 use crate::store::record::{BeamRecord, PrimitiveValue};
+use crate::worker::pool::WorkerPool;
 use crate::{
     engine::{
         harness::{
@@ -42,36 +44,46 @@ use crate::{
     },
 };
 
-/// The minimum duration between two consecutive `progress + split_evaluation` runs.
-const MIN_PROGRESS_TICK: Duration = Duration::from_millis(100);
-/// The maximum duration between two consecutive `progress + split_evaluation` runs.
-const MAX_PROGRESS_TICK: Duration = Duration::from_secs(30);
+/// Default duration between progress polls.
+const DEFAULT_PROGRESS_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// Default fraction of remaining work the SDK keeps after a split.
 const DEFAULT_SPLIT_FRACTION_OF_REMAINDER: f64 = 0.5;
-/// Default elapsed time after which a still-progressing bundle is split.
-const DEFAULT_SPLIT_AFTER: Duration = Duration::from_secs(2);
-/// Default no-progress window before the fallback stall detector asks to split.
-///
-/// SDK output counters can be buffered for seconds, so this is intentionally
-/// longer than the time-based trigger. SDK work-progress metrics take precedence
-/// whenever the harness reports them.
+/// Default per-bundle cooldown after a successful split.
+const DEFAULT_SPLIT_COOLDOWN: Duration = Duration::from_secs(2);
+/// Default minimum estimated remaining duration before a split is useful.
+const DEFAULT_MIN_SPLIT: Duration = Duration::from_secs(10);
+/// Spawn cost multiplier used for the default minimum split duration.
+const SPAWN_COST_MULTIPLIER: u32 = 3;
+/// Default no-progress window for the capacity-gated stall fallback.
 const DEFAULT_STALL_AFTER: Duration = Duration::from_secs(5);
+/// Default maximum recursive split depth.
+const DEFAULT_MAX_SPLIT_DEPTH: usize = 4;
+/// Stop creating new bundles after this many per configured worker.
+const MAX_BUNDLES_PER_WORKER: usize = 8;
 /// Default number of initial SDF partitions per configured worker.
 const DEFAULT_SDF_OVERDECOMPOSE: usize = 4;
+/// Minimum duration between estimator rate samples.
+const ESTIMATOR_RATE_WINDOW: Duration = Duration::from_millis(500);
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct SdfSplitConfig {
-    split_after: Duration,
+    progress_poll_interval: Duration,
     stall_after: Duration,
+    cooldown: Duration,
+    min_split_override: Option<Duration>,
     fraction_of_remainder: f64,
+    max_depth: usize,
 }
 
 impl Default for SdfSplitConfig {
     fn default() -> Self {
         Self {
-            split_after: DEFAULT_SPLIT_AFTER,
+            progress_poll_interval: DEFAULT_PROGRESS_POLL_INTERVAL,
             stall_after: DEFAULT_STALL_AFTER,
+            cooldown: DEFAULT_SPLIT_COOLDOWN,
+            min_split_override: None,
             fraction_of_remainder: DEFAULT_SPLIT_FRACTION_OF_REMAINDER,
+            max_depth: DEFAULT_MAX_SPLIT_DEPTH,
         }
     }
 }
@@ -79,19 +91,30 @@ impl Default for SdfSplitConfig {
 impl SdfSplitConfig {
     fn from_env() -> Self {
         let defaults = Self::default();
+        let min_split_override = std::env::var("FLAREDB_SDF_MIN_SPLIT_SECS")
+            .ok()
+            .and_then(|value| value.trim().parse::<f64>().ok())
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .map(Duration::from_secs_f64);
         Self {
-            split_after: duration_from_seconds_env(
-                "FLAREDB_SDF_SPLIT_AFTER_SECS",
-                defaults.split_after,
+            progress_poll_interval: duration_from_seconds_env(
+                "FLAREDB_SDF_PROGRESS_POLL_SECS",
+                defaults.progress_poll_interval,
             ),
             stall_after: duration_from_seconds_env(
                 "FLAREDB_SDF_STALL_AFTER_SECS",
                 defaults.stall_after,
             ),
+            cooldown: duration_from_seconds_env(
+                "FLAREDB_SDF_SPLIT_COOLDOWN_SECS",
+                defaults.cooldown,
+            ),
+            min_split_override,
             fraction_of_remainder: split_fraction_from_env(
                 "FLAREDB_SDF_SPLIT_FRACTION",
                 defaults.fraction_of_remainder,
             ),
+            max_depth: positive_usize_from_env("FLAREDB_SDF_MAX_SPLIT_DEPTH", defaults.max_depth),
         }
     }
 }
@@ -107,8 +130,13 @@ pub struct SdfWorkItem {
     pub seed: Vec<u8>,
     pub holds: Vec<Timestamp>,
     /// SDK-reported SplitAndSize work estimate, when available. This is used to
-    /// order initial partitions and will feed the Stage 7 progress estimator.
+    /// order initial partitions and feed the progress estimator.
     pub estimated_size: Option<f64>,
+    /// Number of recursive splits that produced this item.
+    pub split_depth: usize,
+    /// Split-manager permit reservation that stays filled until this item is
+    /// picked up by the dispatcher.
+    pub permit_id: Option<u64>,
 }
 
 /// A split residual routed to the dispatcher while its parent bundle is still
@@ -140,77 +168,6 @@ pub struct SdfBundleOutcome {
     pub progress_tick: Duration,
 }
 
-/// `Progress + split_evaluation` state for a single running bundle.
-struct SplitMonitor {
-    /// `beam:metric:data_channel:read_index:v1` at the previous tick,
-    prev_index: i64,
-    /// Sum of `beam:metric:element_count:v1` across every fused transform
-    /// output at the previous tick.
-    prev_output_element_count_sum: i64,
-    /// SDK-reported completion fraction for the active element.
-    prev_work_completed: Option<f32>,
-    /// SDK-reported remaining fraction for the active element.
-    prev_work_remaining: Option<f32>,
-    /// Whether splitting is still allowed for this bundle;
-    /// cleared once the SDK declines a split or progress polling fails.
-    can_split: bool,
-    /// Upper bound on remaining work.
-    estimated_input_elements: i64,
-    /// Duration between two consecutive `progress + split_evaluation` runs, for this bundle.
-    tick: Duration,
-    /// Lowest whole input element index already handed back as a residual.
-    handed_back_from: Option<i64>,
-    /// Whether at least one `progress + split_evaluation` run has happened for this bundle.
-    ticked: bool,
-    /// Number of progress polls made for this bundle.
-    polls: u64,
-    /// Number of `ProcessBundleSplit` requests sent for this bundle.
-    split_requests: u64,
-    /// Number of split responses that actually produced new work items.
-    splits: u64,
-    /// Wall-clock start used by the progress/time-based split policy.
-    started: Instant,
-    /// Most recent successful split, used to rate-limit time-based splits.
-    last_split: Option<Instant>,
-    config: SdfSplitConfig,
-}
-
-impl SplitMonitor {
-    #[cfg(test)]
-    fn new(estimated_input_elements: i64, progress_tick: Option<Duration>) -> Self {
-        Self::with_config(
-            estimated_input_elements,
-            progress_tick,
-            SdfSplitConfig::default(),
-        )
-    }
-
-    fn with_config(
-        estimated_input_elements: i64,
-        progress_tick: Option<Duration>,
-        config: SdfSplitConfig,
-    ) -> Self {
-        Self {
-            // Starts at -2 so the first tick only record numbers.
-            prev_index: -2,
-            prev_output_element_count_sum: -2,
-            prev_work_completed: None,
-            prev_work_remaining: None,
-            can_split: true,
-            estimated_input_elements,
-            tick: clamp_progress_tick(progress_tick.unwrap_or(MIN_PROGRESS_TICK)),
-            handed_back_from: None,
-            ticked: false,
-            polls: 0,
-            split_requests: 0,
-            splits: 0,
-            started: Instant::now(),
-            last_split: None,
-            config,
-        }
-    }
-}
-
 /// A snapshot of one `ProcessBundleProgressResponse`.
 ///
 /// `read_index` is the input-element index of the SDK data-channel processor. It
@@ -227,95 +184,499 @@ struct ProgressMetrics {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SplitDecision {
-    Poll,
-    SkipDisabled,
-    SkipNoInput,
-    SkipNoRemainingWork,
-    WaitForProgress,
-    RequestTime,
-    RequestStall,
+enum ProgressEstimatorMode {
+    Weighted,
+    Coarse,
+    None,
 }
 
-impl SplitDecision {
-    fn action(self) -> &'static str {
+impl ProgressEstimatorMode {
+    fn as_str(self) -> &'static str {
         match self {
-            Self::Poll => "poll",
-            Self::SkipDisabled => "skip-splitting-disabled",
-            Self::SkipNoInput => "skip-no-input-elements",
-            Self::SkipNoRemainingWork => "skip-no-remaining-work",
-            Self::WaitForProgress => "wait-for-progress",
-            Self::RequestTime => "request-split-time",
-            Self::RequestStall => "request-split-stall",
+            Self::Weighted => "weighted",
+            Self::Coarse => "coarse",
+            Self::None => "none",
         }
-    }
-
-    fn requests_split(self) -> bool {
-        matches!(self, Self::RequestTime | Self::RequestStall)
     }
 }
 
-impl SplitMonitor {
-    fn decision(&self, metrics: &ProgressMetrics, now: Instant) -> SplitDecision {
-        if !self.can_split {
-            return SplitDecision::SkipDisabled;
+#[derive(Clone, Copy, Debug)]
+struct BundleProgressEstimate {
+    progress: Option<f64>,
+    rate_per_second: Option<f64>,
+    est_remaining: Option<Duration>,
+    mode: ProgressEstimatorMode,
+    changed: bool,
+}
+
+struct BundleSplitRuntime {
+    estimator: ProgressEstimator,
+    handed_back_from: Option<i64>,
+    polls: u64,
+    split_requests: u64,
+    splits: u64,
+    last_denial: Option<SplitDenyReason>,
+}
+
+impl BundleSplitRuntime {
+    fn new(now: Instant) -> Self {
+        Self {
+            estimator: ProgressEstimator::new(now),
+            handed_back_from: None,
+            polls: 0,
+            split_requests: 0,
+            splits: 0,
+            last_denial: None,
         }
-        if self.estimated_input_elements <= 0 {
-            return SplitDecision::SkipNoInput;
+    }
+}
+
+struct ProgressEstimator {
+    rate_window: Option<(Instant, f64)>,
+    rate_per_second: Option<f64>,
+    last_progress: f64,
+    last_progress_at: Instant,
+    last_metrics: Option<(i64, i64, Option<u32>, Option<u32>)>,
+}
+
+impl ProgressEstimator {
+    fn new(now: Instant) -> Self {
+        Self {
+            rate_window: None,
+            rate_per_second: None,
+            last_progress: 0.0,
+            last_progress_at: now,
+            last_metrics: None,
         }
-        if metrics
-            .work_remaining
-            .is_some_and(|remaining| remaining <= 0.0)
-        {
-            return SplitDecision::SkipNoRemainingWork;
+    }
+
+    fn observe(
+        &mut self,
+        metrics: &ProgressMetrics,
+        spans: &[SdfInputSpan],
+        now: Instant,
+    ) -> BundleProgressEstimate {
+        let active_fraction = active_work_fraction(metrics);
+        let (progress, mode) = estimate_progress(metrics.read_index, active_fraction, spans);
+        let metrics_signature = (
+            metrics.read_index,
+            metrics.output_element_count_sum,
+            metrics.work_completed.map(f32::to_bits),
+            metrics.work_remaining.map(f32::to_bits),
+        );
+        let metrics_changed = self.last_metrics != Some(metrics_signature);
+        self.last_metrics = Some(metrics_signature);
+        let progress_changed =
+            progress.is_some_and(|progress| progress > self.last_progress + 1e-9);
+        if progress_changed {
+            self.last_progress = progress.unwrap_or(self.last_progress);
+            self.last_progress_at = now;
         }
 
-        let has_baseline = self.prev_index != -2;
-        if !has_baseline {
-            return SplitDecision::Poll;
-        }
-
-        let counters_changed = metrics.read_index != self.prev_index
-            || metrics.output_element_count_sum != self.prev_output_element_count_sum;
-        let work_changed = !same_float(self.prev_work_completed, metrics.work_completed)
-            || !same_float(self.prev_work_remaining, metrics.work_remaining);
-        let observed_progress = counters_changed || work_changed;
-        let elapsed = now.duration_since(self.started);
-
-        if observed_progress {
-            let time_split_due = match self.last_split {
-                Some(last_split) => now.duration_since(last_split) >= self.config.split_after,
-                None => elapsed >= self.config.split_after,
-            };
-            if time_split_due {
-                SplitDecision::RequestTime
-            } else {
-                SplitDecision::Poll
+        if let Some(progress) = progress {
+            match self.rate_window {
+                Some((sample_at, sample_progress)) => {
+                    let elapsed = now.duration_since(sample_at);
+                    if elapsed >= ESTIMATOR_RATE_WINDOW {
+                        let delta = (progress - sample_progress).max(0.0);
+                        let instantaneous = delta / elapsed.as_secs_f64();
+                        if instantaneous.is_finite() && instantaneous > 0.0 {
+                            self.rate_per_second = Some(match self.rate_per_second {
+                                Some(previous) => previous * 0.7 + instantaneous * 0.3,
+                                None => instantaneous,
+                            });
+                        }
+                        self.rate_window = Some((now, progress));
+                    }
+                }
+                None => self.rate_window = Some((now, progress)),
             }
-        } else if elapsed >= self.config.stall_after {
-            SplitDecision::RequestStall
-        } else {
-            SplitDecision::WaitForProgress
+        }
+
+        let est_remaining = progress.and_then(|progress| {
+            let rate = self.rate_per_second?;
+            if progress >= 1.0 || !rate.is_finite() || rate <= 0.0 {
+                return None;
+            }
+            let seconds = (1.0 - progress) / rate;
+            seconds
+                .is_finite()
+                .then(|| Duration::try_from_secs_f64(seconds.max(0.0)).ok())
+                .flatten()
+        });
+
+        BundleProgressEstimate {
+            progress,
+            rate_per_second: self.rate_per_second,
+            est_remaining,
+            mode,
+            changed: metrics_changed || progress_changed,
         }
     }
 
-    fn record_poll(&mut self, metrics: &ProgressMetrics) {
-        self.prev_index = metrics.read_index;
-        self.prev_output_element_count_sum = metrics.output_element_count_sum;
-        self.prev_work_completed = metrics.work_completed;
-        self.prev_work_remaining = metrics.work_remaining;
-    }
-
-    fn record_split(&mut self, now: Instant) {
-        self.last_split = Some(now);
+    fn reset_after_split(&mut self, progress: Option<f64>, now: Instant) {
+        self.rate_window = None;
+        self.rate_per_second = None;
+        if let Some(progress) = progress {
+            self.last_progress = progress;
+        }
+        self.last_progress_at = now;
     }
 }
 
-fn same_float(left: Option<f32>, right: Option<f32>) -> bool {
-    match (left, right) {
-        (Some(left), Some(right)) => left.to_bits() == right.to_bits(),
-        (None, None) => true,
-        _ => false,
+fn active_work_fraction(metrics: &ProgressMetrics) -> Option<f64> {
+    if metrics
+        .work_remaining
+        .is_some_and(|remaining| remaining <= 0.0)
+    {
+        return Some(1.0);
+    }
+    let completed = f64::from(metrics.work_completed?);
+    let remaining = f64::from(metrics.work_remaining?);
+    let total = completed + remaining;
+    if total.is_finite() && total > 0.0 {
+        let fraction = completed / total;
+        fraction.is_finite().then_some(fraction.clamp(0.0, 1.0))
+    } else {
+        None
+    }
+}
+
+fn estimate_progress(
+    read_index: i64,
+    active_fraction: Option<f64>,
+    spans: &[SdfInputSpan],
+) -> (Option<f64>, ProgressEstimatorMode) {
+    if spans.is_empty() {
+        return (None, ProgressEstimatorMode::None);
+    }
+    let active_index = read_index.max(0) as usize;
+    let completed_elements = active_index.min(spans.len());
+    if completed_elements == spans.len() {
+        return (Some(1.0), ProgressEstimatorMode::Coarse);
+    }
+
+    if let Some(active_fraction) = active_fraction
+        && spans.iter().all(|span| {
+            span.size
+                .is_some_and(|size| size.is_finite() && size >= 0.0)
+        })
+    {
+        let total_size: f64 = spans.iter().filter_map(|span| span.size).sum();
+        if total_size.is_finite() && total_size > 0.0 {
+            let completed_size: f64 = spans[..completed_elements]
+                .iter()
+                .filter_map(|span| span.size)
+                .sum();
+            let active_size = spans[completed_elements].size.unwrap_or(0.0);
+            let progress = (completed_size + active_fraction * active_size) / total_size;
+            return (
+                Some(progress.clamp(0.0, 1.0)),
+                ProgressEstimatorMode::Weighted,
+            );
+        }
+    }
+
+    let progress =
+        (completed_elements as f64 + active_fraction.unwrap_or(0.0)) / spans.len() as f64;
+    (
+        Some(progress.clamp(0.0, 1.0)),
+        ProgressEstimatorMode::Coarse,
+    )
+}
+
+struct ManagedBundle {
+    stage: String,
+    depth: usize,
+    progress: Option<f64>,
+    est_remaining: Option<Duration>,
+    last_progress_at: Instant,
+    last_split_at: Option<Instant>,
+    can_split: bool,
+}
+
+#[derive(Default)]
+struct SplitManagerState {
+    bundles: HashMap<u64, ManagedBundle>,
+    permits: HashSet<u64>,
+    filled_permits: HashMap<u64, usize>,
+    queue_depth: HashMap<String, usize>,
+    capacity: usize,
+    max_workers: usize,
+    spawn_cost: Duration,
+    next_bundle_id: u64,
+    total_bundles: usize,
+}
+
+pub struct SplitManager {
+    config: SdfSplitConfig,
+    state: Mutex<SplitManagerState>,
+    pool: Option<Arc<WorkerPool>>,
+}
+
+struct SplitPermit {
+    bundle_id: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SplitDenyReason {
+    Capacity,
+    QueueNotEmpty,
+    BelowMinimum,
+    Cooldown,
+    MaxBundles,
+    MaxDepth,
+    Disabled,
+    AlreadyPermitted,
+    NotTopCandidate,
+}
+
+impl SplitDenyReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Capacity => "no-capacity",
+            Self::QueueNotEmpty => "queue-not-empty",
+            Self::BelowMinimum => "below-min-split",
+            Self::Cooldown => "cooldown",
+            Self::MaxBundles => "max-bundles",
+            Self::MaxDepth => "max-depth",
+            Self::Disabled => "disabled",
+            Self::AlreadyPermitted => "already-permitted",
+            Self::NotTopCandidate => "not-top-candidate",
+        }
+    }
+}
+
+enum SplitPermitDecision {
+    Granted(SplitPermit),
+    Denied(SplitDenyReason),
+}
+
+impl SplitManager {
+    pub fn from_env(pool: Option<Arc<WorkerPool>>) -> Arc<Self> {
+        Arc::new(Self {
+            config: SdfSplitConfig::from_env(),
+            state: Mutex::new(SplitManagerState {
+                next_bundle_id: 1,
+                spawn_cost: Duration::ZERO,
+                ..Default::default()
+            }),
+            pool,
+        })
+    }
+
+    fn refresh_pool_state(&self) {
+        let Some(pool) = &self.pool else {
+            return;
+        };
+        let snapshot = pool.snapshot();
+        self.set_pool_state(
+            snapshot.idle,
+            snapshot.max_workers,
+            snapshot
+                .spawn_cost_ms
+                .and_then(|millis| u64::try_from(millis).ok())
+                .map(Duration::from_millis),
+        );
+    }
+
+    pub fn set_pool_state(
+        &self,
+        capacity: usize,
+        max_workers: usize,
+        spawn_cost: Option<Duration>,
+    ) {
+        let mut state = self.state.lock().expect("split manager lock not poisoned");
+        state.capacity = capacity;
+        state.max_workers = max_workers.max(1);
+        state.spawn_cost = spawn_cost.unwrap_or(Duration::ZERO);
+    }
+
+    pub fn set_queue_depth(&self, stage: &str, depth: usize) {
+        self.state
+            .lock()
+            .expect("split manager lock not poisoned")
+            .queue_depth
+            .insert(stage.to_string(), depth);
+    }
+
+    pub fn register_bundle(&self, stage: &str, depth: usize, now: Instant) -> u64 {
+        let mut state = self.state.lock().expect("split manager lock not poisoned");
+        let bundle_id = state.next_bundle_id;
+        state.next_bundle_id += 1;
+        state.total_bundles += 1;
+        state.bundles.insert(
+            bundle_id,
+            ManagedBundle {
+                stage: stage.to_string(),
+                depth,
+                progress: None,
+                est_remaining: None,
+                last_progress_at: now,
+                last_split_at: None,
+                can_split: true,
+            },
+        );
+        bundle_id
+    }
+
+    pub fn finish_bundle(&self, bundle_id: u64) {
+        let mut state = self.state.lock().expect("split manager lock not poisoned");
+        state.bundles.remove(&bundle_id);
+        if !state.filled_permits.contains_key(&bundle_id) {
+            state.permits.remove(&bundle_id);
+        }
+    }
+
+    fn update_progress(&self, bundle_id: u64, estimate: BundleProgressEstimate, now: Instant) {
+        let mut state = self.state.lock().expect("split manager lock not poisoned");
+        if let Some(bundle) = state.bundles.get_mut(&bundle_id) {
+            bundle.progress = estimate.progress;
+            bundle.est_remaining = estimate.est_remaining;
+            if estimate.changed {
+                bundle.last_progress_at = now;
+            }
+        }
+    }
+
+    fn try_acquire_permit(&self, bundle_id: u64, now: Instant) -> SplitPermitDecision {
+        self.refresh_pool_state();
+        let mut state = self.state.lock().expect("split manager lock not poisoned");
+        let permits_available = state.capacity.saturating_sub(state.permits.len());
+        let Some(bundle) = state.bundles.get(&bundle_id) else {
+            return SplitPermitDecision::Denied(SplitDenyReason::Disabled);
+        };
+        if !bundle.can_split {
+            return SplitPermitDecision::Denied(SplitDenyReason::Disabled);
+        }
+        if state.permits.contains(&bundle_id) {
+            return SplitPermitDecision::Denied(SplitDenyReason::AlreadyPermitted);
+        }
+        if state.total_bundles >= state.max_workers.saturating_mul(MAX_BUNDLES_PER_WORKER) {
+            return SplitPermitDecision::Denied(SplitDenyReason::MaxBundles);
+        }
+        if bundle.depth >= self.config.max_depth {
+            return SplitPermitDecision::Denied(SplitDenyReason::MaxDepth);
+        }
+        if state.queue_depth.get(&bundle.stage).copied().unwrap_or(0) > 0 {
+            return SplitPermitDecision::Denied(SplitDenyReason::QueueNotEmpty);
+        }
+        if bundle
+            .last_split_at
+            .is_some_and(|last| now.duration_since(last) < self.config.cooldown)
+        {
+            return SplitPermitDecision::Denied(SplitDenyReason::Cooldown);
+        }
+        if permits_available == 0 {
+            return SplitPermitDecision::Denied(SplitDenyReason::Capacity);
+        }
+
+        let min_split = self.config.min_split_override.unwrap_or_else(|| {
+            Duration::from_secs_f64(
+                DEFAULT_MIN_SPLIT
+                    .as_secs_f64()
+                    .max(SPAWN_COST_MULTIPLIER as f64 * state.spawn_cost.as_secs_f64()),
+            )
+        });
+        let mut candidates = state
+            .bundles
+            .iter()
+            .filter_map(|(id, bundle)| {
+                if !bundle.can_split
+                    || state.permits.contains(id)
+                    || bundle.depth >= self.config.max_depth
+                    || state.queue_depth.get(&bundle.stage).copied().unwrap_or(0) > 0
+                    || bundle
+                        .last_split_at
+                        .is_some_and(|last| now.duration_since(last) < self.config.cooldown)
+                {
+                    return None;
+                }
+                let stalled =
+                    now.duration_since(bundle.last_progress_at) >= self.config.stall_after;
+                let rank = bundle
+                    .est_remaining
+                    .filter(|remaining| *remaining >= min_split)
+                    .or(stalled.then_some(Duration::MAX))?;
+                Some((*id, rank))
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+        let Some(position) = candidates
+            .iter()
+            .position(|(candidate_id, _)| *candidate_id == bundle_id)
+        else {
+            return SplitPermitDecision::Denied(SplitDenyReason::BelowMinimum);
+        };
+        if position >= permits_available {
+            return SplitPermitDecision::Denied(SplitDenyReason::NotTopCandidate);
+        }
+
+        state.permits.insert(bundle_id);
+        SplitPermitDecision::Granted(SplitPermit { bundle_id })
+    }
+
+    fn complete_permit(
+        &self,
+        permit: SplitPermit,
+        created_items: usize,
+        declined: bool,
+        now: Instant,
+    ) {
+        let mut state = self.state.lock().expect("split manager lock not poisoned");
+        let stage = state
+            .bundles
+            .get(&permit.bundle_id)
+            .map(|bundle| bundle.stage.clone());
+        if let Some(bundle) = state.bundles.get_mut(&permit.bundle_id) {
+            if created_items > 0 {
+                bundle.last_split_at = Some(now);
+                bundle.last_progress_at = now;
+                bundle.progress = None;
+                bundle.est_remaining = None;
+            } else if declined {
+                bundle.can_split = false;
+            }
+        }
+        if let Some(stage) = stage
+            && created_items > 0
+        {
+            let depth = state.queue_depth.get(&stage).copied().unwrap_or(0);
+            state
+                .queue_depth
+                .insert(stage.clone(), depth + created_items);
+            state.filled_permits.insert(permit.bundle_id, created_items);
+        } else {
+            state.permits.remove(&permit.bundle_id);
+        }
+    }
+
+    pub fn note_item_picked(&self, bundle_id: u64) {
+        let mut state = self.state.lock().expect("split manager lock not poisoned");
+        let Some(remaining) = state.filled_permits.get_mut(&bundle_id) else {
+            return;
+        };
+        *remaining = remaining.saturating_sub(1);
+        if *remaining == 0 {
+            state.filled_permits.remove(&bundle_id);
+            state.permits.remove(&bundle_id);
+        }
+    }
+
+    fn disable_bundle(&self, permit: SplitPermit) {
+        let mut state = self.state.lock().expect("split manager lock not poisoned");
+        state.permits.remove(&permit.bundle_id);
+        if let Some(bundle) = state.bundles.get_mut(&permit.bundle_id) {
+            bundle.can_split = false;
+        }
+    }
+
+    fn disable_bundle_id(&self, bundle_id: u64) {
+        let mut state = self.state.lock().expect("split manager lock not poisoned");
+        state.permits.remove(&bundle_id);
+        if let Some(bundle) = state.bundles.get_mut(&bundle_id) {
+            bundle.can_split = false;
+        }
     }
 }
 
@@ -338,6 +699,7 @@ impl SplittableStageExecutor {
     /// residual work items this bundle produced and the holds of the item it
     /// consumed. The caller schedules one bundle per work item and applies the item
     /// holds as output-watermark clamps until the item completes.
+    #[allow(clippy::too_many_arguments)]
     pub async fn execute_bundle(
         &mut self,
         stage: &SplittableStage,
@@ -348,6 +710,9 @@ impl SplittableStageExecutor {
         progress_tick: Option<Duration>,
         max_workers: usize,
         overdecompose: usize,
+        split_manager: Arc<SplitManager>,
+        bundle_id: u64,
+        split_depth: usize,
         immediate_items: SdfWorkItemSender,
     ) -> anyhow::Result<(ProcessBundleResponse, SdfBundleOutcome)> {
         let plan = stage.plan();
@@ -420,7 +785,8 @@ impl SplittableStageExecutor {
                                     initialized: true,
                                     consumed_holds,
                                     items,
-                                    progress_tick: progress_tick.unwrap_or(MIN_PROGRESS_TICK),
+                                    progress_tick: progress_tick
+                                        .unwrap_or(DEFAULT_PROGRESS_POLL_INTERVAL),
                                 },
                             ));
                         }
@@ -456,11 +822,19 @@ impl SplittableStageExecutor {
                 !registered,
                 allow_split,
                 progress_tick,
+                split_manager,
+                bundle_id,
+                split_depth,
                 immediate_items,
             )
             .await?;
 
-        let items = residual_items(stage, &response.residual_roots);
+        let items = residual_items(
+            stage,
+            &response.residual_roots,
+            split_depth.saturating_add(1),
+            None,
+        );
 
         Ok((
             response,
@@ -626,6 +1000,7 @@ impl SplittableStageExecutor {
     /// (`None` for the first). Split residuals are sent through
     /// `immediate_items`; the returned tuple carries the final response and the
     /// progress-poll interval to use after this bundle.
+    #[allow(clippy::too_many_arguments)]
     async fn run_process_stage(
         &mut self,
         stage: &ExecutableStage,
@@ -635,6 +1010,9 @@ impl SplittableStageExecutor {
         register: bool,
         allow_split: bool,
         progress_tick: Option<Duration>,
+        split_manager: Arc<SplitManager>,
+        bundle_id: u64,
+        split_depth: usize,
         immediate_items: SdfWorkItemSender,
     ) -> anyhow::Result<(ProcessBundleResponse, Duration)> {
         let descriptor_id = stage.id().to_string();
@@ -712,15 +1090,20 @@ impl SplittableStageExecutor {
 
         let mut split_residual_roots: Vec<DelayedBundleApplication> = Vec::new();
         let mut channel_items: Vec<SdfWorkItem> = Vec::new();
-        let split_config = SdfSplitConfig::from_env();
         info!(
-            "SDF split policy: split_after_ms={}, stall_after_ms={}, fraction={}",
-            split_config.split_after.as_millis(),
-            split_config.stall_after.as_millis(),
-            split_config.fraction_of_remainder
+            "SDF split policy: min_split_override_ms={:?}, stall_after_ms={}, cooldown_ms={}, \
+             fraction={}, max_depth={}",
+            split_manager
+                .config
+                .min_split_override
+                .map(|value| value.as_millis()),
+            split_manager.config.stall_after.as_millis(),
+            split_manager.config.cooldown.as_millis(),
+            split_manager.config.fraction_of_remainder,
+            split_manager.config.max_depth
         );
-        let mut monitor =
-            SplitMonitor::with_config(estimated_input_elements, progress_tick, split_config);
+        let poll_interval = progress_tick.unwrap_or(split_manager.config.progress_poll_interval);
+        let mut split_runtime = BundleSplitRuntime::new(Instant::now());
         let monitor_enabled = allow_split && estimated_input_elements > 0;
 
         let control_response = {
@@ -728,7 +1111,7 @@ impl SplittableStageExecutor {
                 tokio::pin!(response_future);
 
                 let response = loop {
-                    let ticker = tokio::time::sleep(monitor.tick);
+                    let ticker = tokio::time::sleep(poll_interval);
                     tokio::pin!(ticker);
 
                     tokio::select! {
@@ -739,7 +1122,7 @@ impl SplittableStageExecutor {
                                 &control,
                                 &instruction_id,
                                 &source_transform_id,
-                                &mut monitor,
+                                &mut split_runtime,
                                 &seed,
                                 &input_runtime,
                                 &input_pcol_id,
@@ -748,6 +1131,9 @@ impl SplittableStageExecutor {
                                 splittable_stage,
                                 &mut split_residual_roots,
                                 &mut channel_items,
+                                split_manager.as_ref(),
+                                bundle_id,
+                                split_depth,
                                 &immediate_items,
                             ).await {
                                 // Progress error stops further splitting.
@@ -757,7 +1143,7 @@ impl SplittableStageExecutor {
                                     instruction_id,
                                     err
                                 );
-                                monitor.can_split = false;
+                                split_manager.disable_bundle_id(bundle_id);
                             }
                         }
                     }
@@ -822,20 +1208,19 @@ impl SplittableStageExecutor {
 
         match control_response {
             ControlResponse::ProcessBundleSuccess(response) => {
-                let next_tick = next_shared_tick(monitor.ticked, monitor.tick);
                 info!(
                     "SDF bundle summary: instruction_id={instruction_id}, \
                      estimated_input_elements={estimated_input_elements}, polls={}, \
                      split_requests={}, splits={}, residual_roots={}, channel_items={}, \
-                     next_tick_ms={}",
-                    monitor.polls,
-                    monitor.split_requests,
-                    monitor.splits,
+                     poll_interval_ms={}",
+                    split_runtime.polls,
+                    split_runtime.split_requests,
+                    split_runtime.splits,
                     split_residual_roots.len(),
                     channel_items.len(),
-                    next_tick.as_millis()
+                    poll_interval.as_millis()
                 );
-                Ok((response, next_tick))
+                Ok((response, poll_interval))
             }
             ControlResponse::ProcessBundleError(err) => {
                 Err(anyhow!("SDF process bundle failed: {}", err))
@@ -969,6 +1354,8 @@ fn partitioned_work_items(
                 seed: bytes[start_byte..end_byte].to_vec(),
                 holds: channel_item_holds(stage, &timestamps),
                 estimated_size,
+                split_depth: 0,
+                permit_id: None,
             }
         })
         .collect::<Vec<_>>();
@@ -988,7 +1375,9 @@ fn partition_span_ranges(spans: &[SdfInputSpan], target_partitions: usize) -> Ve
     }
     let partitions = target_partitions.clamp(1, spans.len());
     if partitions == 1 {
-        return vec![0..spans.len()];
+        let mut range = Vec::with_capacity(1);
+        range.push(0..spans.len());
+        return range;
     }
 
     let sizes = spans
@@ -1108,13 +1497,14 @@ fn decode_windowed_value_spans(
     Ok(spans)
 }
 
-/// Read progress and if bundle looks stalled, ask the SDK to split it.
+/// Read progress and ask the SDK to split only when the shared manager grants a
+/// capacity permit.
 #[allow(clippy::too_many_arguments)]
 async fn poll_progress_and_maybe_split(
     control: &ControlChannel,
     bundle_instruction_id: &str,
     input_transform_id: &str,
-    monitor: &mut SplitMonitor,
+    runtime_state: &mut BundleSplitRuntime,
     input_bytes: &[u8],
     runtime: &BundleRuntime,
     input_pcol_id: &str,
@@ -1123,45 +1513,19 @@ async fn poll_progress_and_maybe_split(
     splittable_stage: &SplittableStage,
     split_residual_roots: &mut Vec<DelayedBundleApplication>,
     channel_items: &mut Vec<SdfWorkItem>,
+    split_manager: &SplitManager,
+    bundle_id: u64,
+    split_depth: usize,
     immediate_items: &SdfWorkItemSender,
 ) -> anyhow::Result<()> {
-    monitor.ticked = true;
-    monitor.polls += 1;
+    runtime_state.polls += 1;
+    let first_poll = runtime_state.polls == 1;
 
     let progress = control
         .send_process_bundle_progress_request(bundle_instruction_id)
         .await?;
     let metrics = extract_progress_metrics(&progress);
     let now = Instant::now();
-    let first_poll = monitor.prev_index == -2;
-    let decision = monitor.decision(&metrics, now);
-    monitor.record_poll(&metrics);
-    let action = decision.action();
-    let poll_message = format!(
-        "SDF progress: instruction_id={bundle_instruction_id}, read_index={}, \
-         output_element_count_sum={}, work_completed={:?}, work_remaining={:?}, \
-         action={action}, polls={}, can_split={}, estimated_input_elements={}, \
-         tick_ms={}",
-        metrics.read_index,
-        metrics.output_element_count_sum,
-        metrics.work_completed,
-        metrics.work_remaining,
-        monitor.polls,
-        monitor.can_split,
-        monitor.estimated_input_elements,
-        monitor.tick.as_millis()
-    );
-    // Keep routine polls at DEBUG. The first sample and actual split decisions
-    // are operator-visible without enabling a log firehose.
-    if first_poll || decision.requests_split() {
-        info!("{poll_message}");
-    } else {
-        debug!("{poll_message}");
-    }
-
-    if !decision.requests_split() {
-        return Ok(());
-    }
 
     if input_spans.is_none() {
         let spans =
@@ -1174,27 +1538,100 @@ async fn poll_progress_and_maybe_split(
                     );
                     Vec::new()
                 });
-        if !spans.is_empty() {
-            monitor.estimated_input_elements = spans.len() as i64;
-        }
         *input_spans = Some(spans);
     }
     let input_spans = input_spans.as_deref().unwrap_or_default();
+    let estimated_input_elements = input_spans.len() as i64;
+    let estimate = runtime_state.estimator.observe(&metrics, input_spans, now);
+    split_manager.update_progress(bundle_id, estimate, now);
+
+    let can_split = split_manager
+        .state
+        .lock()
+        .expect("split manager lock not poisoned")
+        .bundles
+        .get(&bundle_id)
+        .is_some_and(|bundle| bundle.can_split);
+    let progress_log = format!(
+        "bundle progress: instruction_id={bundle_instruction_id}, worker_bundle_id={bundle_id}, \
+         read_index={}, output_element_count_sum={}, work_completed={:?}, \
+         work_remaining={:?}, p={:?}, rate_per_s={:?}, est_remaining_s={:?}, \
+         estimator={}, polls={}, can_split={can_split}, estimated_input_elements={}",
+        metrics.read_index,
+        metrics.output_element_count_sum,
+        metrics.work_completed,
+        metrics.work_remaining,
+        estimate.progress,
+        estimate.rate_per_second,
+        estimate.est_remaining.map(|value| value.as_secs_f64()),
+        estimate.mode.as_str(),
+        runtime_state.polls,
+        estimated_input_elements
+    );
+    if first_poll {
+        info!("{progress_log}");
+    } else {
+        debug!("{progress_log}");
+    }
+
+    if estimated_input_elements <= 0
+        || metrics
+            .work_remaining
+            .is_some_and(|remaining| remaining <= 0.0)
+    {
+        return Ok(());
+    }
+
+    let permit = match split_manager.try_acquire_permit(bundle_id, now) {
+        SplitPermitDecision::Granted(permit) => {
+            runtime_state.last_denial = None;
+            permit
+        }
+        SplitPermitDecision::Denied(reason) => {
+            let message = format!(
+                "SDF split decision: instruction_id={bundle_instruction_id}, \
+                 worker_bundle_id={bundle_id}, granted=false, reason={}",
+                reason.as_str()
+            );
+            if runtime_state.last_denial != Some(reason) {
+                info!("{message}");
+            } else {
+                debug!("{message}");
+            }
+            runtime_state.last_denial = Some(reason);
+            return Ok(());
+        }
+    };
+    info!(
+        "SDF split decision: instruction_id={bundle_instruction_id}, \
+         worker_bundle_id={bundle_id}, granted=true, p={:?}, est_remaining_s={:?}, \
+         estimator={}",
+        estimate.progress,
+        estimate.est_remaining.map(|value| value.as_secs_f64()),
+        estimate.mode.as_str()
+    );
 
     let mut desired_splits = HashMap::new();
     desired_splits.insert(
         input_transform_id.to_string(),
         DesiredSplit {
-            fraction_of_remainder: monitor.config.fraction_of_remainder,
+            fraction_of_remainder: split_manager.config.fraction_of_remainder,
             allowed_split_points: Vec::new(),
-            estimated_input_elements: monitor.estimated_input_elements,
+            estimated_input_elements,
         },
     );
 
-    monitor.split_requests += 1;
-    let split = control
+    runtime_state.split_requests += 1;
+    let split = match control
         .send_process_bundle_split_request(bundle_instruction_id, desired_splits)
-        .await?;
+        .await
+    {
+        Ok(split) => split,
+        Err(error) => {
+            split_manager.disable_bundle(permit);
+            return Err(error);
+        }
+    };
     let channel_splits = split.channel_splits.len();
     let reported_roots = split.residual_roots.len();
     let residual_roots_before = split_residual_roots.len();
@@ -1203,12 +1640,12 @@ async fn poll_progress_and_maybe_split(
     if split.channel_splits.is_empty() {
         // SDK cannot split (nothing left, or unsupported). Note that any
         // `residual_roots` in this response are not scheduled.
-        monitor.can_split = false;
+        split_manager.complete_permit(permit, 0, true, now);
         info!(
             "SDF split response: instruction_id={bundle_instruction_id}, \
              residual_roots={reported_roots}, channel_splits=0, action=disable-splitting, \
              split_requests={}, splits={}",
-            monitor.split_requests, monitor.splits
+            runtime_state.split_requests, runtime_state.splits
         );
         return Ok(());
     }
@@ -1222,7 +1659,12 @@ async fn poll_progress_and_maybe_split(
 
     // Intra-element remainders (of one or more elements that are partially
     // processed): process in future.
-    for item in residual_items(splittable_stage, &split.residual_roots) {
+    for item in residual_items(
+        splittable_stage,
+        &split.residual_roots,
+        split_depth.saturating_add(1),
+        Some(bundle_id),
+    ) {
         immediate_items
             .send((splittable_stage.id().to_string(), item))
             .map_err(|_| anyhow!("SDF residual dispatcher closed"))?;
@@ -1247,7 +1689,7 @@ async fn poll_progress_and_maybe_split(
             );
             continue;
         }
-        if let Some(previous) = monitor.handed_back_from
+        if let Some(previous) = runtime_state.handed_back_from
             && first > previous
         {
             warn!(
@@ -1261,53 +1703,53 @@ async fn poll_progress_and_maybe_split(
         debug!(
             "SDF channel split: first_residual_element={}, handed_back_from={:?}, \
              decoded_input_elements={}",
-            first, monitor.handed_back_from, input_element_count
+            first, runtime_state.handed_back_from, input_element_count
         );
 
         if let Some((start, end, count)) =
-            channel_split_range(first, monitor.handed_back_from, input_spans)
+            channel_split_range(first, runtime_state.handed_back_from, input_spans)
         {
-            let timestamps = channel_item_timestamps(input_spans, monitor.handed_back_from, first);
+            let timestamps =
+                channel_item_timestamps(input_spans, runtime_state.handed_back_from, first);
+            let first_span = first.max(0) as usize;
+            let last_span = runtime_state
+                .handed_back_from
+                .map(|value| value as usize)
+                .unwrap_or(input_spans.len());
             let item = SdfWorkItem {
                 seed: input_bytes[start..end].to_vec(),
                 holds: channel_item_holds(splittable_stage, &timestamps),
-                estimated_size: None,
+                estimated_size: partition_size(input_spans, &(first_span..last_span)),
+                split_depth: split_depth.saturating_add(1),
+                permit_id: Some(bundle_id),
             };
             immediate_items
                 .send((splittable_stage.id().to_string(), item.clone()))
                 .map_err(|_| anyhow!("SDF residual dispatcher closed"))?;
             channel_items.push(item);
-            monitor.handed_back_from = Some(first);
+            runtime_state.handed_back_from = Some(first);
             debug_assert!(count > 0);
         }
         // Otherwise `first == input_element_count` (no whole elements) or
         // `first == handed_back_from` (nothing newly relinquished): no item.
     }
 
-    if let Some(channel_split) = split.channel_splits.first()
-        && monitor.estimated_input_elements >= channel_split.first_residual_element
-    {
-        monitor.estimated_input_elements = channel_split.first_residual_element;
-    }
-
-    // Increase interval to avoid over-split.
-    monitor.tick = clamp_progress_tick(monitor.tick * 4);
-
     let new_residual_roots = split_residual_roots.len() - residual_roots_before;
     let new_channel_items = channel_items.len() - channel_items_before;
-    if new_residual_roots + new_channel_items > 0 {
-        monitor.splits += 1;
-        monitor.record_split(now);
+    let new_work_items = new_residual_roots + new_channel_items;
+    split_manager.complete_permit(permit, new_work_items, new_work_items == 0, now);
+    if new_work_items > 0 {
+        runtime_state.splits += 1;
+        runtime_state
+            .estimator
+            .reset_after_split(estimate.progress, now);
     }
     info!(
         "SDF split response: instruction_id={bundle_instruction_id}, \
          residual_roots={new_residual_roots}, channel_splits={channel_splits}, \
          channel_items={new_channel_items}, new_work_items={}, \
-         split_requests={}, splits={}, next_tick_ms={}",
-        new_residual_roots + new_channel_items,
-        monitor.split_requests,
-        monitor.splits,
-        monitor.tick.as_millis()
+         split_requests={}, splits={}",
+        new_work_items, runtime_state.split_requests, runtime_state.splits
     );
     Ok(())
 }
@@ -1319,6 +1761,8 @@ async fn poll_progress_and_maybe_split(
 fn residual_items(
     stage: &SplittableStage,
     residuals: &[DelayedBundleApplication],
+    split_depth: usize,
+    permit_id: Option<u64>,
 ) -> Vec<SdfWorkItem> {
     if residuals.is_empty() {
         return Vec::new();
@@ -1359,6 +1803,8 @@ fn residual_items(
                 seed: application.element.clone(),
                 holds,
                 estimated_size: None,
+                split_depth,
+                permit_id,
             }
         })
         .collect()
@@ -1495,10 +1941,6 @@ fn channel_item_holds(splittable_stage: &SplittableStage, timestamps: &[i64]) ->
     boundary.iter().map(|_| min_timestamp).collect()
 }
 
-fn clamp_progress_tick(tick: Duration) -> Duration {
-    tick.max(MIN_PROGRESS_TICK).min(MAX_PROGRESS_TICK)
-}
-
 fn duration_from_seconds_env(name: &str, default: Duration) -> Duration {
     duration_from_seconds_value(std::env::var(name).ok().as_deref(), default)
 }
@@ -1527,18 +1969,12 @@ fn split_fraction_from_value(configured: Option<&str>, default: f64, name: &str)
     }
 }
 
-/// The stage-shared progress tick to carry forward after a bundle.
-/// A bundle that polled at least once keeps its current tick.
-/// A bundle that finished before its first poll shrinks the tick
-/// by one MIN_PROGRESS_TICK (floored), so short bundles pull the
-/// wait back down. Shrinking is far slower than the ×4 growth on each
-/// split, balancing over-splitting against still allowing genuine splits.
-fn next_shared_tick(ticked: bool, tick: Duration) -> Duration {
-    if ticked {
-        tick
-    } else {
-        clamp_progress_tick(tick.saturating_sub(MIN_PROGRESS_TICK))
-    }
+fn positive_usize_from_env(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
 }
 
 /// Decode one beam varint (`beam:coder:varint:v1`) payload.
@@ -1731,34 +2167,34 @@ mod tests {
         );
 
         // A boundary output reported at 5000ms becomes a hold at 5000.
-        let items = residual_items(&stage, &[residual("process", "out", 5_000)]);
+        let items = residual_items(&stage, &[residual("process", "out", 5_000)], 1, None);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].holds, vec![5_000]);
 
         // An internal output is not tracked by the runner, so the residual
         // reports no usable watermark for the boundary output: the Fn API's
         // MIN_TIMESTAMP default applies (it may still produce anything).
-        let items = residual_items(&stage, &[residual("process", "internal", 5_000)]);
+        let items = residual_items(&stage, &[residual("process", "internal", 5_000)], 1, None);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].holds, vec![MIN_TIMESTAMP]);
 
         // The same default covers a local output name not declared on the
         // transform: the boundary output was not reported.
         assert_eq!(
-            residual_items(&stage, &[residual("process", "missing", 5_000)])[0].holds,
+            residual_items(&stage, &[residual("process", "missing", 5_000)], 1, None)[0].holds,
             vec![MIN_TIMESTAMP]
         );
 
         // A transform that is not part of the process stage cannot be mapped to
         // an output at all; the existing warning path imposes no hold.
         assert!(
-            residual_items(&stage, &[residual("elsewhere", "out", 5_000)])[0]
+            residual_items(&stage, &[residual("elsewhere", "out", 5_000)], 1, None)[0]
                 .holds
                 .is_empty()
         );
 
         // No residuals: no items.
-        assert!(residual_items(&stage, &[]).is_empty());
+        assert!(residual_items(&stage, &[], 1, None).is_empty());
     }
 
     #[test]
@@ -1767,7 +2203,12 @@ mod tests {
 
         // A tracker that reports "no progress" as MIN_TIMESTAMP is held at MIN,
         // not treated as "no hold".
-        let items = residual_items(&stage, &[residual("process", "out", MIN_TIMESTAMP)]);
+        let items = residual_items(
+            &stage,
+            &[residual("process", "out", MIN_TIMESTAMP)],
+            1,
+            None,
+        );
         assert_eq!(items[0].holds, vec![MIN_TIMESTAMP]);
     }
 
@@ -1787,7 +2228,7 @@ mod tests {
             .output_watermarks
             .remove("a");
         // Nothing reported: both boundary outputs hold at MIN.
-        let items = residual_items(&stage, &[application.clone()]);
+        let items = residual_items(&stage, &[application.clone()], 1, None);
         assert_eq!(items[0].holds.len(), 2);
         assert!(items[0].holds.iter().all(|hold| *hold == MIN_TIMESTAMP));
 
@@ -1804,7 +2245,9 @@ mod tests {
                     nanos: 0,
                 },
             );
-        let mut holds = residual_items(&stage, &[application])[0].holds.clone();
+        let mut holds = residual_items(&stage, &[application], 1, None)[0]
+            .holds
+            .clone();
         holds.sort_unstable();
         assert_eq!(holds, vec![MIN_TIMESTAMP, 5_000]);
     }
@@ -1820,7 +2263,7 @@ mod tests {
         // A residual with no application is skipped rather than panicking.
         let empty = DelayedBundleApplication::default();
 
-        let items = residual_items(&stage, &[first, empty, second]);
+        let items = residual_items(&stage, &[first, empty, second], 2, None);
         assert_eq!(items.len(), 2, "one item per residual application");
         assert_eq!(items[0].seed, b"first".to_vec());
         assert_eq!(items[0].holds, vec![5_000]);
@@ -1837,7 +2280,7 @@ mod tests {
         let mut valid = residual("process", "out", 2_000);
         valid.application.as_mut().unwrap().element = b"valid".to_vec();
 
-        let items = residual_items(&stage, &[empty_element, valid]);
+        let items = residual_items(&stage, &[empty_element, valid], 1, None);
         assert_eq!(items.len(), 1, "empty-element residuals must be dropped");
         assert_eq!(items[0].seed, b"valid".to_vec());
         assert_eq!(items[0].holds, vec![2_000]);
@@ -2037,100 +2480,6 @@ mod tests {
     }
 
     #[test]
-    fn progress_tick_is_clamped_to_the_authoritative_range() {
-        assert_eq!(
-            clamp_progress_tick(Duration::from_millis(1)),
-            MIN_PROGRESS_TICK
-        );
-        assert_eq!(clamp_progress_tick(MIN_PROGRESS_TICK), MIN_PROGRESS_TICK);
-        assert_eq!(
-            clamp_progress_tick(Duration::from_millis(400)),
-            Duration::from_millis(400)
-        );
-        assert_eq!(
-            clamp_progress_tick(Duration::from_secs(60)),
-            MAX_PROGRESS_TICK
-        );
-        assert_eq!(clamp_progress_tick(MAX_PROGRESS_TICK), MAX_PROGRESS_TICK);
-    }
-
-    #[test]
-    fn split_backoff_grows_before_clamping_at_the_ceiling() {
-        // Flare multiplies the stage tick by 4 after each successful split and
-        // clamps to [100ms, 30s]; the sequence is what keeps residual bundles
-        // from re-splitting aggressively.
-        let mut tick = MIN_PROGRESS_TICK;
-        let mut observed = Vec::new();
-        for _ in 0..7 {
-            tick = clamp_progress_tick(tick * 4);
-            observed.push(tick);
-        }
-        assert_eq!(
-            observed,
-            vec![
-                Duration::from_millis(400),
-                Duration::from_millis(1_600),
-                Duration::from_millis(6_400),
-                Duration::from_millis(25_600),
-                MAX_PROGRESS_TICK,
-                MAX_PROGRESS_TICK,
-                MAX_PROGRESS_TICK,
-            ]
-        );
-    }
-
-    #[test]
-    fn next_shared_tick_passes_through_when_ticked_and_shrinks_when_not() {
-        // A bundle that polled at least once keeps the shared tick unchanged.
-        assert_eq!(
-            next_shared_tick(true, Duration::from_millis(1_600)),
-            Duration::from_millis(1_600)
-        );
-        // A bundle that finished before its first poll shrinks it by one step.
-        assert_eq!(
-            next_shared_tick(false, Duration::from_millis(1_600)),
-            Duration::from_millis(1_500)
-        );
-        // Shrinking never goes below the floor.
-        assert_eq!(
-            next_shared_tick(false, MIN_PROGRESS_TICK),
-            MIN_PROGRESS_TICK
-        );
-        assert_eq!(
-            next_shared_tick(false, Duration::from_millis(50)),
-            MIN_PROGRESS_TICK
-        );
-    }
-
-    #[test]
-    fn monitor_adopts_the_stage_shared_tick_and_clamps_it() {
-        // No shared tick yet: the first bundle starts at the floor, with clean
-        // `-2` baselines so the first poll only records numbers.
-        let monitor = SplitMonitor::new(7, None);
-        assert_eq!(monitor.tick, MIN_PROGRESS_TICK);
-        assert_eq!(monitor.estimated_input_elements, 7);
-        assert_eq!(monitor.prev_index, -2);
-        assert_eq!(monitor.prev_output_element_count_sum, -2);
-        assert!(monitor.can_split);
-        assert!(!monitor.ticked);
-        assert_eq!(monitor.handed_back_from, None);
-
-        // An in-range shared tick is adopted verbatim; out-of-range is clamped.
-        assert_eq!(
-            SplitMonitor::new(1, Some(Duration::from_secs(2))).tick,
-            Duration::from_secs(2)
-        );
-        assert_eq!(
-            SplitMonitor::new(1, Some(Duration::from_millis(1))).tick,
-            MIN_PROGRESS_TICK
-        );
-        assert_eq!(
-            SplitMonitor::new(1, Some(Duration::from_secs(120))).tick,
-            MAX_PROGRESS_TICK
-        );
-    }
-
-    #[test]
     fn decode_varint_payload_round_trips_signed_values() {
         for value in [0i64, 1, 127, 128, 300, -1, -128] {
             assert_eq!(decode_varint_payload(&varint_payload(value)), Some(value));
@@ -2199,9 +2548,12 @@ mod tests {
 
     fn split_config() -> SdfSplitConfig {
         SdfSplitConfig {
-            split_after: Duration::from_secs(2),
+            progress_poll_interval: DEFAULT_PROGRESS_POLL_INTERVAL,
             stall_after: Duration::from_secs(5),
+            cooldown: Duration::from_secs(2),
+            min_split_override: Some(Duration::from_secs(10)),
             fraction_of_remainder: 0.5,
+            max_depth: 4,
         }
     }
 
@@ -2220,58 +2572,355 @@ mod tests {
     }
 
     #[test]
-    fn sdk_work_progress_prevents_a_false_stall_while_outputs_are_buffered() {
-        let mut monitor = SplitMonitor::with_config(100, None, split_config());
+    fn weighted_estimator_uses_completed_elements_and_active_work_fraction() {
         let now = Instant::now();
-        monitor.record_poll(&ProgressMetrics {
-            read_index: 0,
-            output_element_count_sum: 0,
-            work_completed: Some(0.1),
-            work_remaining: Some(0.9),
-        });
-        let decision = monitor.decision(
+        let spans = spans_with_sizes(&[Some(10.0), Some(30.0), Some(60.0)]);
+        let mut estimator = ProgressEstimator::new(now);
+        let estimate = estimator.observe(
+            &ProgressMetrics {
+                read_index: 1,
+                work_completed: Some(0.5),
+                work_remaining: Some(0.5),
+                ..Default::default()
+            },
+            &spans,
+            now,
+        );
+        assert_eq!(estimate.mode, ProgressEstimatorMode::Weighted);
+        assert_eq!(estimate.progress, Some(0.25));
+    }
+
+    #[test]
+    fn estimator_falls_back_to_counts_without_sizes_or_finite_work_metrics() {
+        let now = Instant::now();
+        let mut estimator = ProgressEstimator::new(now);
+        let estimate = estimator.observe(
+            &ProgressMetrics {
+                read_index: 1,
+                work_completed: Some(0.5),
+                work_remaining: Some(0.5),
+                ..Default::default()
+            },
+            &spans_with_sizes(&[None, None, None]),
+            now,
+        );
+        assert_eq!(estimate.mode, ProgressEstimatorMode::Coarse);
+        assert_eq!(estimate.progress, Some(0.5));
+
+        let estimate = estimator.observe(
+            &ProgressMetrics {
+                read_index: 1,
+                work_completed: Some(f32::NAN),
+                work_remaining: Some(0.5),
+                ..Default::default()
+            },
+            &spans_with_sizes(&[Some(1.0), Some(1.0), Some(1.0)]),
+            now,
+        );
+        assert_eq!(estimate.mode, ProgressEstimatorMode::Coarse);
+        assert_eq!(estimate.progress, Some(1.0 / 3.0));
+    }
+
+    #[test]
+    fn estimator_rate_requires_a_window_and_resets_after_split() {
+        let start = Instant::now();
+        let spans = spans_with_sizes(&[Some(1.0); 10]);
+        let mut estimator = ProgressEstimator::new(start);
+        let first = estimator.observe(
+            &ProgressMetrics {
+                read_index: 0,
+                work_completed: Some(0.0),
+                work_remaining: Some(1.0),
+                ..Default::default()
+            },
+            &spans,
+            start,
+        );
+        assert_eq!(first.est_remaining, None);
+
+        let second_at = start + Duration::from_secs(1);
+        let second = estimator.observe(
+            &ProgressMetrics {
+                read_index: 2,
+                work_completed: Some(0.0),
+                work_remaining: Some(1.0),
+                ..Default::default()
+            },
+            &spans,
+            second_at,
+        );
+        assert_eq!(second.rate_per_second, Some(0.2));
+        assert_eq!(second.est_remaining, Some(Duration::from_secs(4)));
+
+        estimator.reset_after_split(second.progress, second_at);
+        let after_reset = estimator.observe(
+            &ProgressMetrics {
+                read_index: 3,
+                work_completed: Some(0.0),
+                work_remaining: Some(1.0),
+                ..Default::default()
+            },
+            &spans,
+            second_at,
+        );
+        assert_eq!(after_reset.rate_per_second, None);
+        assert_eq!(after_reset.est_remaining, None);
+    }
+
+    #[test]
+    fn estimator_treats_counter_changes_as_activity_without_changing_progress() {
+        let now = Instant::now();
+        let spans = spans_with_sizes(&[Some(1.0); 10]);
+        let mut estimator = ProgressEstimator::new(now);
+        let first = estimator.observe(
             &ProgressMetrics {
                 read_index: 0,
                 output_element_count_sum: 0,
-                work_completed: Some(0.2),
-                work_remaining: Some(0.8),
+                work_completed: Some(0.0),
+                work_remaining: Some(1.0),
             },
-            now + Duration::from_secs(3),
+            &spans,
+            now,
         );
-        assert_eq!(decision, SplitDecision::RequestTime);
-        assert!(
-            !matches!(decision, SplitDecision::RequestStall),
-            "SDK work progress must not be classified as a stall"
-        );
-    }
-
-    #[test]
-    fn fallback_stall_detection_waits_for_the_configured_quiet_window() {
-        let mut monitor = SplitMonitor::with_config(100, None, split_config());
-        monitor.record_poll(&ProgressMetrics::default());
-        let now = Instant::now();
-        assert_eq!(
-            monitor.decision(&ProgressMetrics::default(), now + Duration::from_secs(1)),
-            SplitDecision::WaitForProgress
-        );
-        assert_eq!(
-            monitor.decision(&ProgressMetrics::default(), now + Duration::from_secs(6)),
-            SplitDecision::RequestStall
-        );
-    }
-
-    #[test]
-    fn completed_sdk_work_skips_a_redundant_split_request() {
-        let monitor = SplitMonitor::with_config(1, None, split_config());
-        let decision = monitor.decision(
+        assert!(first.changed);
+        let second = estimator.observe(
             &ProgressMetrics {
+                read_index: 0,
+                output_element_count_sum: 1_000,
+                work_completed: Some(0.0),
+                work_remaining: Some(1.0),
+            },
+            &spans,
+            now + Duration::from_secs(1),
+        );
+        assert_eq!(second.progress, Some(0.0));
+        assert!(second.changed);
+    }
+
+    #[test]
+    fn estimator_marks_completed_active_element_work() {
+        let now = Instant::now();
+        let mut estimator = ProgressEstimator::new(now);
+        let estimate = estimator.observe(
+            &ProgressMetrics {
+                read_index: 0,
                 work_completed: Some(1.0),
                 work_remaining: Some(0.0),
                 ..Default::default()
             },
-            Instant::now() + Duration::from_secs(10),
+            &spans_with_sizes(&[Some(100.0), Some(100.0)]),
+            now,
         );
-        assert_eq!(decision, SplitDecision::SkipNoRemainingWork);
+        assert_eq!(estimate.progress, Some(0.5));
+        assert_eq!(estimate.est_remaining, None);
+    }
+
+    fn split_manager() -> SplitManager {
+        SplitManager {
+            config: split_config(),
+            state: Mutex::new(SplitManagerState {
+                next_bundle_id: 1,
+                max_workers: 2,
+                spawn_cost: Duration::from_secs(1),
+                ..Default::default()
+            }),
+            pool: None,
+        }
+    }
+
+    fn update_managed_remaining(
+        manager: &SplitManager,
+        bundle_id: u64,
+        remaining: Duration,
+        changed: bool,
+        now: Instant,
+    ) {
+        manager.update_progress(
+            bundle_id,
+            BundleProgressEstimate {
+                progress: Some(0.25),
+                rate_per_second: Some(0.1),
+                est_remaining: Some(remaining),
+                mode: ProgressEstimatorMode::Weighted,
+                changed,
+            },
+            now,
+        );
+    }
+
+    fn assert_denied(decision: SplitPermitDecision, expected: SplitDenyReason) {
+        match decision {
+            SplitPermitDecision::Denied(reason) => assert_eq!(reason, expected),
+            SplitPermitDecision::Granted(_) => panic!("expected split permit denial"),
+        }
+    }
+
+    #[test]
+    fn split_manager_grants_one_permit_to_the_largest_remaining_bundle() {
+        let now = Instant::now();
+        let manager = split_manager();
+        manager.set_pool_state(1, 2, Some(Duration::from_secs(1)));
+        let small = manager.register_bundle("stage", 0, now);
+        let large = manager.register_bundle("stage", 0, now);
+        update_managed_remaining(&manager, small, Duration::from_secs(20), true, now);
+        update_managed_remaining(&manager, large, Duration::from_secs(30), true, now);
+
+        assert_denied(
+            manager.try_acquire_permit(small, now),
+            SplitDenyReason::NotTopCandidate,
+        );
+        assert!(matches!(
+            manager.try_acquire_permit(large, now),
+            SplitPermitDecision::Granted(_)
+        ));
+        assert_denied(
+            manager.try_acquire_permit(small, now),
+            SplitDenyReason::Capacity,
+        );
+    }
+
+    #[test]
+    fn split_manager_denies_without_capacity_or_with_queued_work() {
+        let now = Instant::now();
+        let manager = split_manager();
+        let bundle = manager.register_bundle("stage", 0, now);
+        update_managed_remaining(&manager, bundle, Duration::from_secs(30), true, now);
+
+        manager.set_pool_state(0, 2, Some(Duration::from_secs(1)));
+        assert_denied(
+            manager.try_acquire_permit(bundle, now),
+            SplitDenyReason::Capacity,
+        );
+
+        manager.set_pool_state(1, 2, Some(Duration::from_secs(1)));
+        manager.set_queue_depth("stage", 1);
+        assert_denied(
+            manager.try_acquire_permit(bundle, now),
+            SplitDenyReason::QueueNotEmpty,
+        );
+    }
+
+    #[test]
+    fn split_manager_enforces_minimum_cooldown_depth_and_bundle_limit() {
+        let now = Instant::now();
+        let manager = split_manager();
+        manager.set_pool_state(1, 2, Some(Duration::from_secs(1)));
+        let bundle = manager.register_bundle("stage", 0, now);
+        update_managed_remaining(&manager, bundle, Duration::from_secs(5), true, now);
+        assert_denied(
+            manager.try_acquire_permit(bundle, now),
+            SplitDenyReason::BelowMinimum,
+        );
+
+        update_managed_remaining(&manager, bundle, Duration::from_secs(30), true, now);
+        let permit = match manager.try_acquire_permit(bundle, now) {
+            SplitPermitDecision::Granted(permit) => permit,
+            SplitPermitDecision::Denied(reason) => panic!("unexpected denial: {reason:?}"),
+        };
+        manager.complete_permit(permit, 1, false, now);
+        manager.note_item_picked(bundle);
+        manager.set_queue_depth("stage", 0);
+        assert_denied(
+            manager.try_acquire_permit(bundle, now + Duration::from_secs(1)),
+            SplitDenyReason::Cooldown,
+        );
+
+        let deep = manager.register_bundle("stage", 4, now);
+        update_managed_remaining(&manager, deep, Duration::from_secs(30), true, now);
+        assert_denied(
+            manager.try_acquire_permit(deep, now + Duration::from_secs(3)),
+            SplitDenyReason::MaxDepth,
+        );
+
+        {
+            let mut state = manager.state.lock().expect("split manager lock");
+            state.total_bundles = MAX_BUNDLES_PER_WORKER * state.max_workers;
+        }
+        assert_denied(
+            manager.try_acquire_permit(bundle, now + Duration::from_secs(3)),
+            SplitDenyReason::MaxBundles,
+        );
+    }
+
+    #[test]
+    fn split_manager_allows_the_stall_fallback_only_after_quiet_window() {
+        let now = Instant::now();
+        let manager = split_manager();
+        manager.set_pool_state(1, 2, Some(Duration::from_secs(1)));
+        let bundle = manager.register_bundle("stage", 0, now);
+        assert_denied(
+            manager.try_acquire_permit(bundle, now + Duration::from_secs(1)),
+            SplitDenyReason::BelowMinimum,
+        );
+        assert!(matches!(
+            manager.try_acquire_permit(bundle, now + Duration::from_secs(6)),
+            SplitPermitDecision::Granted(_)
+        ));
+    }
+
+    #[test]
+    fn split_manager_releases_permits_when_a_split_produces_nothing() {
+        let now = Instant::now();
+        let manager = split_manager();
+        manager.set_pool_state(1, 2, Some(Duration::from_secs(1)));
+        let bundle = manager.register_bundle("stage", 0, now);
+        update_managed_remaining(&manager, bundle, Duration::from_secs(30), true, now);
+        let permit = match manager.try_acquire_permit(bundle, now) {
+            SplitPermitDecision::Granted(permit) => permit,
+            SplitPermitDecision::Denied(reason) => panic!("unexpected denial: {reason:?}"),
+        };
+        manager.complete_permit(permit, 0, false, now);
+        assert!(matches!(
+            manager.try_acquire_permit(bundle, now),
+            SplitPermitDecision::Granted(_)
+        ));
+    }
+
+    #[test]
+    fn filled_permit_reserves_capacity_until_its_residual_is_picked_up() {
+        let now = Instant::now();
+        let manager = split_manager();
+        manager.set_pool_state(1, 2, Some(Duration::from_secs(1)));
+        let first = manager.register_bundle("stage-a", 0, now);
+        let second = manager.register_bundle("stage-b", 0, now);
+        update_managed_remaining(&manager, first, Duration::from_secs(30), true, now);
+        update_managed_remaining(&manager, second, Duration::from_secs(30), true, now);
+
+        let permit = match manager.try_acquire_permit(first, now) {
+            SplitPermitDecision::Granted(permit) => permit,
+            SplitPermitDecision::Denied(reason) => panic!("unexpected denial: {reason:?}"),
+        };
+        manager.complete_permit(permit, 1, false, now);
+        assert_denied(
+            manager.try_acquire_permit(second, now),
+            SplitDenyReason::Capacity,
+        );
+
+        manager.note_item_picked(first);
+        manager.set_queue_depth("stage-a", 0);
+        assert!(matches!(
+            manager.try_acquire_permit(second, now),
+            SplitPermitDecision::Granted(_)
+        ));
+    }
+
+    #[test]
+    fn split_manager_default_minimum_scales_with_spawn_cost() {
+        let now = Instant::now();
+        let mut manager = split_manager();
+        manager.config.min_split_override = None;
+        manager.set_pool_state(1, 2, Some(Duration::from_secs(5)));
+        let bundle = manager.register_bundle("stage", 0, now);
+        update_managed_remaining(&manager, bundle, Duration::from_secs(14), true, now);
+        assert_denied(
+            manager.try_acquire_permit(bundle, now),
+            SplitDenyReason::BelowMinimum,
+        );
+        update_managed_remaining(&manager, bundle, Duration::from_secs(15), true, now);
+        assert!(matches!(
+            manager.try_acquire_permit(bundle, now),
+            SplitPermitDecision::Granted(_)
+        ));
     }
 
     #[test]
