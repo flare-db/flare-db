@@ -2375,6 +2375,7 @@ dependencies = [
  "serde",
  "serde_json",
  "slatedb",
+ "sysinfo 0.35.2",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",

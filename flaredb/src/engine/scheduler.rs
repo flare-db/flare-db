@@ -92,6 +92,10 @@ fn splittable_max_in_flight_from(configured: Option<&str>) -> usize {
 
 impl NodeScheduler {
     pub fn new(graph: ExecutableGraph) -> Self {
+        Self::new_with_bundle_capacity(graph, splittable_max_in_flight())
+    }
+
+    pub fn new_with_bundle_capacity(graph: ExecutableGraph, max_bundle_slots: usize) -> Self {
         let mut watermarks = WatermarkManager::from_executable_graph(&graph);
         let mut index_of = HashMap::new();
         let mut transform_to_stage = HashMap::new();
@@ -110,17 +114,31 @@ impl NodeScheduler {
         // slots pull from that queue. Only element-based residuals are
         // independent (the runner does not support keyed SDFs), so other process
         // kinds stay at one bundle.
-        let splittable_concurrency = splittable_max_in_flight();
+        let splittable_concurrency = max_bundle_slots.max(1);
         let mut splittable_stages = 0usize;
         for index in graph.get_executable_graph().node_indices() {
             let node = &graph.get_executable_graph()[index];
-            if let ExecutableNode::Splittable(stage) = node
-                && stage.plan().process_kind
+            if let ExecutableNode::Splittable(stage) = node {
+                let process = &stage.plan().process_stage;
+                let has_state = !process.user_states().is_empty();
+                let has_timers = !process.timers().is_empty();
+                let concurrency = if stage.plan().process_kind
                     == SplittableProcessKind::ProcessSizedElementsAndRestrictions
-            {
-                watermarks
-                    .set_max_in_flight(stage.id(), splittable_concurrency)
-                    .ok();
+                    && !has_state
+                    && !has_timers
+                {
+                    splittable_concurrency
+                } else {
+                    if has_state || has_timers {
+                        info!(
+                            "scheduler: SDF stage '{}' capped at 1 concurrent bundle \
+                             (has_state={has_state}, has_timers={has_timers})",
+                            stage.id()
+                        );
+                    }
+                    1
+                };
+                watermarks.set_max_in_flight(stage.id(), concurrency).ok();
                 splittable_stages += 1;
             }
         }

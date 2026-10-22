@@ -17,7 +17,32 @@ enum Commands {
     /// Initial setup: downloads the latest FlareDB release and the Beam Java worker jar.
     Init,
     /// Start a FlareDB instance.
-    Up,
+    Up {
+        /// Maximum number of local SDK harness processes.
+        #[arg(long)]
+        workers: Option<usize>,
+        /// Minimum number of eagerly started SDK harness processes.
+        #[arg(long)]
+        min_workers: Option<usize>,
+        /// Seconds an unused worker may remain alive.
+        #[arg(long)]
+        worker_idle_timeout_secs: Option<u64>,
+        /// Concurrent bundle slots per harness process.
+        #[arg(long)]
+        bundles_per_worker: Option<usize>,
+        /// Pool logging interval in seconds.
+        #[arg(long)]
+        pool_log_interval_secs: Option<u64>,
+        /// SDF static overdecomposition factor.
+        #[arg(long)]
+        sdf_overdecompose: Option<usize>,
+        /// Available memory budget used to derive the default worker cap.
+        #[arg(long)]
+        memory_budget_bytes: Option<u64>,
+        /// Estimated RSS budget for one harness process.
+        #[arg(long)]
+        harness_rss_bytes: Option<u64>,
+    },
     /// Stop the running FlareDB instance.
     Down,
     /// Launch the interactive SQL shell.
@@ -87,7 +112,28 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Init => init::init().await?,
-        Commands::Up => server::up().await?,
+        Commands::Up {
+            workers,
+            min_workers,
+            worker_idle_timeout_secs,
+            bundles_per_worker,
+            pool_log_interval_secs,
+            sdf_overdecompose,
+            memory_budget_bytes,
+            harness_rss_bytes,
+        } => {
+            server::up(server::UpOptions {
+                workers,
+                min_workers,
+                worker_idle_timeout_secs,
+                bundles_per_worker,
+                pool_log_interval_secs,
+                sdf_overdecompose,
+                memory_budget_bytes,
+                harness_rss_bytes,
+            })
+            .await?
+        }
         Commands::Down => server::down().await?,
         Commands::Sql => flare_sql::run().await?,
         Commands::Version => release::version().await?,
@@ -976,7 +1022,19 @@ mod server {
 
     const PORT: u16 = 8099;
 
-    pub async fn up() -> Result<()> {
+    #[derive(Default)]
+    pub struct UpOptions {
+        pub workers: Option<usize>,
+        pub min_workers: Option<usize>,
+        pub worker_idle_timeout_secs: Option<u64>,
+        pub bundles_per_worker: Option<usize>,
+        pub pool_log_interval_secs: Option<u64>,
+        pub sdf_overdecompose: Option<usize>,
+        pub memory_budget_bytes: Option<u64>,
+        pub harness_rss_bytes: Option<u64>,
+    }
+
+    pub async fn up(options: UpOptions) -> Result<()> {
         let home_dir = dirs::home_dir().context("failed to determine home directory")?;
         let base_dir = home_dir.join(".flaredb");
         let bin_dir = base_dir.join("bin");
@@ -1061,6 +1119,49 @@ mod server {
             .stdout(Stdio::from(log_file))
             .stderr(Stdio::from(log_file_err))
             .kill_on_drop(false);
+
+        for (name, value) in [
+            (
+                "FLAREDB_WORKERS",
+                options.workers.map(|value| value.to_string()),
+            ),
+            (
+                "FLAREDB_MIN_WORKERS",
+                options.min_workers.map(|value| value.to_string()),
+            ),
+            (
+                "FLAREDB_WORKER_IDLE_TIMEOUT_SECS",
+                options
+                    .worker_idle_timeout_secs
+                    .map(|value| value.to_string()),
+            ),
+            (
+                "FLAREDB_BUNDLES_PER_WORKER",
+                options.bundles_per_worker.map(|value| value.to_string()),
+            ),
+            (
+                "FLAREDB_POOL_LOG_INTERVAL_SECS",
+                options
+                    .pool_log_interval_secs
+                    .map(|value| value.to_string()),
+            ),
+            (
+                "FLAREDB_SDF_OVERDECOMPOSE",
+                options.sdf_overdecompose.map(|value| value.to_string()),
+            ),
+            (
+                "FLAREDB_MEMORY_BUDGET_BYTES",
+                options.memory_budget_bytes.map(|value| value.to_string()),
+            ),
+            (
+                "FLAREDB_HARNESS_RSS_BYTES",
+                options.harness_rss_bytes.map(|value| value.to_string()),
+            ),
+        ] {
+            if let Some(value) = value {
+                command.env(name, value);
+            }
+        }
 
         let child = command.spawn().with_context(|| {
             format!(

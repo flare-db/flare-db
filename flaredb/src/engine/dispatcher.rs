@@ -1,14 +1,12 @@
 use crate::engine::metrics::JobMetrics;
 use crate::engine::sdf::{SdfBundleOutcome, SdfWorkItem, SplittableStageExecutor};
 use crate::transforms::SourceProgress;
+use crate::worker::pool::{WorkerKind, WorkerPool};
 use crate::{
     engine::timer::{TimerEntry, build_timer_store},
     engine::{
         executor::StageExecutor,
-        harness::{
-            Channels, HarnessStatus, WorkerHandle, control::ControlResponse,
-            state::SideInputRegistry,
-        },
+        harness::{Channels, HarnessStatus, control::ControlResponse, state::SideInputRegistry},
         runtime::BundleRuntime,
         scheduler::NodeScheduler,
         timer::TimerService,
@@ -108,8 +106,8 @@ pub struct ExecutorDispatcher {
     store: Arc<FlareElementStore>,
     pipeline_coders: Arc<HashMap<String, Coder>>,
     pipeline_components: Arc<Components>,
-    worker: Option<WorkerHandle>,
-    registered_on: HashSet<(String, String)>,
+    pool: Option<Arc<WorkerPool>>,
+    registered_on: Arc<std::sync::Mutex<HashSet<(String, String)>>>,
     timer_service: Arc<TimerService>,
     /// Runner-source progress reports (TestStream) sent from bundle execution.
     source_reports_tx: mpsc::UnboundedSender<SourceProgress>,
@@ -129,8 +127,8 @@ impl ExecutorDispatcher {
             store,
             pipeline_coders: Arc::new(HashMap::new()),
             pipeline_components: Arc::new(Components::default()),
-            worker: None,
-            registered_on: HashSet::new(),
+            pool: None,
+            registered_on: Arc::new(std::sync::Mutex::new(HashSet::new())),
             timer_service,
             source_reports_tx,
             source_reports_rx,
@@ -140,8 +138,11 @@ impl ExecutorDispatcher {
     /// Reset all channels so a new worker can connect.
     pub async fn reset_channels(&mut self) {
         self.channels.reset().await;
-        self.worker = None;
-        self.registered_on.clear();
+        self.pool = None;
+        self.registered_on
+            .lock()
+            .expect("registration lock not poisoned")
+            .clear();
     }
 
     /// Route SDK worker log entries for a job into that job's per-job
@@ -165,20 +166,24 @@ impl ExecutorDispatcher {
         Ok(())
     }
 
-    /// Wait for the worker to connect its control stream.
-    pub async fn wait_connected(
-        &mut self,
-        worker_id: &crate::worker::manager::WorkerId,
-        timeout: Duration,
-    ) -> anyhow::Result<()> {
-        self.channels.wait_connected(worker_id, timeout).await?;
-        self.worker = Some(self.channels.handle(worker_id));
-        Ok(())
-    }
-
     /// Job-scoped health signal shared with the Fn API stream handlers.
     pub fn harness_status(&self) -> HarnessStatus {
         self.channels.status()
+    }
+
+    pub fn worker_channels(&self) -> Channels {
+        self.channels.clone()
+    }
+
+    pub fn set_worker_pool(&mut self, pool: Arc<WorkerPool>) {
+        self.pool = Some(pool);
+    }
+
+    pub fn bundle_capacity(&self) -> usize {
+        self.pool
+            .as_ref()
+            .map(|pool| pool.config().max_bundle_slots())
+            .unwrap_or(1)
     }
 
     /// Start dispatcher tasks and cache the pipeline coders/components used to
@@ -199,11 +204,6 @@ impl ExecutorDispatcher {
         self.pipeline_coders = Arc::new(coders);
         self.pipeline_components = Arc::new(pipeline_graph.components.clone());
         Ok(())
-    }
-
-    /// Build a [`StageExecutor`] from the currently prepared state.
-    pub fn new_executor(&self) -> anyhow::Result<StageExecutor> {
-        Ok(StageExecutor::new(self.new_bundle_runtime()?))
     }
 
     /// Run the executable graph to completion.
@@ -251,7 +251,6 @@ impl ExecutorDispatcher {
                 .set_residual_holds(&residual_holds);
 
             for (idx, node) in scheduler.next_nodes() {
-                let runtime = self.new_bundle_runtime()?;
                 let input_metadata = scheduler.input_edge_metadata(idx);
                 let output_metadata = scheduler.output_edge_metadata(idx);
                 let stage_id = node.id();
@@ -266,28 +265,10 @@ impl ExecutorDispatcher {
                     .watermarks()
                     .validate_bundle_input_watermark(&stage_id, input_watermark)?;
 
-                // A splittable stage runs one bundle per queued work item. Take
-                // the next item here (the initialization bundle has no item), so
-                // each started bundle gets distinct seed bytes.
-                let worker_id = runtime.worker_id().clone();
-                let ordinary_register = match &node {
-                    ExecutableNode::Worker(stage) => {
-                        self.mark_registration(&worker_id, &stage.id())
-                    }
-                    _ => false,
-                };
-                let (sdf_seed, sdf_initialized, sdf_register, sdf_progress_tick) = match &node {
-                    ExecutableNode::Splittable(stage) => {
+                let (sdf_seed, sdf_initialized, sdf_progress_tick) = match &node {
+                    ExecutableNode::Splittable(_stage) => {
                         let queue = sdf_queues.entry(stage_id.clone()).or_default();
                         let initialized = queue.initialized;
-                        if !initialized {
-                            self.mark_registration(
-                                &worker_id,
-                                &stage.plan().initialization_stage.id(),
-                            );
-                        }
-                        let register =
-                            self.mark_registration(&worker_id, &stage.plan().process_stage.id());
                         let seed = if initialized {
                             queue.items.pop_front()
                         } else {
@@ -300,14 +281,53 @@ impl ExecutorDispatcher {
                             scheduler.watermarks().in_flight_bundles(&stage_id),
                             seed.as_ref().map_or(0, |item| item.seed.len())
                         );
-                        (seed, queue.initialized, register, queue.progress_tick)
+                        (seed, queue.initialized, queue.progress_tick)
                     }
-                    _ => (None, false, false, None),
+                    _ => (None, false, None),
                 };
 
                 let immediate_sdf_tx = immediate_sdf_tx.clone();
+                let pool = self
+                    .pool
+                    .clone()
+                    .ok_or_else(|| anyhow!("worker pool is not configured"))?;
+                let registered_on = Arc::clone(&self.registered_on);
+                let store = self.store.clone();
+                let pipeline_coders = self.pipeline_coders.clone();
+                let pipeline_components = self.pipeline_components.clone();
+                let timer_service = self.timer_service.clone();
+                let source_reports = self.source_reports_tx.clone();
                 in_flight.spawn(async move {
+                    if matches!(&node, ExecutableNode::Runner(_)) {
+                        if let Err(error) = pool.shrink_to(pool.min_workers()).await {
+                            return (idx, Err(error), StageRun::Plain);
+                        }
+                    }
+                    let lease = match pool.acquire(WorkerKind::Cpu).await {
+                        Ok(lease) => lease,
+                        Err(error) => return (idx, Err(error), StageRun::Plain),
+                    };
+                    let worker_id = lease.id().clone();
+                    let worker = lease.worker();
+                    let runtime = BundleRuntime::new(
+                        worker,
+                        store,
+                        pipeline_coders,
+                        pipeline_components,
+                        timer_service,
+                        source_reports,
+                    );
+                    let mark_registration = |descriptor_id: &str| {
+                        registered_on
+                            .lock()
+                            .expect("registration lock not poisoned")
+                            .insert((worker_id.as_str().to_string(), descriptor_id.to_string()))
+                    };
                     if let ExecutableNode::Splittable(stage) = node {
+                        if !sdf_initialized {
+                            mark_registration(&stage.plan().initialization_stage.id());
+                        }
+                        let sdf_register = mark_registration(&stage.plan().process_stage.id());
                         let mut executor = SplittableStageExecutor::new(runtime);
                         let run = match executor
                             .execute_bundle(
@@ -327,8 +347,16 @@ impl ExecutorDispatcher {
                             ),
                             Err(err) => (Err(err), StageRun::Plain),
                         };
+                        if run.0.is_ok() {
+                            pool.record_bundle_complete(&worker_id);
+                        }
                         (idx, run.0, run.1)
                     } else {
+                        let ordinary_register = if let ExecutableNode::Worker(stage) = &node {
+                            mark_registration(&stage.id())
+                        } else {
+                            false
+                        };
                         let mut executor = StageExecutor::new(runtime);
                         let result = executor
                             .execute_with_timers(
@@ -340,6 +368,9 @@ impl ExecutorDispatcher {
                                 ordinary_register,
                             )
                             .await;
+                        if result.is_ok() {
+                            pool.record_bundle_complete(&worker_id);
+                        }
                         (idx, result, StageRun::Plain)
                     }
                 });
@@ -596,30 +627,6 @@ impl ExecutorDispatcher {
             pending_timers.entry(stage).or_default().extend(timers);
         }
         Ok(promoted)
-    }
-
-    fn new_bundle_runtime(&self) -> anyhow::Result<BundleRuntime> {
-        let worker = self
-            .worker
-            .clone()
-            .ok_or_else(|| anyhow!("executor has no connected worker"))?;
-        Ok(BundleRuntime::new(
-            worker,
-            self.store.clone(),
-            self.pipeline_coders.clone(),
-            self.pipeline_components.clone(),
-            self.timer_service.clone(),
-            self.source_reports_tx.clone(),
-        ))
-    }
-
-    fn mark_registration(
-        &mut self,
-        worker_id: &crate::worker::manager::WorkerId,
-        descriptor_id: &str,
-    ) -> bool {
-        self.registered_on
-            .insert((worker_id.as_str().to_string(), descriptor_id.to_string()))
     }
 
     /// Apply runner-source progress reports (TestStream).

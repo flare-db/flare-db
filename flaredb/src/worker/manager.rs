@@ -164,6 +164,12 @@ impl WorkerManager {
         self.exit_tx.subscribe()
     }
 
+    pub fn worker_pid(&self, worker_id: &WorkerId) -> Option<u32> {
+        self.active_workers
+            .get(worker_id.as_str())
+            .and_then(|worker| worker.pid)
+    }
+
     fn next_worker_id(&self, job_id: &str) -> WorkerId {
         let sequence = self
             .worker_sequence

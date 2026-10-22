@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use beam_model_rs::v1::{
     ApiServiceDescriptor, CancelJobRequest, CancelJobResponse, DescribePipelineOptionsRequest,
@@ -25,6 +25,7 @@ use crate::jobservice::job::Job;
 use crate::jobservice::job::JobStore;
 use crate::jobservice::status::{is_terminal_state, job_state_event, record_job_state};
 use crate::worker::manager::WorkerRuntime;
+use crate::worker::pool::{ManagerPoolBackend, WorkerPool, WorkerPoolConfig};
 
 pub struct FlareJobService {
     job_store: JobStore,
@@ -108,47 +109,22 @@ impl FlareJobService {
         &self,
         job_id: &str,
         job_graph: Arc<ExecutableGraph>,
-        worker_id: crate::worker::manager::WorkerId,
     ) -> anyhow::Result<()> {
         let mut dispatcher = self.dispatcher.lock().await;
         dispatcher
             .set_job_store(job_id)
             .await
             .map_err(|e| anyhow::anyhow!("failed to set job store: {e}"))?;
-        let connect_timeout_secs = self.worker_manager.config().connect_timeout_secs;
-        dispatcher
-            .wait_connected(&worker_id, Duration::from_secs(connect_timeout_secs))
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "failed waiting for harness connection for job {}: {}",
-                    job_id,
-                    e
-                )
-            })?;
-
         dispatcher
             .prepare_pipeline(job_graph.as_ref())
             .await
             .map_err(|e| anyhow::anyhow!("failed to prepare pipeline for job {}: {}", job_id, e))?;
 
         let status = dispatcher.harness_status();
-        let mut exits = self.worker_manager.subscribe_worker_exits();
-        let exit_worker_id = worker_id.clone();
-        let exit_status = status.clone();
-        tokio::spawn(async move {
-            while let Ok(exit) = exits.recv().await {
-                if exit.worker_id == exit_worker_id && !exit.intentional {
-                    exit_status.report_worker_failure(
-                        exit_worker_id.as_str(),
-                        "harness process",
-                        format_args!("unexpected exit status {}", exit.status),
-                    );
-                    break;
-                }
-            }
-        });
-        let mut scheduler = NodeScheduler::new((*job_graph).clone());
+        let mut scheduler = NodeScheduler::new_with_bundle_capacity(
+            (*job_graph).clone(),
+            dispatcher.bundle_capacity(),
+        );
         tokio::select! {
             result = dispatcher.run_pipeline(&mut scheduler) => result,
             failure = status.wait_for_failure() => Err(anyhow::anyhow!(failure)),
@@ -314,14 +290,47 @@ impl JobService for FlareJobService {
                 );
             }
 
-            let worker_id = self
-                .worker_manager
-                .spawn_worker(&preparation_id, &runtime, staging_dir, &self.instance_id)
-                .await?;
+            let pool_config = WorkerPoolConfig::from_env();
+            log::info!(
+                "pool config: max={} min={} idle_timeout_s={} bundles_per_worker={} \
+                 log_interval_s={} memory_budget_bytes={} harness_rss_bytes={}",
+                pool_config.max_workers,
+                pool_config.min_workers,
+                pool_config.idle_timeout.as_secs(),
+                pool_config.bundles_per_worker,
+                pool_config.log_interval.as_secs(),
+                pool_config.memory_budget_bytes,
+                pool_config.harness_rss_bytes
+            );
+            let channels = self.dispatcher.lock().await.worker_channels();
+            let pool_backend = Arc::new(ManagerPoolBackend::new(
+                self.worker_manager.clone(),
+                channels,
+                runtime,
+                &preparation_id,
+                staging_dir,
+                &self.instance_id,
+            ));
+            let worker_pool = WorkerPool::new(pool_config, pool_backend);
+            if let Err(error) = worker_pool.start_min_workers().await {
+                self.dispatcher
+                    .lock()
+                    .await
+                    .harness_status()
+                    .begin_intentional_shutdown();
+                let _ = worker_pool.shutdown().await;
+                self.set_job_state(&preparation_id, JobStateEnum::Failed);
+                return Err(Status::internal(truncate_grpc_error(format!(
+                    "failed to start worker pool for job {}: {}",
+                    preparation_id, error
+                ))));
+            }
+            self.dispatcher
+                .lock()
+                .await
+                .set_worker_pool(worker_pool.clone());
 
-            let run_result = self
-                .execute_spawned_job(&preparation_id, job_graph, worker_id.clone())
-                .await;
+            let run_result = self.execute_spawned_job(&preparation_id, job_graph).await;
 
             // Any stream closures caused by this cleanup are expected. Mark the
             // shutdown before killing the process so their BrokenPipe/h2 errors
@@ -331,7 +340,7 @@ impl JobService for FlareJobService {
                 .await
                 .harness_status()
                 .begin_intentional_shutdown();
-            let stop_result = self.worker_manager.stop_worker(&worker_id).await;
+            let stop_result = worker_pool.shutdown().await;
 
             if let Err(error) = run_result {
                 let message = match stop_result {
