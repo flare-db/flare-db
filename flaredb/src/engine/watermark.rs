@@ -779,6 +779,14 @@ impl WatermarkManager {
             .sum()
     }
 
+    pub fn total_in_flight_bundles(&self) -> usize {
+        self.stages.values().map(|stage| stage.in_flight).sum()
+    }
+
+    pub fn total_queued_bundles(&self) -> usize {
+        self.stages.values().map(|stage| stage.queued).sum()
+    }
+
     /// The concurrency ceiling for `stage` (default `1`).
     pub fn max_in_flight(&self, stage: &str) -> usize {
         self.stages.get(stage).map(|s| s.max_in_flight).unwrap_or(1)

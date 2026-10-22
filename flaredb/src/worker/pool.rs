@@ -9,6 +9,7 @@ use std::{
 
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
+use sysinfo::{Pid, ProcessesToUpdate, System};
 use tokio::sync::{Notify, broadcast};
 use tokio::task::JoinSet;
 
@@ -159,6 +160,7 @@ pub fn decide_scale(inputs: &ScaleDecisionInputs) -> ScaleDecision {
 
 #[derive(Clone, Debug)]
 pub struct WorkerPoolConfig {
+    pub job_id: String,
     pub max_workers: usize,
     pub min_workers: usize,
     pub idle_timeout: Duration,
@@ -196,6 +198,7 @@ impl WorkerPoolConfig {
             .unwrap_or(1)
             .min(max_workers);
         Self {
+            job_id: String::new(),
             max_workers,
             min_workers,
             idle_timeout: Duration::from_secs(env_u64("FLAREDB_WORKER_IDLE_TIMEOUT_SECS", 10)),
@@ -319,11 +322,17 @@ impl PoolWorkerBackend for ManagerPoolBackend {
     }
 }
 
+struct ActiveLease {
+    started: Instant,
+    stage: Option<String>,
+    instruction_id: Option<String>,
+}
+
 struct WorkerEntry {
     id: WorkerId,
     pid: Option<u32>,
     handle: WorkerHandle,
-    active: HashMap<u64, Instant>,
+    active: HashMap<u64, ActiveLease>,
     stopping: bool,
     bundles_done: u64,
     busy_seconds: f64,
@@ -340,7 +349,16 @@ struct PoolInner {
     total_busy_seconds: f64,
     total_idle_seconds: f64,
     completed_bundles: u64,
+    peak_workers: usize,
+    total_output_elements: u64,
+    queue_depth: usize,
+    in_flight_bundles: usize,
+    splits: u64,
+    started_at: Instant,
     last_scale_log: Option<(ScaleReason, usize)>,
+    last_worker_log: HashMap<String, (String, Option<String>)>,
+    last_worker_log_at: HashMap<String, Instant>,
+    process_system: System,
 }
 
 pub struct WorkerPool {
@@ -374,6 +392,38 @@ impl Lease {
     pub fn id(&self) -> &WorkerId {
         &self.worker_id
     }
+
+    pub fn token(&self) -> u64 {
+        self.lease_id
+    }
+
+    pub fn annotate_stage(&mut self, stage: impl Into<String>) {
+        if let Some(lease) = self
+            .pool
+            .inner
+            .lock()
+            .expect("worker pool lock not poisoned")
+            .workers
+            .get_mut(self.worker_id.as_str())
+            .and_then(|worker| worker.active.get_mut(&self.lease_id))
+        {
+            lease.stage = Some(stage.into());
+        }
+    }
+
+    pub fn annotate_instruction(&self, lease_id: u64, instruction_id: &str) {
+        if let Some(lease) = self
+            .pool
+            .inner
+            .lock()
+            .expect("worker pool lock not poisoned")
+            .workers
+            .get_mut(self.worker_id.as_str())
+            .and_then(|worker| worker.active.get_mut(&lease_id))
+        {
+            lease.instruction_id = Some(instruction_id.to_string());
+        }
+    }
 }
 
 impl Drop for Lease {
@@ -403,10 +453,15 @@ impl Drop for Lease {
 pub struct WorkerSnapshot {
     pub id: String,
     pub pid: Option<u32>,
+    pub state: String,
+    pub bundle: Option<String>,
+    pub oldest_bundle_age_seconds: Option<f64>,
     pub active_bundles: usize,
     pub bundles_done: u64,
     pub busy_seconds: f64,
     pub idle_seconds: f64,
+    pub rss_mb: Option<f64>,
+    pub cpu_pct: Option<f32>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -417,7 +472,11 @@ pub struct PoolSnapshot {
     pub busy: usize,
     pub idle: usize,
     pub starting: usize,
+    pub peak_workers: usize,
     pub remaining_bundles: usize,
+    pub queue_depth: usize,
+    pub in_flight_bundles: usize,
+    pub splits: u64,
     pub want_workers: usize,
     pub scale_reason: String,
     pub target_seconds_per_worker: f64,
@@ -425,6 +484,9 @@ pub struct PoolSnapshot {
     pub estimated_remaining_seconds: Option<f64>,
     pub spawn_count: u64,
     pub completed_bundles: u64,
+    pub output_elements: u64,
+    pub output_elements_per_second: f64,
+    pub utilization: f64,
     pub total_busy_seconds: f64,
     pub total_idle_seconds: f64,
     pub spawn_cost_ms: Option<u128>,
@@ -441,7 +503,7 @@ fn scale_decision(config: &WorkerPoolConfig, inner: &PoolInner) -> ScaleDecision
         .workers
         .values()
         .flat_map(|worker| worker.active.values())
-        .map(Instant::elapsed)
+        .map(|lease| lease.started.elapsed())
         .map(|elapsed| elapsed.as_secs_f64())
         .sum::<f64>();
     decide_scale(&ScaleDecisionInputs {
@@ -535,13 +597,23 @@ impl WorkerPool {
                 total_busy_seconds: 0.0,
                 total_idle_seconds: 0.0,
                 completed_bundles: 0,
+                peak_workers: 0,
+                total_output_elements: 0,
+                queue_depth: 0,
+                in_flight_bundles: 0,
+                splits: 0,
+                started_at: Instant::now(),
                 last_scale_log: None,
+                last_worker_log: HashMap::new(),
+                last_worker_log_at: HashMap::new(),
+                process_system: System::new(),
             }),
             notify: Notify::new(),
             next_lease_id: AtomicU64::new(1),
         });
         pool.start_exit_monitor();
         pool.start_scale_monitor();
+        pool.start_pool_log_monitor();
         pool
     }
 
@@ -567,6 +639,31 @@ impl WorkerPool {
         log_scale_decision(&self.config, &mut inner, decision, "workload");
         drop(inner);
         self.notify.notify_waiters();
+    }
+
+    pub fn observe_dispatcher_state(
+        &self,
+        queue_depth: usize,
+        in_flight_bundles: usize,
+        splits: u64,
+    ) {
+        let mut inner = self.inner.lock().expect("worker pool lock not poisoned");
+        inner.queue_depth = queue_depth;
+        inner.in_flight_bundles = in_flight_bundles;
+        inner.splits = splits;
+    }
+
+    pub fn annotate_instruction(&self, worker_id: &WorkerId, lease_id: u64, instruction_id: &str) {
+        if let Some(lease) = self
+            .inner
+            .lock()
+            .expect("worker pool lock not poisoned")
+            .workers
+            .get_mut(worker_id.as_str())
+            .and_then(|worker| worker.active.get_mut(&lease_id))
+        {
+            lease.instruction_id = Some(instruction_id.to_string());
+        }
     }
 
     pub async fn acquire(self: &Arc<Self>, _kind: WorkerKind) -> Result<Lease> {
@@ -598,7 +695,14 @@ impl WorkerPool {
                             0.0
                         };
                         let started = Instant::now();
-                        worker.active.insert(lease_id, started);
+                        worker.active.insert(
+                            lease_id,
+                            ActiveLease {
+                                started,
+                                stage: None,
+                                instruction_id: None,
+                            },
+                        );
                         idle_elapsed
                     };
                     inner.total_idle_seconds += idle_elapsed;
@@ -606,10 +710,11 @@ impl WorkerPool {
                         .workers
                         .get(&selected)
                         .expect("selected worker must exist");
-                    let started = *worker
+                    let started = worker
                         .active
                         .get(&lease_id)
-                        .expect("leased worker slot must exist");
+                        .expect("leased worker slot must exist")
+                        .started;
                     return Ok(Lease {
                         pool: Arc::clone(self),
                         worker_id: worker.id.clone(),
@@ -694,8 +799,10 @@ impl WorkerPool {
             }
             None => startup,
         });
+        let spawned_id = spawned.id.as_str().to_string();
+        let spawned_pid = spawned.pid;
         inner.workers.insert(
-            spawned.id.as_str().to_string(),
+            spawned_id.clone(),
             WorkerEntry {
                 id: spawned.id,
                 pid: spawned.pid,
@@ -706,6 +813,25 @@ impl WorkerPool {
                 busy_seconds: 0.0,
                 idle_since: Instant::now(),
             },
+        );
+        inner.peak_workers = inner.peak_workers.max(
+            inner
+                .workers
+                .values()
+                .filter(|worker| !worker.stopping)
+                .count(),
+        );
+        log::info!(
+            "worker spawned: id={} pid={} startup_ms={} live={} peak={} reason=pool-demand",
+            spawned_id,
+            spawned_pid.map_or_else(|| "na".to_string(), |pid| pid.to_string()),
+            startup.as_millis(),
+            inner
+                .workers
+                .values()
+                .filter(|worker| !worker.stopping)
+                .count(),
+            inner.peak_workers
         );
         let decision = scale_decision(&self.config, &inner);
         log_scale_decision(&self.config, &mut inner, decision, "spawn-complete");
@@ -740,12 +866,13 @@ impl WorkerPool {
             }
             ids
         };
-        self.stop_selected(&stop_ids).await
+        self.stop_selected(&stop_ids, "shrink-to-min").await
     }
 
-    pub fn record_bundle_complete(&self, worker_id: &WorkerId) {
+    pub fn record_bundle_complete(&self, worker_id: &WorkerId, output_elements: u64) {
         let mut inner = self.inner.lock().expect("worker pool lock not poisoned");
         inner.completed_bundles += 1;
+        inner.total_output_elements = inner.total_output_elements.saturating_add(output_elements);
         if let Some(worker) = inner.workers.get_mut(worker_id.as_str()) {
             worker.bundles_done += 1;
         }
@@ -816,26 +943,81 @@ impl WorkerPool {
             floor,
             self.config.idle_timeout.as_secs()
         );
-        self.stop_selected(&stop_ids).await
+        self.stop_selected(&stop_ids, "idle-timeout").await
     }
 
     pub fn snapshot(&self) -> PoolSnapshot {
-        let inner = self.inner.lock().expect("worker pool lock not poisoned");
+        self.snapshot_with_processes(false)
+    }
+
+    pub fn telemetry_snapshot(&self) -> PoolSnapshot {
+        self.snapshot_with_processes(true)
+    }
+
+    fn snapshot_with_processes(&self, include_processes: bool) -> PoolSnapshot {
+        let mut inner = self.inner.lock().expect("worker pool lock not poisoned");
+        if include_processes {
+            let pids = inner
+                .workers
+                .values()
+                .filter_map(|worker| worker.pid)
+                .map(Pid::from_u32)
+                .collect::<Vec<_>>();
+            if !pids.is_empty() {
+                inner
+                    .process_system
+                    .refresh_processes(ProcessesToUpdate::Some(&pids), true);
+            }
+        }
         let workers: Vec<WorkerSnapshot> = inner
             .workers
             .values()
             .filter(|worker| !worker.stopping)
-            .map(|worker| WorkerSnapshot {
-                id: worker.id.as_str().to_string(),
-                pid: worker.pid,
-                active_bundles: worker.active.len(),
-                bundles_done: worker.bundles_done,
-                busy_seconds: worker.busy_seconds,
-                idle_seconds: if worker.active.is_empty() {
-                    worker.idle_since.elapsed().as_secs_f64()
-                } else {
-                    0.0
-                },
+            .map(|worker| {
+                let oldest = worker
+                    .active
+                    .values()
+                    .min_by_key(|lease| lease.started)
+                    .map(|lease| {
+                        (
+                            lease
+                                .instruction_id
+                                .clone()
+                                .or_else(|| {
+                                    lease.stage.as_ref().map(|stage| format!("stage:{stage}"))
+                                })
+                                .unwrap_or_else(|| "unknown".to_string()),
+                            lease.started.elapsed().as_secs_f64(),
+                        )
+                    });
+                let process = include_processes
+                    .then(|| {
+                        worker
+                            .pid
+                            .and_then(|pid| inner.process_system.process(Pid::from_u32(pid)))
+                    })
+                    .flatten();
+                WorkerSnapshot {
+                    id: worker.id.as_str().to_string(),
+                    pid: worker.pid,
+                    state: if worker.active.is_empty() {
+                        "idle".to_string()
+                    } else {
+                        "busy".to_string()
+                    },
+                    bundle: oldest.as_ref().map(|(bundle, _)| bundle.clone()),
+                    oldest_bundle_age_seconds: oldest.map(|(_, age)| age),
+                    active_bundles: worker.active.len(),
+                    bundles_done: worker.bundles_done,
+                    busy_seconds: worker.busy_seconds,
+                    idle_seconds: if worker.active.is_empty() {
+                        worker.idle_since.elapsed().as_secs_f64()
+                    } else {
+                        0.0
+                    },
+                    rss_mb: process.map(|process| process.memory() as f64 / 1024.0 / 1024.0),
+                    cpu_pct: process.map(|process| process.cpu_usage()),
+                }
             })
             .collect();
         let decision = scale_decision(&self.config, &inner);
@@ -843,6 +1025,25 @@ impl WorkerPool {
             .iter()
             .filter(|worker| worker.active_bundles > 0)
             .count();
+        let active_worker_seconds = inner
+            .workers
+            .values()
+            .flat_map(|worker| worker.active.values())
+            .map(|lease| lease.started.elapsed().as_secs_f64())
+            .sum::<f64>();
+        let total_idle_seconds = inner.total_idle_seconds
+            + workers
+                .iter()
+                .map(|worker| worker.idle_seconds)
+                .sum::<f64>();
+        let busy_worker_seconds = inner.total_busy_seconds + active_worker_seconds;
+        let observed_worker_seconds = busy_worker_seconds + total_idle_seconds;
+        let utilization = if observed_worker_seconds > 0.0 {
+            (busy_worker_seconds / observed_worker_seconds).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let elapsed = inner.started_at.elapsed().as_secs_f64().max(f64::EPSILON);
         PoolSnapshot {
             max_workers: self.config.max_workers,
             min_workers: self.config.min_workers,
@@ -850,7 +1051,11 @@ impl WorkerPool {
             busy,
             idle: workers.len().saturating_sub(busy),
             starting: inner.starting,
+            peak_workers: inner.peak_workers,
             remaining_bundles: inner.remaining_bundles,
+            queue_depth: inner.queue_depth,
+            in_flight_bundles: inner.in_flight_bundles,
+            splits: inner.splits,
             want_workers: decision.want_workers,
             scale_reason: decision.reason.as_str().to_string(),
             target_seconds_per_worker: decision.target_seconds_per_worker,
@@ -858,12 +1063,11 @@ impl WorkerPool {
             estimated_remaining_seconds: decision.estimated_remaining_seconds,
             spawn_count: inner.spawn_count,
             completed_bundles: inner.completed_bundles,
-            total_busy_seconds: inner.total_busy_seconds,
-            total_idle_seconds: inner.total_idle_seconds
-                + workers
-                    .iter()
-                    .map(|worker| worker.idle_seconds)
-                    .sum::<f64>(),
+            output_elements: inner.total_output_elements,
+            output_elements_per_second: inner.total_output_elements as f64 / elapsed,
+            utilization,
+            total_busy_seconds: busy_worker_seconds,
+            total_idle_seconds,
             spawn_cost_ms: inner.spawn_cost.map(|value| value.as_millis()),
             workers,
         }
@@ -884,6 +1088,11 @@ impl WorkerPool {
         for worker_id in worker_ids {
             if let Err(error) = self.backend.stop_worker(&worker_id).await {
                 first_error.get_or_insert(error);
+            } else {
+                log::info!(
+                    "worker stopped: id={} reason=job-shutdown",
+                    worker_id.as_str()
+                );
             }
         }
         self.inner
@@ -895,11 +1104,12 @@ impl WorkerPool {
         first_error.map_or(Ok(()), Err)
     }
 
-    async fn stop_selected(&self, worker_ids: &[WorkerId]) -> Result<()> {
+    async fn stop_selected(&self, worker_ids: &[WorkerId], reason: &str) -> Result<()> {
         let mut first_error = None;
         for worker_id in worker_ids {
             match self.backend.stop_worker(worker_id).await {
                 Ok(()) => {
+                    log::info!("worker stopped: id={} reason={reason}", worker_id.as_str());
                     self.inner
                         .lock()
                         .expect("worker pool lock not poisoned")
@@ -960,6 +1170,89 @@ impl WorkerPool {
                 }
                 if let Err(error) = pool.reconcile_scale().await {
                     log::error!("pool scale reconciliation failed: {error}");
+                }
+            }
+        });
+    }
+
+    fn start_pool_log_monitor(self: &Arc<Self>) {
+        let pool = Arc::downgrade(self);
+        let interval_duration = self.config.log_interval;
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(interval_duration);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let Some(pool) = pool.upgrade() else {
+                    break;
+                };
+                if pool
+                    .inner
+                    .lock()
+                    .expect("worker pool lock not poisoned")
+                    .shutting_down
+                {
+                    break;
+                }
+                let snapshot = pool.telemetry_snapshot();
+                log::info!(
+                    "pool: job={} max={} live={} busy={} idle={} starting={} queue={} \
+                     in_flight={} done_bundles={} splits={} est_remaining_s={:?} want={} \
+                     out_rows_per_s={:.0} util={:.2} peak={} spawned={}",
+                    pool.config.job_id,
+                    snapshot.max_workers,
+                    snapshot.live,
+                    snapshot.busy,
+                    snapshot.idle,
+                    snapshot.starting,
+                    snapshot.queue_depth,
+                    snapshot.in_flight_bundles,
+                    snapshot.completed_bundles,
+                    snapshot.splits,
+                    snapshot.estimated_remaining_seconds,
+                    snapshot.want_workers,
+                    snapshot.output_elements_per_second,
+                    snapshot.utilization,
+                    snapshot.peak_workers,
+                    snapshot.spawn_count
+                );
+                for worker in &snapshot.workers {
+                    let key = (worker.state.clone(), worker.bundle.clone());
+                    let changed = {
+                        let mut inner = pool.inner.lock().expect("worker pool lock not poisoned");
+                        if inner.last_worker_log.get(&worker.id) == Some(&key) {
+                            inner
+                                .last_worker_log_at
+                                .get(&worker.id)
+                                .is_none_or(|last| last.elapsed() >= Duration::from_secs(30))
+                        } else {
+                            inner.last_worker_log.insert(worker.id.clone(), key);
+                            true
+                        }
+                    };
+                    if changed {
+                        pool.inner
+                            .lock()
+                            .expect("worker pool lock not poisoned")
+                            .last_worker_log_at
+                            .insert(worker.id.clone(), Instant::now());
+                        log::info!(
+                            "worker {}: pid={} state={} bundle={} bundle_age_s={:?} \
+                             bundles_done={} busy_s={:.1} idle_s={:.1} rss_mb={:?} cpu_pct={:?}",
+                            worker.id,
+                            worker
+                                .pid
+                                .map_or_else(|| "na".to_string(), |pid| pid.to_string()),
+                            worker.state,
+                            worker.bundle.as_deref().unwrap_or("none"),
+                            worker.oldest_bundle_age_seconds,
+                            worker.bundles_done,
+                            worker.busy_seconds,
+                            worker.idle_seconds,
+                            worker.rss_mb,
+                            worker.cpu_pct
+                        );
+                    }
                 }
             }
         });
@@ -1028,6 +1321,7 @@ mod tests {
 
     fn config(max: usize, min: usize, slots: usize) -> WorkerPoolConfig {
         WorkerPoolConfig {
+            job_id: "test-job".to_string(),
             max_workers: max,
             min_workers: min,
             idle_timeout: Duration::from_secs(1),
@@ -1130,8 +1424,16 @@ mod tests {
         pool.start_min_workers().await.unwrap();
         assert_eq!(pool.snapshot().live, 1);
 
-        let first = pool.acquire(WorkerKind::Cpu).await.unwrap();
+        let mut first = pool.acquire(WorkerKind::Cpu).await.unwrap();
         assert_eq!(first.id().as_str(), "fake-w0");
+        first.annotate_stage("stage-a");
+        pool.annotate_instruction(first.id(), first.token(), "instr-1");
+        let active = pool.snapshot();
+        assert_eq!(active.workers[0].state, "busy");
+        assert_eq!(active.workers[0].bundle.as_deref(), Some("instr-1"));
+        assert!(active.workers[0].oldest_bundle_age_seconds.is_some());
+        pool.observe_dispatcher_state(4, 1, 2);
+        pool.record_bundle_complete(first.id(), 120);
         pool.observe_workload(100);
         {
             let mut inner = pool.inner.lock().expect("worker pool lock not poisoned");
@@ -1142,6 +1444,14 @@ mod tests {
         assert_eq!(second.id().as_str(), "fake-w1");
         assert_eq!(pool.snapshot().live, 2);
         assert_eq!(pool.snapshot().busy, 2);
+        let snapshot = pool.snapshot();
+        assert_eq!(snapshot.peak_workers, 2);
+        assert_eq!(snapshot.queue_depth, 4);
+        assert_eq!(snapshot.in_flight_bundles, 1);
+        assert_eq!(snapshot.splits, 2);
+        assert_eq!(snapshot.output_elements, 120);
+        assert!(snapshot.output_elements_per_second > 0.0);
+        assert!(snapshot.utilization > 0.0);
         drop(first);
         drop(second);
         assert_eq!(pool.snapshot().idle, 2);

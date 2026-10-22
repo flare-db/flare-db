@@ -1,4 +1,5 @@
 use crate::engine::metrics::JobMetrics;
+use crate::engine::metrics::sum_element_count;
 use crate::engine::sdf::{SdfBundleOutcome, SdfWorkItem, SplitManager, SplittableStageExecutor};
 use crate::transforms::SourceProgress;
 use crate::worker::pool::{WorkerKind, WorkerPool};
@@ -35,6 +36,20 @@ enum StageRun {
     Sdf { outcome: SdfBundleOutcome },
 }
 
+#[derive(Default)]
+struct StageTelemetry {
+    started_at: Option<Instant>,
+    bundles: u64,
+    output_elements: u64,
+    bundle_durations_ms: Vec<u64>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct BundleObservation {
+    duration: Duration,
+    output_elements: u64,
+}
+
 /// Pending bundle work for one splittable stage.
 #[derive(Default)]
 struct SdfQueue {
@@ -68,6 +83,15 @@ fn remove_holds(map: &mut HashMap<String, Vec<Timestamp>>, stage: &str, holds: &
     }
     if list.is_empty() {
         map.remove(stage);
+    }
+}
+
+fn control_output_elements(response: &ControlResponse) -> Option<u64> {
+    match response {
+        ControlResponse::ProcessBundleSuccess(response) => {
+            Some(sum_element_count(&response.monitoring_infos))
+        }
+        _ => None,
     }
 }
 
@@ -228,6 +252,9 @@ impl ExecutorDispatcher {
         let split_manager = SplitManager::from_env(self.pool.clone());
         // Timers to deliver the next time each re-armed stage runs.
         let mut pending_timers: HashMap<String, Vec<TimerEntry>> = HashMap::new();
+        let mut stage_telemetry: HashMap<String, StageTelemetry> = HashMap::new();
+        let mut summarized_stages = HashSet::new();
+        let mut first_idle_queue_empty_at: Option<Instant> = None;
         // Pending residual work items per splittable stage, and the union of the
         // output-watermark holds their deferred work imposes. Both per-run.
         let mut sdf_queues: HashMap<String, SdfQueue> = HashMap::new();
@@ -266,11 +293,25 @@ impl ExecutorDispatcher {
             let nodes = scheduler.next_nodes();
             if let Some(pool) = &self.pool {
                 pool.observe_workload(scheduler.outstanding_bundle_count());
+                pool.observe_dispatcher_state(
+                    scheduler.queued_bundle_count(),
+                    scheduler.in_flight_bundle_count(),
+                    split_manager.total_splits(),
+                );
+                let snapshot = pool.snapshot();
+                if scheduler.queued_bundle_count() == 0 && snapshot.idle > 0 {
+                    first_idle_queue_empty_at.get_or_insert_with(Instant::now);
+                }
             }
             for (idx, node) in nodes {
                 let input_metadata = scheduler.input_edge_metadata(idx);
                 let output_metadata = scheduler.output_edge_metadata(idx);
                 let stage_id = node.id();
+                stage_telemetry
+                    .entry(stage_id.clone())
+                    .or_default()
+                    .started_at
+                    .get_or_insert_with(Instant::now);
                 let timers = pending_timers.remove(&stage_id).unwrap_or_default();
                 // The stage's input watermark at the start of this bundle, used by
                 // windowed aggregation to decide which windows are ready.
@@ -323,12 +364,26 @@ impl ExecutorDispatcher {
                     if matches!(&node, ExecutableNode::Runner(_))
                         && let Err(error) = pool.shrink_to(pool.min_workers()).await
                     {
-                        return (idx, Err(error), StageRun::Plain);
+                        return (
+                            idx,
+                            Err(error),
+                            StageRun::Plain,
+                            BundleObservation::default(),
+                        );
                     }
-                    let lease = match pool.acquire(WorkerKind::Cpu).await {
+                    let mut lease = match pool.acquire(WorkerKind::Cpu).await {
                         Ok(lease) => lease,
-                        Err(error) => return (idx, Err(error), StageRun::Plain),
+                        Err(error) => {
+                            return (
+                                idx,
+                                Err(error),
+                                StageRun::Plain,
+                                BundleObservation::default(),
+                            );
+                        }
                     };
+                    lease.annotate_stage(stage_id.clone());
+                    let bundle_started = Instant::now();
                     let worker_id = lease.id().clone();
                     let snapshot = pool.snapshot();
                     split_manager.set_pool_state(
@@ -340,7 +395,10 @@ impl ExecutorDispatcher {
                             .map(Duration::from_millis),
                     );
                     let worker = lease.worker();
-                    let runtime = BundleRuntime::new(
+                    let instruction_pool = Arc::clone(&pool);
+                    let instruction_worker = worker_id.clone();
+                    let instruction_lease = lease.token();
+                    let mut runtime = BundleRuntime::new(
                         worker,
                         store,
                         pipeline_coders,
@@ -348,6 +406,13 @@ impl ExecutorDispatcher {
                         timer_service,
                         source_reports,
                     );
+                    runtime.set_instruction_observer(Arc::new(move |instruction_id| {
+                        instruction_pool.annotate_instruction(
+                            &instruction_worker,
+                            instruction_lease,
+                            instruction_id,
+                        );
+                    }));
                     let mark_registration = |descriptor_id: &str| {
                         registered_on
                             .lock()
@@ -382,17 +447,29 @@ impl ExecutorDispatcher {
                             )
                             .await
                         {
-                            Ok((response, outcome)) => (
-                                Ok(ControlResponse::ProcessBundleSuccess(response)),
-                                StageRun::Sdf { outcome },
-                            ),
-                            Err(err) => (Err(err), StageRun::Plain),
+                            Ok((response, outcome)) => {
+                                let output_elements = sum_element_count(&response.monitoring_infos);
+                                (
+                                    Ok(ControlResponse::ProcessBundleSuccess(response)),
+                                    StageRun::Sdf { outcome },
+                                    output_elements,
+                                )
+                            }
+                            Err(err) => (Err(err), StageRun::Plain, 0),
                         };
                         split_manager.finish_bundle(split_bundle_id);
                         if run.0.is_ok() {
-                            pool.record_bundle_complete(&worker_id);
+                            pool.record_bundle_complete(&worker_id, run.2);
                         }
-                        (idx, run.0, run.1)
+                        (
+                            idx,
+                            run.0,
+                            run.1,
+                            BundleObservation {
+                                duration: bundle_started.elapsed(),
+                                output_elements: run.2,
+                            },
+                        )
                     } else {
                         let ordinary_register = if let ExecutableNode::Worker(stage) = &node {
                             mark_registration(&stage.id())
@@ -410,10 +487,23 @@ impl ExecutorDispatcher {
                                 ordinary_register,
                             )
                             .await;
+                        let output_elements = result
+                            .as_ref()
+                            .ok()
+                            .and_then(control_output_elements)
+                            .unwrap_or(0);
                         if result.is_ok() {
-                            pool.record_bundle_complete(&worker_id);
+                            pool.record_bundle_complete(&worker_id, output_elements);
                         }
-                        (idx, result, StageRun::Plain)
+                        (
+                            idx,
+                            result,
+                            StageRun::Plain,
+                            BundleObservation {
+                                duration: bundle_started.elapsed(),
+                                output_elements,
+                            },
+                        )
                     }
                 });
             }
@@ -519,9 +609,19 @@ impl ExecutorDispatcher {
             };
 
             if let Some(joined) = joined {
-                let (idx, result, run) = joined?;
-                result?;
+                let (idx, result, run, observation) = joined?;
                 let stage_id = scheduler.stage_id(idx);
+                {
+                    let telemetry = stage_telemetry.entry(stage_id.clone()).or_default();
+                    telemetry.bundles += 1;
+                    telemetry.output_elements = telemetry
+                        .output_elements
+                        .saturating_add(observation.output_elements);
+                    telemetry
+                        .bundle_durations_ms
+                        .push(observation.duration.as_millis().min(u128::from(u64::MAX)) as u64);
+                }
+                result?;
 
                 // Release the holds of the item this bundle consumed, publish the
                 // holds of the residuals it produced, queue those residuals, and
@@ -598,6 +698,56 @@ impl ExecutorDispatcher {
                     None
                 };
                 scheduler.mark_complete_with_min(idx, output_min_ts);
+                if scheduler.watermarks().in_flight_bundles(&stage_id) == 0
+                    && scheduler.watermarks().queued_bundles(&stage_id) == 0
+                    && summarized_stages.insert(stage_id.clone())
+                {
+                    let telemetry = stage_telemetry.entry(stage_id.clone()).or_default();
+                    let wall = telemetry
+                        .started_at
+                        .map(|started| started.elapsed().as_secs_f64())
+                        .unwrap_or(0.0);
+                    let mut durations = telemetry.bundle_durations_ms.clone();
+                    durations.sort_unstable();
+                    let percentile = |fraction: f64| {
+                        if durations.is_empty() {
+                            0
+                        } else {
+                            durations[((durations.len() - 1) as f64 * fraction).round() as usize]
+                        }
+                    };
+                    let busy_seconds =
+                        telemetry.bundle_durations_ms.iter().sum::<u64>() as f64 / 1_000.0;
+                    let max_workers = self
+                        .pool
+                        .as_ref()
+                        .map(|pool| pool.config().max_workers)
+                        .unwrap_or(1)
+                        .max(1);
+                    let worker_utilization = if wall > 0.0 {
+                        (busy_seconds / (wall * max_workers as f64)).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    let tail_s = first_idle_queue_empty_at
+                        .map(|started| started.elapsed().as_secs_f64())
+                        .unwrap_or(0.0);
+                    log::info!(
+                        "stage summary: stage={} wall_s={:.3} bundles={} splits={} \
+                         worker_utilization={:.2} tail_s={:.3} bundle_ms_min={} \
+                         bundle_ms_p50={} bundle_ms_max={} output_elements={}",
+                        stage_id,
+                        wall,
+                        telemetry.bundles,
+                        split_manager.stage_splits(&stage_id),
+                        worker_utilization,
+                        tail_s,
+                        percentile(0.0),
+                        percentile(0.5),
+                        percentile(1.0),
+                        telemetry.output_elements
+                    );
+                }
             }
         }
 

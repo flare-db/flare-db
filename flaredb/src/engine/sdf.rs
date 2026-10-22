@@ -22,6 +22,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::coders::primitives::{VarIntCoder, WindowedValue, WindowedValueCoder};
 use crate::coders::{BeamCoder, StandardBeamCoders};
 use crate::engine::harness::control::ControlChannel;
+use crate::engine::metrics::sum_element_count;
 use crate::fusion::stage::SplittableProcessKind;
 use crate::jobservice::urns::beam_urns;
 use crate::store::record::{BeamRecord, PrimitiveValue};
@@ -64,6 +65,7 @@ const MAX_BUNDLES_PER_WORKER: usize = 8;
 const DEFAULT_SDF_OVERDECOMPOSE: usize = 4;
 /// Minimum duration between estimator rate samples.
 const ESTIMATOR_RATE_WINDOW: Duration = Duration::from_millis(500);
+const BUNDLE_PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug)]
 struct SdfSplitConfig {
@@ -216,6 +218,7 @@ struct BundleSplitRuntime {
     split_requests: u64,
     splits: u64,
     last_denial: Option<SplitDenyReason>,
+    last_progress_log_at: Instant,
 }
 
 impl BundleSplitRuntime {
@@ -227,6 +230,7 @@ impl BundleSplitRuntime {
             split_requests: 0,
             splits: 0,
             last_denial: None,
+            last_progress_log_at: now,
         }
     }
 }
@@ -406,6 +410,8 @@ struct SplitManagerState {
     spawn_cost: Duration,
     next_bundle_id: u64,
     total_bundles: usize,
+    total_splits: u64,
+    stage_splits: HashMap<String, u64>,
 }
 
 pub struct SplitManager {
@@ -498,6 +504,23 @@ impl SplitManager {
             .expect("split manager lock not poisoned")
             .queue_depth
             .insert(stage.to_string(), depth);
+    }
+
+    pub fn total_splits(&self) -> u64 {
+        self.state
+            .lock()
+            .expect("split manager lock not poisoned")
+            .total_splits
+    }
+
+    pub fn stage_splits(&self, stage: &str) -> u64 {
+        self.state
+            .lock()
+            .expect("split manager lock not poisoned")
+            .stage_splits
+            .get(stage)
+            .copied()
+            .unwrap_or(0)
     }
 
     pub fn register_bundle(&self, stage: &str, depth: usize, now: Instant) -> u64 {
@@ -616,6 +639,33 @@ impl SplitManager {
         SplitPermitDecision::Granted(SplitPermit { bundle_id })
     }
 
+    fn decision_context(&self, bundle_id: u64) -> String {
+        let state = self.state.lock().expect("split manager lock not poisoned");
+        let Some(bundle) = state.bundles.get(&bundle_id) else {
+            return "bundle=missing".to_string();
+        };
+        let min_split = self.config.min_split_override.unwrap_or_else(|| {
+            Duration::from_secs_f64(
+                DEFAULT_MIN_SPLIT
+                    .as_secs_f64()
+                    .max(SPAWN_COST_MULTIPLIER as f64 * state.spawn_cost.as_secs_f64()),
+            )
+        });
+        format!(
+            "capacity={} permits={} queue_depth={} depth={} total_bundles={} \
+             max_bundles={} min_split_s={:.2} est_remaining_s={:?} spawn_cost_ms={}",
+            state.capacity,
+            state.permits.len(),
+            state.queue_depth.get(&bundle.stage).copied().unwrap_or(0),
+            bundle.depth,
+            state.total_bundles,
+            state.max_workers.saturating_mul(MAX_BUNDLES_PER_WORKER),
+            min_split.as_secs_f64(),
+            bundle.est_remaining.map(|value| value.as_secs_f64()),
+            state.spawn_cost.as_millis()
+        )
+    }
+
     fn complete_permit(
         &self,
         permit: SplitPermit,
@@ -641,6 +691,8 @@ impl SplitManager {
         if let Some(stage) = stage
             && created_items > 0
         {
+            state.total_splits += 1;
+            *state.stage_splits.entry(stage.clone()).or_default() += 1;
             let depth = state.queue_depth.get(&stage).copied().unwrap_or(0);
             state
                 .queue_depth
@@ -852,6 +904,7 @@ impl SplittableStageExecutor {
         &mut self,
         stage: &ExecutableStage,
     ) -> anyhow::Result<(ProcessBundleResponse, Vec<u8>)> {
+        let started = Instant::now();
         let descriptor_id = stage.id().to_string();
         let bundle_status = self.runtime.register_bundle(stage).await?;
         if !matches!(bundle_status, ControlResponse::BundleRegistered) {
@@ -867,10 +920,18 @@ impl SplittableStageExecutor {
             .control()
             .send_process_bundle_request(&descriptor_id)
             .await?;
+        self.runtime.record_instruction_id(&instruction_id);
 
         info!(
             "SDF initialization stage {} instruction_id={}",
             descriptor_id, instruction_id
+        );
+        info!(
+            "bundle start: worker={} instr={} stage={} elements=unknown seed_bytes=0 \
+             queue_depth=0 phase=initialization",
+            self.runtime.worker_id().as_str(),
+            instruction_id,
+            descriptor_id
         );
 
         let coder_id = stage.input_pcol().node().coder_id.clone();
@@ -982,7 +1043,21 @@ impl SplittableStageExecutor {
         .await?;
 
         match control_response {
-            (ControlResponse::ProcessBundleSuccess(response), bytes) => Ok((response, bytes)),
+            (ControlResponse::ProcessBundleSuccess(response), bytes) => {
+                info!(
+                    "bundle end: worker={} instr={} stage={} dur_ms={} output_elements={} \
+                     paimon_write_ms={} status=ok phase=initialization",
+                    self.runtime.worker_id().as_str(),
+                    instruction_id,
+                    descriptor_id,
+                    started.elapsed().as_millis(),
+                    sum_element_count(&response.monitoring_infos),
+                    self.runtime
+                        .last_paimon_write_ms()
+                        .map_or_else(|| "na".to_string(), |value| value.to_string())
+                );
+                Ok((response, bytes))
+            }
             (ControlResponse::ProcessBundleError(err), _) => {
                 Err(anyhow!("SDF initialization stage failed: {}", err))
             }
@@ -1015,6 +1090,7 @@ impl SplittableStageExecutor {
         split_depth: usize,
         immediate_items: SdfWorkItemSender,
     ) -> anyhow::Result<(ProcessBundleResponse, Duration)> {
+        let started = Instant::now();
         let descriptor_id = stage.id().to_string();
         if register {
             let bundle_status = self.runtime.register_bundle(stage).await?;
@@ -1068,9 +1144,20 @@ impl SplittableStageExecutor {
             .control()
             .send_process_bundle_request(&descriptor_id)
             .await?;
+        self.runtime.record_instruction_id(&instruction_id);
         info!(
             "SDF process stage {} instruction_id={}, estimated_input_elements={}",
             descriptor_id, instruction_id, estimated_input_elements
+        );
+        info!(
+            "bundle start: worker={} instr={} stage={} elements={} seed_bytes={} \
+             queue_depth=na depth={} phase=process",
+            self.runtime.worker_id().as_str(),
+            instruction_id,
+            descriptor_id,
+            estimated_input_elements,
+            seed.len(),
+            split_depth
         );
 
         let source_transform_id = stage_source_transform_id(stage);
@@ -1208,6 +1295,18 @@ impl SplittableStageExecutor {
 
         match control_response {
             ControlResponse::ProcessBundleSuccess(response) => {
+                info!(
+                    "bundle end: worker={} instr={} stage={} dur_ms={} output_elements={} \
+                     paimon_write_ms={} status=ok phase=process",
+                    self.runtime.worker_id().as_str(),
+                    instruction_id,
+                    descriptor_id,
+                    started.elapsed().as_millis(),
+                    sum_element_count(&response.monitoring_infos),
+                    self.runtime
+                        .last_paimon_write_ms()
+                        .map_or_else(|| "na".to_string(), |value| value.to_string())
+                );
                 info!(
                     "SDF bundle summary: instruction_id={instruction_id}, \
                      estimated_input_elements={estimated_input_elements}, polls={}, \
@@ -1369,15 +1468,14 @@ fn partitioned_work_items(
     items
 }
 
+#[allow(clippy::single_range_in_vec_init)]
 fn partition_span_ranges(spans: &[SdfInputSpan], target_partitions: usize) -> Vec<Range<usize>> {
     if spans.is_empty() {
         return Vec::new();
     }
     let partitions = target_partitions.clamp(1, spans.len());
     if partitions == 1 {
-        let mut range = Vec::with_capacity(1);
-        range.push(0..spans.len());
-        return range;
+        return vec![0..spans.len()];
     }
 
     let sizes = spans
@@ -1568,7 +1666,10 @@ async fn poll_progress_and_maybe_split(
         runtime_state.polls,
         estimated_input_elements
     );
-    if first_poll {
+    let progress_log_due =
+        now.duration_since(runtime_state.last_progress_log_at) >= BUNDLE_PROGRESS_LOG_INTERVAL;
+    if first_poll || progress_log_due {
+        runtime_state.last_progress_log_at = now;
         info!("{progress_log}");
     } else {
         debug!("{progress_log}");
@@ -1582,6 +1683,7 @@ async fn poll_progress_and_maybe_split(
         return Ok(());
     }
 
+    let decision_context = split_manager.decision_context(bundle_id);
     let permit = match split_manager.try_acquire_permit(bundle_id, now) {
         SplitPermitDecision::Granted(permit) => {
             runtime_state.last_denial = None;
@@ -1590,8 +1692,8 @@ async fn poll_progress_and_maybe_split(
         SplitPermitDecision::Denied(reason) => {
             let message = format!(
                 "SDF split decision: instruction_id={bundle_instruction_id}, \
-                 worker_bundle_id={bundle_id}, granted=false, reason={}",
-                reason.as_str()
+                 worker_bundle_id={bundle_id}, granted=false, reason={} {decision_context}",
+                reason.as_str(),
             );
             if runtime_state.last_denial != Some(reason) {
                 info!("{message}");
@@ -1605,10 +1707,10 @@ async fn poll_progress_and_maybe_split(
     info!(
         "SDF split decision: instruction_id={bundle_instruction_id}, \
          worker_bundle_id={bundle_id}, granted=true, p={:?}, est_remaining_s={:?}, \
-         estimator={}",
+         estimator={} {decision_context}",
         estimate.progress,
         estimate.est_remaining.map(|value| value.as_secs_f64()),
-        estimate.mode.as_str()
+        estimate.mode.as_str(),
     );
 
     let mut desired_splits = HashMap::new();
@@ -2891,6 +2993,8 @@ mod tests {
             SplitPermitDecision::Denied(reason) => panic!("unexpected denial: {reason:?}"),
         };
         manager.complete_permit(permit, 1, false, now);
+        assert_eq!(manager.total_splits(), 1);
+        assert_eq!(manager.stage_splits("stage-a"), 1);
         assert_denied(
             manager.try_acquire_permit(second, now),
             SplitDenyReason::Capacity,

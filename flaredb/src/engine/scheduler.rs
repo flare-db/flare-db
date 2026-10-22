@@ -251,6 +251,14 @@ impl NodeScheduler {
         self.watermarks.outstanding_bundles()
     }
 
+    pub fn in_flight_bundle_count(&self) -> usize {
+        self.watermarks.total_in_flight_bundles()
+    }
+
+    pub fn queued_bundle_count(&self) -> usize {
+        self.watermarks.total_queued_bundles()
+    }
+
     /// Marks a node as completed, propagating its outputs.
     ///
     /// A bounded source reports `+∞` when it finishes, so a source's completion

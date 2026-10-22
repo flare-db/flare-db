@@ -1,8 +1,8 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
 use async_trait::async_trait;
-use beam_model_rs::v1::{ApiServiceDescriptor, ProcessBundleDescriptor};
+use beam_model_rs::v1::{ApiServiceDescriptor, MonitoringInfo, ProcessBundleDescriptor};
 use log::{error, info, warn};
 
 use crate::{
@@ -13,6 +13,7 @@ use crate::{
             control::ControlResponse,
             data::{DataKey, TimersKey},
         },
+        metrics::sum_element_count,
         runtime::{
             BundleRuntime, runner_consumer_transform_id, runner_output_pcollection_id,
             stage_sink_transform_id, stage_source_transform_id, stage_timer_endpoints,
@@ -36,6 +37,13 @@ pub struct StageExecutor {
 impl StageExecutor {
     pub fn new(runtime: BundleRuntime) -> Self {
         Self { runtime }
+    }
+}
+
+fn control_process_bundle_response(response: &ControlResponse) -> Option<&[MonitoringInfo]> {
+    match response {
+        ControlResponse::ProcessBundleSuccess(response) => Some(&response.monitoring_infos),
+        _ => None,
     }
 }
 
@@ -83,16 +91,41 @@ impl StageExecutor {
         input_watermark: i64,
         register_bundle: bool,
     ) -> anyhow::Result<ControlResponse> {
-        self.execute_node(
-            node,
-            input_edge_metadata,
-            output_edge_metadata,
-            None,
-            timers,
-            input_watermark,
-            register_bundle,
-        )
-        .await
+        let started = Instant::now();
+        let stage_id = node.id();
+        let result = self
+            .execute_node(
+                node,
+                input_edge_metadata,
+                output_edge_metadata,
+                None,
+                timers,
+                input_watermark,
+                register_bundle,
+            )
+            .await;
+        let output_elements = result
+            .as_ref()
+            .ok()
+            .and_then(control_process_bundle_response)
+            .map(sum_element_count)
+            .unwrap_or(0);
+        info!(
+            "bundle end: worker={} instr={} stage={} dur_ms={} output_elements={} \
+             paimon_write_ms={} status={}",
+            self.runtime.worker_id().as_str(),
+            self.runtime
+                .last_instruction_id()
+                .unwrap_or_else(|| "runner-native".to_string()),
+            stage_id,
+            started.elapsed().as_millis(),
+            output_elements,
+            self.runtime
+                .last_paimon_write_ms()
+                .map_or_else(|| "na".to_string(), |value| value.to_string()),
+            if result.is_ok() { "ok" } else { "error" }
+        );
+        result
     }
 }
 
@@ -154,8 +187,16 @@ impl StageExecutor {
                                 .control()
                                 .send_process_bundle_request(&descriptor_id)
                                 .await?;
+                            self.runtime.record_instruction_id(&instruction_id);
 
                             info!("Process instruction id {}", instruction_id);
+                            info!(
+                                "bundle start: worker={} instr={} stage={} elements=unknown \
+                                 seed_bytes=0 queue_depth=0",
+                                self.runtime.worker_id().as_str(),
+                                instruction_id,
+                                descriptor_id
+                            );
 
                             // Spawn background task to send input elements to worker.
                             if !input_edge_metadata.is_empty() {
@@ -380,6 +421,12 @@ impl StageExecutor {
             }
             ExecutableNode::Runner(runner_transform) => {
                 info!("Executing runner node");
+                info!(
+                    "bundle start: worker={} instr=runner-native stage={} elements=unknown \
+                     seed_bytes=0 queue_depth=0",
+                    self.runtime.worker_id().as_str(),
+                    runner_transform.id()
+                );
 
                 let output_metadata = output_edge_metadata.as_ref();
 

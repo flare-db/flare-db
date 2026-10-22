@@ -290,7 +290,8 @@ impl JobService for FlareJobService {
                 );
             }
 
-            let pool_config = WorkerPoolConfig::from_env();
+            let mut pool_config = WorkerPoolConfig::from_env();
+            pool_config.job_id = preparation_id.clone();
             log::info!(
                 "pool config: max={} min={} idle_timeout_s={} bundles_per_worker={} \
                  log_interval_s={} memory_budget_bytes={} harness_rss_bytes={}",
@@ -331,6 +332,22 @@ impl JobService for FlareJobService {
                 .set_worker_pool(worker_pool.clone());
 
             let run_result = self.execute_spawned_job(&preparation_id, job_graph).await;
+            let pool_summary = worker_pool.snapshot();
+            log::info!(
+                "job summary: job={} status={} peak_workers={} workers_spawned={} \
+                 busy_worker_seconds={:.1} idle_worker_seconds={:.1} util={:.2} \
+                 completed_bundles={} splits={} output_elements={}",
+                preparation_id,
+                if run_result.is_ok() { "ok" } else { "error" },
+                pool_summary.peak_workers,
+                pool_summary.spawn_count,
+                pool_summary.total_busy_seconds,
+                pool_summary.total_idle_seconds,
+                pool_summary.utilization,
+                pool_summary.completed_bundles,
+                pool_summary.splits,
+                pool_summary.output_elements
+            );
 
             // Any stream closures caused by this cleanup are expected. Mark the
             // shutdown before killing the process so their BrokenPipe/h2 errors

@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     io::Cursor,
     panic::{AssertUnwindSafe, catch_unwind},
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant},
 };
 
@@ -87,7 +87,12 @@ pub struct BundleRuntime {
     window_merger: Option<Arc<WindowMergeService>>,
     timer_service: Arc<TimerService>,
     source_reports: tokio::sync::mpsc::UnboundedSender<SourceProgress>,
+    last_instruction_id: Arc<StdMutex<Option<String>>>,
+    instruction_observer: Option<InstructionObserver>,
+    last_paimon_write_ms: Arc<StdMutex<Option<u128>>>,
 }
+
+type InstructionObserver = Arc<dyn Fn(&str) + Send + Sync>;
 
 impl BundleRuntime {
     #[allow(clippy::too_many_arguments)]
@@ -121,11 +126,42 @@ impl BundleRuntime {
             window_merger,
             timer_service,
             source_reports,
+            last_instruction_id: Arc::new(StdMutex::new(None)),
+            instruction_observer: None,
+            last_paimon_write_ms: Arc::new(StdMutex::new(None)),
         }
     }
 
     pub fn worker_id(&self) -> &crate::worker::manager::WorkerId {
         self.worker.id()
+    }
+
+    pub(crate) fn record_instruction_id(&self, instruction_id: &str) {
+        *self
+            .last_instruction_id
+            .lock()
+            .expect("instruction id lock not poisoned") = Some(instruction_id.to_string());
+        if let Some(observer) = &self.instruction_observer {
+            observer(instruction_id);
+        }
+    }
+
+    pub(crate) fn set_instruction_observer(&mut self, observer: InstructionObserver) {
+        self.instruction_observer = Some(observer);
+    }
+
+    pub(crate) fn last_instruction_id(&self) -> Option<String> {
+        self.last_instruction_id
+            .lock()
+            .expect("instruction id lock not poisoned")
+            .clone()
+    }
+
+    pub(crate) fn last_paimon_write_ms(&self) -> Option<u128> {
+        *self
+            .last_paimon_write_ms
+            .lock()
+            .expect("Paimon write telemetry lock not poisoned")
     }
 
     /// Sender for runner-source progress reports (used by `TestStream`).
@@ -398,6 +434,10 @@ impl BundleRuntime {
         let commit_started = Instant::now();
         writer.commit().await?;
         write_time += commit_started.elapsed();
+        *self
+            .last_paimon_write_ms
+            .lock()
+            .expect("Paimon write telemetry lock not poisoned") = Some(write_time.as_millis());
 
         info!(
             "Finished decoding output elements: {} total elements for {} in {:?} (paimon_write={:?})",

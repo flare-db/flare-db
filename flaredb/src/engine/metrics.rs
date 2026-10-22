@@ -10,6 +10,7 @@ use log::warn;
 use prost_types::Timestamp;
 
 use crate::coders::primitives::encode_varint;
+use crate::jobservice::urns::beam_urns;
 
 const SUM_INT64_TYPE: &str = "beam:metrics:sum_int64:v1";
 const DISTRIBUTION_INT64_TYPE: &str = "beam:metrics:distribution_int64:v1";
@@ -116,6 +117,19 @@ impl JobMetrics {
             .cloned()
             .collect()
     }
+}
+
+/// Sum the SDK's fused-transform output-element counters for one bundle.
+///
+/// This is the same `element_count` value used by progress reporting; it counts
+/// outputs across fused transforms, not source records.
+pub(crate) fn sum_element_count(monitoring_infos: &[MonitoringInfo]) -> u64 {
+    monitoring_infos
+        .iter()
+        .filter(|info| info.urn == beam_urns::ELEMENT_COUNT_METRIC)
+        .filter_map(|info| decode_single_i64(&info.payload).ok())
+        .filter(|value| *value > 0)
+        .fold(0u64, |total, value| total.saturating_add(value as u64))
 }
 
 fn is_supported_type(type_urn: &str) -> bool {
@@ -341,6 +355,26 @@ mod tests {
             encode_varint(*value as u64, &mut payload);
         }
         payload
+    }
+
+    #[test]
+    fn element_count_telemetry_sums_fused_outputs() {
+        let values = [
+            MonitoringInfo {
+                urn: beam_urns::ELEMENT_COUNT_METRIC.to_string(),
+                r#type: SUM_INT64_TYPE.to_string(),
+                payload: int64_payload(&[7]),
+                ..Default::default()
+            },
+            MonitoringInfo {
+                urn: beam_urns::ELEMENT_COUNT_METRIC.to_string(),
+                r#type: SUM_INT64_TYPE.to_string(),
+                payload: int64_payload(&[3]),
+                ..Default::default()
+            },
+            metric(SUM_INT64_TYPE, &[], int64_payload(&[99])),
+        ];
+        assert_eq!(sum_element_count(&values), 10);
     }
 
     #[test]
