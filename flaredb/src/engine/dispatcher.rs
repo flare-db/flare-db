@@ -224,6 +224,7 @@ impl ExecutorDispatcher {
     /// complete until the deferred work drains.
     pub async fn run_pipeline(&mut self, scheduler: &mut NodeScheduler) -> anyhow::Result<()> {
         let mut in_flight = JoinSet::new();
+        let sdf_overdecompose = crate::engine::sdf::sdf_overdecompose_from_env();
         // Timers to deliver the next time each re-armed stage runs.
         let mut pending_timers: HashMap<String, Vec<TimerEntry>> = HashMap::new();
         // Pending residual work items per splittable stage, and the union of the
@@ -333,6 +334,7 @@ impl ExecutorDispatcher {
                         }
                         let sdf_register = mark_registration(&stage.plan().process_stage.id());
                         let mut executor = SplittableStageExecutor::new(runtime);
+                        let max_workers = pool.config().max_workers;
                         let run = match executor
                             .execute_bundle(
                                 &stage,
@@ -341,6 +343,8 @@ impl ExecutorDispatcher {
                                 sdf_initialized,
                                 sdf_register,
                                 sdf_progress_tick,
+                                max_workers,
+                                sdf_overdecompose,
                                 immediate_sdf_tx,
                             )
                             .await

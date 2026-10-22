@@ -3,7 +3,10 @@ use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use std::time::{Duration, Instant};
+use std::{
+    ops::Range,
+    time::{Duration, Instant},
+};
 
 use anyhow::anyhow;
 use beam_model_rs::v1::process_bundle_split_request::DesiredSplit;
@@ -15,11 +18,12 @@ use bytes::Buf;
 use log::{debug, error, info, warn};
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::coders::primitives::{VarIntCoder, WindowedValueCoder};
+use crate::coders::primitives::{VarIntCoder, WindowedValue, WindowedValueCoder};
 use crate::coders::{BeamCoder, StandardBeamCoders};
 use crate::engine::harness::control::ControlChannel;
 use crate::fusion::stage::SplittableProcessKind;
 use crate::jobservice::urns::beam_urns;
+use crate::store::record::{BeamRecord, PrimitiveValue};
 use crate::{
     engine::{
         harness::{
@@ -52,6 +56,8 @@ const DEFAULT_SPLIT_AFTER: Duration = Duration::from_secs(2);
 /// longer than the time-based trigger. SDK work-progress metrics take precedence
 /// whenever the harness reports them.
 const DEFAULT_STALL_AFTER: Duration = Duration::from_secs(5);
+/// Default number of initial SDF partitions per configured worker.
+const DEFAULT_SDF_OVERDECOMPOSE: usize = 4;
 
 #[derive(Clone, Copy, Debug)]
 struct SdfSplitConfig {
@@ -100,19 +106,23 @@ impl SdfSplitConfig {
 pub struct SdfWorkItem {
     pub seed: Vec<u8>,
     pub holds: Vec<Timestamp>,
+    /// SDK-reported SplitAndSize work estimate, when available. This is used to
+    /// order initial partitions and will feed the Stage 7 progress estimator.
+    pub estimated_size: Option<f64>,
 }
 
 /// A split residual routed to the dispatcher while its parent bundle is still
 /// running.
 pub type SdfWorkItemSender = UnboundedSender<(String, SdfWorkItem)>;
 
-/// The byte span of one windowed input element plus the event-time metadata needed
-/// to hold back downstream watermarks while that element is deferred.
+/// The byte span of one windowed input element plus the event-time and
+/// SplitAndSize metadata needed for partitioning, progress, and watermark holds.
 #[derive(Clone, Debug)]
 struct SdfInputSpan {
     start: usize,
     end: usize,
     timestamp_millis: i64,
+    size: Option<f64>,
 }
 
 /// What one executed SDF bundle reports back to the dispatcher.
@@ -336,6 +346,8 @@ impl SplittableStageExecutor {
         initialized: bool,
         registered: bool,
         progress_tick: Option<Duration>,
+        max_workers: usize,
+        overdecompose: usize,
         immediate_items: SdfWorkItemSender,
     ) -> anyhow::Result<(ProcessBundleResponse, SdfBundleOutcome)> {
         let plan = stage.plan();
@@ -345,14 +357,89 @@ impl SplittableStageExecutor {
             None => (None, Vec::new()),
         };
 
-        // The first bundle runs the initialization stage to capture its seed;
-        // later bundles are seeded by their work item.
-        let bytes = if initialized {
-            seed_bytes.unwrap_or_default()
+        // The first bundle runs the initialization stage to capture its sized
+        // restrictions. With more than one worker we return those restrictions
+        // as independent work items so dispatch can begin immediately instead of
+        // processing the entire input as one bundle.
+        let (bytes, initialization_response) = if initialized {
+            (seed_bytes.unwrap_or_default(), None)
         } else {
-            self.run_initialization_stage(&plan.initialization_stage)
-                .await?
+            let (response, bytes) = self
+                .run_initialization_stage(&plan.initialization_stage)
+                .await?;
+            (bytes, Some(response))
         };
+
+        if let Some(initialization_response) = initialization_response {
+            if max_workers <= 1 {
+                info!(
+                    "SDF initialization partition: max_workers=1, overdecompose={overdecompose}, \
+                     partitions=1, mode=single-bundle"
+                );
+            } else {
+                let process_input = plan.process_stage.input_pcol();
+                match decode_windowed_value_spans(
+                    &self.runtime,
+                    process_input.id(),
+                    &process_input.node().coder_id,
+                    &bytes,
+                ) {
+                    Ok(spans) if !spans.is_empty() => {
+                        let target =
+                            initial_partition_count(max_workers, overdecompose, spans.len());
+                        if target > 1 {
+                            if registered {
+                                let process_descriptor_id = plan.process_stage.id().to_string();
+                                let bundle_status =
+                                    self.runtime.register_bundle(&plan.process_stage).await?;
+                                if !matches!(bundle_status, ControlResponse::BundleRegistered) {
+                                    return Err(anyhow!(
+                                        "failed to register SDF process bundle {process_descriptor_id}"
+                                    ));
+                                }
+                                info!(
+                                    "SDF process bundle {} registered after initialization partition",
+                                    process_descriptor_id
+                                );
+                            }
+                            let items = partitioned_work_items(stage, &bytes, &spans, target);
+                            info!(
+                                "SDF initialization partition: max_workers={max_workers}, \
+                             overdecompose={overdecompose}, elements={}, partitions={}, \
+                             sizes={:?}",
+                                spans.len(),
+                                items.len(),
+                                items
+                                    .iter()
+                                    .map(|item| item.estimated_size)
+                                    .collect::<Vec<_>>()
+                            );
+                            return Ok((
+                                initialization_response,
+                                SdfBundleOutcome {
+                                    initialized: true,
+                                    consumed_holds,
+                                    items,
+                                    progress_tick: progress_tick.unwrap_or(MIN_PROGRESS_TICK),
+                                },
+                            ));
+                        }
+                        info!(
+                            "SDF initialization partition: max_workers={max_workers}, \
+                         overdecompose={overdecompose}, elements={}, partitions=1, \
+                         mode=single-bundle",
+                            spans.len()
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(err) => warn!(
+                        "failed to decode SplitAndSize output for static partitioning ({}); \
+                     falling back to one process bundle",
+                        err
+                    ),
+                }
+            }
+        }
 
         // Dynamic split only applies to restriction-based SDF form.
         let allow_split = matches!(
@@ -390,7 +477,7 @@ impl SplittableStageExecutor {
     async fn run_initialization_stage(
         &mut self,
         stage: &ExecutableStage,
-    ) -> anyhow::Result<Vec<u8>> {
+    ) -> anyhow::Result<(ProcessBundleResponse, Vec<u8>)> {
         let descriptor_id = stage.id().to_string();
         let bundle_status = self.runtime.register_bundle(stage).await?;
         if !matches!(bundle_status, ControlResponse::BundleRegistered) {
@@ -521,7 +608,7 @@ impl SplittableStageExecutor {
         .await?;
 
         match control_response {
-            (ControlResponse::ProcessBundleSuccess(_), bytes) => Ok(bytes),
+            (ControlResponse::ProcessBundleSuccess(response), bytes) => Ok((response, bytes)),
             (ControlResponse::ProcessBundleError(err), _) => {
                 Err(anyhow!("SDF initialization stage failed: {}", err))
             }
@@ -822,6 +909,162 @@ impl SplittableStageExecutor {
     }
 }
 
+pub(crate) fn sdf_overdecompose_from_env() -> usize {
+    sdf_overdecompose_from(std::env::var("FLAREDB_SDF_OVERDECOMPOSE").ok().as_deref())
+}
+
+fn sdf_overdecompose_from(configured: Option<&str>) -> usize {
+    configured
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_SDF_OVERDECOMPOSE)
+}
+
+fn initial_partition_count(max_workers: usize, overdecompose: usize, elements: usize) -> usize {
+    if max_workers <= 1 || elements <= 1 {
+        return 1;
+    }
+    max_workers
+        .saturating_mul(overdecompose.max(1))
+        .clamp(1, elements)
+}
+
+fn split_and_size_size(value: &WindowedValue) -> Option<f64> {
+    let BeamRecord::KV(outer) = &value.value else {
+        return None;
+    };
+    let BeamRecord::PRIMITIVE(PrimitiveValue::Float64(size)) = outer.value.as_ref() else {
+        return None;
+    };
+    size.is_finite()
+        .then_some(*size)
+        .filter(|size| *size >= 0.0)
+}
+
+/// Build independently schedulable work items from the SplitAndSize output.
+///
+/// Partition boundaries are contiguous element ranges. When every element has a
+/// finite, non-negative SDK size, cuts minimize byte-size skew; otherwise the
+/// fallback is equal element counts. Items are returned largest-first so the
+/// dispatcher starts expensive partitions before small tail work.
+fn partitioned_work_items(
+    stage: &SplittableStage,
+    bytes: &[u8],
+    spans: &[SdfInputSpan],
+    target_partitions: usize,
+) -> Vec<SdfWorkItem> {
+    let ranges = partition_span_ranges(spans, target_partitions);
+    let mut items = ranges
+        .into_iter()
+        .filter(|range| !range.is_empty())
+        .map(|range| {
+            let start_byte = spans[range.start].start;
+            let end_byte = spans[range.end - 1].end;
+            let timestamps = spans[range.clone()]
+                .iter()
+                .map(|span| span.timestamp_millis)
+                .collect::<Vec<_>>();
+            let estimated_size = partition_size(spans, &range);
+            SdfWorkItem {
+                seed: bytes[start_byte..end_byte].to_vec(),
+                holds: channel_item_holds(stage, &timestamps),
+                estimated_size,
+            }
+        })
+        .collect::<Vec<_>>();
+    items.sort_by(|left, right| {
+        right
+            .estimated_size
+            .unwrap_or_default()
+            .total_cmp(&left.estimated_size.unwrap_or_default())
+            .then_with(|| right.seed.len().cmp(&left.seed.len()))
+    });
+    items
+}
+
+fn partition_span_ranges(spans: &[SdfInputSpan], target_partitions: usize) -> Vec<Range<usize>> {
+    if spans.is_empty() {
+        return Vec::new();
+    }
+    let partitions = target_partitions.clamp(1, spans.len());
+    if partitions == 1 {
+        return vec![0..spans.len()];
+    }
+
+    let sizes = spans
+        .iter()
+        .map(|span| span.size)
+        .collect::<Option<Vec<_>>>()
+        .filter(|sizes| sizes.iter().all(|size| size.is_finite() && *size >= 0.0));
+    let Some(sizes) = sizes else {
+        return equal_count_ranges(spans.len(), partitions);
+    };
+    let total_size: f64 = sizes.iter().sum();
+    if !total_size.is_finite() || total_size <= 0.0 {
+        return equal_count_ranges(spans.len(), partitions);
+    }
+    if sizes.windows(2).all(|pair| pair[0] == pair[1]) {
+        return equal_count_ranges(spans.len(), partitions);
+    }
+
+    let mut ranges = Vec::with_capacity(partitions);
+    let mut start = 0usize;
+    let mut remaining_size = total_size;
+    for group in 0..partitions {
+        let groups_left = partitions - group;
+        if groups_left == 1 {
+            ranges.push(start..spans.len());
+            break;
+        }
+
+        let min_end = start + 1;
+        let max_end = spans.len() - (groups_left - 1);
+        let target_size = remaining_size / groups_left as f64;
+        let mut accumulated = 0.0;
+        let mut best_end = min_end;
+        let mut best_difference = f64::INFINITY;
+        for end in min_end..=max_end {
+            accumulated += sizes[end - 1];
+            let difference = (accumulated - target_size).abs();
+            if difference < best_difference {
+                best_difference = difference;
+                best_end = end;
+            }
+            if accumulated >= target_size {
+                break;
+            }
+        }
+        let group_size: f64 = sizes[start..best_end].iter().sum();
+        remaining_size = (remaining_size - group_size).max(0.0);
+        ranges.push(start..best_end);
+        start = best_end;
+    }
+    ranges
+}
+
+fn equal_count_ranges(elements: usize, partitions: usize) -> Vec<Range<usize>> {
+    let base = elements / partitions;
+    let remainder = elements % partitions;
+    let mut start = 0usize;
+    (0..partitions)
+        .map(|index| {
+            let count = base + usize::from(index < remainder);
+            let end = start + count;
+            let range = start..end;
+            start = end;
+            range
+        })
+        .collect()
+}
+
+fn partition_size(spans: &[SdfInputSpan], range: &Range<usize>) -> Option<f64> {
+    spans[range.clone()]
+        .iter()
+        .map(|span| span.size)
+        .sum::<Option<f64>>()
+        .filter(|size| size.is_finite() && *size >= 0.0)
+}
+
 /// Decode the byte span and event timestamp of each `WindowedValue` in an SDF
 /// process input.
 fn decode_windowed_value_spans(
@@ -847,11 +1090,14 @@ fn decode_windowed_value_spans(
             windowed_value_coder.decode(&mut cursor)
         }));
         match decoded {
-            Ok(Ok(value)) => spans.push(SdfInputSpan {
-                start,
-                end: cursor.position() as usize,
-                timestamp_millis: value.timestamp_millis,
-            }),
+            Ok(Ok(value)) => {
+                spans.push(SdfInputSpan {
+                    start,
+                    end: cursor.position() as usize,
+                    timestamp_millis: value.timestamp_millis,
+                    size: split_and_size_size(&value),
+                });
+            }
             Ok(Err(err)) => {
                 return Err(anyhow!("failed to decode SDF input element: {:?}", err));
             }
@@ -1025,6 +1271,7 @@ async fn poll_progress_and_maybe_split(
             let item = SdfWorkItem {
                 seed: input_bytes[start..end].to_vec(),
                 holds: channel_item_holds(splittable_stage, &timestamps),
+                estimated_size: None,
             };
             immediate_items
                 .send((splittable_stage.id().to_string(), item.clone()))
@@ -1111,6 +1358,7 @@ fn residual_items(
             SdfWorkItem {
                 seed: application.element.clone(),
                 holds,
+                estimated_size: None,
             }
         })
         .collect()
@@ -1394,6 +1642,7 @@ mod tests {
 
     use crate::fusion::pipeline::{PCollectionNode, PTransformNode};
     use crate::fusion::stage::{ExecutableStage, SplittableExecutionPlan, SplittableProcessKind};
+    use crate::store::record::BeamKV;
 
     /// A splittable stage whose process stage has one transform with the given
     /// local-name -> PCollection-id outputs, and the listed boundary outputs.
@@ -1601,21 +1850,25 @@ mod tests {
                 start: 0,
                 end: 2,
                 timestamp_millis: 10,
+                size: Some(1.0),
             },
             SdfInputSpan {
                 start: 2,
                 end: 4,
                 timestamp_millis: 20,
+                size: Some(1.0),
             },
             SdfInputSpan {
                 start: 4,
                 end: 6,
                 timestamp_millis: 30,
+                size: Some(1.0),
             },
             SdfInputSpan {
                 start: 6,
                 end: 8,
                 timestamp_millis: 40,
+                size: Some(1.0),
             },
         ];
 
@@ -1669,8 +1922,118 @@ mod tests {
                 start: 2 * i,
                 end: 2 * i + 2,
                 timestamp_millis: 0,
+                size: Some(1.0),
             })
             .collect()
+    }
+
+    fn spans_with_sizes(sizes: &[Option<f64>]) -> Vec<SdfInputSpan> {
+        sizes
+            .iter()
+            .enumerate()
+            .map(|(index, size)| SdfInputSpan {
+                start: 2 * index,
+                end: 2 * index + 2,
+                timestamp_millis: index as i64 * 1_000,
+                size: *size,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn split_and_size_size_reads_the_outer_kv_value() {
+        let value = WindowedValue::global(BeamRecord::KV(BeamKV {
+            key: PrimitiveValue::Void,
+            value: Box::new(BeamRecord::PRIMITIVE(PrimitiveValue::Float64(42.5))),
+        }));
+        assert_eq!(split_and_size_size(&value), Some(42.5));
+
+        let invalid = WindowedValue::global(BeamRecord::KV(BeamKV {
+            key: PrimitiveValue::Void,
+            value: Box::new(BeamRecord::PRIMITIVE(PrimitiveValue::Float64(f64::NAN))),
+        }));
+        assert_eq!(split_and_size_size(&invalid), None);
+        assert_eq!(
+            split_and_size_size(&WindowedValue::global(BeamRecord::PRIMITIVE(
+                PrimitiveValue::Float64(1.0)
+            ))),
+            None
+        );
+    }
+
+    #[test]
+    fn initial_partition_count_keeps_one_worker_single_bundle() {
+        assert_eq!(initial_partition_count(1, 4, 100), 1);
+        assert_eq!(initial_partition_count(4, 4, 100), 16);
+        assert_eq!(initial_partition_count(4, 4, 6), 6);
+        assert_eq!(initial_partition_count(4, 0, 6), 4);
+    }
+
+    #[test]
+    fn overdecompose_uses_default_for_missing_or_invalid_values() {
+        assert_eq!(sdf_overdecompose_from(None), DEFAULT_SDF_OVERDECOMPOSE);
+        assert_eq!(sdf_overdecompose_from(Some(" 2 ")), 2);
+        assert_eq!(sdf_overdecompose_from(Some("0")), DEFAULT_SDF_OVERDECOMPOSE);
+        assert_eq!(
+            sdf_overdecompose_from(Some("invalid")),
+            DEFAULT_SDF_OVERDECOMPOSE
+        );
+    }
+
+    #[test]
+    fn partition_ranges_balance_equal_sizes() {
+        let spans = spans_with_sizes(&[Some(1.0); 8]);
+        assert_eq!(
+            partition_span_ranges(&spans, 4),
+            vec![0..2, 2..4, 4..6, 6..8]
+        );
+    }
+
+    #[test]
+    fn partition_ranges_keep_contiguous_balanced_byte_groups() {
+        let spans = spans_with_sizes(&[
+            Some(10.0),
+            Some(1.0),
+            Some(1.0),
+            Some(1.0),
+            Some(1.0),
+            Some(1.0),
+        ]);
+        assert_eq!(partition_span_ranges(&spans, 2), vec![0..1, 1..6]);
+
+        let ranges = partition_span_ranges(&spans_with_sizes(&[Some(1.0); 7]), 3);
+        assert_eq!(ranges, vec![0..3, 3..5, 5..7]);
+    }
+
+    #[test]
+    fn partition_ranges_fall_back_to_equal_counts_without_sizes() {
+        let spans =
+            spans_with_sizes(&[Some(10.0), None, Some(1.0), Some(1.0), Some(1.0), Some(1.0)]);
+        assert_eq!(partition_span_ranges(&spans, 3), vec![0..2, 2..4, 4..6]);
+    }
+
+    #[test]
+    fn partition_ranges_handle_fewer_elements_than_requested() {
+        let spans = spans_with_sizes(&[Some(1.0), Some(2.0)]);
+        assert_eq!(partition_span_ranges(&spans, 8), vec![0..1, 1..2]);
+        assert_eq!(partition_span_ranges(&spans, 1), vec![0..2]);
+    }
+
+    #[test]
+    fn partitioned_work_items_preserve_bytes_and_dispatch_largest_first() {
+        let stage = splittable_stage(&["pcol-out"], "process", &[("out", "pcol-out")]);
+        let bytes = b"aabbcc";
+        let spans = spans_with_sizes(&[Some(5.0), Some(1.0), Some(5.0)]);
+
+        let items = partitioned_work_items(&stage, bytes, &spans, 2);
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].seed, b"bbcc");
+        assert_eq!(items[0].estimated_size, Some(6.0));
+        assert_eq!(items[0].holds, vec![1_000]);
+        assert_eq!(items[1].seed, b"aa");
+        assert_eq!(items[1].estimated_size, Some(5.0));
+        assert_eq!(items[1].holds, vec![0]);
     }
 
     #[test]
