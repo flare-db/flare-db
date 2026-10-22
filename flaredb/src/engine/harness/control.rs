@@ -1,6 +1,9 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex as StdMutex},
+    sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -85,6 +88,7 @@ impl ControlChannel {
                 .take()
                 .expect("control outgoing receiver must be initialized")
         };
+        self.connected.store(true, Ordering::Release);
         Ok(ReceiverStream::new(rx))
     }
 
@@ -106,6 +110,7 @@ impl ControlChannel {
             response_task: Arc::new(std::sync::Mutex::new(None)),
             status,
             worker_id,
+            connected: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -283,6 +288,7 @@ pub struct ControlChannel {
     response_task: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     status: HarnessStatus,
     worker_id: String,
+    connected: Arc<AtomicBool>,
 }
 
 impl ControlChannel {
@@ -291,7 +297,7 @@ impl ControlChannel {
     /// Wait for the worker to connect its control stream.
     pub async fn wait_connected(&self) -> Result<()> {
         loop {
-            if self.stream.incoming.lock().await.is_some() {
+            if self.connected.load(Ordering::Acquire) {
                 return Ok(());
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -315,6 +321,7 @@ impl ControlChannel {
         *self.stream.outgoing_tx.lock().await = Some(tx);
         *self.stream.outgoing_rx.lock().await = Some(rx);
         *self.stream.incoming.lock().await = None;
+        self.connected.store(false, Ordering::Release);
         self.stream.descriptors.lock().await.clear();
         self.stream.pending.clear();
         *self
@@ -576,7 +583,8 @@ impl ControlChannel {
         let task_slot = self.response_task.clone();
         let status = self.status.clone();
         let worker_id = self.worker_id.clone();
-        info!("Streaming control responses from worker");
+        let connected = Arc::clone(&self.connected);
+        info!("Streaming control responses from worker={worker_id}");
 
         let join_handle = tokio::spawn(async move {
             loop {
@@ -647,6 +655,7 @@ impl ControlChannel {
             if status.is_worker_intentional_shutdown(&worker_id) {
                 debug!("BeamFnControl stream from worker closed");
             }
+            connected.store(false, Ordering::Release);
         });
 
         *task_slot.lock().unwrap() = Some(join_handle);
@@ -725,5 +734,22 @@ mod tests {
         deliver_bundle_response(&channel, "bundle-1", Some(counter_info())).await;
 
         assert!(metrics.snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn connection_wait_uses_the_atomic_connected_signal() {
+        let (channel, _service) = start_control_server(HarnessStatus::new()).await.unwrap();
+        channel.connected.store(true, Ordering::Release);
+        tokio::time::timeout(Duration::from_millis(100), channel.wait_connected())
+            .await
+            .expect("connected channel must wake without taking the stream mutex")
+            .unwrap();
+
+        channel.connected.store(false, Ordering::Release);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), channel.wait_connected())
+                .await
+                .is_err()
+        );
     }
 }

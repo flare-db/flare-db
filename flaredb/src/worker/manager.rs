@@ -87,8 +87,13 @@ impl WorkerLogRouter {
             .append(true)
             .open(log_path)?;
         let sink = Arc::new(Mutex::new(file));
-        self.sinks.insert(log_path.to_path_buf(), Arc::clone(&sink));
-        Ok(sink)
+        match self.sinks.entry(log_path.to_path_buf()) {
+            dashmap::mapref::entry::Entry::Occupied(entry) => Ok(Arc::clone(entry.get())),
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(Arc::clone(&sink));
+                Ok(sink)
+            }
+        }
     }
 }
 
@@ -666,6 +671,46 @@ mod tests {
         let contents = std::fs::read_to_string(path).unwrap();
         assert!(contents.contains("worker=job-w0 source=stdout message=first"));
         assert!(contents.contains("worker=job-w1 source=stderr message=second"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_first_writes_keep_complete_logical_lines() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("flare-worker.log");
+        let router = Arc::new(WorkerLogRouter::new());
+        let barrier = Arc::new(tokio::sync::Barrier::new(32));
+        let mut tasks = Vec::new();
+        for index in 0..32 {
+            let router = Arc::clone(&router);
+            let path = path.clone();
+            let barrier = Arc::clone(&barrier);
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                let message = format!("message-{index}-{}", "x".repeat(512));
+                router
+                    .append_line(
+                        &path,
+                        &WorkerId(format!("job-w{index}")),
+                        "stdout",
+                        &message,
+                    )
+                    .await
+                    .unwrap();
+                format!("worker=job-w{index} source=stdout message={message}")
+            }));
+        }
+        let mut expected = Vec::new();
+        for task in tasks {
+            expected.push(task.await.unwrap());
+        }
+
+        let contents = std::fs::read_to_string(path).unwrap();
+        let lines = contents.lines().map(str::to_string).collect::<Vec<_>>();
+        assert_eq!(lines.len(), expected.len());
+        expected.sort();
+        let mut lines = lines;
+        lines.sort();
+        assert_eq!(lines, expected);
     }
 
     #[tokio::test]

@@ -248,7 +248,8 @@ impl BundleRuntime {
 
         let response = self.control.register_bundle(descriptor).await;
         info!(
-            "Registered bundle at worker for descriptor id {}",
+            "Registered bundle at worker={} for descriptor id {}",
+            self.worker_id().as_str(),
             stage.id()
         );
         response

@@ -745,12 +745,14 @@ impl SplittableStageExecutor {
     /// Execute exactly one bundle of a splittable (SDF) stage.
     ///
     /// `seed` is the work item to process, or `None` for the first
-    /// (initialization) bundle. `initialized`/`registered` are the stage's flags
-    /// from prior bundles and `progress_tick` is its progress-poll interval
-    /// (`None` for the first); the outcome carries them forward along with the
-    /// residual work items this bundle produced and the holds of the item it
-    /// consumed. The caller schedules one bundle per work item and applies the item
-    /// holds as output-watermark clamps until the item completes.
+    /// (initialization) bundle. `initialized` is the stage flag from prior
+    /// bundles, while `register_process_bundle` requests one-time process
+    /// descriptor registration on the selected worker. `progress_tick` is the
+    /// progress-poll interval (`None` for the first). The outcome carries them
+    /// forward along with the residual work items this bundle produced and the
+    /// holds of the item it consumed. The caller schedules one bundle per work
+    /// item and applies the item holds as output-watermark clamps until the item
+    /// completes.
     #[allow(clippy::too_many_arguments)]
     pub async fn execute_bundle(
         &mut self,
@@ -758,7 +760,7 @@ impl SplittableStageExecutor {
         output_edge_metadata: Option<ConsumerMetaData>,
         seed: Option<SdfWorkItem>,
         initialized: bool,
-        registered: bool,
+        register_process_bundle: bool,
         progress_tick: Option<Duration>,
         max_workers: usize,
         overdecompose: usize,
@@ -805,7 +807,7 @@ impl SplittableStageExecutor {
                         let target =
                             initial_partition_count(max_workers, overdecompose, spans.len());
                         if target > 1 {
-                            if registered {
+                            if register_process_bundle {
                                 let process_descriptor_id = plan.process_stage.id().to_string();
                                 let bundle_status =
                                     self.runtime.register_bundle(&plan.process_stage).await?;
@@ -871,7 +873,7 @@ impl SplittableStageExecutor {
                 stage,
                 output_edge_metadata,
                 bytes,
-                !registered,
+                register_process_bundle,
                 allow_split,
                 progress_tick,
                 split_manager,

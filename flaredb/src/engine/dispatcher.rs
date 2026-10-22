@@ -427,7 +427,8 @@ impl ExecutorDispatcher {
                         if !sdf_initialized {
                             mark_registration(&stage.plan().initialization_stage.id());
                         }
-                        let sdf_register = mark_registration(&stage.plan().process_stage.id());
+                        let register_process_bundle =
+                            mark_registration(&stage.plan().process_stage.id());
                         let mut executor = SplittableStageExecutor::new(runtime);
                         let max_workers = pool.config().max_workers;
                         let run = match executor
@@ -436,7 +437,7 @@ impl ExecutorDispatcher {
                                 output_metadata,
                                 sdf_seed,
                                 sdf_initialized,
-                                sdf_register,
+                                register_process_bundle,
                                 sdf_progress_tick,
                                 max_workers,
                                 sdf_overdecompose,
