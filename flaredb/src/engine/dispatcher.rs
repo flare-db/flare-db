@@ -266,6 +266,14 @@ impl ExecutorDispatcher {
         // Drop any stale reports left by a previous job over the same dispatcher.
         while self.source_reports_rx.try_recv().is_ok() {}
 
+        // Long bundles can park the scheduling loop in `select!` for minutes.
+        // Refresh the pool's view of outstanding work on a timer so telemetry
+        // does not keep showing the snapshot taken before those bundles
+        // registered (which can look like a completed job).
+        let mut observation_tick = tokio::time::interval(Duration::from_secs(1));
+        observation_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        observation_tick.tick().await;
+
         loop {
             // Reconcile output-watermark holds with the durable event-time timers
             // before scheduling: a pending event-time timer holds its owning
@@ -282,8 +290,8 @@ impl ExecutorDispatcher {
             if let Some(pool) = &self.pool {
                 let snapshot = pool.snapshot();
                 split_manager.set_pool_state(
-                    snapshot.idle,
-                    snapshot.max_workers,
+                    snapshot.free_bundle_slots,
+                    snapshot.max_bundle_slots,
                     snapshot
                         .spawn_cost_ms
                         .and_then(|millis| u64::try_from(millis).ok())
@@ -339,7 +347,7 @@ impl ExecutorDispatcher {
                             split_manager.note_item_picked(permit_id);
                         }
                         split_manager.set_queue_depth(&stage_id, queue.items.len());
-                        log::info!(
+                        log::debug!(
                             "SDF stage '{stage_id}': starting bundle, initialized={initialized}, \
                              queue_depth={}, in_flight={}, seed_bytes={}",
                             queue.items.len(),
@@ -390,8 +398,8 @@ impl ExecutorDispatcher {
                     let worker_id = lease.id().clone();
                     let snapshot = pool.snapshot();
                     split_manager.set_pool_state(
-                        snapshot.idle,
-                        snapshot.max_workers,
+                        snapshot.free_bundle_slots,
+                        snapshot.max_bundle_slots,
                         snapshot
                             .spawn_cost_ms
                             .and_then(|millis| u64::try_from(millis).ok())
@@ -437,7 +445,7 @@ impl ExecutorDispatcher {
                         let register_process_bundle =
                             mark_registration(&stage.plan().process_stage.id());
                         let mut executor = SplittableStageExecutor::new(runtime);
-                        let max_workers = pool.config().max_workers;
+                        let max_bundle_slots = pool.config().max_bundle_slots();
                         let run = match executor
                             .execute_bundle(
                                 &stage,
@@ -446,7 +454,7 @@ impl ExecutorDispatcher {
                                 sdf_initialized,
                                 register_process_bundle,
                                 sdf_progress_tick,
-                                max_workers,
+                                max_bundle_slots,
                                 sdf_overdecompose,
                                 Arc::clone(&split_manager),
                                 split_bundle_id,
@@ -604,13 +612,32 @@ impl ExecutorDispatcher {
                     let queue = sdf_queues
                         .get(&stage_id)
                         .expect("enqueued SDF stage must have a queue");
-                    log::info!(
+                    log::debug!(
                         "SDF stage '{stage_id}': queued {count} split work item immediately, \
                          queue_depth={}, in_flight={}, holds={:?}",
                         queue.items.len(),
                         scheduler.watermarks().in_flight_bundles(&stage_id),
                         residual_holds.get(&stage_id)
                     );
+                    continue;
+                }
+                _ = observation_tick.tick() => {
+                    if let Some(pool) = &self.pool {
+                        // Queue depths change when residuals/splits are queued
+                        // or a bundle starts, not only when a bundle finishes.
+                        for (stage, queue) in &sdf_queues {
+                            split_manager.set_queue_depth(stage, queue.items.len());
+                        }
+                        pool.observe_workload(scheduler.outstanding_bundle_count());
+                        pool.observe_dispatcher_state(
+                            scheduler.queued_bundle_count(),
+                            scheduler.in_flight_bundle_count(),
+                            split_manager.total_splits(),
+                        );
+                        pool.observe_remaining_work_seconds(
+                            split_manager.estimated_remaining_work_seconds(),
+                        );
+                    }
                     continue;
                 }
                 joined = in_flight.join_next() => joined
@@ -655,7 +682,7 @@ impl ExecutorDispatcher {
                     let queue = sdf_queues
                         .get(&stage_id)
                         .expect("SDF completion stage must have a queue");
-                    log::info!(
+                    log::debug!(
                         "SDF stage '{stage_id}': queued {count} work item(s), queue_depth={}, \
                          in_flight={}, holds={:?}",
                         queue.items.len(),
@@ -681,7 +708,7 @@ impl ExecutorDispatcher {
                         let queue = sdf_queues
                             .get(&event_stage)
                             .expect("drained SDF stage must have a queue");
-                        log::info!(
+                        log::debug!(
                             "SDF stage '{event_stage}': queued {count} split work item before \
                              parent completion, queue_depth={}, in_flight={}, holds={:?}",
                             queue.items.len(),

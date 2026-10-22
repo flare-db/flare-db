@@ -12,7 +12,7 @@ use beam_model_rs::v1::{
     ProcessBundleDescriptor, RemoteGrpcPort, elements,
 };
 use bytes::{Buf, BytesMut};
-use log::{debug, info};
+use log::debug;
 use prost::Message;
 use tokio::sync::{Mutex, mpsc::UnboundedReceiver};
 
@@ -261,7 +261,7 @@ impl BundleRuntime {
         };
 
         let response = self.control.register_bundle(descriptor).await;
-        info!(
+        debug!(
             "Registered bundle at worker={} for descriptor id {}",
             self.worker_id().as_str(),
             stage.id()
@@ -314,7 +314,7 @@ impl BundleRuntime {
         let progress_started = Instant::now();
         let mut next_progress = 1_000_000usize;
         let mut write_time = Duration::ZERO;
-        info!("Receiving output elements for {pcollection_id}");
+        debug!("Receiving output elements for {pcollection_id}");
 
         // One Paimon writer/committer per bundle: every decoded batch is
         // appended to a single table writer and committed exactly once, instead
@@ -390,8 +390,16 @@ impl BundleRuntime {
                                     unreported_decoded = 0;
                                 }
                                 if total_decoded >= next_progress {
-                                    info!(
-                                        "Decoded {total_decoded} output elements for {pcollection_id} in {:?}",
+                                    // Scope: one decoder stream, i.e. one
+                                    // produced PCollection in one bundle on one
+                                    // worker. `total_decoded` is cumulative for
+                                    // this stream and the elapsed time starts
+                                    // when the stream opened.
+                                    debug!(
+                                        "Decoded {total_decoded} output elements for \
+                                         {pcollection_id} on worker={} in {:?} \
+                                         (cumulative for this bundle's decoder stream)",
+                                        self.worker_id().as_str(),
                                         progress_started.elapsed()
                                     );
                                     next_progress = (total_decoded / 1_000_000 + 1) * 1_000_000;
@@ -476,7 +484,7 @@ impl BundleRuntime {
             .lock()
             .expect("Paimon write telemetry lock not poisoned") = Some(write_time.as_millis());
 
-        info!(
+        debug!(
             "Finished decoding output elements: {} total elements for {} in {:?} (paimon_write={:?})",
             total_decoded,
             pcollection_id,
@@ -484,7 +492,7 @@ impl BundleRuntime {
             write_time,
         );
         let wall_time = progress_started.elapsed();
-        info!(
+        debug!(
             "output pipeline summary: pcollection={} bytes={} elements={} wall_ms={} \
              receive_wait_ms={} paimon_write_ms={} decode_compute_ms={}",
             pcollection_id,
@@ -724,7 +732,7 @@ impl BundleRuntime {
             return Ok(());
         };
 
-        info!(
+        debug!(
             "timer receive: transform_id={transform_id}, timer_family_id={timer_family_id}, domain={domain:?}"
         );
 
@@ -947,7 +955,7 @@ async fn flush_timers(
     let count = pending.len();
     let started = std::time::Instant::now();
     match timer_service.apply(pending).await {
-        Ok(()) => info!(
+        Ok(()) => debug!(
             "persisted {count} timer(s) for {transform_id}/{timer_family_id} in {}ms",
             started.elapsed().as_millis()
         ),

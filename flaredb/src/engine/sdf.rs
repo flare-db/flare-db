@@ -65,6 +65,13 @@ const MAX_BUNDLES_PER_WORKER: usize = 8;
 const DEFAULT_SDF_OVERDECOMPOSE: usize = 4;
 /// Minimum duration between estimator rate samples.
 const ESTIMATOR_RATE_WINDOW: Duration = Duration::from_millis(500);
+/// Smallest progress increase that counts as a new sample.
+const ESTIMATOR_PROGRESS_EPSILON: f64 = 1e-9;
+/// How long a rate remains valid without an observed progress increase. SDK
+/// progress reports are coarse (often once per active element/buffer), so this
+/// is well above the poll interval; beyond it there is no evidence the last
+/// rate still holds and the estimate becomes unknown.
+const ESTIMATOR_RATE_STALE_AFTER: Duration = Duration::from_secs(30);
 const BUNDLE_PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug)]
@@ -217,7 +224,6 @@ struct BundleSplitRuntime {
     polls: u64,
     split_requests: u64,
     splits: u64,
-    last_denial: Option<SplitDenyReason>,
     last_progress_log_at: Instant,
 }
 
@@ -229,28 +235,41 @@ impl BundleSplitRuntime {
             polls: 0,
             split_requests: 0,
             splits: 0,
-            last_denial: None,
             last_progress_log_at: now,
         }
     }
 }
 
+/// Tracks size-weighted SDF progress for one bundle and derives a throughput
+/// estimate from it.
+///
+/// The SDK reports progress in coarse steps, often once per active
+/// element/buffer. The rate must therefore be sampled only when reported
+/// progress actually increases: averaging every poll (including zero-delta
+/// windows) into an EWMA makes the rate decay geometrically between SDK
+/// updates, which produces enormous ETAs while work is progressing normally.
 struct ProgressEstimator {
-    rate_window: Option<(Instant, f64)>,
+    /// Anchor for the next rate sample: progress at the last sampled increase.
+    last_change: Option<(Instant, f64)>,
     rate_per_second: Option<f64>,
+    /// Highest progress observed since the last reset. Regressions are ignored
+    /// for rate purposes because the SDK can switch which active element's
+    /// `work_completed`/`work_remaining` pair it reports.
     last_progress: f64,
-    last_progress_at: Instant,
     last_metrics: Option<(i64, i64, Option<u32>, Option<u32>)>,
+    /// A split rebases the restriction, so the next observation re-anchors the
+    /// progress baseline even if it is lower than the pre-split value.
+    rebase_after_reset: bool,
 }
 
 impl ProgressEstimator {
-    fn new(now: Instant) -> Self {
+    fn new(_now: Instant) -> Self {
         Self {
-            rate_window: None,
+            last_change: None,
             rate_per_second: None,
             last_progress: 0.0,
-            last_progress_at: now,
             last_metrics: None,
+            rebase_after_reset: false,
         }
     }
 
@@ -270,36 +289,62 @@ impl ProgressEstimator {
         );
         let metrics_changed = self.last_metrics != Some(metrics_signature);
         self.last_metrics = Some(metrics_signature);
-        let progress_changed =
-            progress.is_some_and(|progress| progress > self.last_progress + 1e-9);
-        if progress_changed {
-            self.last_progress = progress.unwrap_or(self.last_progress);
-            self.last_progress_at = now;
-        }
+        let progress_changed = progress
+            .is_some_and(|progress| progress > self.last_progress + ESTIMATOR_PROGRESS_EPSILON);
 
         if let Some(progress) = progress {
-            match self.rate_window {
-                Some((sample_at, sample_progress)) => {
-                    let elapsed = now.duration_since(sample_at);
-                    if elapsed >= ESTIMATOR_RATE_WINDOW {
-                        let delta = (progress - sample_progress).max(0.0);
-                        let instantaneous = delta / elapsed.as_secs_f64();
-                        if instantaneous.is_finite() {
-                            self.rate_per_second = Some(match self.rate_per_second {
-                                Some(previous) => previous * 0.7 + instantaneous * 0.3,
-                                None => instantaneous,
-                            });
+            if self.rebase_after_reset {
+                // The SDK restarted the retained restriction after a split.
+                // Anchor on its new value instead of treating the drop as a
+                // permanent regression, and wait for fresh evidence before
+                // reporting a rate.
+                self.last_progress = progress;
+                self.last_change = Some((now, progress));
+                self.rebase_after_reset = false;
+            } else if progress_changed {
+                match self.last_change {
+                    Some((sample_at, sample_progress)) => {
+                        let elapsed = now.duration_since(sample_at);
+                        if elapsed >= ESTIMATOR_RATE_WINDOW {
+                            let instantaneous =
+                                (progress - sample_progress) / elapsed.as_secs_f64();
+                            if instantaneous.is_finite() && instantaneous > 0.0 {
+                                self.rate_per_second = Some(match self.rate_per_second {
+                                    Some(previous) => previous * 0.7 + instantaneous * 0.3,
+                                    None => instantaneous,
+                                });
+                            }
+                            self.last_change = Some((now, progress));
                         }
-                        self.rate_window = Some((now, progress));
+                        // Changes inside the sampling window are folded into the
+                        // next sample; the anchor is left in place.
                     }
+                    None => self.last_change = Some((now, progress)),
                 }
-                None => self.rate_window = Some((now, progress)),
+                self.last_progress = progress;
+            } else if self.last_change.is_none() {
+                // The first observation anchors the baseline even when
+                // progress is still zero, so the first real increase can be
+                // timed from here.
+                self.last_change = Some((now, progress));
             }
         }
 
+        // Only report a rate while progress is still moving. A rate whose last
+        // confirmed increase is older than the staleness horizon is no longer
+        // evidence of current throughput, so the ETA becomes unknown instead of
+        // extrapolating a shrinking rate into an arbitrarily large duration.
+        let rate = self.rate_per_second.filter(|rate| {
+            rate.is_finite()
+                && *rate > 0.0
+                && self.last_change.is_some_and(|(confirmed_at, _)| {
+                    now.duration_since(confirmed_at) < ESTIMATOR_RATE_STALE_AFTER
+                })
+        });
+
         let est_remaining = progress.and_then(|progress| {
-            let rate = self.rate_per_second?;
-            if progress >= 1.0 || !rate.is_finite() || rate <= 0.0 {
+            let rate = rate?;
+            if progress >= 1.0 {
                 return None;
             }
             let seconds = (1.0 - progress) / rate;
@@ -311,20 +356,20 @@ impl ProgressEstimator {
 
         BundleProgressEstimate {
             progress,
-            rate_per_second: self.rate_per_second,
+            rate_per_second: rate,
             est_remaining,
             mode,
             changed: metrics_changed || progress_changed,
         }
     }
 
-    fn reset_after_split(&mut self, progress: Option<f64>, now: Instant) {
-        self.rate_window = None;
+    fn reset_after_split(&mut self, progress: Option<f64>, _now: Instant) {
         self.rate_per_second = None;
+        self.last_change = None;
         if let Some(progress) = progress {
             self.last_progress = progress;
         }
-        self.last_progress_at = now;
+        self.rebase_after_reset = true;
     }
 }
 
@@ -478,8 +523,8 @@ impl SplitManager {
         };
         let snapshot = pool.snapshot();
         self.set_pool_state(
-            snapshot.idle,
-            snapshot.max_workers,
+            snapshot.free_bundle_slots,
+            snapshot.max_bundle_slots,
             snapshot
                 .spawn_cost_ms
                 .and_then(|millis| u64::try_from(millis).ok())
@@ -493,6 +538,9 @@ impl SplitManager {
         max_workers: usize,
         spawn_cost: Option<Duration>,
     ) {
+        // `max_workers` here is the job's parallel bundle-slot budget, not the
+        // number of worker processes: the bundle cap below scales with the same
+        // unit that admission uses.
         let mut state = self.state.lock().expect("split manager lock not poisoned");
         state.capacity = capacity;
         state.max_workers = max_workers.max(1);
@@ -528,8 +576,18 @@ impl SplitManager {
     /// queued work. Progress-based estimates are preferred over the short-window
     /// rate because they remain meaningful while output counters advance but
     /// `read_index` stays on one large input element.
+    ///
+    /// Returns `None` when there is no trustworthy evidence. The split manager
+    /// cannot determine job completion on its own: between scheduling waves it
+    /// may briefly have no registered bundles even though the pool still counts
+    /// outstanding work. Callers must not read `Some(0.0)` from this method as
+    /// "job complete"; the worker pool derives completion from its outstanding
+    /// bundle count and uses this only as the ETA input.
     pub fn estimated_remaining_work_seconds(&self) -> Option<f64> {
         let state = self.state.lock().expect("split manager lock not poisoned");
+        if state.bundles.is_empty() && state.queue_depth.values().all(|depth| *depth == 0) {
+            return None;
+        }
         let mut active_remaining = 0.0;
         let mut bundle_total_estimates = Vec::new();
         let mut unknown_active_estimate = false;
@@ -814,7 +872,7 @@ impl SplittableStageExecutor {
         initialized: bool,
         register_process_bundle: bool,
         progress_tick: Option<Duration>,
-        max_workers: usize,
+        max_bundle_slots: usize,
         overdecompose: usize,
         split_manager: Arc<SplitManager>,
         bundle_id: u64,
@@ -842,9 +900,9 @@ impl SplittableStageExecutor {
         };
 
         if let Some(initialization_response) = initialization_response {
-            if max_workers <= 1 {
-                info!(
-                    "SDF initialization partition: max_workers=1, overdecompose={overdecompose}, \
+            if max_bundle_slots <= 1 {
+                debug!(
+                    "SDF initialization partition: max_bundle_slots=1, overdecompose={overdecompose}, \
                      partitions=1, mode=single-bundle"
                 );
             } else {
@@ -857,7 +915,7 @@ impl SplittableStageExecutor {
                 ) {
                     Ok(spans) if !spans.is_empty() => {
                         let target =
-                            initial_partition_count(max_workers, overdecompose, spans.len());
+                            initial_partition_count(max_bundle_slots, overdecompose, spans.len());
                         if target > 1 {
                             if register_process_bundle {
                                 let process_descriptor_id = plan.process_stage.id().to_string();
@@ -868,22 +926,17 @@ impl SplittableStageExecutor {
                                         "failed to register SDF process bundle {process_descriptor_id}"
                                     ));
                                 }
-                                info!(
+                                debug!(
                                     "SDF process bundle {} registered after initialization partition",
                                     process_descriptor_id
                                 );
                             }
                             let items = partitioned_work_items(stage, &bytes, &spans, target);
                             info!(
-                                "SDF initialization partition: max_workers={max_workers}, \
-                             overdecompose={overdecompose}, elements={}, partitions={}, \
-                             sizes={:?}",
+                                "SDF initialization partition: max_bundle_slots={max_bundle_slots}, \
+                             overdecompose={overdecompose}, elements={}, partitions={}",
                                 spans.len(),
-                                items.len(),
-                                items
-                                    .iter()
-                                    .map(|item| item.estimated_size)
-                                    .collect::<Vec<_>>()
+                                items.len()
                             );
                             return Ok((
                                 initialization_response,
@@ -896,8 +949,8 @@ impl SplittableStageExecutor {
                                 },
                             ));
                         }
-                        info!(
-                            "SDF initialization partition: max_workers={max_workers}, \
+                        debug!(
+                            "SDF initialization partition: max_bundle_slots={max_bundle_slots}, \
                          overdecompose={overdecompose}, elements={}, partitions=1, \
                          mode=single-bundle",
                             spans.len()
@@ -967,7 +1020,7 @@ impl SplittableStageExecutor {
                 descriptor_id
             ));
         }
-        info!("SDF initialization bundle {} registered", descriptor_id);
+        debug!("SDF initialization bundle {} registered", descriptor_id);
 
         let (instruction_id, bundle_response_rx) = self
             .runtime
@@ -976,11 +1029,11 @@ impl SplittableStageExecutor {
             .await?;
         self.runtime.record_instruction_id(&instruction_id);
 
-        info!(
+        debug!(
             "SDF initialization stage {} instruction_id={}",
             descriptor_id, instruction_id
         );
-        info!(
+        debug!(
             "bundle start: worker={} instr={} stage={} elements=unknown seed_bytes=0 \
              queue_depth=0 phase=initialization",
             self.runtime.worker_id().as_str(),
@@ -1098,7 +1151,7 @@ impl SplittableStageExecutor {
 
         match control_response {
             (ControlResponse::ProcessBundleSuccess(response), bytes) => {
-                info!(
+                debug!(
                     "bundle end: worker={} instr={} stage={} dur_ms={} output_elements={} \
                      paimon_write_ms={} status=ok phase=initialization",
                     self.runtime.worker_id().as_str(),
@@ -1154,7 +1207,7 @@ impl SplittableStageExecutor {
                     descriptor_id
                 ));
             }
-            info!("SDF process bundle {} registered", descriptor_id);
+            debug!("SDF process bundle {} registered", descriptor_id);
         }
 
         let input_pcol = stage.input_pcol();
@@ -1199,11 +1252,11 @@ impl SplittableStageExecutor {
             .send_process_bundle_request(&descriptor_id)
             .await?;
         self.runtime.record_instruction_id(&instruction_id);
-        info!(
+        debug!(
             "SDF process stage {} instruction_id={}, estimated_input_elements={}",
             descriptor_id, instruction_id, estimated_input_elements
         );
-        info!(
+        debug!(
             "bundle start: worker={} instr={} stage={} elements={} seed_bytes={} \
              queue_depth=na depth={} phase=process",
             self.runtime.worker_id().as_str(),
@@ -1231,7 +1284,7 @@ impl SplittableStageExecutor {
 
         let mut split_residual_roots: Vec<DelayedBundleApplication> = Vec::new();
         let mut channel_items: Vec<SdfWorkItem> = Vec::new();
-        info!(
+        debug!(
             "SDF split policy: min_split_override_ms={:?}, stall_after_ms={}, cooldown_ms={}, \
              fraction={}, max_depth={}",
             split_manager
@@ -1349,7 +1402,7 @@ impl SplittableStageExecutor {
 
         match control_response {
             ControlResponse::ProcessBundleSuccess(response) => {
-                info!(
+                debug!(
                     "bundle end: worker={} instr={} stage={} dur_ms={} output_elements={} \
                      paimon_write_ms={} status=ok phase=process",
                     self.runtime.worker_id().as_str(),
@@ -1361,7 +1414,7 @@ impl SplittableStageExecutor {
                         .last_paimon_write_ms()
                         .map_or_else(|| "na".to_string(), |value| value.to_string())
                 );
-                info!(
+                debug!(
                     "SDF bundle summary: instruction_id={instruction_id}, \
                      estimated_input_elements={estimated_input_elements}, polls={}, \
                      split_requests={}, splits={}, residual_roots={}, channel_items={}, \
@@ -1398,7 +1451,7 @@ impl SplittableStageExecutor {
         data: Vec<u8>,
         timer_endpoints: &[(String, String)],
     ) -> anyhow::Result<()> {
-        info!(
+        debug!(
             "Sending SDF raw elements: instruction_id={}, transform_id={}, bytes={}",
             instruction_id,
             source_transform_id,
@@ -1424,7 +1477,7 @@ impl SplittableStageExecutor {
         let timers: Vec<beam_model_rs::v1::elements::Timers> = timer_endpoints
             .iter()
             .map(|(transform_id, timer_family_id)| {
-                info!(
+                debug!(
                     "Terminating SDF inbound timer endpoint: instruction_id={}, transform_id={}, timer_family_id={}",
                     instruction_id, transform_id, timer_family_id
                 );
@@ -1458,11 +1511,15 @@ fn sdf_overdecompose_from(configured: Option<&str>) -> usize {
         .unwrap_or(DEFAULT_SDF_OVERDECOMPOSE)
 }
 
-fn initial_partition_count(max_workers: usize, overdecompose: usize, elements: usize) -> usize {
-    if max_workers <= 1 || elements <= 1 {
+fn initial_partition_count(
+    max_bundle_slots: usize,
+    overdecompose: usize,
+    elements: usize,
+) -> usize {
+    if max_bundle_slots <= 1 || elements <= 1 {
         return 1;
     }
-    max_workers
+    max_bundle_slots
         .saturating_mul(overdecompose.max(1))
         .clamp(1, elements)
 }
@@ -1724,8 +1781,6 @@ async fn poll_progress_and_maybe_split(
         now.duration_since(runtime_state.last_progress_log_at) >= BUNDLE_PROGRESS_LOG_INTERVAL;
     if first_poll || progress_log_due {
         runtime_state.last_progress_log_at = now;
-        info!("{progress_log}");
-    } else {
         debug!("{progress_log}");
     }
 
@@ -1739,22 +1794,14 @@ async fn poll_progress_and_maybe_split(
 
     let decision_context = split_manager.decision_context(bundle_id);
     let permit = match split_manager.try_acquire_permit(bundle_id, now) {
-        SplitPermitDecision::Granted(permit) => {
-            runtime_state.last_denial = None;
-            permit
-        }
+        SplitPermitDecision::Granted(permit) => permit,
         SplitPermitDecision::Denied(reason) => {
             let message = format!(
                 "SDF split decision: instruction_id={bundle_instruction_id}, \
                  worker_bundle_id={bundle_id}, granted=false, reason={} {decision_context}",
                 reason.as_str(),
             );
-            if runtime_state.last_denial != Some(reason) {
-                info!("{message}");
-            } else {
-                debug!("{message}");
-            }
-            runtime_state.last_denial = Some(reason);
+            debug!("{message}");
             return Ok(());
         }
     };
@@ -1797,7 +1844,7 @@ async fn poll_progress_and_maybe_split(
         // SDK cannot split (nothing left, or unsupported). Note that any
         // `residual_roots` in this response are not scheduled.
         split_manager.complete_permit(permit, 0, true, now);
-        info!(
+        debug!(
             "SDF split response: instruction_id={bundle_instruction_id}, \
              residual_roots={reported_roots}, channel_splits=0, action=disable-splitting, \
              split_requests={}, splits={}",
@@ -1900,7 +1947,7 @@ async fn poll_progress_and_maybe_split(
             .estimator
             .reset_after_split(estimate.progress, now);
     }
-    info!(
+    debug!(
         "SDF split response: instruction_id={bundle_instruction_id}, \
          residual_roots={new_residual_roots}, channel_splits={channel_splits}, \
          channel_items={new_channel_items}, new_work_items={}, \
@@ -2561,8 +2608,11 @@ mod tests {
     }
 
     #[test]
-    fn initial_partition_count_keeps_one_worker_single_bundle() {
+    fn initial_partition_count_uses_bundle_slots() {
+        // One slot (one worker, one bundle per worker) stays a single bundle.
         assert_eq!(initial_partition_count(1, 4, 100), 1);
+        // Slots, not workers, drive the target: bundles_per_worker > 1 fans out.
+        assert_eq!(initial_partition_count(2, 4, 100), 8);
         assert_eq!(initial_partition_count(4, 4, 100), 16);
         assert_eq!(initial_partition_count(4, 4, 6), 6);
         assert_eq!(initial_partition_count(4, 0, 6), 4);
@@ -2854,7 +2904,7 @@ mod tests {
     }
 
     #[test]
-    fn estimator_rate_decays_when_progress_stops() {
+    fn estimator_rate_does_not_decay_on_zero_delta_polls() {
         let start = Instant::now();
         let spans = spans_with_sizes(&[Some(1.0); 10]);
         let mut estimator = ProgressEstimator::new(start);
@@ -2880,23 +2930,229 @@ mod tests {
         );
         assert_eq!(progressed.rate_per_second, Some(0.2));
 
+        // The SDK only refreshes progress every ~30s in the field. Zero-delta
+        // polls in between must not pull the EWMA toward zero.
         let quiet = estimator.observe(
             &ProgressMetrics {
                 read_index: 2,
                 output_element_count_sum: 1_000_000,
                 work_completed: Some(f32::NAN),
                 work_remaining: Some(1.0),
+            },
+            &spans,
+            start + Duration::from_secs(20),
+        );
+        assert_eq!(quiet.rate_per_second, Some(0.2));
+        assert_eq!(quiet.est_remaining, progressed.est_remaining);
+    }
+
+    #[test]
+    fn estimator_rate_becomes_unknown_after_progress_goes_stale() {
+        let start = Instant::now();
+        let spans = spans_with_sizes(&[Some(1.0); 10]);
+        let mut estimator = ProgressEstimator::new(start);
+        estimator.observe(
+            &ProgressMetrics {
+                read_index: 0,
+                work_completed: Some(0.0),
+                work_remaining: Some(1.0),
+                ..Default::default()
+            },
+            &spans,
+            start,
+        );
+        let progressed = estimator.observe(
+            &ProgressMetrics {
+                read_index: 2,
+                work_completed: Some(0.0),
+                work_remaining: Some(1.0),
+                ..Default::default()
+            },
+            &spans,
+            start + Duration::from_secs(1),
+        );
+        assert_eq!(progressed.rate_per_second, Some(0.2));
+
+        let stale = estimator.observe(
+            &ProgressMetrics {
+                read_index: 2,
+                output_element_count_sum: 5_000_000,
+                work_completed: Some(f32::NAN),
+                work_remaining: Some(1.0),
+            },
+            &spans,
+            start + Duration::from_secs(31),
+        );
+        assert_eq!(stale.progress, Some(0.2));
+        assert_eq!(stale.rate_per_second, None);
+        assert_eq!(stale.est_remaining, None);
+
+        // A later increase is averaged over the whole quiet interval, so the
+        // recovered rate reflects the stall instead of pretending it did not
+        // happen.
+        let resumed = estimator.observe(
+            &ProgressMetrics {
+                read_index: 4,
+                work_completed: Some(0.0),
+                work_remaining: Some(1.0),
+                ..Default::default()
+            },
+            &spans,
+            start + Duration::from_secs(32),
+        );
+        assert!(resumed.rate_per_second.is_some_and(|rate| rate < 0.2));
+    }
+
+    #[test]
+    fn estimator_ignores_progress_regressions_for_rate() {
+        let start = Instant::now();
+        let spans = spans_with_sizes(&[Some(1.0); 10]);
+        let mut estimator = ProgressEstimator::new(start);
+        estimator.observe(
+            &ProgressMetrics {
+                read_index: 0,
+                work_completed: Some(0.0),
+                work_remaining: Some(1.0),
+                ..Default::default()
+            },
+            &spans,
+            start,
+        );
+        let progressed = estimator.observe(
+            &ProgressMetrics {
+                read_index: 5,
+                work_completed: Some(0.0),
+                work_remaining: Some(1.0),
+                ..Default::default()
+            },
+            &spans,
+            start + Duration::from_secs(1),
+        );
+        assert_eq!(progressed.rate_per_second, Some(0.5));
+
+        // The SDK switched the active element's work pair; the weighted
+        // progress dropped. That is not negative throughput.
+        let regressed = estimator.observe(
+            &ProgressMetrics {
+                read_index: 2,
+                work_completed: Some(0.0),
+                work_remaining: Some(1.0),
                 ..Default::default()
             },
             &spans,
             start + Duration::from_secs(2),
         );
-        assert!(
-            quiet
-                .rate_per_second
-                .is_some_and(|rate| (rate - 0.14).abs() < 1e-9)
+        assert_eq!(regressed.progress, Some(0.2));
+        assert_eq!(regressed.rate_per_second, Some(0.5));
+    }
+
+    #[test]
+    fn estimator_folds_sub_window_changes_into_the_next_sample() {
+        let start = Instant::now();
+        let spans = spans_with_sizes(&[Some(1.0); 10]);
+        let mut estimator = ProgressEstimator::new(start);
+        estimator.observe(
+            &ProgressMetrics {
+                read_index: 0,
+                work_completed: Some(0.0),
+                work_remaining: Some(1.0),
+                ..Default::default()
+            },
+            &spans,
+            start,
         );
-        assert!(quiet.est_remaining > progressed.est_remaining);
+        // Inside the 500ms sampling window: no division by a tiny elapsed time.
+        let early = estimator.observe(
+            &ProgressMetrics {
+                read_index: 1,
+                work_completed: Some(0.0),
+                work_remaining: Some(1.0),
+                ..Default::default()
+            },
+            &spans,
+            start + Duration::from_millis(100),
+        );
+        assert_eq!(early.rate_per_second, None);
+        assert_eq!(early.est_remaining, None);
+
+        let sampled = estimator.observe(
+            &ProgressMetrics {
+                read_index: 2,
+                work_completed: Some(0.0),
+                work_remaining: Some(1.0),
+                ..Default::default()
+            },
+            &spans,
+            start + Duration::from_millis(500),
+        );
+        assert!(
+            sampled
+                .rate_per_second
+                .is_some_and(|rate| (rate - 0.4).abs() < 1e-9),
+            "{:?}",
+            sampled.rate_per_second
+        );
+    }
+
+    #[test]
+    fn estimator_reanchors_after_split_progress_reset() {
+        let start = Instant::now();
+        let spans = spans_with_sizes(&[Some(1.0); 10]);
+        let mut estimator = ProgressEstimator::new(start);
+        estimator.observe(
+            &ProgressMetrics {
+                read_index: 0,
+                work_completed: Some(0.0),
+                work_remaining: Some(1.0),
+                ..Default::default()
+            },
+            &spans,
+            start,
+        );
+        let progressed = estimator.observe(
+            &ProgressMetrics {
+                read_index: 6,
+                work_completed: Some(0.0),
+                work_remaining: Some(1.0),
+                ..Default::default()
+            },
+            &spans,
+            start + Duration::from_secs(1),
+        );
+        assert_eq!(progressed.rate_per_second, Some(0.6));
+
+        estimator.reset_after_split(progressed.progress, start + Duration::from_secs(1));
+        // The retained restriction restarts from zero after the split.
+        let rebased = estimator.observe(
+            &ProgressMetrics {
+                read_index: 1,
+                work_completed: Some(0.0),
+                work_remaining: Some(1.0),
+                ..Default::default()
+            },
+            &spans,
+            start + Duration::from_secs(2),
+        );
+        assert_eq!(rebased.progress, Some(0.1));
+        assert_eq!(rebased.rate_per_second, None);
+
+        let resumed = estimator.observe(
+            &ProgressMetrics {
+                read_index: 3,
+                work_completed: Some(0.0),
+                work_remaining: Some(1.0),
+                ..Default::default()
+            },
+            &spans,
+            start + Duration::from_secs(4),
+        );
+        assert!(
+            resumed
+                .rate_per_second
+                .is_some_and(|rate| (rate - 0.1).abs() < 1e-9),
+            "{:?}",
+            resumed.rate_per_second
+        );
     }
 
     #[test]
@@ -3152,6 +3408,44 @@ mod tests {
         // Active work: 20s elapsed / 0.25 total => 80s total, 60s remaining.
         // Queued work: four bundles at the same estimated total => 320s.
         assert!((370.0..=390.0).contains(&estimate), "{estimate}");
+    }
+
+    #[test]
+    fn split_manager_remaining_is_unknown_without_evidence() {
+        let manager = split_manager();
+        // No registered bundles and an empty queue is not evidence of
+        // completion. The pool derives completion from its own outstanding
+        // bundle count, so fabricating `Some(0.0)` here would make an active
+        // job look finished.
+        assert_eq!(manager.estimated_remaining_work_seconds(), None);
+
+        let now = Instant::now();
+        let bundle = manager.register_bundle("stage", 0, now - Duration::from_secs(4));
+        // A registered bundle without progress cannot produce an estimate.
+        assert_eq!(manager.estimated_remaining_work_seconds(), None);
+
+        update_managed_remaining(&manager, bundle, Duration::from_secs(12), true, now);
+        let estimate = manager
+            .estimated_remaining_work_seconds()
+            .expect("progress-based remaining estimate");
+        assert!((11.0..=13.0).contains(&estimate), "{estimate}");
+    }
+
+    #[test]
+    fn split_manager_remaining_requires_an_estimate_for_queued_work() {
+        let now = Instant::now();
+        let manager = split_manager();
+        let bundle = manager.register_bundle("stage", 0, now - Duration::from_secs(4));
+        manager.set_queue_depth("stage", 3);
+        // Queued work with no per-bundle estimate is unknown, not zero.
+        assert_eq!(manager.estimated_remaining_work_seconds(), None);
+
+        update_managed_remaining(&manager, bundle, Duration::from_secs(12), true, now);
+        let estimate = manager
+            .estimated_remaining_work_seconds()
+            .expect("active plus queued estimate");
+        // Active: ~12s remaining. Queued: 3 bundles at a ~16s total each.
+        assert!(estimate > 40.0, "{estimate}");
     }
 
     #[test]

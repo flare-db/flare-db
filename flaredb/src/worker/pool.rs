@@ -41,6 +41,9 @@ pub enum WorkerKind {
 pub struct ScaleDecisionInputs {
     pub remaining_bundles: usize,
     pub active_bundles: usize,
+    /// Bundles already waiting for a slot. Queued work is known demand, so it
+    /// can justify a worker before a throughput sample exists.
+    pub queue_depth: usize,
     pub completed_bundles: u64,
     pub busy_worker_seconds: f64,
     pub spawn_cost: Duration,
@@ -116,6 +119,29 @@ pub fn decide_scale(inputs: &ScaleDecisionInputs) -> ScaleDecision {
             estimated_remaining_seconds: None,
             want_workers: min_workers,
             reason: ScaleReason::NoParallelWork,
+        };
+    }
+
+    // A queued bundle is known demand and does not need a throughput sample to
+    // justify a slot. This matters for SDF residuals produced early in a long
+    // source bundle: they should overlap with the source instead of waiting for
+    // the rate window to fill.
+    if inputs.queue_depth > 0 {
+        let demand = inputs
+            .active_bundles
+            .saturating_add(inputs.queue_depth)
+            .clamp(min_workers, max_workers);
+        let reason = match demand.cmp(&current_workers) {
+            std::cmp::Ordering::Greater => ScaleReason::ScaleUp,
+            std::cmp::Ordering::Less => ScaleReason::ScaleDown,
+            std::cmp::Ordering::Equal => ScaleReason::Hold,
+        };
+        return ScaleDecision {
+            target_seconds_per_worker,
+            observed_rate_bundles_per_second: None,
+            estimated_remaining_seconds: None,
+            want_workers: demand,
+            reason,
         };
     }
 
@@ -477,12 +503,25 @@ pub struct PoolSnapshot {
     pub remaining_bundles: usize,
     pub queue_depth: usize,
     pub in_flight_bundles: usize,
+    /// Bundle slots the configured worker ceiling can host.
+    pub max_bundle_slots: usize,
+    /// Bundles currently holding a slot across live workers.
+    pub active_bundles: usize,
+    /// Slots still available for new bundles. This is the admission budget for
+    /// SDF splits: unlike `idle`, it stays positive while a worker with
+    /// `bundles_per_worker > 1` still has room.
+    pub free_bundle_slots: usize,
     pub splits: u64,
     pub want_workers: usize,
     pub scale_reason: String,
     pub target_seconds_per_worker: f64,
     pub observed_rate_bundles_per_second: Option<f64>,
+    /// Estimated duration of all outstanding work if it ran on one worker,
+    /// derived from SDF progress. `None` when unknown or stale; `Some(0.0)`
+    /// only when no work is outstanding.
     pub remaining_work_seconds: Option<f64>,
+    /// Wall-clock ETA under current parallelism: `remaining_work_seconds`
+    /// divided by live workers. `None` when the ETA is unknown.
     pub estimated_remaining_seconds: Option<f64>,
     pub spawn_count: u64,
     pub completed_bundles: u64,
@@ -511,6 +550,7 @@ fn scale_decision(config: &WorkerPoolConfig, inner: &PoolInner) -> ScaleDecision
     decide_scale(&ScaleDecisionInputs {
         remaining_bundles: inner.remaining_bundles,
         active_bundles,
+        queue_depth: inner.queue_depth,
         completed_bundles: inner.completed_bundles,
         busy_worker_seconds: inner.total_busy_seconds + active_worker_seconds,
         spawn_cost: inner
@@ -1061,11 +1101,33 @@ impl WorkerPool {
             0.0
         };
         let elapsed = inner.started_at.elapsed().as_secs_f64().max(f64::EPSILON);
-        let remaining_work_seconds = inner
-            .reported_remaining_work_seconds
-            .or_else(|| (inner.remaining_bundles == 0).then_some(0.0));
+        // `remaining_work_seconds` is the duration all outstanding work would
+        // take on one worker; `estimated_remaining_seconds` divides it by the
+        // current worker count, i.e. the wall-clock ETA under current
+        // parallelism. It deliberately excludes queue/in-flight counts, which
+        // are reported separately.
+        //
+        // An estimate is only trustworthy when it is finite, non-negative, and
+        // not zero while work is still outstanding. The dispatcher can push a
+        // stale zero from an earlier scheduling wave (before long bundles
+        // registered); showing that as the ETA would claim the job is done.
+        // Completion is the one case where zero is known: no outstanding
+        // bundles.
+        let outstanding = inner.remaining_bundles > 0;
+        let remaining_work_seconds = if outstanding {
+            inner
+                .reported_remaining_work_seconds
+                .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+        } else {
+            // No outstanding bundles: completion is known, so a stale positive
+            // estimate from an earlier wave must not outlive it.
+            Some(0.0)
+        };
         let estimated_remaining_seconds =
             remaining_work_seconds.map(|seconds| seconds / workers.len().max(1) as f64);
+        let active_bundles: usize = workers.iter().map(|worker| worker.active_bundles).sum();
+        let max_bundle_slots = self.config.max_bundle_slots();
+        let free_bundle_slots = max_bundle_slots.saturating_sub(active_bundles);
         PoolSnapshot {
             max_workers: self.config.max_workers,
             min_workers: self.config.min_workers,
@@ -1077,6 +1139,9 @@ impl WorkerPool {
             remaining_bundles: inner.remaining_bundles,
             queue_depth: inner.queue_depth,
             in_flight_bundles: inner.in_flight_bundles,
+            max_bundle_slots,
+            active_bundles,
+            free_bundle_slots,
             splits: inner.splits,
             want_workers: decision.want_workers,
             scale_reason: decision.reason.as_str().to_string(),
@@ -1365,6 +1430,7 @@ mod tests {
         ScaleDecisionInputs {
             remaining_bundles,
             active_bundles: 0,
+            queue_depth: 0,
             completed_bundles,
             busy_worker_seconds,
             spawn_cost,
@@ -1386,6 +1452,22 @@ mod tests {
         assert_eq!(decision.reason, ScaleReason::NoRateSample);
         assert_eq!(decision.want_workers, 1);
         assert_eq!(decision.observed_rate_bundles_per_second, None);
+    }
+
+    #[test]
+    fn scale_policy_spawns_for_known_queued_work_before_a_rate_sample() {
+        let mut inputs = scale_inputs(2, 0, 0.1, Duration::from_millis(500));
+        inputs.active_bundles = 1;
+        inputs.queue_depth = 1;
+        let decision = decide_scale(&inputs);
+        assert_eq!(decision.reason, ScaleReason::ScaleUp);
+        assert_eq!(decision.want_workers, 2);
+        assert_eq!(decision.observed_rate_bundles_per_second, None);
+
+        // Demand is capped by the configured ceiling, not by the queue length.
+        inputs.queue_depth = 10;
+        let decision = decide_scale(&inputs);
+        assert_eq!(decision.want_workers, inputs.max_workers);
     }
 
     #[test]
@@ -1483,6 +1565,76 @@ mod tests {
         drop(first);
         drop(second);
         assert_eq!(pool.snapshot().idle, 2);
+    }
+
+    #[tokio::test]
+    async fn snapshot_reports_free_slots_for_multi_bundle_workers() {
+        let backend = Arc::new(FakeBackend::new());
+        // Two workers, each able to host two bundles: four slots in total.
+        let pool = WorkerPool::new(config(2, 2, 2), backend);
+        pool.start_min_workers().await.unwrap();
+        assert_eq!(pool.snapshot().max_bundle_slots, 4);
+        assert_eq!(pool.snapshot().free_bundle_slots, 4);
+
+        let first = pool.acquire(WorkerKind::Cpu).await.unwrap();
+        let second = pool.acquire(WorkerKind::Cpu).await.unwrap();
+        let snapshot = pool.snapshot();
+        assert_eq!(snapshot.active_bundles, 2);
+        assert_eq!(snapshot.free_bundle_slots, 2);
+        // Every worker is busy, so `idle` is zero even though two slots remain.
+        // SDF split admission uses the free-slot count for exactly this case.
+        assert_eq!(snapshot.idle, 0);
+
+        let third = pool.acquire(WorkerKind::Cpu).await.unwrap();
+        assert_eq!(pool.snapshot().free_bundle_slots, 1);
+
+        drop(first);
+        drop(second);
+        drop(third);
+        assert_eq!(pool.snapshot().free_bundle_slots, 4);
+        assert_eq!(pool.snapshot().active_bundles, 0);
+    }
+
+    #[tokio::test]
+    async fn pool_snapshot_does_not_report_a_zero_eta_for_outstanding_work() {
+        let backend = Arc::new(FakeBackend::new());
+        let pool = WorkerPool::new(config(2, 1, 2), backend);
+        pool.start_min_workers().await.unwrap();
+
+        pool.observe_workload(24);
+        pool.observe_dispatcher_state(18, 6, 0);
+        // A stale zero pushed before the long bundles registered must not be
+        // presented as a completed job.
+        pool.observe_remaining_work_seconds(Some(0.0));
+        let snapshot = pool.snapshot();
+        assert_eq!(snapshot.remaining_bundles, 24);
+        assert_eq!(snapshot.queue_depth, 18);
+        assert_eq!(snapshot.remaining_work_seconds, None);
+        assert_eq!(snapshot.estimated_remaining_seconds, None);
+
+        pool.observe_remaining_work_seconds(None);
+        assert_eq!(pool.snapshot().remaining_work_seconds, None);
+
+        // Invalid samples stay unknown rather than becoming zero or infinity.
+        pool.observe_remaining_work_seconds(Some(f64::NAN));
+        assert_eq!(pool.snapshot().remaining_work_seconds, None);
+        pool.observe_remaining_work_seconds(Some(f64::INFINITY));
+        assert_eq!(pool.snapshot().remaining_work_seconds, None);
+        pool.observe_remaining_work_seconds(Some(-1.0));
+        assert_eq!(pool.snapshot().remaining_work_seconds, None);
+
+        // A positive estimate is divided by the current worker count: parallel
+        // work is aggregated once, not summed per worker.
+        pool.observe_remaining_work_seconds(Some(90.0));
+        let parallel = pool.snapshot();
+        assert_eq!(parallel.remaining_work_seconds, Some(90.0));
+        assert_eq!(parallel.estimated_remaining_seconds, Some(90.0));
+
+        // Only a drained workload reports a completed zero.
+        pool.observe_workload(0);
+        let done = pool.snapshot();
+        assert_eq!(done.remaining_work_seconds, Some(0.0));
+        assert_eq!(done.estimated_remaining_seconds, Some(0.0));
     }
 
     #[tokio::test]
