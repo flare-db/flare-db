@@ -351,6 +351,7 @@ struct PoolInner {
     completed_bundles: u64,
     peak_workers: usize,
     total_output_elements: u64,
+    reported_remaining_work_seconds: Option<f64>,
     queue_depth: usize,
     in_flight_bundles: usize,
     splits: u64,
@@ -481,6 +482,7 @@ pub struct PoolSnapshot {
     pub scale_reason: String,
     pub target_seconds_per_worker: f64,
     pub observed_rate_bundles_per_second: Option<f64>,
+    pub remaining_work_seconds: Option<f64>,
     pub estimated_remaining_seconds: Option<f64>,
     pub spawn_count: u64,
     pub completed_bundles: u64,
@@ -599,6 +601,7 @@ impl WorkerPool {
                 completed_bundles: 0,
                 peak_workers: 0,
                 total_output_elements: 0,
+                reported_remaining_work_seconds: None,
                 queue_depth: 0,
                 in_flight_bundles: 0,
                 splits: 0,
@@ -651,6 +654,21 @@ impl WorkerPool {
         inner.queue_depth = queue_depth;
         inner.in_flight_bundles = in_flight_bundles;
         inner.splits = splits;
+    }
+
+    pub fn observe_remaining_work_seconds(&self, seconds: Option<f64>) {
+        self.inner
+            .lock()
+            .expect("worker pool lock not poisoned")
+            .reported_remaining_work_seconds = seconds;
+    }
+
+    pub fn record_output_elements(&self, count: u64) {
+        if count == 0 {
+            return;
+        }
+        let mut inner = self.inner.lock().expect("worker pool lock not poisoned");
+        inner.total_output_elements = inner.total_output_elements.saturating_add(count);
     }
 
     pub fn annotate_instruction(&self, worker_id: &WorkerId, lease_id: u64, instruction_id: &str) {
@@ -869,10 +887,9 @@ impl WorkerPool {
         self.stop_selected(&stop_ids, "shrink-to-min").await
     }
 
-    pub fn record_bundle_complete(&self, worker_id: &WorkerId, output_elements: u64) {
+    pub fn record_bundle_complete(&self, worker_id: &WorkerId) {
         let mut inner = self.inner.lock().expect("worker pool lock not poisoned");
         inner.completed_bundles += 1;
-        inner.total_output_elements = inner.total_output_elements.saturating_add(output_elements);
         if let Some(worker) = inner.workers.get_mut(worker_id.as_str()) {
             worker.bundles_done += 1;
         }
@@ -1044,6 +1061,11 @@ impl WorkerPool {
             0.0
         };
         let elapsed = inner.started_at.elapsed().as_secs_f64().max(f64::EPSILON);
+        let remaining_work_seconds = inner
+            .reported_remaining_work_seconds
+            .or_else(|| (inner.remaining_bundles == 0).then_some(0.0));
+        let estimated_remaining_seconds =
+            remaining_work_seconds.map(|seconds| seconds / workers.len().max(1) as f64);
         PoolSnapshot {
             max_workers: self.config.max_workers,
             min_workers: self.config.min_workers,
@@ -1060,7 +1082,8 @@ impl WorkerPool {
             scale_reason: decision.reason.as_str().to_string(),
             target_seconds_per_worker: decision.target_seconds_per_worker,
             observed_rate_bundles_per_second: decision.observed_rate_bundles_per_second,
-            estimated_remaining_seconds: decision.estimated_remaining_seconds,
+            remaining_work_seconds,
+            estimated_remaining_seconds,
             spawn_count: inner.spawn_count,
             completed_bundles: inner.completed_bundles,
             output_elements: inner.total_output_elements,
@@ -1197,8 +1220,8 @@ impl WorkerPool {
                 let snapshot = pool.telemetry_snapshot();
                 log::info!(
                     "pool: job={} max={} live={} busy={} idle={} starting={} queue={} \
-                     in_flight={} done_bundles={} splits={} est_remaining_s={:?} want={} \
-                     out_rows_per_s={:.0} util={:.2} peak={} spawned={}",
+                     in_flight={} done_bundles={} splits={} remaining_work_s={:?} \
+                     eta_s={:?} want={} out_rows_per_s={:.0} util={:.2} peak={} spawned={}",
                     pool.config.job_id,
                     snapshot.max_workers,
                     snapshot.live,
@@ -1209,6 +1232,7 @@ impl WorkerPool {
                     snapshot.in_flight_bundles,
                     snapshot.completed_bundles,
                     snapshot.splits,
+                    snapshot.remaining_work_seconds,
                     snapshot.estimated_remaining_seconds,
                     snapshot.want_workers,
                     snapshot.output_elements_per_second,
@@ -1433,7 +1457,9 @@ mod tests {
         assert_eq!(active.workers[0].bundle.as_deref(), Some("instr-1"));
         assert!(active.workers[0].oldest_bundle_age_seconds.is_some());
         pool.observe_dispatcher_state(4, 1, 2);
-        pool.record_bundle_complete(first.id(), 120);
+        pool.observe_remaining_work_seconds(Some(80.0));
+        pool.record_output_elements(120);
+        pool.record_bundle_complete(first.id());
         pool.observe_workload(100);
         {
             let mut inner = pool.inner.lock().expect("worker pool lock not poisoned");
@@ -1450,6 +1476,8 @@ mod tests {
         assert_eq!(snapshot.in_flight_bundles, 1);
         assert_eq!(snapshot.splits, 2);
         assert_eq!(snapshot.output_elements, 120);
+        assert_eq!(snapshot.remaining_work_seconds, Some(80.0));
+        assert_eq!(snapshot.estimated_remaining_seconds, Some(40.0));
         assert!(snapshot.output_elements_per_second > 0.0);
         assert!(snapshot.utilization > 0.0);
         drop(first);

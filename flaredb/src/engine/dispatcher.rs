@@ -298,6 +298,9 @@ impl ExecutorDispatcher {
                     scheduler.in_flight_bundle_count(),
                     split_manager.total_splits(),
                 );
+                pool.observe_remaining_work_seconds(
+                    split_manager.estimated_remaining_work_seconds(),
+                );
                 let snapshot = pool.snapshot();
                 if scheduler.queued_bundle_count() == 0 && snapshot.idle > 0 {
                     first_idle_queue_empty_at.get_or_insert_with(Instant::now);
@@ -413,6 +416,10 @@ impl ExecutorDispatcher {
                             instruction_id,
                         );
                     }));
+                    let output_pool = Arc::clone(&pool);
+                    runtime.set_output_progress_observer(Arc::new(move |count| {
+                        output_pool.record_output_elements(count);
+                    }));
                     let mark_registration = |descriptor_id: &str| {
                         registered_on
                             .lock()
@@ -460,7 +467,7 @@ impl ExecutorDispatcher {
                         };
                         split_manager.finish_bundle(split_bundle_id);
                         if run.0.is_ok() {
-                            pool.record_bundle_complete(&worker_id, run.2);
+                            pool.record_bundle_complete(&worker_id);
                         }
                         (
                             idx,
@@ -494,7 +501,7 @@ impl ExecutorDispatcher {
                             .and_then(control_output_elements)
                             .unwrap_or(0);
                         if result.is_ok() {
-                            pool.record_bundle_complete(&worker_id, output_elements);
+                            pool.record_bundle_complete(&worker_id);
                         }
                         (
                             idx,

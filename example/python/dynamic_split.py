@@ -6,21 +6,33 @@ the initial restriction stays one big range: the only way the work can be
 divided is for the runner to ask the SDK to split a *running* bundle, which is
 what makes this a dynamic split.
 
-While a bundle runs, FlareDB polls its progress on a short interval. When two
-consecutive polls show no new input index and no new output elements, the
-bundle is treated as stalled and FlareDB asks the SDK to split it. The SDK
-keeps part of the remaining blocks and hands the rest back as a residual, which
-the runner schedules as a new bundle. Making a block slower than the poll
-interval is what causes the split.
+While a bundle runs, FlareDB polls the SDK for progress. The SplitManager grants
+a split only when worker capacity is idle, the work queue is empty, the bundle
+has enough estimated work remaining, and its cooldown/depth limits allow it.
+The SDK keeps part of the remaining restriction and hands the rest back as a
+residual, which the runner schedules as a new bundle.
 
-Each claimed block is logged, so a run shows the work divided across several
-bundles. After the pipeline finishes, the claimed blocks are read back and
-checked against 0..BLOCKS-1 to confirm every block ran exactly once, no matter
-how often the work was split.
+Claim and split events are written under `build/`. After the pipeline finishes,
+the example checks that every block ran exactly once and that the requested
+number of dynamic splits was observed.
 
 Run from the repository root with a FlareDB instance already started:
 
+    FLAREDB_WORKERS=4 \
+    FLAREDB_MIN_WORKERS=4 \
+    FLAREDB_SDF_OVERDECOMPOSE=1 \
+    FLAREDB_SDF_MIN_SPLIT_SECS=1 \
+    FLAREDB_SDF_PROGRESS_POLL_SECS=0.25 \
+    ./flareup-dev.sh --debug --log-level info
+
     python3 example/python/dynamic_split.py
+
+Environment overrides:
+
+    DYNAMIC_SPLIT_BLOCKS=40
+    DYNAMIC_SPLIT_BLOCK_SECONDS=0.25
+    DYNAMIC_SPLIT_ELEMENTS=1
+    DYNAMIC_SPLIT_EXPECT_SPLITS=1
 
 See runner-sdk/python/flarerunner for how to install the flaredb dependency,
 and the repository root README.md for how to start FlareDB.
@@ -40,20 +52,27 @@ from flaredb_runner.flare_runner import FlareRunner
 
 LOG = logging.getLogger(__name__)
 
-# Number of blocks in the single job, and how long each block takes. Keep
-# BLOCK_SECONDS above the runner's progress-poll interval so the bundle looks
-# stalled and is split.
-BLOCKS = 24
-BLOCK_SECONDS = 0.5
+# Workload shape. The default creates one long SDF restriction and expects
+# dynamic splitting when at least one worker remains idle. Set
+# DYNAMIC_SPLIT_EXPECT_SPLITS=0 for a capacity-saturated control run.
+BLOCKS = int(os.environ.get("DYNAMIC_SPLIT_BLOCKS", "24"))
+BLOCK_SECONDS = float(os.environ.get("DYNAMIC_SPLIT_BLOCK_SECONDS", "0.5"))
+ELEMENT_COUNT = int(os.environ.get("DYNAMIC_SPLIT_ELEMENTS", "1"))
+EXPECT_DYNAMIC_SPLITS = int(os.environ.get("DYNAMIC_SPLIT_EXPECT_SPLITS", "1"))
 
 
-def append_claim(path, block):
-  """Appends one claimed block to `path`, creating the parent directory."""
+def append_event(path, value):
+  """Appends one complete event line for post-run validation."""
   directory = os.path.dirname(path)
   if directory:
     os.makedirs(directory, exist_ok=True)
   with open(path, "a", encoding="utf-8") as handle:
-    handle.write("%d\n" % block)
+    handle.write(value + "\n")
+
+
+def append_claim(path, name, block):
+  """Appends one claimed block to `path`, creating the parent directory."""
+  append_event(path, "%s:%d" % (name, block))
 
 
 class BlockRangeProvider(beam.RestrictionProvider):
@@ -78,8 +97,10 @@ class BlockRangeProvider(beam.RestrictionProvider):
 class SlowBlockFn(beam.DoFn):
   """Processes each block slowly, logging claims and any dynamic split."""
 
-  def __init__(self, claims_file):
+  def __init__(self, claims_file, segments_file, splits_file):
     self.claims_file = claims_file
+    self.segments_file = segments_file
+    self.splits_file = splits_file
 
   def process(
       self,
@@ -88,6 +109,7 @@ class SlowBlockFn(beam.DoFn):
     name, _ = element
     restriction = tracker.current_restriction()
     segment = "%d-%d" % (restriction.start, restriction.stop)
+    append_event(self.segments_file, "%s:%d:%d" % (name, restriction.start, restriction.stop))
     LOG.info(
         "segment %s started: blocks [%d, %d)",
         segment,
@@ -100,7 +122,7 @@ class SlowBlockFn(beam.DoFn):
     # returns False once the offset falls outside the (possibly shrunk)
     # restriction.
     while tracker.try_claim(offset):
-      append_claim(self.claims_file, offset)
+      append_claim(self.claims_file, name, offset)
       LOG.info("segment %s claimed block %d", segment, offset)
 
       # A dynamic split shrinks the current restriction; the tail becomes a
@@ -112,6 +134,7 @@ class SlowBlockFn(beam.DoFn):
             segment,
             current.stop,
             stop)
+        append_event(self.splits_file, "%s:%d:%d" % (name, current.stop, stop))
         stop = current.stop
 
       time.sleep(BLOCK_SECONDS)
@@ -130,26 +153,44 @@ def log_result(element):
   LOG.info("result=%s", element)
 
 
-def read_claims(path):
-  """Reads the claimed blocks recorded by the pipeline."""
+def read_events(path):
+  """Reads non-empty event lines recorded by the pipeline."""
   if not os.path.exists(path):
     return []
   with open(path, "r", encoding="utf-8") as handle:
-    return [int(line) for line in handle if line.strip()]
+    return [line.strip() for line in handle if line.strip()]
 
 
-def verify_claims(claims):
-  """Checks that every block 0..BLOCKS-1 was claimed exactly once."""
-  ok = sorted(claims) == list(range(BLOCKS))
+def verify_claims(claims, split_events):
+  """Checks exact block coverage and the configured dynamic split count."""
+  expected = [
+      "job-%d:%d" % (element, block)
+      for element in range(ELEMENT_COUNT)
+      for block in range(BLOCKS)
+  ]
+  ok = sorted(claims) == sorted(expected)
   LOG.info(
-      "Every block 0..%d processed exactly once: %s",
+      "Every block processed exactly once for %d element(s), blocks 0..%d: %s",
+      ELEMENT_COUNT,
       BLOCKS - 1,
       "YES" if ok else "NO  <-- BUG")
   if not ok:
     raise AssertionError(
-        "dynamic-split-example FAILED: processed blocks do not match the "
-        "input.\n  expected=%s\n  actual=%s"
-        % (list(range(BLOCKS)), sorted(claims)))
+        "dynamic-split-example FAILED: claims do not match the input.\n"
+        "  expected_count=%d actual_count=%d" % (len(expected), len(claims)))
+
+  split_ok = (
+      EXPECT_DYNAMIC_SPLITS < 0
+      or len(split_events) >= EXPECT_DYNAMIC_SPLITS)
+  LOG.info(
+      "Dynamic split validation: observed=%d expected_min=%d: %s",
+      len(split_events),
+      EXPECT_DYNAMIC_SPLITS,
+      "YES" if split_ok else "NO  <-- BUG")
+  if not split_ok:
+    raise AssertionError(
+        "dynamic-split-example FAILED: expected at least %d dynamic split(s), "
+        "observed %d" % (EXPECT_DYNAMIC_SPLITS, len(split_events)))
 
 
 def run(argv=None):
@@ -160,10 +201,14 @@ def run(argv=None):
       job_endpoint="127.0.0.1:8099",
   )
 
-  claims_file = str(Path("build").resolve() / "dynamic-split-claims.txt")
+  build_dir = Path("build").resolve()
+  claims_file = str(build_dir / "dynamic-split-claims.txt")
+  segments_file = str(build_dir / "dynamic-split-segments.txt")
+  splits_file = str(build_dir / "dynamic-split-splits.txt")
 
-  if os.path.exists(claims_file):
-    os.remove(claims_file)
+  for path in (claims_file, segments_file, splits_file):
+    if os.path.exists(path):
+      os.remove(path)
 
   with beam.Pipeline(
       runner=FlareRunner(),
@@ -171,12 +216,25 @@ def run(argv=None):
   ) as p:
     (
         p
-        | "Create" >> beam.Create([("job", BLOCKS)])
-        | "SlowBlocks" >> beam.ParDo(SlowBlockFn(claims_file))
+        | "Create" >> beam.Create(
+            [("job-%d" % index, BLOCKS) for index in range(ELEMENT_COUNT)])
+        | "SlowBlocks" >> beam.ParDo(
+            SlowBlockFn(claims_file, segments_file, splits_file))
         | "LogResults" >> beam.Map(log_result)
     )
 
-  verify_claims(read_claims(claims_file))
+  claims = read_events(claims_file)
+  segments = read_events(segments_file)
+  split_events = read_events(splits_file)
+  LOG.info(
+      "Dynamic split run summary: elements=%d blocks=%d block_seconds=%s "
+      "segments=%d splits=%d",
+      ELEMENT_COUNT,
+      BLOCKS,
+      BLOCK_SECONDS,
+      len(segments),
+      len(split_events))
+  verify_claims(claims, split_events)
 
 
 if __name__ == "__main__":

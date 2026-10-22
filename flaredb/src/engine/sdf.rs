@@ -284,7 +284,7 @@ impl ProgressEstimator {
                     if elapsed >= ESTIMATOR_RATE_WINDOW {
                         let delta = (progress - sample_progress).max(0.0);
                         let instantaneous = delta / elapsed.as_secs_f64();
-                        if instantaneous.is_finite() && instantaneous > 0.0 {
+                        if instantaneous.is_finite() {
                             self.rate_per_second = Some(match self.rate_per_second {
                                 Some(previous) => previous * 0.7 + instantaneous * 0.3,
                                 None => instantaneous,
@@ -392,6 +392,7 @@ fn estimate_progress(
 struct ManagedBundle {
     stage: String,
     depth: usize,
+    started_at: Instant,
     progress: Option<f64>,
     est_remaining: Option<Duration>,
     last_progress_at: Instant,
@@ -523,6 +524,56 @@ impl SplitManager {
             .unwrap_or(0)
     }
 
+    /// Estimate remaining single-worker seconds from active bundle progress and
+    /// queued work. Progress-based estimates are preferred over the short-window
+    /// rate because they remain meaningful while output counters advance but
+    /// `read_index` stays on one large input element.
+    pub fn estimated_remaining_work_seconds(&self) -> Option<f64> {
+        let state = self.state.lock().expect("split manager lock not poisoned");
+        let mut active_remaining = 0.0;
+        let mut bundle_total_estimates = Vec::new();
+        let mut unknown_active_estimate = false;
+        for bundle in state.bundles.values() {
+            let estimate: Option<(f64, Option<f64>)> = bundle
+                .progress
+                .filter(|progress| *progress > 0.0 && *progress <= 1.0)
+                .map(|progress| {
+                    let elapsed = bundle.started_at.elapsed().as_secs_f64();
+                    let total = elapsed / progress;
+                    (total * (1.0 - progress), Some(total))
+                })
+                .or_else(|| {
+                    bundle
+                        .est_remaining
+                        .map(|remaining| (remaining.as_secs_f64(), None))
+                });
+            match estimate {
+                Some((remaining, Some(total))) => {
+                    active_remaining += remaining;
+                    bundle_total_estimates.push(total);
+                }
+                Some((remaining, None)) => active_remaining += remaining,
+                None => unknown_active_estimate = true,
+            }
+        }
+        if unknown_active_estimate {
+            return None;
+        }
+
+        let queued = state.queue_depth.values().copied().sum::<usize>();
+        let average_bundle_total = if bundle_total_estimates.is_empty() {
+            None
+        } else {
+            Some(bundle_total_estimates.iter().sum::<f64>() / bundle_total_estimates.len() as f64)
+        };
+        let queued_work = match (queued, average_bundle_total) {
+            (0, _) => 0.0,
+            (queued, Some(average)) => queued as f64 * average,
+            _ => return None,
+        };
+        Some(active_remaining + queued_work)
+    }
+
     pub fn register_bundle(&self, stage: &str, depth: usize, now: Instant) -> u64 {
         let mut state = self.state.lock().expect("split manager lock not poisoned");
         let bundle_id = state.next_bundle_id;
@@ -533,6 +584,7 @@ impl SplitManager {
             ManagedBundle {
                 stage: stage.to_string(),
                 depth,
+                started_at: now,
                 progress: None,
                 est_remaining: None,
                 last_progress_at: now,
@@ -1304,7 +1356,7 @@ impl SplittableStageExecutor {
                     instruction_id,
                     descriptor_id,
                     started.elapsed().as_millis(),
-                    sum_element_count(&response.monitoring_infos),
+                    self.runtime.decoded_output_elements(),
                     self.runtime
                         .last_paimon_write_ms()
                         .map_or_else(|| "na".to_string(), |value| value.to_string())
@@ -2802,6 +2854,52 @@ mod tests {
     }
 
     #[test]
+    fn estimator_rate_decays_when_progress_stops() {
+        let start = Instant::now();
+        let spans = spans_with_sizes(&[Some(1.0); 10]);
+        let mut estimator = ProgressEstimator::new(start);
+        estimator.observe(
+            &ProgressMetrics {
+                read_index: 0,
+                work_completed: Some(0.0),
+                work_remaining: Some(1.0),
+                ..Default::default()
+            },
+            &spans,
+            start,
+        );
+        let progressed = estimator.observe(
+            &ProgressMetrics {
+                read_index: 2,
+                work_completed: Some(0.0),
+                work_remaining: Some(1.0),
+                ..Default::default()
+            },
+            &spans,
+            start + Duration::from_secs(1),
+        );
+        assert_eq!(progressed.rate_per_second, Some(0.2));
+
+        let quiet = estimator.observe(
+            &ProgressMetrics {
+                read_index: 2,
+                output_element_count_sum: 1_000_000,
+                work_completed: Some(f32::NAN),
+                work_remaining: Some(1.0),
+                ..Default::default()
+            },
+            &spans,
+            start + Duration::from_secs(2),
+        );
+        assert!(
+            quiet
+                .rate_per_second
+                .is_some_and(|rate| (rate - 0.14).abs() < 1e-9)
+        );
+        assert!(quiet.est_remaining > progressed.est_remaining);
+    }
+
+    #[test]
     fn estimator_marks_completed_active_element_work() {
         let now = Instant::now();
         let mut estimator = ProgressEstimator::new(now);
@@ -3027,6 +3125,33 @@ mod tests {
             manager.try_acquire_permit(bundle, now),
             SplitPermitDecision::Granted(_)
         ));
+    }
+
+    #[test]
+    fn split_manager_eta_uses_progress_and_queued_work() {
+        let now = Instant::now();
+        let manager = split_manager();
+        let started = now - Duration::from_secs(20);
+        let bundle = manager.register_bundle("stage", 0, started);
+        manager.update_progress(
+            bundle,
+            BundleProgressEstimate {
+                progress: Some(0.25),
+                rate_per_second: Some(0.1),
+                est_remaining: Some(Duration::from_secs(1)),
+                mode: ProgressEstimatorMode::Coarse,
+                changed: true,
+            },
+            now,
+        );
+        manager.set_queue_depth("stage", 4);
+
+        let estimate = manager
+            .estimated_remaining_work_seconds()
+            .expect("progress-based remaining estimate");
+        // Active work: 20s elapsed / 0.25 total => 80s total, 60s remaining.
+        // Queued work: four bundles at the same estimated total => 320s.
+        assert!((370.0..=390.0).contains(&estimate), "{estimate}");
     }
 
     #[test]

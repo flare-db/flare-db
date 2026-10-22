@@ -90,9 +90,12 @@ pub struct BundleRuntime {
     last_instruction_id: Arc<StdMutex<Option<String>>>,
     instruction_observer: Option<InstructionObserver>,
     last_paimon_write_ms: Arc<StdMutex<Option<u128>>>,
+    output_progress_observer: Option<OutputProgressObserver>,
+    decoded_output_elements: Arc<std::sync::atomic::AtomicU64>,
 }
 
 type InstructionObserver = Arc<dyn Fn(&str) + Send + Sync>;
+type OutputProgressObserver = Arc<dyn Fn(u64) + Send + Sync>;
 
 impl BundleRuntime {
     #[allow(clippy::too_many_arguments)]
@@ -129,6 +132,8 @@ impl BundleRuntime {
             last_instruction_id: Arc::new(StdMutex::new(None)),
             instruction_observer: None,
             last_paimon_write_ms: Arc::new(StdMutex::new(None)),
+            output_progress_observer: None,
+            decoded_output_elements: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -148,6 +153,15 @@ impl BundleRuntime {
 
     pub(crate) fn set_instruction_observer(&mut self, observer: InstructionObserver) {
         self.instruction_observer = Some(observer);
+    }
+
+    pub(crate) fn set_output_progress_observer(&mut self, observer: OutputProgressObserver) {
+        self.output_progress_observer = Some(observer);
+    }
+
+    pub(crate) fn decoded_output_elements(&self) -> u64 {
+        self.decoded_output_elements
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub(crate) fn last_instruction_id(&self) -> Option<String> {
@@ -294,6 +308,9 @@ impl BundleRuntime {
         let pcollection_id = edge_metadata.produced_pcol_id.clone();
         let mut stream_ended = false;
         let mut total_decoded: usize = 0;
+        let mut unreported_decoded: u64 = 0;
+        let mut received_bytes: u64 = 0;
+        let mut receive_wait_time = Duration::ZERO;
         let progress_started = Instant::now();
         let mut next_progress = 1_000_000usize;
         let mut write_time = Duration::ZERO;
@@ -308,11 +325,16 @@ impl BundleRuntime {
 
         while !stream_ended {
             let payload = {
+                let receive_started = Instant::now();
                 let mut receiver_lock = receiver.lock().await;
-                receiver_lock.recv().await
+                let payload = receiver_lock.recv().await;
+                receive_wait_time += receive_started.elapsed();
+                payload
             };
             match payload {
                 Some(ElementStreamPayload::Data(data_chunk)) => {
+                    received_bytes =
+                        received_bytes.saturating_add(data_chunk.data.data.len() as u64);
                     stream_buffer.extend_from_slice(&data_chunk.data.data);
 
                     if data_chunk.data.is_last {
@@ -358,6 +380,15 @@ impl BundleRuntime {
                                 stream_buffer.advance(consumed);
 
                                 total_decoded += 1;
+                                self.decoded_output_elements
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                unreported_decoded += 1;
+                                if unreported_decoded >= 100_000 {
+                                    if let Some(observer) = &self.output_progress_observer {
+                                        observer(unreported_decoded);
+                                    }
+                                    unreported_decoded = 0;
+                                }
                                 if total_decoded >= next_progress {
                                     info!(
                                         "Decoded {total_decoded} output elements for {pcollection_id} in {:?}",
@@ -435,6 +466,11 @@ impl BundleRuntime {
         let commit_started = Instant::now();
         writer.commit().await?;
         write_time += commit_started.elapsed();
+        if unreported_decoded > 0
+            && let Some(observer) = &self.output_progress_observer
+        {
+            observer(unreported_decoded);
+        }
         *self
             .last_paimon_write_ms
             .lock()
@@ -446,6 +482,21 @@ impl BundleRuntime {
             pcollection_id,
             progress_started.elapsed(),
             write_time,
+        );
+        let wall_time = progress_started.elapsed();
+        info!(
+            "output pipeline summary: pcollection={} bytes={} elements={} wall_ms={} \
+             receive_wait_ms={} paimon_write_ms={} decode_compute_ms={}",
+            pcollection_id,
+            received_bytes,
+            total_decoded,
+            wall_time.as_millis(),
+            receive_wait_time.as_millis(),
+            write_time.as_millis(),
+            wall_time
+                .saturating_sub(receive_wait_time)
+                .saturating_sub(write_time)
+                .as_millis()
         );
 
         Ok(())
