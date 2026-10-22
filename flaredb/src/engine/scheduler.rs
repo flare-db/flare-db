@@ -1169,6 +1169,42 @@ mod tests {
         assert!(scheduler.is_complete());
     }
 
+    #[test]
+    fn next_nodes_counts_scheduled_bundles_as_in_flight() {
+        let (mut scheduler, _source, stateful, _source_id, stateful_id) = source_and_stateful();
+
+        let first = scheduler.next_nodes();
+        scheduler.mark_complete(first[0].0);
+
+        scheduler
+            .watermarks_mut()
+            .set_max_in_flight(&stateful_id, 3)
+            .unwrap();
+        scheduler
+            .watermarks_mut()
+            .enqueue_bundles(&stateful_id, 5)
+            .unwrap();
+
+        let scheduled = scheduler.next_nodes();
+        assert_eq!(scheduled.len(), 3);
+        assert!(scheduled.iter().all(|(idx, _)| *idx == stateful));
+        assert_eq!(scheduler.watermarks().in_flight_bundles(&stateful_id), 3);
+        assert_eq!(scheduler.watermarks().queued_bundles(&stateful_id), 2);
+
+        // A bundle slot waiting for a pool lease is still scheduled/in flight;
+        // next_nodes must not over-reserve beyond the ceiling.
+        assert!(scheduler.next_nodes().is_empty());
+        assert_eq!(scheduler.watermarks().in_flight_bundles(&stateful_id), 3);
+        assert_eq!(scheduler.watermarks().queued_bundles(&stateful_id), 2);
+
+        scheduler.mark_complete(scheduled[0].0);
+        let replacement = scheduler.next_nodes();
+        assert_eq!(replacement.len(), 1);
+        assert_eq!(replacement[0].0, stateful);
+        assert_eq!(scheduler.watermarks().in_flight_bundles(&stateful_id), 3);
+        assert_eq!(scheduler.watermarks().queued_bundles(&stateful_id), 1);
+    }
+
     /// A stage whose first bundle is still in flight must not be duplicated just
     /// because it has a concurrency ceiling above one. Additional concurrent
     /// bundles are only valid for declared work items (SDF residuals).
