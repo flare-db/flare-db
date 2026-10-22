@@ -115,8 +115,8 @@ pub struct ExecutionContext {
     ///
     /// A windowed aggregation uses this to decide which windows are ready: Beam's
     /// default trigger (`AfterWatermark.pastEndOfWindow`) fires a window once the
-    /// input watermark reaches its end, i.e.
-    /// `window.max_timestamp_millis() <= input_watermark`.
+    /// input watermark is strictly after its maximum timestamp, i.e.
+    /// `window.max_timestamp_millis() < input_watermark`.
     pub input_watermark: i64,
     /// The primary output PCollection's element coder, when the transform asked
     /// for it (see [`FlareTransform::needs_output_coder`]). A runner source decodes

@@ -31,7 +31,7 @@ use datafusion::{
     },
     prelude::{SessionConfig, SessionContext, col},
 };
-use log::info;
+use log::{info, warn};
 use paimon::table::ArrowRecordBatchStream;
 use tempfile::TempDir;
 use tokio_stream::StreamExt;
@@ -232,7 +232,7 @@ impl GbkStateBackend for InMemoryGbkState {
         processing_time: i64,
     ) -> Result<Option<WindowedValue>> {
         let end = window.max_timestamp_millis();
-        let expired = spec.earliest_completion(end) <= input_watermark;
+        let expired = spec.earliest_completion(end) < input_watermark;
         let mut inner = self.inner.lock().expect("gbk state lock not poisoned");
         if inner.states.is_empty()
             && expired
@@ -408,6 +408,23 @@ impl FlareTransform for GroupByKey {
             .store
             .cursor(&ctx.stage_id, &input_pcollection_id)
             .await?;
+        let dropped_due_to_lateness = if let Some(cutoff) = window_prune_before {
+            let dropped = ctx
+                .store
+                .count_incremental_arrow_pruned_before(&input_pcollection_id, cursor, cutoff)
+                .await?;
+            if dropped > 0 {
+                warn!(
+                    "GroupByKey: dropped {dropped} input row(s) due to lateness at cutoff {cutoff}; \
+                     bounded global-window pipelines must not reach this path"
+                );
+            } else {
+                info!("GroupByKey: lateness pruning dropped 0 input row(s) at cutoff {cutoff}");
+            }
+            dropped
+        } else {
+            0
+        };
         let config = GbkSortConfig::from_env();
         let (sorted_input, latest) = open_sorted_input_stream(
             &ctx.store,
@@ -423,6 +440,7 @@ impl FlareTransform for GroupByKey {
         let mut fired = 0usize;
 
         if let Some(mut sorted_input) = sorted_input {
+            let sort_result: Result<()> = async {
             let mut decoder = SortedGroupDecoder::default();
             let sort_started = Instant::now();
             let mut decoded_rows = 0usize;
@@ -475,6 +493,21 @@ impl FlareTransform for GroupByKey {
                 )
                 .await?;
             }
+            Ok(())
+            }
+            .await;
+            if let Err(error) = sort_result {
+                let actual_spill_bytes = directory_size_bytes(sorted_input._temp_dir.path());
+                let configured_spill_limit = GbkSortConfig::from_env().spill_limit_bytes;
+                warn!(
+                    "GroupByKey: external sort failed (configured_spill_limit={configured_spill_limit} \
+                     bytes, actual_spill_bytes={actual_spill_bytes}): {error:#}"
+                );
+                return Err(anyhow!(
+                    "GroupByKey external sort failed (configured_spill_limit={configured_spill_limit} \
+                     bytes, actual_spill_bytes={actual_spill_bytes}): {error:#}"
+                ));
+            }
         }
 
         // A watermark advance can make groups from an earlier run ready without
@@ -514,13 +547,14 @@ impl FlareTransform for GroupByKey {
 
         if fired == 0 {
             info!(
-                "GroupByKey: no window fired at input watermark {}",
-                ctx.input_watermark
+                "GroupByKey: no window fired at input watermark {} (dropped_due_to_lateness={})",
+                ctx.input_watermark, dropped_due_to_lateness
             );
         } else {
             info!(
-                "Executed GroupByKey: {} pane(s) fired at input watermark {}",
-                fired, ctx.input_watermark
+                "Executed GroupByKey: {} pane(s) fired at input watermark {} \
+                 (dropped_due_to_lateness={})",
+                fired, ctx.input_watermark, dropped_due_to_lateness
             );
         }
 
@@ -752,6 +786,29 @@ async fn open_sorted_input_stream(
         }),
         latest,
     ))
+}
+
+fn directory_size_bytes(path: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|entry| {
+            let path = entry.path();
+            entry
+                .metadata()
+                .ok()
+                .map(|metadata| {
+                    if metadata.is_dir() {
+                        directory_size_bytes(&path)
+                    } else {
+                        metadata.len()
+                    }
+                })
+                .unwrap_or(0)
+        })
+        .sum()
 }
 
 fn gbk_input_schema(table_schema: &ArrowSchema) -> Result<Arc<ArrowSchema>> {
@@ -1269,8 +1326,11 @@ fn fire_state(
     processing_time: i64,
 ) -> Option<WindowedValue> {
     let end = state.window.max_timestamp_millis();
-    let end_of_window = end <= input_watermark;
-    let expired = spec.earliest_completion(end) <= input_watermark;
+    // Beam fires the end-of-window timer only after the window's maximum
+    // timestamp. For [0, 100) maxTimestamp is 99, so the earliest firing
+    // watermark is 100.
+    let end_of_window = end < input_watermark;
+    let expired = spec.earliest_completion(end) < input_watermark;
     let trigger_ctx = TriggerContext {
         end_of_window,
         expired,
@@ -1862,8 +1922,53 @@ mod tests {
         assert!(scanned.is_empty(), "expected empty output, got {scanned:?}");
     }
 
-    /// Beam's default trigger: a window emits only once the input watermark has
-    /// reached its end, and only once ever as the watermark advances.
+    #[tokio::test]
+    async fn drained_residual_batches_are_grouped_together_in_one_fire() {
+        let (_dir, store) = make_store().await;
+        let input = "gbk-in-drained-residuals";
+        let output = "gbk-out-drained-residuals";
+
+        // The two commits model the parent bundle output and a residual that
+        // completes later. The scheduler barrier ensures GBK first runs only after
+        // both are materialized.
+        store
+            .write_windowed_value_batch(
+                input,
+                vec![kv_windowed("a", 1, vec![BeamWindow::Global], 0)],
+            )
+            .await
+            .unwrap();
+        store
+            .write_windowed_value_batch(
+                input,
+                vec![kv_windowed("a", 2, vec![BeamWindow::Global], 0)],
+            )
+            .await
+            .unwrap();
+
+        run_gbk(&store, input, output).await;
+        let scanned = scan_output(&store, output).await;
+        assert_eq!(scanned.len(), 1, "one global-window group should fire");
+        let BeamRecord::GBK(group) = &scanned[0].value else {
+            panic!("expected GBK output, got {:?}", scanned[0].value);
+        };
+        let mut values = group
+            .value
+            .list
+            .iter()
+            .map(|record| {
+                let BeamRecord::PRIMITIVE(PrimitiveValue::Int64(value)) = record else {
+                    panic!("expected int64 group value, got {record:?}");
+                };
+                *value
+            })
+            .collect::<Vec<_>>();
+        values.sort_unstable();
+        assert_eq!(values, vec![1, 2]);
+    }
+
+    /// Beam's default trigger: a window emits only once the input watermark is
+    /// strictly after its maximum timestamp, and only once as the watermark advances.
     #[tokio::test]
     async fn emits_only_windows_the_input_watermark_has_reached() {
         let (_dir, store) = make_store().await;
@@ -1894,8 +1999,15 @@ mod tests {
             "no window should emit before its end"
         );
 
-        // WM = 99: the first window's end is reached (max 99 <= 99).
+        // WM = 99: still inside [0, 100) because its max timestamp is 99.
         run_gbk_with(&transform, &store, input, output, 99).await;
+        assert!(
+            scan_output(&store, output).await.is_empty(),
+            "watermark equal to maxTimestamp is still on time"
+        );
+
+        // WM = 100: the timer has advanced past maxTimestamp 99.
+        run_gbk_with(&transform, &store, input, output, 100).await;
         let groups = collect_groups(&scan_output(&store, output).await);
         assert_eq!(
             groups.len(),
@@ -1904,14 +2016,14 @@ mod tests {
         );
         assert_eq!(groups.get(&("a".to_string(), 0, 100)), Some(&vec![1]));
 
-        // WM = 199: the second window is now ready; the first is not re-emitted.
-        run_gbk_with(&transform, &store, input, output, 199).await;
+        // WM = 200: the second window is now ready; the first is not re-emitted.
+        run_gbk_with(&transform, &store, input, output, 200).await;
         let groups = collect_groups(&scan_output(&store, output).await);
         assert_eq!(groups.len(), 2, "both windows ready, got {groups:?}");
         assert_eq!(groups.get(&("a".to_string(), 100, 200)), Some(&vec![2]));
 
         // Re-running at the same watermark emits nothing new (emit-once).
-        run_gbk_with(&transform, &store, input, output, 199).await;
+        run_gbk_with(&transform, &store, input, output, 200).await;
         assert_eq!(
             collect_groups(&scan_output(&store, output).await).len(),
             2,
@@ -1975,7 +2087,7 @@ mod tests {
             input,
             output,
             Some(strategy.clone()),
-            99,
+            100,
         )
         .await;
         let panes = scan_output(&store, output).await;
@@ -1994,7 +2106,7 @@ mod tests {
             )
             .await
             .unwrap();
-        run_gbk_with_strategy(&transform, &store, input, output, Some(strategy), 99).await;
+        run_gbk_with_strategy(&transform, &store, input, output, Some(strategy), 100).await;
 
         let panes = scan_output(&store, output).await;
         assert_eq!(
@@ -2024,10 +2136,10 @@ mod tests {
             )
             .await
             .unwrap();
-        run_gbk_with(&transform, &store, input, output, 99).await;
+        run_gbk_with(&transform, &store, input, output, 100).await;
         assert_eq!(scan_output(&store, output).await.len(), 1);
 
-        // The first run committed watermark 99 and closed [0, 100), whose max
+        // The first run committed watermark 100 and closed [0, 100), whose max
         // timestamp is 99. A later element for that window is too late.
         store
             .write_windowed_value_batch(
@@ -2036,7 +2148,7 @@ mod tests {
             )
             .await
             .unwrap();
-        run_gbk_with(&transform, &store, input, output, 99).await;
+        run_gbk_with(&transform, &store, input, output, 100).await;
 
         assert_eq!(
             scan_output(&store, output).await.len(),

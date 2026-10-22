@@ -263,6 +263,9 @@ impl ExecutorDispatcher {
                     .watermarks()
                     .bundle_input_watermark(&stage_id)
                     .unwrap_or(MIN_TIMESTAMP);
+                scheduler
+                    .watermarks()
+                    .validate_bundle_input_watermark(&stage_id, input_watermark)?;
 
                 // A splittable stage runs one bundle per queued work item. Take
                 // the next item here (the initialization bundle has no item), so

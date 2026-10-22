@@ -40,7 +40,7 @@ use log::{debug, info, warn};
 
 use crate::engine::timer::{TimeDomain, TimerEntry};
 use crate::engine::watermark::{
-    MAX_TIMESTAMP, MIN_TIMESTAMP, StageKind, Timestamp, WatermarkManager, format_timestamp,
+    MIN_TIMESTAMP, StageKind, Timestamp, WatermarkManager, format_timestamp,
 };
 use crate::fusion::pipeline::{ConsumerMetaData, ExecutableGraph, ExecutableNode};
 use crate::fusion::stage::SplittableProcessKind;
@@ -242,18 +242,26 @@ impl NodeScheduler {
     /// pending input until that input is consumed.
     pub fn mark_complete_with_min(&mut self, idx: NodeIndex, output_min_ts: Option<Timestamp>) {
         let stage = self.graph.get_executable_graph()[idx].id();
-        if self.watermarks.is_source(&stage) && self.watermarks.source_auto_finishes(&stage) {
+        let source_finished =
+            self.watermarks.is_source(&stage) && self.watermarks.source_auto_finishes(&stage);
+        if source_finished {
             let _ = self.watermarks.report_source_finished(&stage);
-            info!(
-                "scheduler: source '{stage}' finished; output watermark = {}",
-                format_timestamp(MAX_TIMESTAMP)
-            );
         }
         let newly_ready = self
             .watermarks
             .complete_bundle_with_min(&stage, output_min_ts)
             .unwrap_or_default();
         let advanced = self.watermarks.refresh();
+        if source_finished {
+            info!(
+                "scheduler: source '{stage}' reported finished; effective output watermark = {}",
+                format_timestamp(
+                    self.watermarks
+                        .output_watermark(&stage)
+                        .unwrap_or(MIN_TIMESTAMP)
+                )
+            );
+        }
         debug!(
             "scheduler: stage '{stage}' completed; newly ready [{}]; advanced [{}]",
             newly_ready.join(", "),
@@ -489,6 +497,7 @@ mod tests {
 
     use crate::engine::scheduler::{NodeScheduler, splittable_max_in_flight_from};
     use crate::engine::timer::{TimeDomain, TimerEntry, TimerKey};
+    use crate::engine::watermark::MIN_TIMESTAMP;
     use crate::fusion::pipeline::{ConsumerMetaData, ExecutableGraph, ExecutableNode};
     use crate::jobservice::urns::beam_urns;
     use crate::transforms::{from_urn, from_urn_with_payload};
@@ -1213,6 +1222,62 @@ mod tests {
         assert_eq!(residuals.len(), 3);
         assert!(residuals.iter().all(|(idx, _)| *idx == stateful));
         assert_eq!(scheduler.watermarks().in_flight_bundles(&stateful_id), 4);
+    }
+
+    #[test]
+    fn gbk_waits_for_queued_residuals_before_its_first_run() {
+        let mut graph = Graph::<ExecutableNode, ConsumerMetaData>::new();
+        let source = graph.add_node(runner_node("source"));
+        let producer = graph.add_node(worker_stage_node("producer"));
+        let aggregate = graph.add_node(gbk_node("aggregate"));
+        graph.add_edge(source, producer, dummy_metadata("sp"));
+        graph.add_edge(producer, aggregate, dummy_metadata("pa"));
+
+        let executable_graph = graph_for_test(graph, dummy_metadata("root"));
+        let producer_id = executable_graph.get_executable_graph()[producer].id();
+        let mut scheduler = NodeScheduler::new(executable_graph);
+
+        let source_bundle = scheduler.next_nodes();
+        assert_eq!(source_bundle.len(), 1);
+        scheduler.mark_complete(source_bundle[0].0);
+
+        let producer_bundle = scheduler.next_nodes();
+        assert_eq!(producer_bundle.len(), 1);
+        assert_eq!(producer_bundle[0].0, producer);
+
+        // A split has produced one residual, and more output is available from
+        // the parent. GBK must not consume that partial PCollection.
+        scheduler
+            .watermarks_mut()
+            .enqueue_bundles(&producer_id, 1)
+            .unwrap();
+        scheduler
+            .watermarks_mut()
+            .set_residual_holds(&HashMap::from([(producer_id.clone(), vec![MIN_TIMESTAMP])]));
+        scheduler.mark_complete(producer_bundle[0].0);
+
+        let residual_bundle = scheduler.next_nodes();
+        assert!(
+            !residual_bundle.iter().any(|(idx, _)| *idx == aggregate),
+            "GBK must wait while the upstream residual is queued"
+        );
+        assert_eq!(residual_bundle.len(), 1);
+        assert_eq!(residual_bundle[0].0, producer);
+        scheduler.mark_complete(residual_bundle[0].0);
+        scheduler
+            .watermarks_mut()
+            .set_residual_holds(&HashMap::new());
+        scheduler.watermarks_mut().refresh();
+
+        let aggregate_bundles = scheduler.next_nodes();
+        assert_eq!(
+            aggregate_bundles
+                .iter()
+                .filter(|(idx, _)| *idx == aggregate)
+                .count(),
+            1,
+            "GBK runs exactly once after the producer drains"
+        );
     }
 
     #[test]

@@ -385,7 +385,19 @@ impl FlareElementStore {
         pcollection_id: &str,
         cursor: Option<i64>,
     ) -> Result<(Vec<RecordBatch>, Option<i64>)> {
-        let (mut stream, latest) = self.open_incremental_arrow(pcollection_id, cursor).await?;
+        self.read_incremental_batches_projected(pcollection_id, cursor, None)
+            .await
+    }
+
+    async fn read_incremental_batches_projected(
+        &self,
+        pcollection_id: &str,
+        cursor: Option<i64>,
+        projection: Option<&[&str]>,
+    ) -> Result<(Vec<RecordBatch>, Option<i64>)> {
+        let (mut stream, latest) = self
+            .open_incremental_arrow_projected(pcollection_id, cursor, projection)
+            .await?;
         let mut batches = Vec::new();
         if let Some(stream) = stream.as_mut() {
             while let Some(batch) = stream.next().await {
@@ -451,6 +463,43 @@ impl FlareElementStore {
             Some(window_prune_before),
         )
         .await
+    }
+
+    /// Count rows in the same incremental snapshot range that
+    /// [`Self::open_incremental_arrow_pruned_before`] would drop.
+    ///
+    /// Only the window-end metadata column is read. This lets callers expose
+    /// bounded-job lateness as an explicit dropped-row count instead of silently
+    /// advancing the cursor over filtered data.
+    pub(crate) async fn count_incremental_arrow_pruned_before(
+        &self,
+        pcollection_id: &str,
+        cursor: Option<i64>,
+        window_prune_before: i64,
+    ) -> Result<usize> {
+        let (batches, _) = self
+            .read_incremental_batches_projected(
+                pcollection_id,
+                cursor,
+                Some(&[WINDOW_MAX_END_COLUMN]),
+            )
+            .await?;
+        let mut dropped = 0usize;
+        for batch in batches {
+            let column = batch
+                .column_by_name(WINDOW_MAX_END_COLUMN)
+                .ok_or_else(|| anyhow!("pruning metadata column is missing"))?;
+            let ends = column
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| anyhow!("pruning metadata column is not Int64"))?;
+            dropped += ends
+                .iter()
+                .flatten()
+                .filter(|end| *end <= window_prune_before)
+                .count();
+        }
+        Ok(dropped)
     }
 
     async fn open_incremental_arrow_planned(
@@ -1716,6 +1765,15 @@ mod element_store_tests {
             .write_windowed_value_batch("pc-pruned", values)
             .await
             .unwrap();
+
+        assert_eq!(
+            store
+                .count_incremental_arrow_pruned_before("pc-pruned", None, 70_000)
+                .await
+                .unwrap(),
+            1,
+            "only the row whose finite window ends at 60_000 is pruned"
+        );
 
         let (stream, _) = store
             .open_incremental_arrow_pruned_before(
