@@ -66,6 +66,7 @@ impl Executor for StageExecutor {
             None,
             Vec::new(),
             input_watermark,
+            true,
         )
         .await
     }
@@ -80,6 +81,7 @@ impl StageExecutor {
         output_edge_metadata: Option<ConsumerMetaData>,
         timers: Vec<TimerEntry>,
         input_watermark: i64,
+        register_bundle: bool,
     ) -> anyhow::Result<ControlResponse> {
         self.execute_node(
             node,
@@ -88,6 +90,7 @@ impl StageExecutor {
             None,
             timers,
             input_watermark,
+            register_bundle,
         )
         .await
     }
@@ -125,12 +128,17 @@ impl StageExecutor {
         _instruction_id: Option<String>,
         timers: Vec<TimerEntry>,
         input_watermark: i64,
+        register_bundle: bool,
     ) -> anyhow::Result<ControlResponse> {
         match node {
             ExecutableNode::Worker(executable_stage) => {
                 info!("Executing worker node");
                 let descriptor_id = executable_stage.id().to_string();
-                let bundle_status = self.runtime.register_bundle(&executable_stage).await;
+                let bundle_status = if register_bundle {
+                    self.runtime.register_bundle(&executable_stage).await
+                } else {
+                    Ok(ControlResponse::BundleRegistered)
+                };
                 info!(
                     "executable_stage input id: {:?}",
                     executable_stage.input_pcol()

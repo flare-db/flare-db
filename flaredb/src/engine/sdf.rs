@@ -120,8 +120,6 @@ struct SdfInputSpan {
 pub struct SdfBundleOutcome {
     /// The initialization bundle has run (carried forward across bundles).
     pub initialized: bool,
-    /// The descriptors are registered with the worker (carried forward).
-    pub registered: bool,
     /// Output-watermark holds of the work item this bundle consumed (to release).
     pub consumed_holds: Vec<Timestamp>,
     /// Residual work items reported with the final bundle response. Split
@@ -381,7 +379,6 @@ impl SplittableStageExecutor {
             response,
             SdfBundleOutcome {
                 initialized: true,
-                registered: true,
                 consumed_holds,
                 items,
                 progress_tick,

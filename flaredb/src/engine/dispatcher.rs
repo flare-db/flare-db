@@ -1,12 +1,14 @@
 use crate::engine::metrics::JobMetrics;
 use crate::engine::sdf::{SdfBundleOutcome, SdfWorkItem, SplittableStageExecutor};
-use crate::engine::window::WindowMergeService;
 use crate::transforms::SourceProgress;
 use crate::{
     engine::timer::{TimerEntry, build_timer_store},
     engine::{
         executor::StageExecutor,
-        harness::{Channels, HarnessStatus, control::ControlResponse, state::SideInputRegistry},
+        harness::{
+            Channels, HarnessStatus, WorkerHandle, control::ControlResponse,
+            state::SideInputRegistry,
+        },
         runtime::BundleRuntime,
         scheduler::NodeScheduler,
         timer::TimerService,
@@ -16,8 +18,12 @@ use crate::{
     store::element_store::FlareElementStore,
 };
 use anyhow::anyhow;
-use beam_model_rs::v1::{ApiServiceDescriptor, Coder, Components};
-use std::{collections::HashMap, collections::VecDeque, sync::Arc, time::Duration};
+use beam_model_rs::v1::{Coder, Components};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    sync::Arc,
+    time::Duration,
+};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
@@ -36,8 +42,6 @@ enum StageRun {
 struct SdfQueue {
     /// The initialization bundle has run (carried forward across bundles).
     initialized: bool,
-    /// The descriptors are registered with the worker.
-    registered: bool,
     /// Residual work items awaiting a bundle, oldest first.
     items: VecDeque<SdfWorkItem>,
     /// Stage-specific duration between two consecutive `progress + split_evaluation` runs.
@@ -85,10 +89,8 @@ fn enqueue_sdf_items(
     }
     if count > 0 {
         // Split events can arrive before the parent's final outcome. The parent
-        // had to initialize and register the process descriptor before the SDK
-        // could produce a residual, so these flags are valid immediately.
+        // had to initialize before the SDK could produce a residual.
         queue.initialized = true;
-        queue.registered = true;
         scheduler
             .watermarks_mut()
             .set_residual_holds(residual_holds);
@@ -106,7 +108,8 @@ pub struct ExecutorDispatcher {
     store: Arc<FlareElementStore>,
     pipeline_coders: Arc<HashMap<String, Coder>>,
     pipeline_components: Arc<Components>,
-    window_merger: Option<Arc<WindowMergeService>>,
+    worker: Option<WorkerHandle>,
+    registered_on: HashSet<(String, String)>,
     timer_service: Arc<TimerService>,
     /// Runner-source progress reports (TestStream) sent from bundle execution.
     source_reports_tx: mpsc::UnboundedSender<SourceProgress>,
@@ -126,7 +129,8 @@ impl ExecutorDispatcher {
             store,
             pipeline_coders: Arc::new(HashMap::new()),
             pipeline_components: Arc::new(Components::default()),
-            window_merger: None,
+            worker: None,
+            registered_on: HashSet::new(),
             timer_service,
             source_reports_tx,
             source_reports_rx,
@@ -134,8 +138,10 @@ impl ExecutorDispatcher {
     }
 
     /// Reset all channels so a new worker can connect.
-    pub async fn reset_channels(&self) {
+    pub async fn reset_channels(&mut self) {
         self.channels.reset().await;
+        self.worker = None;
+        self.registered_on.clear();
     }
 
     /// Route SDK worker log entries for a job into that job's per-job
@@ -146,7 +152,7 @@ impl ExecutorDispatcher {
 
     /// Install the metrics accumulator for the job that is about to run.
     pub(crate) fn set_job_metrics(&self, metrics: Arc<JobMetrics>) {
-        self.channels.control().set_job_metrics(metrics);
+        self.channels.set_job_metrics(metrics);
     }
 
     /// Point the element store (and timer store) at the job's warehouse database.
@@ -160,8 +166,14 @@ impl ExecutorDispatcher {
     }
 
     /// Wait for the worker to connect its control stream.
-    pub async fn wait_connected(&self) -> anyhow::Result<()> {
-        self.channels.wait_connected().await
+    pub async fn wait_connected(
+        &mut self,
+        worker_id: &crate::worker::manager::WorkerId,
+        timeout: Duration,
+    ) -> anyhow::Result<()> {
+        self.channels.wait_connected(worker_id, timeout).await?;
+        self.worker = Some(self.channels.handle(worker_id));
+        Ok(())
     }
 
     /// Job-scoped health signal shared with the Fn API stream handlers.
@@ -171,40 +183,27 @@ impl ExecutorDispatcher {
 
     /// Start dispatcher tasks and cache the pipeline coders/components used to
     /// build a [`StageExecutor`].
-    pub fn prepare_pipeline(&mut self, pipeline_graph: &ExecutableGraph) -> anyhow::Result<()> {
+    pub async fn prepare_pipeline(
+        &mut self,
+        pipeline_graph: &ExecutableGraph,
+    ) -> anyhow::Result<()> {
         // Resolve `pickled_python` leaves through length-prefixed wrappers so the
         // runner's decoder sees the same coder graph the SDK is asked to emit.
         let mut coders = pipeline_graph.components.coders.clone();
         crate::coders::length_prefix_pickled_leaves(&mut coders);
         let side_inputs = SideInputRegistry::from_executable_graph(pipeline_graph, &coders)?;
 
-        // Start data channel dispatcher to listen and demux incoming elements.
-        self.channels.stream_elements();
-        // Start control channel dispatcher to route responses to waiting futures.
-        self.channels.stream_responses();
-        // Start state channel dispatcher to service user state and materialized
-        // iterable side inputs from the same job store.
         self.channels
-            .state()
-            .stream_requests(self.store.clone(), side_inputs);
+            .prepare_state(self.store.clone(), side_inputs)
+            .await?;
         self.pipeline_coders = Arc::new(coders);
         self.pipeline_components = Arc::new(pipeline_graph.components.clone());
-        self.window_merger = Some(Arc::new(WindowMergeService::new(
-            self.channels.control(),
-            self.channels.data(),
-            self.pipeline_coders.clone(),
-            self.pipeline_components.clone(),
-            ApiServiceDescriptor {
-                url: crate::DEFAULT_API_SERVICE_URL.to_string(),
-                ..Default::default()
-            },
-        )));
         Ok(())
     }
 
     /// Build a [`StageExecutor`] from the currently prepared state.
-    pub fn new_executor(&self) -> StageExecutor {
-        StageExecutor::new(self.new_bundle_runtime())
+    pub fn new_executor(&self) -> anyhow::Result<StageExecutor> {
+        Ok(StageExecutor::new(self.new_bundle_runtime()?))
     }
 
     /// Run the executable graph to completion.
@@ -252,7 +251,7 @@ impl ExecutorDispatcher {
                 .set_residual_holds(&residual_holds);
 
             for (idx, node) in scheduler.next_nodes() {
-                let runtime = self.new_bundle_runtime();
+                let runtime = self.new_bundle_runtime()?;
                 let input_metadata = scheduler.input_edge_metadata(idx);
                 let output_metadata = scheduler.output_edge_metadata(idx);
                 let stage_id = node.id();
@@ -270,10 +269,25 @@ impl ExecutorDispatcher {
                 // A splittable stage runs one bundle per queued work item. Take
                 // the next item here (the initialization bundle has no item), so
                 // each started bundle gets distinct seed bytes.
-                let (sdf_seed, sdf_initialized, sdf_registered, sdf_progress_tick) = match &node {
-                    ExecutableNode::Splittable(_) => {
+                let worker_id = runtime.worker_id().clone();
+                let ordinary_register = match &node {
+                    ExecutableNode::Worker(stage) => {
+                        self.mark_registration(&worker_id, &stage.id())
+                    }
+                    _ => false,
+                };
+                let (sdf_seed, sdf_initialized, sdf_register, sdf_progress_tick) = match &node {
+                    ExecutableNode::Splittable(stage) => {
                         let queue = sdf_queues.entry(stage_id.clone()).or_default();
                         let initialized = queue.initialized;
+                        if !initialized {
+                            self.mark_registration(
+                                &worker_id,
+                                &stage.plan().initialization_stage.id(),
+                            );
+                        }
+                        let register =
+                            self.mark_registration(&worker_id, &stage.plan().process_stage.id());
                         let seed = if initialized {
                             queue.items.pop_front()
                         } else {
@@ -286,12 +300,7 @@ impl ExecutorDispatcher {
                             scheduler.watermarks().in_flight_bundles(&stage_id),
                             seed.as_ref().map_or(0, |item| item.seed.len())
                         );
-                        (
-                            seed,
-                            queue.initialized,
-                            queue.registered,
-                            queue.progress_tick,
-                        )
+                        (seed, queue.initialized, register, queue.progress_tick)
                     }
                     _ => (None, false, false, None),
                 };
@@ -306,7 +315,7 @@ impl ExecutorDispatcher {
                                 output_metadata,
                                 sdf_seed,
                                 sdf_initialized,
-                                sdf_registered,
+                                sdf_register,
                                 sdf_progress_tick,
                                 immediate_sdf_tx,
                             )
@@ -328,6 +337,7 @@ impl ExecutorDispatcher {
                                 output_metadata,
                                 timers,
                                 input_watermark,
+                                ordinary_register,
                             )
                             .await;
                         (idx, result, StageRun::Plain)
@@ -453,7 +463,6 @@ impl ExecutorDispatcher {
                     remove_holds(&mut residual_holds, &stage_id, &outcome.consumed_holds);
                     let queue = sdf_queues.entry(stage_id.clone()).or_default();
                     queue.initialized = outcome.initialized;
-                    queue.registered = outcome.registered;
                     queue.progress_tick = Some(outcome.progress_tick);
                     let count = enqueue_sdf_items(
                         scheduler,
@@ -589,17 +598,28 @@ impl ExecutorDispatcher {
         Ok(promoted)
     }
 
-    fn new_bundle_runtime(&self) -> BundleRuntime {
-        BundleRuntime::new(
-            self.channels.control(),
-            self.channels.data(),
+    fn new_bundle_runtime(&self) -> anyhow::Result<BundleRuntime> {
+        let worker = self
+            .worker
+            .clone()
+            .ok_or_else(|| anyhow!("executor has no connected worker"))?;
+        Ok(BundleRuntime::new(
+            worker,
             self.store.clone(),
             self.pipeline_coders.clone(),
             self.pipeline_components.clone(),
-            self.window_merger.clone(),
             self.timer_service.clone(),
             self.source_reports_tx.clone(),
-        )
+        ))
+    }
+
+    fn mark_registration(
+        &mut self,
+        worker_id: &crate::worker::manager::WorkerId,
+        descriptor_id: &str,
+    ) -> bool {
+        self.registered_on
+            .insert((worker_id.as_str().to_string(), descriptor_id.to_string()))
     }
 
     /// Apply runner-source progress reports (TestStream).

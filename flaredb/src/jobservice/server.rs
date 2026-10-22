@@ -11,7 +11,6 @@ use beam_model_rs::v1::{
 use dashmap::{DashMap, DashSet};
 use prost::Message;
 use tokio::sync::{Mutex, watch};
-use tokio::time::timeout;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Response;
 use tonic::Status;
@@ -109,41 +108,46 @@ impl FlareJobService {
         &self,
         job_id: &str,
         job_graph: Arc<ExecutableGraph>,
+        worker_id: crate::worker::manager::WorkerId,
     ) -> anyhow::Result<()> {
-        self.dispatcher
-            .lock()
-            .await
+        let mut dispatcher = self.dispatcher.lock().await;
+        dispatcher
             .set_job_store(job_id)
             .await
             .map_err(|e| anyhow::anyhow!("failed to set job store: {e}"))?;
-
         let connect_timeout_secs = self.worker_manager.config().connect_timeout_secs;
-        timeout(Duration::from_secs(connect_timeout_secs), async {
-            let dispatcher = self.dispatcher.lock().await;
-            dispatcher.wait_connected().await
-        })
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "harness did not connect within {}s for job {}",
-                connect_timeout_secs,
-                job_id
-            )
-        })?
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "failed waiting for harness connection for job {}: {}",
-                job_id,
-                e
-            )
-        })?;
+        dispatcher
+            .wait_connected(&worker_id, Duration::from_secs(connect_timeout_secs))
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "failed waiting for harness connection for job {}: {}",
+                    job_id,
+                    e
+                )
+            })?;
 
-        let mut dispatcher = self.dispatcher.lock().await;
         dispatcher
             .prepare_pipeline(job_graph.as_ref())
+            .await
             .map_err(|e| anyhow::anyhow!("failed to prepare pipeline for job {}: {}", job_id, e))?;
 
         let status = dispatcher.harness_status();
+        let mut exits = self.worker_manager.subscribe_worker_exits();
+        let exit_worker_id = worker_id.clone();
+        let exit_status = status.clone();
+        tokio::spawn(async move {
+            while let Ok(exit) = exits.recv().await {
+                if exit.worker_id == exit_worker_id && !exit.intentional {
+                    exit_status.report_worker_failure(
+                        exit_worker_id.as_str(),
+                        "harness process",
+                        format_args!("unexpected exit status {}", exit.status),
+                    );
+                    break;
+                }
+            }
+        });
         let mut scheduler = NodeScheduler::new((*job_graph).clone());
         tokio::select! {
             result = dispatcher.run_pipeline(&mut scheduler) => result,
@@ -289,7 +293,7 @@ impl JobService for FlareJobService {
             // Reset channels so the new harness can connect on fresh streams, then
             // install the accumulator that completed bundles will report into.
             {
-                let dispatcher = self.dispatcher.lock().await;
+                let mut dispatcher = self.dispatcher.lock().await;
                 dispatcher.reset_channels().await;
                 dispatcher.set_job_metrics(job_metrics);
             }
@@ -315,7 +319,9 @@ impl JobService for FlareJobService {
                 .spawn_worker(&preparation_id, &runtime, staging_dir, &self.instance_id)
                 .await?;
 
-            let run_result = self.execute_spawned_job(&preparation_id, job_graph).await;
+            let run_result = self
+                .execute_spawned_job(&preparation_id, job_graph, worker_id.clone())
+                .await;
 
             // Any stream closures caused by this cleanup are expected. Mark the
             // shutdown before killing the process so their BrokenPipe/h2 errors

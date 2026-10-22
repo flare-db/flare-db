@@ -5,7 +5,7 @@ use flaredb::{
         artifact::{ArtifactStore, FlareArtifactStagingService},
         server::FlareJobService,
     },
-    worker::manager::{WorkerLaunchConfig, WorkerManager},
+    worker::manager::{WorkerLaunchConfig, WorkerLogRouter, WorkerManager},
 };
 use std::{net::SocketAddr, sync::Arc};
 use tokio::sync::Mutex;
@@ -43,7 +43,8 @@ async fn flare_up() -> Result<(), Box<dyn std::error::Error>> {
     let artifact_store =
         Arc::new(ArtifactStore::from(artifact_root_str, "pipeline-artifact").await?);
 
-    let (channels, services) = Channels::builder().build().await?;
+    let log_router = WorkerLogRouter::new();
+    let (channels, services) = Channels::builder(log_router.clone()).build().await?;
 
     let dispatcher = Arc::new(Mutex::new(ExecutorDispatcher::new(channels).await?));
 
@@ -62,7 +63,7 @@ async fn flare_up() -> Result<(), Box<dyn std::error::Error>> {
         connect_timeout_secs: 20,
         python_bin: std::env::var("FLAREDB_PYTHON_BIN").ok(),
     };
-    let worker_manager = WorkerManager::new(worker_cfg);
+    let worker_manager = WorkerManager::with_log_router(worker_cfg, log_router);
     let job_service = FlareJobService::with(
         artifact_store.clone(),
         worker_manager,

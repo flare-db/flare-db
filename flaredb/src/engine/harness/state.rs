@@ -62,29 +62,66 @@ impl StateInner {
 pub async fn start_state_server(
     status: HarnessStatus,
 ) -> Result<(StateChannel, FlareStateService)> {
-    let (tx, rx) = mpsc::channel::<Result<StateResponse, Status>>(32);
-
-    let stream = Arc::new(StateInner {
-        outgoing_tx: Mutex::new(Some(tx)),
-        outgoing_rx: Mutex::new(Some(rx)),
-        incoming: Mutex::new(None),
-    });
-
+    let channel = StateChannel::new(status, "test-state-worker".to_string());
     let service = FlareStateService {
-        inner: stream.clone(),
+        inner: Some(channel.stream.clone()),
+        registry: None,
     };
-
-    let channel = StateChannel {
-        stream,
-        stream_task: Arc::new(std::sync::Mutex::new(None)),
-        status,
-    };
-
     Ok((channel, service))
 }
 
+impl StateChannel {
+    pub(crate) fn new(status: HarnessStatus, worker_id: String) -> Self {
+        let (tx, rx) = mpsc::channel::<Result<StateResponse, Status>>(32);
+
+        let stream = Arc::new(StateInner {
+            outgoing_tx: Mutex::new(Some(tx)),
+            outgoing_rx: Mutex::new(Some(rx)),
+            incoming: Mutex::new(None),
+        });
+
+        StateChannel {
+            stream,
+            stream_task: Arc::new(std::sync::Mutex::new(None)),
+            status,
+            worker_id,
+        }
+    }
+}
+
 pub struct FlareStateService {
-    inner: Arc<StateInner>,
+    inner: Option<Arc<StateInner>>,
+    registry: Option<super::WorkerChannelRegistry>,
+}
+
+impl FlareStateService {
+    pub(crate) fn new(registry: super::WorkerChannelRegistry) -> Self {
+        Self {
+            inner: None,
+            registry: Some(registry),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct StateServiceContext {
+    pub(crate) store: Arc<FlareElementStore>,
+    pub(crate) backend: Arc<StateBackend>,
+    pub(crate) side_inputs: SideInputRegistry,
+}
+
+impl StateServiceContext {
+    pub(crate) async fn build(
+        store: Arc<FlareElementStore>,
+        side_inputs: SideInputRegistry,
+    ) -> Result<Self> {
+        let backend = Arc::new(build_state_backend(store.clone()).await?);
+        Ok(Self {
+            store,
+            backend,
+            side_inputs,
+        })
+    }
 }
 
 impl BeamFnState for FlareStateService {
@@ -107,16 +144,30 @@ impl BeamFnState for FlareStateService {
     {
         Box::pin(async move {
             log::info!("BeamFnState stream connected from worker");
-            *self.inner.incoming.lock().await = Some(request.into_inner());
+            if let Some(registry) = &self.registry {
+                let worker_id = super::WorkerChannelRegistry::worker_id(request.metadata())?;
+                let worker = registry.worker(&worker_id);
+                let rx = worker
+                    .state
+                    .attach_incoming_stream(request.into_inner())
+                    .await?;
+                registry.begin_state_driver(worker_id);
+                return Ok(Response::new(rx));
+            }
+            let inner = self
+                .inner
+                .as_ref()
+                .expect("state service must have a channel backend");
+            *inner.incoming.lock().await = Some(request.into_inner());
 
             let rx = {
-                let mut rx_guard = self.inner.outgoing_rx.lock().await;
+                let mut rx_guard = inner.outgoing_rx.lock().await;
                 if rx_guard.is_none() {
                     log::warn!(
                         "State stream connected while a previous harness stream was still active; replacing stale stream"
                     );
                     let (tx, rx) = mpsc::channel::<Result<StateResponse, Status>>(32);
-                    *self.inner.outgoing_tx.lock().await = Some(tx);
+                    *inner.outgoing_tx.lock().await = Some(tx);
                     *rx_guard = Some(rx);
                 }
                 rx_guard
@@ -606,9 +657,29 @@ pub struct StateChannel {
     /// Aborted on reset to prevent a stale task from consuming a new stream.
     stream_task: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     status: HarnessStatus,
+    worker_id: String,
 }
 
 impl StateChannel {
+    pub(crate) async fn attach_incoming_stream(
+        &self,
+        incoming: tonic::Streaming<StateRequest>,
+    ) -> std::result::Result<ReceiverStream<Result<StateResponse, Status>>, Status> {
+        *self.stream.incoming.lock().await = Some(incoming);
+        let rx = {
+            let mut rx_guard = self.stream.outgoing_rx.lock().await;
+            if rx_guard.is_none() {
+                let (tx, rx) = mpsc::channel::<Result<StateResponse, Status>>(32);
+                *self.stream.outgoing_tx.lock().await = Some(tx);
+                *rx_guard = Some(rx);
+            }
+            rx_guard
+                .take()
+                .expect("state outgoing receiver must be initialized")
+        };
+        Ok(ReceiverStream::new(rx))
+    }
+
     pub async fn wait_connected(&self) -> Result<()> {
         loop {
             if self.stream.incoming.lock().await.is_some() {
@@ -678,14 +749,23 @@ impl StateChannel {
             match build_state_backend(store.clone()).await {
                 Ok(backend) => {
                     let side_inputs = SideInputResolver::new(store, side_inputs);
-                    channel.drive_state_requests(backend, side_inputs).await
+                    channel
+                        .drive_state_requests(Arc::new(backend), side_inputs)
+                        .await
                 }
                 Err(e) => {
-                    if channel.status.is_intentional_shutdown() {
+                    if channel
+                        .status
+                        .is_worker_intentional_shutdown(&channel.worker_id)
+                    {
                         debug!("state backend construction ended during worker shutdown: {e}");
                     } else {
                         error!("failed to construct state backend: {e}");
-                        channel.status.report_failure("BeamFnState backend", &e);
+                        channel.status.report_worker_failure(
+                            &channel.worker_id,
+                            "BeamFnState backend",
+                            &e,
+                        );
                     }
                 }
             }
@@ -694,7 +774,23 @@ impl StateChannel {
         *task_slot.lock().unwrap() = Some(join_handle);
     }
 
-    async fn drive_state_requests(&self, backend: StateBackend, side_inputs: SideInputResolver) {
+    pub(crate) fn stream_requests_with_context(&self, context: StateServiceContext) {
+        let channel = self.clone();
+        let task_slot = self.stream_task.clone();
+        let join_handle = tokio::spawn(async move {
+            let side_inputs = SideInputResolver::new(context.store, context.side_inputs);
+            channel
+                .drive_state_requests(context.backend, side_inputs)
+                .await;
+        });
+        *task_slot.lock().unwrap() = Some(join_handle);
+    }
+
+    async fn drive_state_requests(
+        &self,
+        backend: Arc<StateBackend>,
+        side_inputs: SideInputResolver,
+    ) {
         info!("state request driver started");
         loop {
             match self.recv_request().await {
@@ -723,14 +819,18 @@ impl StateChannel {
                         Ok(response) => {
                             //info!("state response sent: id={}", response.id);
                             if let Err(e) = self.send_response(response).await {
-                                if self.status.is_intentional_shutdown() {
+                                if self.status.is_worker_intentional_shutdown(&self.worker_id) {
                                     debug!(
                                         "state response closed during intentional worker shutdown: {}",
                                         e
                                     );
                                 } else {
                                     warn!("failed to send state response (worker gone?): {}", e);
-                                    self.status.report_failure("BeamFnState", &e);
+                                    self.status.report_worker_failure(
+                                        &self.worker_id,
+                                        "BeamFnState",
+                                        &e,
+                                    );
                                 }
                                 break;
                             }
@@ -743,7 +843,7 @@ impl StateChannel {
                                 response: None,
                             };
                             if let Err(e) = self.send_response(response).await {
-                                if self.status.is_intentional_shutdown() {
+                                if self.status.is_worker_intentional_shutdown(&self.worker_id) {
                                     debug!(
                                         "state error response closed during intentional worker shutdown: {}",
                                         e
@@ -753,7 +853,11 @@ impl StateChannel {
                                         "failed to send state error response (worker gone?): {}",
                                         e
                                     );
-                                    self.status.report_failure("BeamFnState", &e);
+                                    self.status.report_worker_failure(
+                                        &self.worker_id,
+                                        "BeamFnState",
+                                        &e,
+                                    );
                                 }
                                 break;
                             }
@@ -761,13 +865,14 @@ impl StateChannel {
                     }
                 }
                 Err(e) => {
-                    if self.status.is_intentional_shutdown() {
+                    if self.status.is_worker_intentional_shutdown(&self.worker_id) {
                         debug!(
                             "state request stream ended during intentional worker shutdown: {e}"
                         );
                     } else {
                         warn!("BeamFnState stream stopped before the job completed: {e}");
-                        self.status.report_failure("BeamFnState", &e);
+                        self.status
+                            .report_worker_failure(&self.worker_id, "BeamFnState", &e);
                     }
                     break;
                 }

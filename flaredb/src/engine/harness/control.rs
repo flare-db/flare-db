@@ -60,33 +60,68 @@ impl ControlInner {
 pub async fn start_control_server(
     status: HarnessStatus,
 ) -> Result<(ControlChannel, FlareControlService)> {
-    let (tx, rx) = mpsc::channel::<Result<InstructionRequest, Status>>(32);
-
-    let stream = Arc::new(ControlInner {
-        outgoing_tx: Mutex::new(Some(tx)),
-        outgoing_rx: Mutex::new(Some(rx)),
-        incoming: Mutex::new(None),
-        descriptors: Mutex::new(HashMap::new()),
-        pending: DashMap::new(),
-        metrics: StdMutex::new(None),
-    });
-
+    let channel = ControlChannel::new(status, "test-control-worker".to_string());
     let service = FlareControlService {
-        inner: stream.clone(),
+        inner: Some(channel.stream.clone()),
+        registry: None,
     };
-
-    let channel = ControlChannel {
-        stream,
-        next_id: 0,
-        response_task: Arc::new(std::sync::Mutex::new(None)),
-        status,
-    };
-
     Ok((channel, service))
 }
 
+impl ControlChannel {
+    pub(crate) async fn attach_incoming_stream(
+        &self,
+        incoming: tonic::Streaming<InstructionResponse>,
+    ) -> std::result::Result<ReceiverStream<Result<InstructionRequest, Status>>, Status> {
+        *self.stream.incoming.lock().await = Some(incoming);
+        let rx = {
+            let mut rx_guard = self.stream.outgoing_rx.lock().await;
+            if rx_guard.is_none() {
+                let (tx, rx) = mpsc::channel::<Result<InstructionRequest, Status>>(32);
+                *self.stream.outgoing_tx.lock().await = Some(tx);
+                *rx_guard = Some(rx);
+            }
+            rx_guard
+                .take()
+                .expect("control outgoing receiver must be initialized")
+        };
+        Ok(ReceiverStream::new(rx))
+    }
+
+    pub(crate) fn new(status: HarnessStatus, worker_id: String) -> Self {
+        let (tx, rx) = mpsc::channel::<Result<InstructionRequest, Status>>(32);
+
+        let stream = Arc::new(ControlInner {
+            outgoing_tx: Mutex::new(Some(tx)),
+            outgoing_rx: Mutex::new(Some(rx)),
+            incoming: Mutex::new(None),
+            descriptors: Mutex::new(HashMap::new()),
+            pending: DashMap::new(),
+            metrics: StdMutex::new(None),
+        });
+
+        ControlChannel {
+            stream,
+            next_id: 0,
+            response_task: Arc::new(std::sync::Mutex::new(None)),
+            status,
+            worker_id,
+        }
+    }
+}
+
 pub struct FlareControlService {
-    pub inner: Arc<ControlInner>,
+    pub inner: Option<Arc<ControlInner>>,
+    pub(crate) registry: Option<super::WorkerChannelRegistry>,
+}
+
+impl FlareControlService {
+    pub(crate) fn new(registry: super::WorkerChannelRegistry) -> Self {
+        Self {
+            inner: None,
+            registry: Some(registry),
+        }
+    }
 }
 
 impl BeamFnControl for FlareControlService {
@@ -120,15 +155,30 @@ impl BeamFnControl for FlareControlService {
         Self: 'async_trait,
     {
         Box::pin(async move {
+            if let Some(registry) = &self.registry {
+                let worker_id = super::WorkerChannelRegistry::worker_id(request.metadata())?;
+                let worker = registry.worker(&worker_id);
+                let rx = worker
+                    .handle
+                    .control
+                    .attach_incoming_stream(request.into_inner())
+                    .await?;
+                worker.handle.control.stream_responses();
+                return Ok(Response::new(rx));
+            }
             // store the incoming stream
             // ControlChannel.recv_response() will read from it directly
             // persisted in Arc<ControlServiceInner> so it outlives control()
-            *self.inner.incoming.lock().await = Some(request.into_inner());
+            let inner = self
+                .inner
+                .as_ref()
+                .expect("control service must have a channel backend");
+            *inner.incoming.lock().await = Some(request.into_inner());
 
             // Take the rx end of the request channel — this is the stream
             // of InstructionRequests the worker will read.
             let rx = {
-                let mut rx_guard = self.inner.outgoing_rx.lock().await;
+                let mut rx_guard = inner.outgoing_rx.lock().await;
                 // If outgoing_rx is None, a previous worker already took it
                 // and disconnected without a clean reset. Create a fresh
                 // channel pair so the new worker gets a working stream
@@ -138,7 +188,7 @@ impl BeamFnControl for FlareControlService {
                         "Control stream connected while a previous worker stream was still active; replacing stale stream"
                     );
                     let (tx, rx) = mpsc::channel::<Result<InstructionRequest, Status>>(32);
-                    *self.inner.outgoing_tx.lock().await = Some(tx);
+                    *inner.outgoing_tx.lock().await = Some(tx);
                     *rx_guard = Some(rx);
                 }
                 // Take ownership of the receiver and return it as a streaming
@@ -179,9 +229,26 @@ impl BeamFnControl for FlareControlService {
         Self: 'async_trait,
     {
         Box::pin(async move {
+            if let Some(registry) = &self.registry {
+                let worker_id = super::WorkerChannelRegistry::worker_id(request.metadata())?;
+                let worker = registry.worker(&worker_id);
+                let id = request.into_inner().process_bundle_descriptor_id;
+                let guard = worker.handle.control.stream.descriptors.lock().await;
+                let descriptor = guard
+                    .get(&id)
+                    .cloned()
+                    .ok_or_else(|| Status::not_found(format!("no descriptor for id {}", id)))?;
+                return Ok(Response::new(descriptor));
+            }
             let id = request.into_inner().process_bundle_descriptor_id;
 
-            let guard = self.inner.descriptors.lock().await;
+            let guard = self
+                .inner
+                .as_ref()
+                .expect("control service must have a channel backend")
+                .descriptors
+                .lock()
+                .await;
             let descriptor = guard
                 .get(&id)
                 .cloned()
@@ -215,6 +282,7 @@ pub struct ControlChannel {
     /// the new worker stream.
     response_task: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     status: HarnessStatus,
+    worker_id: String,
 }
 
 impl ControlChannel {
@@ -496,9 +564,18 @@ impl ControlChannel {
     }
 
     pub fn stream_responses(&self) {
+        if self
+            .response_task
+            .lock()
+            .expect("control task lock not poisoned")
+            .is_some()
+        {
+            return;
+        }
         let stream = self.stream.clone();
         let task_slot = self.response_task.clone();
         let status = self.status.clone();
+        let worker_id = self.worker_id.clone();
         info!("Streaming control responses from worker");
 
         let join_handle = tokio::spawn(async move {
@@ -538,13 +615,14 @@ impl ControlChannel {
                         continue;
                     }
                     Ok(None) => {
-                        if status.is_intentional_shutdown() {
+                        if status.is_worker_intentional_shutdown(&worker_id) {
                             debug!(
                                 "BeamFnControl stream closed during intentional worker shutdown"
                             );
                         } else {
                             warn!("BeamFnControl stream closed before the job completed");
-                            status.report_failure(
+                            status.report_worker_failure(
+                                &worker_id,
                                 "BeamFnControl",
                                 "worker closed the stream cleanly",
                             );
@@ -552,21 +630,21 @@ impl ControlChannel {
                         break;
                     }
                     Err(e) => {
-                        if status.is_intentional_shutdown() {
+                        if status.is_worker_intentional_shutdown(&worker_id) {
                             debug!(
                                 "BeamFnControl stream closed during intentional worker shutdown: {}",
                                 e
                             );
                         } else {
                             warn!("BeamFnControl stream error (worker gone?): {}", e);
-                            status.report_failure("BeamFnControl", &e);
+                            status.report_worker_failure(&worker_id, "BeamFnControl", &e);
                         }
                         break;
                     }
                 }
             }
 
-            if status.is_intentional_shutdown() {
+            if status.is_worker_intentional_shutdown(&worker_id) {
                 debug!("BeamFnControl stream from worker closed");
             }
         });

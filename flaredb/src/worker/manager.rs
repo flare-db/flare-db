@@ -23,6 +23,10 @@ use crate::{jobservice::urns::beam_urns, utils::path::logs_dir};
 pub struct WorkerId(String);
 
 impl WorkerId {
+    pub(crate) fn from_string(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -44,7 +48,7 @@ pub struct WorkerExit {
 }
 
 /// Serializes all worker output for a job into the shared `flare-worker.log`.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct WorkerLogRouter {
     sinks: Arc<DashMap<PathBuf, Arc<Mutex<std::fs::File>>>>,
 }
@@ -134,12 +138,16 @@ pub struct WorkerManager {
 
 impl WorkerManager {
     pub fn new(config: WorkerLaunchConfig) -> Self {
+        Self::with_log_router(config, WorkerLogRouter::new())
+    }
+
+    pub fn with_log_router(config: WorkerLaunchConfig, log_router: WorkerLogRouter) -> Self {
         let (exit_tx, _) = broadcast::channel(64);
         Self {
             config,
             active_workers: Arc::new(DashMap::new()),
             worker_sequence: Arc::new(DashMap::new()),
-            log_router: WorkerLogRouter::new(),
+            log_router,
             exit_tx,
         }
     }

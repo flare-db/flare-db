@@ -1,5 +1,3 @@
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::PathBuf;
 use std::{sync::Arc, time::Duration};
 
@@ -13,59 +11,19 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Response, Status};
 
 use crate::utils::path;
+use crate::worker::manager::{WorkerId, WorkerLogRouter};
 
 /// Destination for SDK worker log entries flowing in over the Beam Fn Logging
 /// API. Entries are appended to a per-job `flare-worker.log`, the same file the
 /// harness process writes its stdout/stderr to, so a single file captures the
 /// whole worker log for a job.
-#[derive(Default)]
-struct LogSink {
-    path: Option<PathBuf>,
-    file: Option<std::fs::File>,
-}
-
-impl LogSink {
-    /// Point the sink at `path`, opening it for appending. No-op when the sink
-    /// is already writing to the same file.
-    fn set_target(&mut self, path: PathBuf) -> std::io::Result<()> {
-        if self.file.is_some() && self.path.as_deref() == Some(path.as_path()) {
-            return Ok(());
-        }
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
-        self.path = Some(path);
-        self.file = Some(file);
-        Ok(())
-    }
-
-    /// Append a line to the configured log file. Returns `false` when no target
-    /// has been configured yet, so the caller can fall back to the server log.
-    fn write_line(&mut self, line: &str) -> bool {
-        match self.file.as_mut() {
-            Some(file) => {
-                let _ = file.write_all(line.as_bytes());
-                let _ = file.flush();
-                true
-            }
-            None => false,
-        }
-    }
-
-    /// Forget the current target so entries fall back to the server log until a
-    /// new job sets its own target.
-    fn clear(&mut self) {
-        self.path = None;
-        self.file = None;
-    }
-}
-
 pub struct LogInner {
     outgoing_tx: Mutex<Option<mpsc::Sender<Result<LogControl, Status>>>>,
     outgoing_rx: Mutex<Option<mpsc::Receiver<Result<LogControl, Status>>>>,
     incoming: Mutex<Option<tonic::Streaming<log_entry::List>>>,
-    sink: Mutex<LogSink>,
+    worker_id: WorkerId,
+    log_router: WorkerLogRouter,
+    target: Mutex<Option<PathBuf>>,
 }
 
 impl LogInner {
@@ -78,27 +36,117 @@ impl LogInner {
     }
 }
 
-pub async fn start_log_server() -> Result<(LogChannel, FlareLogService)> {
-    let (tx, rx) = mpsc::channel::<Result<LogControl, Status>>(32);
-
-    let stream = Arc::new(LogInner {
-        outgoing_tx: Mutex::new(Some(tx)),
-        outgoing_rx: Mutex::new(Some(rx)),
-        incoming: Mutex::new(None),
-        sink: Mutex::new(LogSink::default()),
-    });
-
+pub async fn start_log_server(
+    log_router: WorkerLogRouter,
+) -> Result<(LogChannel, FlareLogService)> {
+    let channel = LogChannel::new(WorkerId::from_string("test-log-worker"), log_router);
     let service = FlareLogService {
-        inner: stream.clone(),
+        inner: Some(channel.stream.clone()),
+        registry: None,
     };
-
-    let channel = LogChannel { stream };
-
     Ok((channel, service))
 }
 
+impl LogChannel {
+    pub(crate) async fn attach_incoming_stream(
+        &self,
+        incoming: tonic::Streaming<log_entry::List>,
+    ) -> std::result::Result<ReceiverStream<Result<LogControl, Status>>, Status> {
+        *self.stream.incoming.lock().await = Some(incoming);
+        let rx = {
+            let mut rx_guard = self.stream.outgoing_rx.lock().await;
+            if rx_guard.is_none() {
+                let (tx, rx) = mpsc::channel::<Result<LogControl, Status>>(32);
+                *self.stream.outgoing_tx.lock().await = Some(tx);
+                *rx_guard = Some(rx);
+            }
+            rx_guard
+                .take()
+                .expect("log outgoing receiver must be initialized")
+        };
+        Ok(ReceiverStream::new(rx))
+    }
+
+    pub(crate) fn stream_incoming(&self) {
+        if self
+            .stream_task
+            .lock()
+            .expect("log task lock not poisoned")
+            .is_some()
+        {
+            return;
+        }
+        let inner = self.stream.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let mut guard = inner.incoming.lock().await;
+                let Some(stream) = guard.as_mut() else {
+                    drop(guard);
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    continue;
+                };
+                loop {
+                    let list = match stream.message().await {
+                        Ok(Some(list)) => list,
+                        Ok(None) | Err(_) => break,
+                    };
+                    let target = inner.target.lock().await.clone();
+                    for entry in list.log_entries {
+                        let message =
+                            format!("level={:?} message={}", entry.severity, entry.message);
+                        if let Some(path) = target.as_deref() {
+                            if let Err(error) = inner
+                                .log_router
+                                .append_line(path, &inner.worker_id, "fn", &message)
+                                .await
+                            {
+                                log::warn!(
+                                    "failed to write Fn log id={} error={}",
+                                    inner.worker_id,
+                                    error
+                                );
+                            }
+                        } else {
+                            log::info!("worker={} source=fn {}", inner.worker_id, message);
+                        }
+                    }
+                }
+                break;
+            }
+        });
+        *self.stream_task.lock().expect("log task lock not poisoned") = Some(task);
+    }
+
+    pub(crate) fn new(worker_id: WorkerId, log_router: WorkerLogRouter) -> Self {
+        let (tx, rx) = mpsc::channel::<Result<LogControl, Status>>(32);
+
+        let stream = Arc::new(LogInner {
+            outgoing_tx: Mutex::new(Some(tx)),
+            outgoing_rx: Mutex::new(Some(rx)),
+            incoming: Mutex::new(None),
+            worker_id,
+            log_router,
+            target: Mutex::new(None),
+        });
+        LogChannel {
+            stream,
+            stream_task: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+}
+
 pub struct FlareLogService {
-    inner: Arc<LogInner>,
+    inner: Option<Arc<LogInner>>,
+    registry: Option<super::WorkerChannelRegistry>,
+}
+
+impl FlareLogService {
+    pub(crate) fn new(registry: super::WorkerChannelRegistry) -> Self {
+        Self {
+            inner: None,
+            registry: Some(registry),
+        }
+    }
 }
 
 impl BeamFnLogging for FlareLogService {
@@ -123,33 +171,62 @@ impl BeamFnLogging for FlareLogService {
         Self: 'async_trait,
     {
         Box::pin(async move {
+            if let Some(registry) = &self.registry {
+                let worker_id = super::WorkerChannelRegistry::worker_id(request.metadata())?;
+                let worker = registry.worker(&worker_id);
+                if let Some(path) = registry.worker_log_path().await {
+                    worker
+                        .log
+                        .set_target_path(path)
+                        .await
+                        .map_err(|e| Status::internal(e.to_string()))?;
+                }
+                let rx = worker
+                    .log
+                    .attach_incoming_stream(request.into_inner())
+                    .await?;
+                worker.log.stream_incoming();
+                return Ok(Response::new(rx));
+            }
+            let inner = self
+                .inner
+                .as_ref()
+                .expect("log service must have a channel backend");
             let mut stream = request.into_inner();
-            let inner = self.inner.clone();
+            let reader_inner = inner.clone();
             tokio::spawn(async move {
                 while let Ok(Some(list)) = stream.message().await {
-                    let mut sink = inner.sink.lock().await;
+                    let target = reader_inner.target.lock().await.clone();
                     for entry in list.log_entries {
-                        let line = format!(
-                            "[FLARE WORKER LOG] level={:?} message={}\n",
-                            entry.severity, entry.message
-                        );
-                        if !sink.write_line(&line) {
-                            // No per-job target configured yet; keep the entry in
-                            // the server log rather than dropping it.
-                            log::info!("{}", line.trim_end());
+                        let message =
+                            format!("level={:?} message={}", entry.severity, entry.message);
+                        if let Some(path) = target.as_deref() {
+                            if let Err(error) = reader_inner
+                                .log_router
+                                .append_line(path, &reader_inner.worker_id, "fn", &message)
+                                .await
+                            {
+                                log::warn!(
+                                    "failed to write Fn log id={} error={}",
+                                    reader_inner.worker_id,
+                                    error
+                                );
+                            }
+                        } else {
+                            log::info!("worker={} source=fn {}", reader_inner.worker_id, message);
                         }
                     }
                 }
             });
 
             let rx = {
-                let mut rx_guard = self.inner.outgoing_rx.lock().await;
+                let mut rx_guard = inner.outgoing_rx.lock().await;
                 if rx_guard.is_none() {
                     log::warn!(
                         "Log stream connected while a previous harness stream was still active; replacing stale stream"
                     );
                     let (tx, rx) = mpsc::channel::<Result<LogControl, Status>>(32);
-                    *self.inner.outgoing_tx.lock().await = Some(tx);
+                    *inner.outgoing_tx.lock().await = Some(tx);
                     *rx_guard = Some(rx);
                 }
                 rx_guard
@@ -162,8 +239,10 @@ impl BeamFnLogging for FlareLogService {
     }
 }
 
+#[derive(Clone)]
 pub struct LogChannel {
     stream: Arc<LogInner>,
+    stream_task: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl LogChannel {
@@ -178,12 +257,22 @@ impl LogChannel {
 
     // Reset the log channel so a new harness can connect.
     pub async fn reset(&self) {
+        let task = {
+            self.stream_task
+                .lock()
+                .expect("log task lock not poisoned")
+                .take()
+        };
+        if let Some(task) = task {
+            task.abort();
+            let _ = task.await;
+        }
         let (tx, rx) = mpsc::channel::<Result<LogControl, Status>>(32);
 
         *self.stream.outgoing_tx.lock().await = Some(tx);
         *self.stream.outgoing_rx.lock().await = Some(rx);
         *self.stream.incoming.lock().await = None;
-        self.stream.sink.lock().await.clear();
+        *self.stream.target.lock().await = None;
 
         log::info!("log channel reset for next harness");
     }
@@ -192,17 +281,12 @@ impl LogChannel {
     /// `flare-worker.log`, alongside the harness process stdout/stderr.
     pub async fn set_target(&self, instance_id: &str, job_id: &str) -> Result<()> {
         let path = path::logs_dir(instance_id, job_id).join("flare-worker.log");
-        self.stream
-            .sink
-            .lock()
-            .await
-            .set_target(path.clone())
-            .map_err(|e| anyhow!("failed to open worker log {}: {}", path.display(), e))?;
-        log::info!(
-            "routing SDK worker logs for job {} to {}",
-            job_id,
-            path.display()
-        );
+        self.set_target_path(path).await
+    }
+
+    pub(crate) async fn set_target_path(&self, path: PathBuf) -> Result<()> {
+        *self.stream.target.lock().await = Some(path.clone());
+        log::info!("routing SDK worker logs to {}", path.display());
         Ok(())
     }
 

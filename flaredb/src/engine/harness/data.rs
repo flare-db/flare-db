@@ -41,30 +41,55 @@ impl DataInner {
 pub async fn start_data_server(
     status: HarnessStatus,
 ) -> Result<(DataChannel, FlareDataService), anyhow::Error> {
-    let (tx, rx) = mpsc::channel::<Result<Elements, Status>>(32);
-
-    let stream = Arc::new(DataInner {
-        outgoing_tx: Mutex::new(Some(tx)),
-        outgoing_rx: Mutex::new(Some(rx)),
-        incoming: Mutex::new(None),
-    });
-
-    let service = FlareDataService {
-        inner: stream.clone(),
-    };
-
-    let channel = DataChannel {
-        worker_stream: stream,
-        runner_stream: Arc::new(ElementStreamMultiplexer::new()),
-        stream_task: Arc::new(std::sync::Mutex::new(None)),
+    let channel = DataChannel::new(
         status,
+        Arc::new(ElementStreamMultiplexer::new()),
+        "test-data-worker".to_string(),
+    );
+    let service = FlareDataService {
+        inner: Some(channel.worker_stream.clone()),
+        registry: None,
     };
     Ok((channel, service))
+}
+
+impl DataChannel {
+    pub(crate) fn new(
+        status: HarnessStatus,
+        runner_stream: Arc<ElementStreamMultiplexer>,
+        worker_id: String,
+    ) -> Self {
+        let (tx, rx) = mpsc::channel::<Result<Elements, Status>>(32);
+
+        let stream = Arc::new(DataInner {
+            outgoing_tx: Mutex::new(Some(tx)),
+            outgoing_rx: Mutex::new(Some(rx)),
+            incoming: Mutex::new(None),
+        });
+
+        DataChannel {
+            worker_stream: stream,
+            runner_stream,
+            stream_task: Arc::new(std::sync::Mutex::new(None)),
+            status,
+            worker_id,
+        }
+    }
 }
 /// gRPC server-side handler for BeamFnData service.
 /// Establishes the bidirectional gRPC stream with the worker.
 pub struct FlareDataService {
-    inner: Arc<DataInner>,
+    inner: Option<Arc<DataInner>>,
+    registry: Option<super::WorkerChannelRegistry>,
+}
+
+impl FlareDataService {
+    pub(crate) fn new(registry: super::WorkerChannelRegistry) -> Self {
+        Self {
+            inner: None,
+            registry: Some(registry),
+        }
+    }
 }
 
 impl BeamFnData for FlareDataService {
@@ -95,16 +120,31 @@ impl BeamFnData for FlareDataService {
     {
         Box::pin(async move {
             info!("BeamFnData stream connected from worker");
-            *self.inner.incoming.lock().await = Some(request.into_inner());
+            if let Some(registry) = &self.registry {
+                let worker_id = super::WorkerChannelRegistry::worker_id(request.metadata())?;
+                let worker = registry.worker(&worker_id);
+                let rx = worker
+                    .handle
+                    .data
+                    .attach_incoming_stream(request.into_inner())
+                    .await?;
+                worker.handle.data.stream_elements();
+                return Ok(Response::new(rx));
+            }
+            let inner = self
+                .inner
+                .as_ref()
+                .expect("data service must have a channel backend");
+            *inner.incoming.lock().await = Some(request.into_inner());
 
             let rx = {
-                let mut rx_guard = self.inner.outgoing_rx.lock().await;
+                let mut rx_guard = inner.outgoing_rx.lock().await;
                 if rx_guard.is_none() {
                     warn!(
                         "Data stream connected while a previous worker stream was still active; replacing stale stream"
                     );
                     let (tx, rx) = mpsc::channel::<Result<Elements, Status>>(32);
-                    *self.inner.outgoing_tx.lock().await = Some(tx);
+                    *inner.outgoing_tx.lock().await = Some(tx);
                     *rx_guard = Some(rx);
                 }
                 rx_guard
@@ -128,11 +168,40 @@ pub struct DataChannel {
     /// Aborted on reset to prevent stale task from consuming new worker stream.
     stream_task: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     status: HarnessStatus,
+    worker_id: String,
 }
 
 impl DataChannel {
+    pub(crate) async fn attach_incoming_stream(
+        &self,
+        incoming: tonic::Streaming<Elements>,
+    ) -> std::result::Result<ReceiverStream<Result<Elements, Status>>, Status> {
+        *self.worker_stream.incoming.lock().await = Some(incoming);
+        let rx = {
+            let mut rx_guard = self.worker_stream.outgoing_rx.lock().await;
+            if rx_guard.is_none() {
+                let (tx, rx) = mpsc::channel::<Result<Elements, Status>>(32);
+                *self.worker_stream.outgoing_tx.lock().await = Some(tx);
+                *rx_guard = Some(rx);
+            }
+            rx_guard
+                .take()
+                .expect("data outgoing receiver must be initialized")
+        };
+        Ok(ReceiverStream::new(rx))
+    }
+
     pub async fn send_elements(&self, elements: Elements) -> anyhow::Result<()> {
-        let sender = self.worker_stream.sender().await?;
+        let sender = tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                if let Ok(sender) = self.worker_stream.sender().await {
+                    return sender;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| anyhow!("worker data stream was not established within 60s"))?;
         sender
             .send(Ok(elements))
             .await
@@ -167,10 +236,19 @@ impl DataChannel {
     /// Start the background dispatcher task that routes incoming elements.
     /// reads from incoming_stream and demuxes every message by (instruction_id, transform_id) to separate queues.
     pub fn stream_elements(&self) {
+        if self
+            .stream_task
+            .lock()
+            .expect("data task lock not poisoned")
+            .is_some()
+        {
+            return;
+        }
         let worker_data_stream = self.worker_stream.clone();
         let runner_stream = self.runner_stream.clone();
         let task_slot = self.stream_task.clone();
         let status = self.status.clone();
+        let worker_id = self.worker_id.clone();
         info!("Streaming elements from worker");
 
         let join_handle = tokio::spawn(async move {
@@ -196,13 +274,14 @@ impl DataChannel {
                             route_elements(elements, &runner_stream);
                         }
                         Ok(None) => {
-                            if status.is_intentional_shutdown() {
+                            if status.is_worker_intentional_shutdown(&worker_id) {
                                 debug!(
                                     "BeamFnData stream closed during intentional worker shutdown"
                                 );
                             } else {
                                 warn!("BeamFnData stream closed before the job completed");
-                                status.report_failure(
+                                status.report_worker_failure(
+                                    &worker_id,
                                     "BeamFnData",
                                     "worker closed the stream cleanly",
                                 );
@@ -210,21 +289,21 @@ impl DataChannel {
                             break;
                         }
                         Err(e) => {
-                            if status.is_intentional_shutdown() {
+                            if status.is_worker_intentional_shutdown(&worker_id) {
                                 debug!(
                                     "BeamFnData stream closed during intentional worker shutdown: {}",
                                     e
                                 );
                             } else {
                                 warn!("BeamFnData stream error (worker gone?): {}", e);
-                                status.report_failure("BeamFnData", &e);
+                                status.report_worker_failure(&worker_id, "BeamFnData", &e);
                             }
                             break;
                         }
                     }
                 }
 
-                if status.is_intentional_shutdown() {
+                if status.is_worker_intentional_shutdown(&worker_id) {
                     debug!("BeamFnData stream from worker closed");
                 }
                 break;

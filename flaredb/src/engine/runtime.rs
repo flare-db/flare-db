@@ -28,6 +28,7 @@ use crate::{
     engine::timer::{TimeDomain, TimerEntry, TimerKey},
     engine::{
         harness::{
+            WorkerHandle,
             control::{ControlChannel, ControlResponse},
             data::{DataChannel, DataKey, ElementStreamPayload},
         },
@@ -77,6 +78,7 @@ pub(crate) fn resolve_window_coder(
 
 #[derive(Clone)]
 pub struct BundleRuntime {
+    worker: WorkerHandle,
     control: ControlChannel,
     data: DataChannel,
     store: Arc<FlareElementStore>,
@@ -90,16 +92,27 @@ pub struct BundleRuntime {
 impl BundleRuntime {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        control: ControlChannel,
-        data: DataChannel,
+        worker: WorkerHandle,
         store: Arc<FlareElementStore>,
         pipeline_coders: Arc<HashMap<String, Coder>>,
         pipeline_components: Arc<Components>,
-        window_merger: Option<Arc<WindowMergeService>>,
         timer_service: Arc<TimerService>,
         source_reports: tokio::sync::mpsc::UnboundedSender<SourceProgress>,
     ) -> Self {
+        let control = worker.control();
+        let data = worker.data();
+        let window_merger = Some(Arc::new(WindowMergeService::new(
+            control.clone(),
+            data.clone(),
+            pipeline_coders.clone(),
+            pipeline_components.clone(),
+            ApiServiceDescriptor {
+                url: crate::DEFAULT_API_SERVICE_URL.to_string(),
+                ..Default::default()
+            },
+        )));
         Self {
+            worker,
             control,
             data,
             store,
@@ -109,6 +122,10 @@ impl BundleRuntime {
             timer_service,
             source_reports,
         }
+    }
+
+    pub fn worker_id(&self) -> &crate::worker::manager::WorkerId {
+        self.worker.id()
     }
 
     /// Sender for runner-source progress reports (used by `TestStream`).
