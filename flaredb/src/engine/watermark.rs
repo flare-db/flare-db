@@ -769,6 +769,16 @@ impl WatermarkManager {
         self.stages.get(stage).map(|s| s.queued).unwrap_or(0)
     }
 
+    /// Number of bundles that are currently queued or in flight across every
+    /// stage. This is the coarse remaining-work input to the worker-pool scale
+    /// policy until per-bundle progress estimation is available.
+    pub fn outstanding_bundles(&self) -> usize {
+        self.stages
+            .values()
+            .map(|stage| stage.in_flight.saturating_add(stage.queued))
+            .sum()
+    }
+
     /// The concurrency ceiling for `stage` (default `1`).
     pub fn max_in_flight(&self, stage: &str) -> usize {
         self.stages.get(stage).map(|s| s.max_in_flight).unwrap_or(1)
@@ -1864,15 +1874,19 @@ mod tests {
     #[test]
     fn queued_bundles_keep_a_stage_incomplete_until_drained() {
         let mut manager = manager(&[("A", &[], &[], &["p"]), ("B", &["p"], &[], &["q"])]);
+        assert_eq!(manager.outstanding_bundles(), 0);
         manager.start_bundle("A").unwrap();
+        assert_eq!(manager.outstanding_bundles(), 1);
         manager.complete_bundle("A").unwrap();
 
         // B declares two residual bundles; neither starts until scheduled.
         manager.enqueue_bundles("B", 2).unwrap();
         assert_eq!(manager.queued_bundles("B"), 2);
+        assert_eq!(manager.outstanding_bundles(), 2);
 
         manager.start_bundle("B").unwrap();
         assert_eq!(manager.queued_bundles("B"), 1);
+        assert_eq!(manager.outstanding_bundles(), 2);
         manager.complete_bundle("B").unwrap();
         assert!(
             !manager.is_complete(),
@@ -1882,6 +1896,7 @@ mod tests {
         manager.start_bundle("B").unwrap();
         assert_eq!(manager.queued_bundles("B"), 0);
         manager.complete_bundle("B").unwrap();
+        assert_eq!(manager.outstanding_bundles(), 0);
         assert!(manager.is_complete(), "all queued bundles drained");
     }
 

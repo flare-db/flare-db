@@ -244,6 +244,13 @@ impl NodeScheduler {
         next
     }
 
+    /// Coarse amount of work the worker pool must still service. This includes
+    /// not-yet-started residuals and bundle tasks that have been scheduled but
+    /// are still waiting for a worker lease.
+    pub fn outstanding_bundle_count(&self) -> usize {
+        self.watermarks.outstanding_bundles()
+    }
+
     /// Marks a node as completed, propagating its outputs.
     ///
     /// A bounded source reports `+∞` when it finishes, so a source's completion

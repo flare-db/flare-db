@@ -19,11 +19,142 @@ use crate::{
 
 const DEFAULT_HARNESS_RSS_BYTES: u64 = 1024 * 1024 * 1024;
 const DEFAULT_MEMORY_FRACTION: f64 = 0.70;
+const MIN_SCALE_RATE_SAMPLE: Duration = Duration::from_secs(1);
+const MIN_SCALE_TARGET: Duration = Duration::from_secs(10);
+const SPAWN_COST_MULTIPLIER: f64 = 3.0;
+const SCALE_RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkerKind {
     Cpu,
     Io,
+}
+
+/// Inputs to the capacity-driven scale-out policy.
+///
+/// Throughput is measured in completed bundles per worker-second. The remaining
+/// work is therefore converted to an estimated single-worker duration before
+/// deciding how many workers are useful. Stage 7 replaces the bundle-count
+/// estimate with the size-weighted per-bundle progress estimator.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScaleDecisionInputs {
+    pub remaining_bundles: usize,
+    pub active_bundles: usize,
+    pub completed_bundles: u64,
+    pub busy_worker_seconds: f64,
+    pub spawn_cost: Duration,
+    pub min_workers: usize,
+    pub max_workers: usize,
+    pub live_workers: usize,
+    pub starting_workers: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScaleReason {
+    WorkComplete,
+    NoParallelWork,
+    NoRateSample,
+    ScaleUp,
+    ScaleDown,
+    Hold,
+}
+
+impl ScaleReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::WorkComplete => "work-complete",
+            Self::NoParallelWork => "no-parallel-work",
+            Self::NoRateSample => "no-rate-sample",
+            Self::ScaleUp => "scale-up",
+            Self::ScaleDown => "scale-down",
+            Self::Hold => "hold",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScaleDecision {
+    pub target_seconds_per_worker: f64,
+    pub observed_rate_bundles_per_second: Option<f64>,
+    pub estimated_remaining_seconds: Option<f64>,
+    pub want_workers: usize,
+    pub reason: ScaleReason,
+}
+
+/// Pure scale-out policy. Short jobs and jobs without at least one second of
+/// observed worker activity remain at the configured minimum.
+pub fn decide_scale(inputs: &ScaleDecisionInputs) -> ScaleDecision {
+    let min_workers = inputs.min_workers.max(1).min(inputs.max_workers.max(1));
+    let max_workers = inputs.max_workers.max(min_workers);
+    let spawn_cost = inputs.spawn_cost.as_secs_f64();
+    let target_seconds_per_worker = MIN_SCALE_TARGET
+        .as_secs_f64()
+        .max(SPAWN_COST_MULTIPLIER * spawn_cost);
+    let current_workers = inputs.live_workers.saturating_add(inputs.starting_workers);
+
+    if inputs.remaining_bundles == 0 {
+        return ScaleDecision {
+            target_seconds_per_worker,
+            observed_rate_bundles_per_second: None,
+            estimated_remaining_seconds: Some(0.0),
+            want_workers: min_workers,
+            reason: ScaleReason::WorkComplete,
+        };
+    }
+
+    // A running bundle with elsewhere-queued work is enough for a coarse
+    // sample. This lets a long parent that produced residuals scale workers
+    // without first requiring the parent itself to finish. A single long
+    // unsplittable bundle does not benefit from another worker, so it stays at
+    // the minimum until queued work appears.
+    let has_parallel_work = inputs.remaining_bundles > inputs.active_bundles;
+    if !has_parallel_work {
+        return ScaleDecision {
+            target_seconds_per_worker,
+            observed_rate_bundles_per_second: None,
+            estimated_remaining_seconds: None,
+            want_workers: min_workers,
+            reason: ScaleReason::NoParallelWork,
+        };
+    }
+
+    let rate_is_usable = inputs.busy_worker_seconds >= MIN_SCALE_RATE_SAMPLE.as_secs_f64();
+    if !rate_is_usable {
+        return ScaleDecision {
+            target_seconds_per_worker,
+            observed_rate_bundles_per_second: None,
+            estimated_remaining_seconds: None,
+            want_workers: min_workers,
+            reason: ScaleReason::NoRateSample,
+        };
+    }
+
+    // Before the first completion, assume one completion per accumulated
+    // worker-second. This deliberately overestimates remaining time while a
+    // long bundle is active, avoiding the false-stall problem that motivated
+    // progress-based sampling.
+    let observed_completions = (inputs.completed_bundles as f64).max(1.0);
+    let observed_rate = observed_completions / inputs.busy_worker_seconds;
+    let remaining_seconds = inputs.remaining_bundles as f64 / observed_rate;
+    let raw_want = (remaining_seconds / target_seconds_per_worker).ceil();
+    let want_workers = if raw_want.is_finite() {
+        (raw_want.max(1.0) as usize).clamp(min_workers, max_workers)
+    } else {
+        max_workers
+    };
+    let reason = match want_workers.cmp(&current_workers) {
+        std::cmp::Ordering::Greater => ScaleReason::ScaleUp,
+        std::cmp::Ordering::Less => ScaleReason::ScaleDown,
+        std::cmp::Ordering::Equal => ScaleReason::Hold,
+    };
+
+    ScaleDecision {
+        target_seconds_per_worker,
+        observed_rate_bundles_per_second: Some(observed_rate),
+        estimated_remaining_seconds: Some(remaining_seconds),
+        want_workers,
+        reason,
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -193,6 +324,7 @@ struct WorkerEntry {
     pid: Option<u32>,
     handle: WorkerHandle,
     active: HashMap<u64, Instant>,
+    stopping: bool,
     bundles_done: u64,
     busy_seconds: f64,
     idle_since: Instant,
@@ -202,11 +334,13 @@ struct PoolInner {
     starting: usize,
     shutting_down: bool,
     workers: HashMap<String, WorkerEntry>,
+    remaining_bundles: usize,
     spawn_count: u64,
     spawn_cost: Option<Duration>,
     total_busy_seconds: f64,
     total_idle_seconds: f64,
     completed_bundles: u64,
+    last_scale_log: Option<(ScaleReason, usize)>,
 }
 
 pub struct WorkerPool {
@@ -258,6 +392,8 @@ impl Drop for Lease {
                 worker.busy_seconds += self.started.elapsed().as_secs_f64();
                 inner.total_busy_seconds += self.started.elapsed().as_secs_f64();
             }
+            let decision = scale_decision(&self.pool.config, &inner);
+            log_scale_decision(&self.pool.config, &mut inner, decision, "lease-release");
         }
         self.pool.notify.notify_waiters();
     }
@@ -281,12 +417,107 @@ pub struct PoolSnapshot {
     pub busy: usize,
     pub idle: usize,
     pub starting: usize,
+    pub remaining_bundles: usize,
+    pub want_workers: usize,
+    pub scale_reason: String,
+    pub target_seconds_per_worker: f64,
+    pub observed_rate_bundles_per_second: Option<f64>,
+    pub estimated_remaining_seconds: Option<f64>,
     pub spawn_count: u64,
     pub completed_bundles: u64,
     pub total_busy_seconds: f64,
     pub total_idle_seconds: f64,
     pub spawn_cost_ms: Option<u128>,
     pub workers: Vec<WorkerSnapshot>,
+}
+
+fn scale_decision(config: &WorkerPoolConfig, inner: &PoolInner) -> ScaleDecision {
+    let active_bundles = inner
+        .workers
+        .values()
+        .map(|worker| worker.active.len())
+        .sum();
+    let active_worker_seconds = inner
+        .workers
+        .values()
+        .flat_map(|worker| worker.active.values())
+        .map(Instant::elapsed)
+        .map(|elapsed| elapsed.as_secs_f64())
+        .sum::<f64>();
+    decide_scale(&ScaleDecisionInputs {
+        remaining_bundles: inner.remaining_bundles,
+        active_bundles,
+        completed_bundles: inner.completed_bundles,
+        busy_worker_seconds: inner.total_busy_seconds + active_worker_seconds,
+        spawn_cost: inner
+            .spawn_cost
+            .unwrap_or_else(|| config.idle_timeout.min(MIN_SCALE_TARGET)),
+        min_workers: config.min_workers,
+        max_workers: config.max_workers,
+        live_workers: inner
+            .workers
+            .values()
+            .filter(|worker| !worker.stopping)
+            .count(),
+        starting_workers: inner.starting,
+    })
+}
+
+fn log_scale_decision(
+    config: &WorkerPoolConfig,
+    inner: &mut PoolInner,
+    decision: ScaleDecision,
+    source: &str,
+) {
+    let decision_key = (decision.reason, decision.want_workers);
+    if inner.last_scale_log == Some(decision_key) {
+        log::debug!(
+            "pool scale: source={source} reason={} remaining_bundles={} active_bundles={} \
+             want={} live={} starting={} spawn_cost_ms={}",
+            decision.reason.as_str(),
+            inner.remaining_bundles,
+            inner
+                .workers
+                .values()
+                .map(|worker| worker.active.len())
+                .sum::<usize>(),
+            decision.want_workers,
+            inner
+                .workers
+                .values()
+                .filter(|worker| !worker.stopping)
+                .count(),
+            inner.starting,
+            inner.spawn_cost.map(|value| value.as_millis()).unwrap_or(0)
+        );
+        return;
+    }
+    inner.last_scale_log = Some(decision_key);
+    log::info!(
+        "pool scale: source={source} reason={} remaining_bundles={} active_bundles={} \
+         rate_bundles_s={:?} remaining_work_s={:?} target_s={:.2} want={} live={} starting={} \
+         spawn_cost_ms={} max={} min={}",
+        decision.reason.as_str(),
+        inner.remaining_bundles,
+        inner
+            .workers
+            .values()
+            .map(|worker| worker.active.len())
+            .sum::<usize>(),
+        decision.observed_rate_bundles_per_second,
+        decision.estimated_remaining_seconds,
+        decision.target_seconds_per_worker,
+        decision.want_workers,
+        inner
+            .workers
+            .values()
+            .filter(|worker| !worker.stopping)
+            .count(),
+        inner.starting,
+        inner.spawn_cost.map(|value| value.as_millis()).unwrap_or(0),
+        config.max_workers,
+        config.min_workers
+    );
 }
 
 impl WorkerPool {
@@ -298,16 +529,19 @@ impl WorkerPool {
                 starting: 0,
                 shutting_down: false,
                 workers: HashMap::new(),
+                remaining_bundles: 0,
                 spawn_count: 0,
                 spawn_cost: None,
                 total_busy_seconds: 0.0,
                 total_idle_seconds: 0.0,
                 completed_bundles: 0,
+                last_scale_log: None,
             }),
             notify: Notify::new(),
             next_lease_id: AtomicU64::new(1),
         });
         pool.start_exit_monitor();
+        pool.start_scale_monitor();
         pool
     }
 
@@ -323,6 +557,18 @@ impl WorkerPool {
         self.ensure_capacity(self.config.min_workers).await
     }
 
+    /// Publish the number of queued plus in-flight bundles. The dispatcher
+    /// updates this before starting a scheduling wave and whenever work is
+    /// queued or drained.
+    pub fn observe_workload(&self, remaining_bundles: usize) {
+        let mut inner = self.inner.lock().expect("worker pool lock not poisoned");
+        inner.remaining_bundles = remaining_bundles;
+        let decision = scale_decision(&self.config, &inner);
+        log_scale_decision(&self.config, &mut inner, decision, "workload");
+        drop(inner);
+        self.notify.notify_waiters();
+    }
+
     pub async fn acquire(self: &Arc<Self>, _kind: WorkerKind) -> Result<Lease> {
         loop {
             let notified = self.notify.notified();
@@ -335,7 +581,9 @@ impl WorkerPool {
                 let selected = inner
                     .workers
                     .iter()
-                    .filter(|(_, worker)| worker.active.len() < self.config.bundles_per_worker)
+                    .filter(|(_, worker)| {
+                        !worker.stopping && worker.active.len() < self.config.bundles_per_worker
+                    })
                     .min_by_key(|(_, worker)| worker.active.len())
                     .map(|(id, _)| id.clone());
                 if let Some(selected) = selected {
@@ -369,7 +617,17 @@ impl WorkerPool {
                         started,
                     });
                 }
-                if inner.workers.len() + inner.starting < self.config.max_workers {
+                let decision = scale_decision(&self.config, &inner);
+                log_scale_decision(&self.config, &mut inner, decision, "acquire");
+                let current_workers = inner
+                    .workers
+                    .values()
+                    .filter(|worker| !worker.stopping)
+                    .count()
+                    .saturating_add(inner.starting);
+                if current_workers < decision.want_workers
+                    && current_workers < self.config.max_workers
+                {
                     inner.starting += 1;
                     true
                 } else {
@@ -443,11 +701,14 @@ impl WorkerPool {
                 pid: spawned.pid,
                 handle: spawned.handle,
                 active: HashMap::new(),
+                stopping: false,
                 bundles_done: 0,
                 busy_seconds: 0.0,
                 idle_since: Instant::now(),
             },
         );
+        let decision = scale_decision(&self.config, &inner);
+        log_scale_decision(&self.config, &mut inner, decision, "spawn-complete");
         drop(inner);
         self.notify.notify_waiters();
         Ok(())
@@ -456,11 +717,11 @@ impl WorkerPool {
     pub async fn shrink_to(self: &Arc<Self>, target: usize) -> Result<()> {
         let target = target.max(self.config.min_workers);
         let stop_ids = {
-            let inner = self.inner.lock().expect("worker pool lock not poisoned");
+            let mut inner = self.inner.lock().expect("worker pool lock not poisoned");
             let mut idle: Vec<(String, WorkerId)> = inner
                 .workers
                 .iter()
-                .filter(|(_, worker)| worker.active.is_empty())
+                .filter(|(_, worker)| !worker.stopping && worker.active.is_empty())
                 .map(|(id, worker)| (id.clone(), worker.id.clone()))
                 .collect();
             let allowed = target.saturating_sub(
@@ -471,18 +732,15 @@ impl WorkerPool {
                     .count(),
             );
             idle.truncate(inner.workers.len().saturating_sub(allowed));
-            idle.into_iter().map(|(_, id)| id).collect::<Vec<_>>()
+            let ids = idle.into_iter().map(|(_, id)| id).collect::<Vec<_>>();
+            for worker_id in &ids {
+                if let Some(worker) = inner.workers.get_mut(worker_id.as_str()) {
+                    worker.stopping = true;
+                }
+            }
+            ids
         };
-        for worker_id in stop_ids {
-            self.backend.stop_worker(&worker_id).await?;
-            self.inner
-                .lock()
-                .expect("worker pool lock not poisoned")
-                .workers
-                .remove(worker_id.as_str());
-        }
-        self.notify.notify_waiters();
-        Ok(())
+        self.stop_selected(&stop_ids).await
     }
 
     pub fn record_bundle_complete(&self, worker_id: &WorkerId) {
@@ -493,11 +751,80 @@ impl WorkerPool {
         }
     }
 
+    pub async fn reconcile_scale(self: &Arc<Self>) -> Result<()> {
+        let (decision, live) = {
+            let mut inner = self.inner.lock().expect("worker pool lock not poisoned");
+            let decision = scale_decision(&self.config, &inner);
+            let live = inner
+                .workers
+                .values()
+                .filter(|worker| !worker.stopping)
+                .count();
+            log_scale_decision(&self.config, &mut inner, decision, "reconcile");
+            (decision, live)
+        };
+        let current = live.saturating_add(
+            self.inner
+                .lock()
+                .expect("worker pool lock not poisoned")
+                .starting,
+        );
+        if decision.want_workers > current {
+            self.ensure_capacity(decision.want_workers).await?;
+            return Ok(());
+        }
+
+        let floor = self.config.min_workers.max(decision.want_workers);
+        if live <= floor {
+            return Ok(());
+        }
+        let stop_ids = {
+            let mut inner = self.inner.lock().expect("worker pool lock not poisoned");
+            let stop_limit = live.saturating_sub(floor);
+            let mut candidates = inner
+                .workers
+                .iter()
+                .filter(|(_, worker)| {
+                    !worker.stopping
+                        && worker.active.is_empty()
+                        && worker.idle_since.elapsed() >= self.config.idle_timeout
+                })
+                .map(|(id, worker)| (worker.idle_since, id.clone(), worker.id.clone()))
+                .collect::<Vec<_>>();
+            candidates.sort_by_key(|(idle_since, _, _)| *idle_since);
+            candidates.truncate(stop_limit);
+            let ids = candidates
+                .into_iter()
+                .map(|(_, _, worker_id)| worker_id)
+                .collect::<Vec<_>>();
+            for worker_id in &ids {
+                if let Some(worker) = inner.workers.get_mut(worker_id.as_str()) {
+                    worker.stopping = true;
+                }
+            }
+            ids
+        };
+        if stop_ids.is_empty() {
+            return Ok(());
+        }
+        log::info!(
+            "pool scale: source=idle-timeout reason=scale-down stopping={} want={} live={} \
+             floor={} idle_timeout_s={}",
+            stop_ids.len(),
+            decision.want_workers,
+            live,
+            floor,
+            self.config.idle_timeout.as_secs()
+        );
+        self.stop_selected(&stop_ids).await
+    }
+
     pub fn snapshot(&self) -> PoolSnapshot {
         let inner = self.inner.lock().expect("worker pool lock not poisoned");
         let workers: Vec<WorkerSnapshot> = inner
             .workers
             .values()
+            .filter(|worker| !worker.stopping)
             .map(|worker| WorkerSnapshot {
                 id: worker.id.as_str().to_string(),
                 pid: worker.pid,
@@ -511,6 +838,7 @@ impl WorkerPool {
                 },
             })
             .collect();
+        let decision = scale_decision(&self.config, &inner);
         let busy = workers
             .iter()
             .filter(|worker| worker.active_bundles > 0)
@@ -522,6 +850,12 @@ impl WorkerPool {
             busy,
             idle: workers.len().saturating_sub(busy),
             starting: inner.starting,
+            remaining_bundles: inner.remaining_bundles,
+            want_workers: decision.want_workers,
+            scale_reason: decision.reason.as_str().to_string(),
+            target_seconds_per_worker: decision.target_seconds_per_worker,
+            observed_rate_bundles_per_second: decision.observed_rate_bundles_per_second,
+            estimated_remaining_seconds: decision.estimated_remaining_seconds,
             spawn_count: inner.spawn_count,
             completed_bundles: inner.completed_bundles,
             total_busy_seconds: inner.total_busy_seconds,
@@ -561,6 +895,35 @@ impl WorkerPool {
         first_error.map_or(Ok(()), Err)
     }
 
+    async fn stop_selected(&self, worker_ids: &[WorkerId]) -> Result<()> {
+        let mut first_error = None;
+        for worker_id in worker_ids {
+            match self.backend.stop_worker(worker_id).await {
+                Ok(()) => {
+                    self.inner
+                        .lock()
+                        .expect("worker pool lock not poisoned")
+                        .workers
+                        .remove(worker_id.as_str());
+                }
+                Err(error) => {
+                    if let Some(worker) = self
+                        .inner
+                        .lock()
+                        .expect("worker pool lock not poisoned")
+                        .workers
+                        .get_mut(worker_id.as_str())
+                    {
+                        worker.stopping = false;
+                    }
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        self.notify.notify_waiters();
+        first_error.map_or(Ok(()), Err)
+    }
+
     fn start_exit_monitor(self: &Arc<Self>) {
         let pool = Arc::clone(self);
         let mut exits = self.backend.subscribe_exits();
@@ -573,6 +936,31 @@ impl WorkerPool {
                     .workers
                     .remove(exit.worker_id.as_str());
                 pool.notify.notify_waiters();
+            }
+        });
+    }
+
+    fn start_scale_monitor(self: &Arc<Self>) {
+        let pool = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(SCALE_RECONCILE_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let Some(pool) = pool.upgrade() else {
+                    break;
+                };
+                if pool
+                    .inner
+                    .lock()
+                    .expect("worker pool lock not poisoned")
+                    .shutting_down
+                {
+                    break;
+                }
+                if let Err(error) = pool.reconcile_scale().await {
+                    log::error!("pool scale reconciliation failed: {error}");
+                }
             }
         });
     }
@@ -650,6 +1038,91 @@ mod tests {
         }
     }
 
+    fn scale_inputs(
+        remaining_bundles: usize,
+        completed_bundles: u64,
+        busy_worker_seconds: f64,
+        spawn_cost: Duration,
+    ) -> ScaleDecisionInputs {
+        ScaleDecisionInputs {
+            remaining_bundles,
+            active_bundles: 0,
+            completed_bundles,
+            busy_worker_seconds,
+            spawn_cost,
+            min_workers: 1,
+            max_workers: 4,
+            live_workers: 1,
+            starting_workers: 0,
+        }
+    }
+
+    #[test]
+    fn scale_policy_waits_for_a_rate_sample() {
+        let decision = decide_scale(&scale_inputs(
+            100,
+            0,
+            MIN_SCALE_RATE_SAMPLE.as_secs_f64() - 0.01,
+            Duration::from_millis(500),
+        ));
+        assert_eq!(decision.reason, ScaleReason::NoRateSample);
+        assert_eq!(decision.want_workers, 1);
+        assert_eq!(decision.observed_rate_bundles_per_second, None);
+    }
+
+    #[test]
+    fn scale_policy_uses_active_progress_when_residual_work_is_queued() {
+        let mut inputs = scale_inputs(4, 0, 12.0, Duration::from_secs(2));
+        inputs.active_bundles = 1;
+        let decision = decide_scale(&inputs);
+        assert_eq!(decision.reason, ScaleReason::ScaleUp);
+        assert_eq!(decision.want_workers, 4);
+        assert_eq!(decision.estimated_remaining_seconds, Some(48.0));
+    }
+
+    #[test]
+    fn scale_policy_does_not_add_a_worker_for_one_long_bundle() {
+        let mut inputs = scale_inputs(1, 0, 30.0, Duration::from_secs(2));
+        inputs.active_bundles = 1;
+        let decision = decide_scale(&inputs);
+        assert_eq!(decision.reason, ScaleReason::NoParallelWork);
+        assert_eq!(decision.want_workers, 1);
+    }
+
+    #[test]
+    fn scale_policy_does_not_spawn_for_the_short_csv_job() {
+        let decision = decide_scale(&scale_inputs(2, 1, 1.0, Duration::from_secs(1)));
+        assert_eq!(decision.reason, ScaleReason::Hold);
+        assert_eq!(decision.want_workers, 1);
+        assert_eq!(decision.target_seconds_per_worker, 10.0);
+        assert_eq!(decision.estimated_remaining_seconds, Some(2.0));
+    }
+
+    #[test]
+    fn scale_policy_uses_spawn_cost_and_remaining_work() {
+        let mut inputs = scale_inputs(100, 2, 1.0, Duration::from_secs(2));
+        let decision = decide_scale(&inputs);
+        assert_eq!(decision.reason, ScaleReason::ScaleUp);
+        assert_eq!(decision.want_workers, 4);
+        assert_eq!(decision.target_seconds_per_worker, 10.0);
+        assert_eq!(decision.estimated_remaining_seconds, Some(50.0));
+
+        inputs.spawn_cost = Duration::from_secs(10);
+        inputs.remaining_bundles = 61;
+        let decision = decide_scale(&inputs);
+        assert_eq!(decision.target_seconds_per_worker, 30.0);
+        assert_eq!(decision.want_workers, 2);
+    }
+
+    #[test]
+    fn scale_policy_returns_to_the_minimum_when_work_drains() {
+        let mut inputs = scale_inputs(0, 10, 5.0, Duration::from_secs(1));
+        inputs.live_workers = 4;
+        let decision = decide_scale(&inputs);
+        assert_eq!(decision.reason, ScaleReason::WorkComplete);
+        assert_eq!(decision.want_workers, 1);
+    }
+
     #[tokio::test]
     async fn pool_starts_minimum_and_acquires_additional_workers() {
         let backend = Arc::new(FakeBackend::new());
@@ -659,6 +1132,12 @@ mod tests {
 
         let first = pool.acquire(WorkerKind::Cpu).await.unwrap();
         assert_eq!(first.id().as_str(), "fake-w0");
+        pool.observe_workload(100);
+        {
+            let mut inner = pool.inner.lock().expect("worker pool lock not poisoned");
+            inner.completed_bundles = 2;
+            inner.total_busy_seconds = 1.0;
+        }
         let second = pool.acquire(WorkerKind::Cpu).await.unwrap();
         assert_eq!(second.id().as_str(), "fake-w1");
         assert_eq!(pool.snapshot().live, 2);
@@ -666,6 +1145,57 @@ mod tests {
         drop(first);
         drop(second);
         assert_eq!(pool.snapshot().idle, 2);
+    }
+
+    #[tokio::test]
+    async fn pool_does_not_spawn_another_worker_without_a_rate_sample() {
+        let backend = Arc::new(FakeBackend::new());
+        let pool = WorkerPool::new(config(3, 1, 1), backend);
+        pool.start_min_workers().await.unwrap();
+        pool.observe_workload(100);
+
+        let first = pool.acquire(WorkerKind::Cpu).await.unwrap();
+        let second =
+            tokio::time::timeout(Duration::from_millis(25), pool.acquire(WorkerKind::Cpu)).await;
+        assert!(
+            second.is_err(),
+            "pool scaled before observing a rate sample"
+        );
+        assert_eq!(pool.snapshot().live, 1);
+        assert_eq!(pool.snapshot().scale_reason, "no-rate-sample");
+
+        {
+            let mut inner = pool.inner.lock().expect("worker pool lock not poisoned");
+            inner.completed_bundles = 2;
+            inner.total_busy_seconds = 1.0;
+        }
+        let second = pool.acquire(WorkerKind::Cpu).await.unwrap();
+        assert_eq!(second.id().as_str(), "fake-w1");
+        assert_eq!(pool.snapshot().live, 2);
+        drop(first);
+        drop(second);
+    }
+
+    #[tokio::test]
+    async fn scale_down_stops_only_expired_idle_workers_above_the_floor() {
+        let backend = Arc::new(FakeBackend::new());
+        let pool = WorkerPool::new(config(3, 1, 1), backend);
+        pool.start_min_workers().await.unwrap();
+        pool.ensure_capacity(3).await.unwrap();
+        pool.observe_workload(0);
+        {
+            let mut inner = pool.inner.lock().expect("worker pool lock not poisoned");
+            let expired = Instant::now() - Duration::from_secs(2);
+            for worker in inner.workers.values_mut() {
+                worker.idle_since = expired;
+            }
+        }
+
+        pool.reconcile_scale().await.unwrap();
+
+        assert_eq!(pool.snapshot().live, 1);
+        assert_eq!(pool.snapshot().want_workers, 1);
+        assert_eq!(pool.snapshot().scale_reason, "work-complete");
     }
 
     #[tokio::test]

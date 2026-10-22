@@ -250,7 +250,11 @@ impl ExecutorDispatcher {
                 .watermarks_mut()
                 .set_residual_holds(&residual_holds);
 
-            for (idx, node) in scheduler.next_nodes() {
+            let nodes = scheduler.next_nodes();
+            if let Some(pool) = &self.pool {
+                pool.observe_workload(scheduler.outstanding_bundle_count());
+            }
+            for (idx, node) in nodes {
                 let input_metadata = scheduler.input_edge_metadata(idx);
                 let output_metadata = scheduler.output_edge_metadata(idx);
                 let stage_id = node.id();
