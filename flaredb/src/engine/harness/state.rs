@@ -11,7 +11,7 @@ use beam_model_rs::v1::{
     state_response,
 };
 use bytes::Buf;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use prost::Message;
 use tokio::sync::{
     Mutex,
@@ -19,6 +19,8 @@ use tokio::sync::{
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Response, Status};
+
+use super::HarnessStatus;
 
 use crate::{
     coders::{
@@ -57,7 +59,9 @@ impl StateInner {
     }
 }
 
-pub async fn start_state_server() -> Result<(StateChannel, FlareStateService)> {
+pub async fn start_state_server(
+    status: HarnessStatus,
+) -> Result<(StateChannel, FlareStateService)> {
     let (tx, rx) = mpsc::channel::<Result<StateResponse, Status>>(32);
 
     let stream = Arc::new(StateInner {
@@ -73,6 +77,7 @@ pub async fn start_state_server() -> Result<(StateChannel, FlareStateService)> {
     let channel = StateChannel {
         stream,
         stream_task: Arc::new(std::sync::Mutex::new(None)),
+        status,
     };
 
     Ok((channel, service))
@@ -600,6 +605,7 @@ pub struct StateChannel {
     /// Handle to the background state request driver task.
     /// Aborted on reset to prevent a stale task from consuming a new stream.
     stream_task: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    status: HarnessStatus,
 }
 
 impl StateChannel {
@@ -674,7 +680,14 @@ impl StateChannel {
                     let side_inputs = SideInputResolver::new(store, side_inputs);
                     channel.drive_state_requests(backend, side_inputs).await
                 }
-                Err(e) => error!("failed to construct state backend: {e}"),
+                Err(e) => {
+                    if channel.status.is_intentional_shutdown() {
+                        debug!("state backend construction ended during worker shutdown: {e}");
+                    } else {
+                        error!("failed to construct state backend: {e}");
+                        channel.status.report_failure("BeamFnState backend", &e);
+                    }
+                }
             }
         });
 
@@ -710,7 +723,15 @@ impl StateChannel {
                         Ok(response) => {
                             //info!("state response sent: id={}", response.id);
                             if let Err(e) = self.send_response(response).await {
-                                warn!("failed to send state response (worker gone?): {}", e);
+                                if self.status.is_intentional_shutdown() {
+                                    debug!(
+                                        "state response closed during intentional worker shutdown: {}",
+                                        e
+                                    );
+                                } else {
+                                    warn!("failed to send state response (worker gone?): {}", e);
+                                    self.status.report_failure("BeamFnState", &e);
+                                }
                                 break;
                             }
                         }
@@ -722,14 +743,32 @@ impl StateChannel {
                                 response: None,
                             };
                             if let Err(e) = self.send_response(response).await {
-                                warn!("failed to send state error response (worker gone?): {}", e);
+                                if self.status.is_intentional_shutdown() {
+                                    debug!(
+                                        "state error response closed during intentional worker shutdown: {}",
+                                        e
+                                    );
+                                } else {
+                                    warn!(
+                                        "failed to send state error response (worker gone?): {}",
+                                        e
+                                    );
+                                    self.status.report_failure("BeamFnState", &e);
+                                }
                                 break;
                             }
                         }
                     }
                 }
                 Err(e) => {
-                    info!("state request stream ended: {}", e);
+                    if self.status.is_intentional_shutdown() {
+                        debug!(
+                            "state request stream ended during intentional worker shutdown: {e}"
+                        );
+                    } else {
+                        warn!("BeamFnState stream stopped before the job completed: {e}");
+                        self.status.report_failure("BeamFnState", &e);
+                    }
                     break;
                 }
             }

@@ -20,6 +20,8 @@ use tonic::{Response, Status};
 
 use crate::engine::metrics::JobMetrics;
 
+use super::HarnessStatus;
+
 /// Shared gRPC channel for sending instructions to the worker.
 pub struct ControlInner {
     // Sender — ControlChannel writes InstructionRequests here.
@@ -55,7 +57,9 @@ impl ControlInner {
 
 // entry point
 
-pub async fn start_control_server() -> Result<(ControlChannel, FlareControlService)> {
+pub async fn start_control_server(
+    status: HarnessStatus,
+) -> Result<(ControlChannel, FlareControlService)> {
     let (tx, rx) = mpsc::channel::<Result<InstructionRequest, Status>>(32);
 
     let stream = Arc::new(ControlInner {
@@ -75,6 +79,7 @@ pub async fn start_control_server() -> Result<(ControlChannel, FlareControlServi
         stream,
         next_id: 0,
         response_task: Arc::new(std::sync::Mutex::new(None)),
+        status,
     };
 
     Ok((channel, service))
@@ -209,6 +214,7 @@ pub struct ControlChannel {
     /// during reset so a stale task from the previous job does not race with
     /// the new worker stream.
     response_task: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    status: HarnessStatus,
 }
 
 impl ControlChannel {
@@ -492,6 +498,7 @@ impl ControlChannel {
     pub fn stream_responses(&self) {
         let stream = self.stream.clone();
         let task_slot = self.response_task.clone();
+        let status = self.status.clone();
         info!("Streaming control responses from worker");
 
         let join_handle = tokio::spawn(async move {
@@ -531,17 +538,37 @@ impl ControlChannel {
                         continue;
                     }
                     Ok(None) => {
-                        info!("BeamFnControl stream from worker closed cleanly");
+                        if status.is_intentional_shutdown() {
+                            debug!(
+                                "BeamFnControl stream closed during intentional worker shutdown"
+                            );
+                        } else {
+                            warn!("BeamFnControl stream closed before the job completed");
+                            status.report_failure(
+                                "BeamFnControl",
+                                "worker closed the stream cleanly",
+                            );
+                        }
                         break;
                     }
                     Err(e) => {
-                        warn!("BeamFnControl stream error (worker gone?): {}", e);
+                        if status.is_intentional_shutdown() {
+                            debug!(
+                                "BeamFnControl stream closed during intentional worker shutdown: {}",
+                                e
+                            );
+                        } else {
+                            warn!("BeamFnControl stream error (worker gone?): {}", e);
+                            status.report_failure("BeamFnControl", &e);
+                        }
                         break;
                     }
                 }
             }
 
-            info!("BeamFnControl stream from worker closed");
+            if status.is_intentional_shutdown() {
+                debug!("BeamFnControl stream from worker closed");
+            }
         });
 
         *task_slot.lock().unwrap() = Some(join_handle);
@@ -599,7 +626,7 @@ mod tests {
 
     #[tokio::test]
     async fn process_bundle_metrics_feed_the_active_job_accumulator() {
-        let (channel, _service) = start_control_server().await.unwrap();
+        let (channel, _service) = start_control_server(HarnessStatus::new()).await.unwrap();
         let metrics = Arc::new(JobMetrics::default());
         channel.set_job_metrics(metrics.clone());
 
@@ -612,7 +639,7 @@ mod tests {
 
     #[tokio::test]
     async fn reset_removes_the_active_accumulator() {
-        let (channel, _service) = start_control_server().await.unwrap();
+        let (channel, _service) = start_control_server(HarnessStatus::new()).await.unwrap();
         let metrics = Arc::new(JobMetrics::default());
         channel.set_job_metrics(metrics.clone());
         channel.reset().await;

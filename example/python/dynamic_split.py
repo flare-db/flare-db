@@ -20,7 +20,7 @@ how often the work was split.
 
 Run from the repository root with a FlareDB instance already started:
 
-    python3 example/python/dynamic_split_new.py
+    python3 example/python/dynamic_split.py
 
 See runner-sdk/python/flarerunner for how to install the flaredb dependency,
 and the repository root README.md for how to start FlareDB.

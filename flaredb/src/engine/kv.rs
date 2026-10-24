@@ -44,9 +44,21 @@ impl SlateKvStore {
         std::fs::create_dir_all(dir)?;
         let object_store: Arc<dyn slatedb::object_store::ObjectStore> =
             Arc::new(slatedb::object_store::local::LocalFileSystem::new_with_prefix(dir)?);
-        let db = slatedb::Db::open(name, object_store).await?;
+        let db = slatedb::Db::builder(name, object_store)
+            .with_settings(local_slate_settings())
+            .build()
+            .await?;
         Ok(Self { db })
     }
+}
+
+/// Local filesystem object stores do not implement SlateDB's conditional update
+/// required by the background garbage collector. Disabling GC avoids a warning
+/// on every collection cycle; local state remains compacted and durable.
+fn local_slate_settings() -> slatedb::config::Settings {
+    let mut settings = slatedb::config::Settings::default();
+    settings.garbage_collector_options = None;
+    settings
 }
 
 #[async_trait::async_trait]
@@ -77,5 +89,18 @@ impl KvStore for SlateKvStore {
             out.push((item.key.to_vec(), item.value.to_vec()));
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::local_slate_settings;
+
+    #[test]
+    fn local_slate_settings_disable_garbage_collection() {
+        assert!(
+            local_slate_settings().garbage_collector_options.is_none(),
+            "local filesystem GC requires unsupported conditional updates"
+        );
     }
 }

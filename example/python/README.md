@@ -39,6 +39,7 @@ python3 example/python/fixed_window.py
 python3 example/python/sliding_window.py
 python3 example/python/timers.py
 python3 example/python/dynamic_split.py
+python3 example/python/csv_etl.py
 ```
 
 All examples target the local job service at `127.0.0.1:8099`; override it with

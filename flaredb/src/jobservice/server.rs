@@ -102,6 +102,54 @@ impl FlareJobService {
         }
         self.worker_manager.config().python_bin.clone()
     }
+
+    /// Wait for a connected harness pipeline, failing as soon as one of the Fn
+    /// transport streams reports an unexpected disconnect or decode error.
+    async fn execute_spawned_job(
+        &self,
+        job_id: &str,
+        job_graph: Arc<ExecutableGraph>,
+    ) -> anyhow::Result<()> {
+        self.dispatcher
+            .lock()
+            .await
+            .set_job_store(job_id)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to set job store: {e}"))?;
+
+        let connect_timeout_secs = self.worker_manager.config().connect_timeout_secs;
+        timeout(Duration::from_secs(connect_timeout_secs), async {
+            let dispatcher = self.dispatcher.lock().await;
+            dispatcher.wait_connected().await
+        })
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "harness did not connect within {}s for job {}",
+                connect_timeout_secs,
+                job_id
+            )
+        })?
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "failed waiting for harness connection for job {}: {}",
+                job_id,
+                e
+            )
+        })?;
+
+        let mut dispatcher = self.dispatcher.lock().await;
+        dispatcher
+            .prepare_pipeline(job_graph.as_ref())
+            .map_err(|e| anyhow::anyhow!("failed to prepare pipeline for job {}: {}", job_id, e))?;
+
+        let status = dispatcher.harness_status();
+        let mut scheduler = NodeScheduler::new((*job_graph).clone());
+        tokio::select! {
+            result = dispatcher.run_pipeline(&mut scheduler) => result,
+            failure = status.wait_for_failure() => Err(anyhow::anyhow!(failure)),
+        }
+    }
 }
 
 impl JobService for FlareJobService {
@@ -266,57 +314,39 @@ impl JobService for FlareJobService {
                 .spawn_worker(&preparation_id, &runtime, staging_dir, &self.instance_id)
                 .await?;
 
+            let run_result = self.execute_spawned_job(&preparation_id, job_graph).await;
+
+            // Any stream closures caused by this cleanup are expected. Mark the
+            // shutdown before killing the process so their BrokenPipe/h2 errors
+            // stay at DEBUG and cannot be mistaken for another worker death.
             self.dispatcher
                 .lock()
                 .await
-                .set_job_store(&preparation_id)
-                .await
-                .map_err(|e| {
-                    Status::internal(truncate_grpc_error(format!(
-                        "failed to set job store: {}",
-                        e
-                    )))
-                })?;
+                .harness_status()
+                .begin_intentional_shutdown();
+            let stop_result = self.worker_manager.stop_worker(&preparation_id).await;
 
-            let connect_timeout_secs = self.worker_manager.config().connect_timeout_secs;
-            timeout(Duration::from_secs(connect_timeout_secs), async {
-                let dispatcher = self.dispatcher.lock().await;
-                dispatcher.wait_connected().await
-            })
-            .await
-            .map_err(|_| {
-                Status::internal(format!(
-                    "harness did not connect within {}s for job {}",
-                    connect_timeout_secs, preparation_id
-                ))
-            })?
-            .map_err(|e| {
-                Status::internal(truncate_grpc_error(format!(
-                    "failed waiting for harness connection for job {}: {}",
-                    preparation_id, e
-                )))
-            })?;
-
-            let mut dispatcher = self.dispatcher.lock().await;
-            dispatcher
-                .prepare_pipeline(job_graph.as_ref())
-                .map_err(|e| {
-                    Status::internal(truncate_grpc_error(format!(
-                        "failed to prepare pipeline for job {}: {}",
-                        preparation_id, e
-                    )))
-                })?;
-
-            let mut scheduler = NodeScheduler::new((*job_graph).clone());
-            dispatcher.run_pipeline(&mut scheduler).await.map_err(|e| {
-                Status::internal(truncate_grpc_error(format!(
-                    "failed to execute pipeline for job {}: {}",
-                    preparation_id, e
-                )))
-            })?;
-
-            // stop worker, next job will get a fresh one.
-            self.worker_manager.stop_worker(&preparation_id).await?;
+            if let Err(error) = run_result {
+                let message = match stop_result {
+                    Ok(()) => format!("job {} failed: {error}; worker terminated", preparation_id),
+                    Err(stop_error) => format!(
+                        "job {} failed: {error}; worker cleanup also failed: {stop_error}",
+                        preparation_id
+                    ),
+                };
+                self.set_job_state(&preparation_id, JobStateEnum::Failed);
+                log::error!("{}", message);
+                return Err(Status::internal(truncate_grpc_error(message)));
+            }
+            if let Err(error) = stop_result {
+                let message = format!(
+                    "job {} completed but worker cleanup failed: {}",
+                    preparation_id, error
+                );
+                self.set_job_state(&preparation_id, JobStateEnum::Failed);
+                log::error!("{}", message);
+                return Err(Status::internal(truncate_grpc_error(message)));
+            }
 
             self.set_job_state(&preparation_id, JobStateEnum::Done);
             log::info!("job execution completed: preparation_id={}", preparation_id);
@@ -431,7 +461,13 @@ impl JobService for FlareJobService {
         Box::pin(async move {
             let job_id = request.into_inner().job_id;
             log::info!("cancel request received for job_id={}", job_id);
+            self.dispatcher
+                .lock()
+                .await
+                .harness_status()
+                .begin_intentional_shutdown();
             self.worker_manager.stop_worker(&job_id).await?;
+            self.set_job_state(&job_id, JobStateEnum::Cancelled);
             Ok(Response::new(CancelJobResponse {
                 state: beam_model_rs::v1::job_state::Enum::Cancelled as i32,
             }))

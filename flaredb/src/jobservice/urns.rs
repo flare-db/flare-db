@@ -144,6 +144,8 @@ pub mod beam_urns {
         "beam:transform:sdf_process_sized_element_and_restrictions:v1";
     pub const DATA_CHANNEL_READ_INDEX_METRIC: &str = "beam:metric:data_channel:read_index:v1";
     pub const ELEMENT_COUNT_METRIC: &str = "beam:metric:element_count:v1";
+    pub const WORK_COMPLETED_METRIC: &str = "beam:metric:ptransform_progress:completed:v1";
+    pub const WORK_REMAINING_METRIC: &str = "beam:metric:ptransform_progress:remaining:v1";
 
     //Deprecated
     pub const SPLITTABLE_PROCESS_KEYED_URN: &str = "beam:transform:sdf_process_keyed_elements:v1";

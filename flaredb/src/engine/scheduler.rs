@@ -1,16 +1,49 @@
+//! Decides which stage runs a bundle next.
+//!
+//! The runner repeats one loop: propagate watermarks, ask which stages are
+//! ready, start their bundles, wait for one to finish, and repeat.
+//!
+//! A stage is **ready** when:
+//! 1. every main input and side input has been produced at least once,
+//! 2. it is below its concurrency ceiling, and
+//! 3. it has work: a first run, unconsumed upstream input, a fired timer, a
+//!    watermark advance past its last run (aggregations), or declared work
+//!    items (SDF residuals).
+//!
+//! ## Bundles per wave
+//! One bundle processes all newly-available input. Extra bundles come only from
+//! declared work items, so `next_nodes` stops once `queued_bundles` reaches zero.
+//! A stage that has never completed always runs exactly one bundle, which keeps
+//! initialization single-threaded.
+//!
+//! ## Splittable DoFns
+//! An SDF stage may run several residual bundles at once (up to
+//! `splittable_max_in_flight`, overridable with `FLAREDB_SDF_MAX_IN_FLIGHT`).
+//! Residuals are independent work items; their holds clamp the stage's output
+//! watermark until each bundle completes.
+//!
+//! ## Completion
+//! [`NodeScheduler::mark_complete_with_min`] records the bundle's minimum event
+//! time, wakes downstream consumers, and refreshes watermarks. Watermarks never
+//! regress; holds only delay their advance.
+//!
+//! Scheduling is single-threaded: bundles run as separate futures, but all
+//! scheduling state lives here and is updated one completion at a time.
+
 use std::collections::{BTreeMap, HashMap};
 
 use petgraph::Direction;
 use petgraph::graph::NodeIndex;
 use petgraph::visit::EdgeRef;
 
-use log::{debug, info};
+use log::{debug, info, warn};
 
 use crate::engine::timer::{TimeDomain, TimerEntry};
 use crate::engine::watermark::{
-    MAX_TIMESTAMP, MIN_TIMESTAMP, StageKind, Timestamp, WatermarkManager, format_timestamp,
+    MIN_TIMESTAMP, StageKind, Timestamp, WatermarkManager, format_timestamp,
 };
 use crate::fusion::pipeline::{ConsumerMetaData, ExecutableGraph, ExecutableNode};
+use crate::fusion::stage::SplittableProcessKind;
 
 /// Scheduler that manages execution state for an `ExecutableGraph`.
 ///
@@ -30,9 +63,36 @@ pub struct NodeScheduler {
     transform_to_stage: HashMap<String, String>,
 }
 
+/// Maximum number of concurrent bundles for one splittable stage.
+///
+/// Splittable DoFns publish independent residual work items and the SDK harness
+/// runs `ProcessBundle` instructions on a worker thread pool, so a bounded number
+/// of them may be in flight at once. The default follows the machine's available
+/// parallelism (capped at four so one job does not monopolise a large host), and
+/// `FLAREDB_SDF_MAX_IN_FLIGHT` overrides it.
+fn splittable_max_in_flight() -> usize {
+    splittable_max_in_flight_from(std::env::var("FLAREDB_SDF_MAX_IN_FLIGHT").ok().as_deref())
+}
+
+fn splittable_max_in_flight_from(configured: Option<&str>) -> usize {
+    if let Some(value) = configured {
+        match value.trim().parse::<usize>() {
+            Ok(parsed) => return parsed.max(1),
+            Err(_) => warn!(
+                "ignoring invalid FLAREDB_SDF_MAX_IN_FLIGHT={value:?};
+                 using the CPU-derived default"
+            ),
+        }
+    }
+    std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(1)
+        .clamp(1, 4)
+}
+
 impl NodeScheduler {
     pub fn new(graph: ExecutableGraph) -> Self {
-        let watermarks = WatermarkManager::from_executable_graph(&graph);
+        let mut watermarks = WatermarkManager::from_executable_graph(&graph);
         let mut index_of = HashMap::new();
         let mut transform_to_stage = HashMap::new();
         for index in graph.get_executable_graph().node_indices() {
@@ -43,6 +103,32 @@ impl NodeScheduler {
                     transform_to_stage.insert(transform.id().clone(), stage.id());
                 }
             }
+        }
+
+        // A splittable stage may run several residual bundles at once: the stage
+        // publishes independent work items and a bounded number of executor
+        // slots pull from that queue. Only element-based residuals are
+        // independent (the runner does not support keyed SDFs), so other process
+        // kinds stay at one bundle.
+        let splittable_concurrency = splittable_max_in_flight();
+        let mut splittable_stages = 0usize;
+        for index in graph.get_executable_graph().node_indices() {
+            let node = &graph.get_executable_graph()[index];
+            if let ExecutableNode::Splittable(stage) = node
+                && stage.plan().process_kind
+                    == SplittableProcessKind::ProcessSizedElementsAndRestrictions
+            {
+                watermarks
+                    .set_max_in_flight(stage.id(), splittable_concurrency)
+                    .ok();
+                splittable_stages += 1;
+            }
+        }
+        if splittable_stages > 0 {
+            info!(
+                "scheduler: {splittable_stages} splittable stage(s), up to \
+                 {splittable_concurrency} concurrent bundle(s) each"
+            );
         }
 
         // One-line plan summary so a job's scheduling shape is visible up front.
@@ -121,10 +207,19 @@ impl NodeScheduler {
             };
             let node = self.graph.get_executable_graph()[index].clone();
             // Start one bundle, and keep going while the stage still has declared
-            // work (e.g. SDF residuals) and is under its concurrency ceiling. For
+            // work items (SDF residuals) and is under its concurrency ceiling. For
             // the common `max_in_flight == 1` case this starts exactly one bundle.
+            //
+            // The first start may be justified by newly-available input rather
+            // than by a work item (the first run, pending input, a timer, or a
+            // watermark advance). Once the declared work items are exhausted, stop:
+            // otherwise a re-polled stage with `pending` still set would start
+            // duplicate wave bundles.
             while self.watermarks.start_bundle(&stage).is_ok() {
                 next.push((index, node.clone()));
+                if self.watermarks.queued_bundles(&stage) == 0 {
+                    break;
+                }
             }
         }
 
@@ -147,18 +242,26 @@ impl NodeScheduler {
     /// pending input until that input is consumed.
     pub fn mark_complete_with_min(&mut self, idx: NodeIndex, output_min_ts: Option<Timestamp>) {
         let stage = self.graph.get_executable_graph()[idx].id();
-        if self.watermarks.is_source(&stage) && self.watermarks.source_auto_finishes(&stage) {
+        let source_finished =
+            self.watermarks.is_source(&stage) && self.watermarks.source_auto_finishes(&stage);
+        if source_finished {
             let _ = self.watermarks.report_source_finished(&stage);
-            info!(
-                "scheduler: source '{stage}' finished; output watermark = {}",
-                format_timestamp(MAX_TIMESTAMP)
-            );
         }
         let newly_ready = self
             .watermarks
             .complete_bundle_with_min(&stage, output_min_ts)
             .unwrap_or_default();
         let advanced = self.watermarks.refresh();
+        if source_finished {
+            info!(
+                "scheduler: source '{stage}' reported finished; effective output watermark = {}",
+                format_timestamp(
+                    self.watermarks
+                        .output_watermark(&stage)
+                        .unwrap_or(MIN_TIMESTAMP)
+                )
+            );
+        }
         debug!(
             "scheduler: stage '{stage}' completed; newly ready [{}]; advanced [{}]",
             newly_ready.join(", "),
@@ -224,7 +327,9 @@ impl NodeScheduler {
         // dependency-ready ordinary stage must be first-run ready.
         for index in &new {
             let stage = graph[*index].id();
-            if !self.watermarks.is_stage_completed(&stage) {
+            if !self.watermarks.is_stage_completed(&stage)
+                && !self.watermarks.is_stage_in_flight(&stage)
+            {
                 assert!(
                     legacy.contains(index),
                     "first-run stage '{stage}' is not dependency-ready"
@@ -390,8 +495,9 @@ mod tests {
 
     use petgraph::Graph;
 
-    use crate::engine::scheduler::NodeScheduler;
+    use crate::engine::scheduler::{NodeScheduler, splittable_max_in_flight_from};
     use crate::engine::timer::{TimeDomain, TimerEntry, TimerKey};
+    use crate::engine::watermark::MIN_TIMESTAMP;
     use crate::fusion::pipeline::{ConsumerMetaData, ExecutableGraph, ExecutableNode};
     use crate::jobservice::urns::beam_urns;
     use crate::transforms::{from_urn, from_urn_with_payload};
@@ -1061,5 +1167,129 @@ mod tests {
         }
         assert_eq!(scheduler.watermarks().in_flight_bundles(&stateful_id), 0);
         assert!(scheduler.is_complete());
+    }
+
+    /// A stage whose first bundle is still in flight must not be duplicated just
+    /// because it has a concurrency ceiling above one. Additional concurrent
+    /// bundles are only valid for declared work items (SDF residuals).
+    #[test]
+    fn next_nodes_does_not_duplicate_a_first_run_bundle() {
+        let (mut scheduler, _source, stateful, _source_id, stateful_id) = source_and_stateful();
+
+        // Raise the ceiling before the stateful stage has ever run.
+        scheduler
+            .watermarks_mut()
+            .set_max_in_flight(&stateful_id, 3)
+            .unwrap();
+
+        let first = scheduler.next_nodes();
+        assert_eq!(first.len(), 1, "only the source is ready");
+        scheduler.mark_complete(first[0].0);
+
+        let batch = scheduler.next_nodes();
+        assert_eq!(batch.len(), 1, "the first run is exactly one bundle");
+        assert_eq!(batch[0].0, stateful);
+
+        // Re-polling while that bundle is in flight must start nothing.
+        assert!(
+            scheduler.next_nodes().is_empty(),
+            "no duplicate first-run bundles"
+        );
+    }
+
+    #[test]
+    fn residuals_start_while_the_parent_bundle_is_still_in_flight() {
+        let (mut scheduler, _source, stateful, _source_id, stateful_id) = source_and_stateful();
+
+        let first = scheduler.next_nodes();
+        scheduler.mark_complete(first[0].0);
+        scheduler
+            .watermarks_mut()
+            .set_max_in_flight(&stateful_id, 4)
+            .unwrap();
+
+        let parent = scheduler.next_nodes();
+        assert_eq!(parent.len(), 1, "one initialization/parent bundle");
+        assert_eq!(scheduler.watermarks().in_flight_bundles(&stateful_id), 1);
+
+        // A split can enqueue residuals before the parent returns. They must be
+        // schedulable immediately, up to the stage ceiling.
+        scheduler
+            .watermarks_mut()
+            .enqueue_bundles(&stateful_id, 3)
+            .unwrap();
+        let residuals = scheduler.next_nodes();
+        assert_eq!(residuals.len(), 3);
+        assert!(residuals.iter().all(|(idx, _)| *idx == stateful));
+        assert_eq!(scheduler.watermarks().in_flight_bundles(&stateful_id), 4);
+    }
+
+    #[test]
+    fn gbk_waits_for_queued_residuals_before_its_first_run() {
+        let mut graph = Graph::<ExecutableNode, ConsumerMetaData>::new();
+        let source = graph.add_node(runner_node("source"));
+        let producer = graph.add_node(worker_stage_node("producer"));
+        let aggregate = graph.add_node(gbk_node("aggregate"));
+        graph.add_edge(source, producer, dummy_metadata("sp"));
+        graph.add_edge(producer, aggregate, dummy_metadata("pa"));
+
+        let executable_graph = graph_for_test(graph, dummy_metadata("root"));
+        let producer_id = executable_graph.get_executable_graph()[producer].id();
+        let mut scheduler = NodeScheduler::new(executable_graph);
+
+        let source_bundle = scheduler.next_nodes();
+        assert_eq!(source_bundle.len(), 1);
+        scheduler.mark_complete(source_bundle[0].0);
+
+        let producer_bundle = scheduler.next_nodes();
+        assert_eq!(producer_bundle.len(), 1);
+        assert_eq!(producer_bundle[0].0, producer);
+
+        // A split has produced one residual, and more output is available from
+        // the parent. GBK must not consume that partial PCollection.
+        scheduler
+            .watermarks_mut()
+            .enqueue_bundles(&producer_id, 1)
+            .unwrap();
+        scheduler
+            .watermarks_mut()
+            .set_residual_holds(&HashMap::from([(producer_id.clone(), vec![MIN_TIMESTAMP])]));
+        scheduler.mark_complete(producer_bundle[0].0);
+
+        let residual_bundle = scheduler.next_nodes();
+        assert!(
+            !residual_bundle.iter().any(|(idx, _)| *idx == aggregate),
+            "GBK must wait while the upstream residual is queued"
+        );
+        assert_eq!(residual_bundle.len(), 1);
+        assert_eq!(residual_bundle[0].0, producer);
+        scheduler.mark_complete(residual_bundle[0].0);
+        scheduler
+            .watermarks_mut()
+            .set_residual_holds(&HashMap::new());
+        scheduler.watermarks_mut().refresh();
+
+        let aggregate_bundles = scheduler.next_nodes();
+        assert_eq!(
+            aggregate_bundles
+                .iter()
+                .filter(|(idx, _)| *idx == aggregate)
+                .count(),
+            1,
+            "GBK runs exactly once after the producer drains"
+        );
+    }
+
+    #[test]
+    fn splittable_concurrency_honours_the_environment_override() {
+        assert_eq!(splittable_max_in_flight_from(Some("3")), 3);
+        assert_eq!(splittable_max_in_flight_from(Some(" 2 ")), 2);
+        // A ceiling below one is clamped so a stage can always run.
+        assert_eq!(splittable_max_in_flight_from(Some("0")), 1);
+
+        let default = splittable_max_in_flight_from(None);
+        assert!((1..=4).contains(&default), "default is {default}");
+        // An unparsable value falls back to the same CPU-derived default.
+        assert_eq!(splittable_max_in_flight_from(Some("nope")), default);
     }
 }

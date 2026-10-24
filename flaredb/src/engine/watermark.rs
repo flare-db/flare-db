@@ -286,11 +286,19 @@ impl StageState {
 
     /// Whether this stage may run a bundle now, given its current input
     /// watermark.
-    fn is_ready(&self) -> bool {
+    fn is_ready_without_upstream_barrier(&self) -> bool {
         if self.in_flight >= self.max_in_flight
             || !self.unproduced.is_empty()
             || !self.unproduced_side_inputs.is_empty()
         {
+            return false;
+        }
+        // A stage's first run is a single bundle. Additional concurrent bundles
+        // are only valid for declared work items (SDF residuals), so with a
+        // concurrency ceiling above one the scheduler must not start a second
+        // copy of the first run when it is polled again before that bundle
+        // completes.
+        if !self.completed && self.in_flight > 0 && self.queued == 0 {
             return false;
         }
         // A stage that has never run starts once its inputs are produced; a
@@ -299,12 +307,13 @@ impl StageState {
         // unconsumed upstream output (push-wake), or — for a watermark-gated
         // stage — when its input watermark has advanced past the watermark at its
         // last run.
+        let effective_input = self.input.min(self.pending_min);
         let has_work = if self.completed {
             self.rerun_pending
                 || self.queued > 0
                 || !self.pending.is_empty()
                 || (self.kind == StageKind::WatermarkGated
-                    && self.input > self.watermark_at_last_run)
+                    && effective_input > self.watermark_at_last_run)
         } else {
             true
         };
@@ -618,6 +627,61 @@ impl WatermarkManager {
         self.stages.get(stage).map(|stage| stage.input)
     }
 
+    /// The effective input watermark captured when the stage's current (or most
+    /// recent) wave of bundles started.
+    ///
+    /// This is the watermark a bundle should use to decide which windows are
+    /// ready: it is clamped by the oldest unconsumed input, so the bundle cannot
+    /// fire past data it has not processed yet.
+    pub fn bundle_input_watermark(&self, stage: &str) -> Option<Timestamp> {
+        self.stages
+            .get(stage)
+            .map(|stage| stage.watermark_at_last_run)
+    }
+
+    /// Validate the invariant that a bundle's input watermark does not exceed an
+    /// outstanding watermark hold on any of its upstream producers.
+    pub fn validate_bundle_input_watermark(
+        &self,
+        stage_id: &str,
+        watermark: Timestamp,
+    ) -> Result<()> {
+        let stage = self
+            .stages
+            .get(stage_id)
+            .ok_or_else(|| anyhow!("unknown stage '{stage_id}'"))?;
+        for input in stage.main_inputs.iter().chain(stage.side_inputs.iter()) {
+            let Some(producer_id) = self.producers.get(input) else {
+                continue;
+            };
+            let Some(producer) = self.stages.get(producer_id) else {
+                continue;
+            };
+            let outstanding_bundle = (!producer.completed
+                && (producer.in_flight > 0 || producer.queued > 0))
+                .then_some(producer.watermark_at_last_run);
+            let hold = match (outstanding_bundle, producer.min_hold()) {
+                (Some(bundle), Some(explicit)) => Some(bundle.min(explicit)),
+                (Some(bundle), None) => Some(bundle),
+                (None, Some(explicit)) => Some(explicit),
+                (None, None) => None,
+            };
+            if let Some(hold) = hold
+                && watermark > hold
+            {
+                bail!(
+                    "watermark invariant violated: stage '{}' was handed input watermark {} \
+                     while upstream '{}' still holds {}",
+                    stage_id,
+                    format_timestamp(watermark),
+                    producer_id,
+                    format_timestamp(hold)
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// The stage's input watermark clamped by the minimum event-time of its
     /// pending (unconsumed) input, or `None` if the stage is unknown.
     ///
@@ -741,7 +805,7 @@ impl WatermarkManager {
         let mut ready: Vec<StageId> = self
             .stages
             .iter()
-            .filter(|(_, stage)| stage.is_ready())
+            .filter(|(id, _)| self.stage_is_ready(id))
             .map(|(id, _)| id.clone())
             .collect();
         ready.sort();
@@ -763,6 +827,14 @@ impl WatermarkManager {
         if stage_state.in_flight >= stage_state.max_in_flight {
             bail!("stage '{stage}' already has its maximum number of bundles in flight");
         }
+        // The first run is one bundle; further bundles must come from declared
+        // work items (e.g. SDF residuals). Without this, a stage with a
+        // concurrency ceiling above one could start duplicate first-run bundles.
+        if !stage_state.completed && stage_state.in_flight > 0 && stage_state.queued == 0 {
+            bail!(
+                "stage '{stage}' already has its first bundle in flight and no queued work items"
+            );
+        }
         let watermark_rerun = stage_state.kind == StageKind::WatermarkGated
             && stage_state.input > stage_state.watermark_at_last_run;
         if stage_state.completed
@@ -783,11 +855,14 @@ impl WatermarkManager {
         // Anything a producer appends while a bundle is in flight re-populates
         // `pending` and re-arms the stage for another run.
         if stage_state.in_flight == 1 {
+            // Capture the effective input watermark (clamped by unconsumed input)
+            // before the pending input is consumed. A bundle must not fire windows
+            // past the oldest input it is about to process, and this is the value
+            // that re-arms a watermark-gated stage when the clamp is released.
+            let effective_input = stage_state.input.min(stage_state.pending_min);
             stage_state.pending.clear();
             stage_state.pending_min = MAX_TIMESTAMP;
-            // Remember the watermark this wave ran at, so a later advance re-arms
-            // a watermark-gated stage.
-            stage_state.watermark_at_last_run = stage_state.input;
+            stage_state.watermark_at_last_run = effective_input;
         }
         Ok(())
     }
@@ -849,9 +924,9 @@ impl WatermarkManager {
                             consumer_state.pending_min =
                                 consumer_state.pending_min.min(output_min_ts);
                         }
-                        if consumer_state.is_ready() {
-                            newly_ready.push(consumer);
-                        }
+                    }
+                    if self.stage_is_ready(&consumer) {
+                        newly_ready.push(consumer);
                     }
                 }
             }
@@ -859,9 +934,9 @@ impl WatermarkManager {
                 for consumer in consumers {
                     if let Some(consumer_state) = self.stages.get_mut(&consumer) {
                         consumer_state.unproduced_side_inputs.remove(&pcollection);
-                        if consumer_state.is_ready() {
-                            newly_ready.push(consumer);
-                        }
+                    }
+                    if self.stage_is_ready(&consumer) {
+                        newly_ready.push(consumer);
                     }
                 }
             }
@@ -935,6 +1010,35 @@ impl WatermarkManager {
         advanced
     }
 
+    fn stage_is_ready(&self, stage_id: &str) -> bool {
+        let Some(stage) = self.stages.get(stage_id) else {
+            return false;
+        };
+        if !stage.is_ready_without_upstream_barrier() {
+            return false;
+        }
+        if stage.kind != StageKind::WatermarkGated {
+            return true;
+        }
+
+        // A bounded aggregate must see the complete upstream PCollection, not
+        // whichever bundle happened to commit first. Queued/in-flight bundles and
+        // watermark holds are outstanding work even after a PCollection has its
+        // first committed output.
+        stage
+            .main_inputs
+            .iter()
+            .chain(stage.side_inputs.iter())
+            .filter_map(|input| self.producers.get(input))
+            .filter_map(|producer| self.stages.get(producer))
+            .all(|producer| {
+                producer.completed
+                    && producer.in_flight == 0
+                    && producer.queued == 0
+                    && producer.min_hold().is_none()
+            })
+    }
+
     /// `MIN` over the upstream output watermarks of the stage's main and side
     /// inputs; [`MAX_TIMESTAMP`] for a source.
     fn compute_input(&self, stage: &StageState) -> Timestamp {
@@ -959,14 +1063,24 @@ impl WatermarkManager {
     /// processed. Without it, a deferred-work hold (e.g. an SDF residual bound below
     /// the input watermark) could never clamp a watermark that had already advanced.
     fn compute_output(&self, stage: &StageState) -> Timestamp {
-        if let Some(source) = &stage.source {
-            return source.output();
+        let mut watermark = if let Some(source) = &stage.source {
+            source.output()
+        } else {
+            let mut watermark = MAX_TIMESTAMP;
+            for input in &stage.main_inputs {
+                watermark = watermark.min(self.upstream(input));
+            }
+            watermark.min(stage.pending_min)
+        };
+
+        // An in-flight or queued bundle is itself an implicit hold: it has not
+        // yet committed all output up to the stage's current input watermark.
+        // Without this, a stage fed by a finished bounded source can publish
+        // `+inf` while its first bundle is still running, and a later SDF hold
+        // cannot regress that monotonic watermark.
+        if !stage.completed && (stage.in_flight > 0 || stage.queued > 0) {
+            watermark = watermark.min(stage.watermark_at_last_run);
         }
-        let mut watermark = MAX_TIMESTAMP;
-        for input in &stage.main_inputs {
-            watermark = watermark.min(self.upstream(input));
-        }
-        watermark = watermark.min(stage.pending_min);
         if let Some(watermark_hold) = stage.min_hold() {
             watermark = watermark.min(watermark_hold);
         }
@@ -1311,6 +1425,98 @@ mod tests {
         manager.refresh();
         assert_eq!(manager.output_watermark("B"), Some(100));
         assert_eq!(manager.input_watermark("C"), Some(100));
+    }
+
+    #[test]
+    fn gated_consumer_waits_for_queued_residual_output() {
+        let mut manager = manager(&[
+            ("A", &[], &[], &["p"]),
+            ("B", &["p"], &[], &["q"]),
+            ("C", &["q"], &[], &["r"]),
+        ]);
+        manager
+            .set_stage_kind("C", StageKind::WatermarkGated)
+            .unwrap();
+        manager
+            .set_required_watermark("C", global_window_completion_watermark(0))
+            .unwrap();
+
+        // The bounded source emits its seed at MIN and then finishes.
+        let source_bundle = manager
+            .ready_stages()
+            .into_iter()
+            .find(|stage| stage == "A")
+            .expect("source is ready");
+        manager.start_bundle(&source_bundle).unwrap();
+        manager
+            .complete_bundle_with_min(&source_bundle, Some(MIN_TIMESTAMP))
+            .unwrap();
+        manager.report_source_finished(&source_bundle).unwrap();
+        manager.refresh();
+
+        // B consumes the seed and produces output that becomes available before
+        // its residual has completed.
+        let first_output_bundle = manager
+            .ready_stages()
+            .into_iter()
+            .find(|stage| stage == "B")
+            .expect("producer is ready");
+        manager.start_bundle(&first_output_bundle).unwrap();
+        manager.refresh();
+
+        assert_eq!(
+            manager.output_watermark("B"),
+            Some(MIN_TIMESTAMP),
+            "an in-flight producer cannot publish a completed output watermark"
+        );
+        manager.enqueue_bundles("B", 1).unwrap();
+        manager.set_residual_holds(&HashMap::from([("B".to_string(), vec![MIN_TIMESTAMP])]));
+        manager
+            .complete_bundle_with_min(&first_output_bundle, Some(1))
+            .unwrap();
+        manager.refresh();
+        assert!(
+            !manager.ready_stages().contains(&"C".to_string()),
+            "the gated consumer must wait while a residual is queued"
+        );
+
+        // The residual runs and drains. Only now may C observe MAX and run once.
+        let residual_bundle = manager
+            .ready_stages()
+            .into_iter()
+            .find(|stage| stage == "B")
+            .expect("queued residual is runnable");
+        manager.start_bundle(&residual_bundle).unwrap();
+        manager
+            .complete_bundle_with_min(&residual_bundle, Some(1))
+            .unwrap();
+        manager.set_residual_holds(&HashMap::new());
+        manager.refresh();
+
+        assert_eq!(manager.output_watermark("B"), Some(MAX_TIMESTAMP));
+        assert_eq!(manager.input_watermark("C"), Some(MAX_TIMESTAMP));
+        assert!(
+            manager.ready_stages().contains(&"C".to_string()),
+            "the gated consumer becomes ready after the upstream drains"
+        );
+    }
+
+    #[test]
+    fn bundle_watermark_above_an_upstream_hold_is_rejected() {
+        let mut manager = manager(&[("A", &[], &[], &["p"]), ("B", &["p"], &[], &["q"])]);
+        let source_bundle = manager
+            .ready_stages()
+            .into_iter()
+            .find(|stage| stage == "A")
+            .expect("source is ready");
+        manager.start_bundle(&source_bundle).unwrap();
+        manager.add_hold("A", MIN_TIMESTAMP).unwrap();
+
+        let error = manager
+            .validate_bundle_input_watermark("B", MAX_TIMESTAMP)
+            .expect_err("watermark above an outstanding upstream hold must fail");
+        assert!(error.to_string().contains("watermark invariant violated"));
+        assert!(error.to_string().contains("upstream 'A'"));
     }
 
     #[test]
@@ -1715,7 +1921,7 @@ mod tests {
 
     /// A multi-bundle producer (as an SDF stage is) clamps its gated consumer at
     /// the earliest outstanding deferred-work hold, and the consumer only becomes
-    /// ready once the last overlapping hold releases.
+    /// ready once every outstanding bundle and hold has drained.
     #[test]
     fn concurrent_producer_bundles_hold_a_gated_consumer_until_all_release() {
         let mut manager = manager(&[
@@ -1758,20 +1964,22 @@ mod tests {
         assert_eq!(manager.output_watermark("P"), Some(50));
         assert!(!manager.ready_stages().contains(&"C".to_string()));
 
-        // The bundle holding 50 completes and its hold releases; the remaining
-        // bound 200 clears the gate, so C becomes ready.
+        // The bundle holding 50 completes and its hold releases. The remaining
+        // in-flight bundle raises P's output to 200, but the bounded aggregate
+        // still waits for that bundle to finish.
         manager.complete_bundle("P").unwrap();
         manager.set_residual_holds(&HashMap::from([("P".to_string(), vec![200])]));
         manager.refresh();
         assert_eq!(manager.output_watermark("P"), Some(200));
-        assert!(manager.ready_stages().contains(&"C".to_string()));
+        assert!(!manager.ready_stages().contains(&"C".to_string()));
 
-        // The last bundle completes and releases; P reaches +inf.
+        // The last bundle completes and releases; P reaches +inf and C runs once.
         manager.complete_bundle("P").unwrap();
         manager.set_residual_holds(&HashMap::new());
         manager.refresh();
         assert_eq!(manager.in_flight_bundles("P"), 0);
         assert_eq!(manager.output_watermark("P"), Some(MAX_TIMESTAMP));
+        assert!(manager.ready_stages().contains(&"C".to_string()));
     }
 
     #[test]

@@ -35,6 +35,7 @@ import org.slf4j.LoggerFactory;
  */
 public class FlareRunner extends PipelineRunner<FlarePipelineJob> {
   private static final Logger LOG = LoggerFactory.getLogger(FlareRunner.class);
+  private static final int GRPC_MAX_MESSAGE_SIZE_BYTES = 64 * 1024 * 1024;
 
   private final FlarePipelineOptions options;
 
@@ -110,7 +111,10 @@ public class FlareRunner extends PipelineRunner<FlarePipelineJob> {
     ManagedChannel jobServiceChannel =
         channelFactory.forDescriptor(ApiServiceDescriptor.newBuilder().setUrl(endpoint).build());
 
-    JobServiceBlockingStub jobService = JobServiceGrpc.newBlockingStub(jobServiceChannel);
+    JobServiceBlockingStub jobService =
+        JobServiceGrpc.newBlockingStub(jobServiceChannel)
+            .withMaxInboundMessageSize(GRPC_MAX_MESSAGE_SIZE_BYTES)
+            .withMaxOutboundMessageSize(GRPC_MAX_MESSAGE_SIZE_BYTES);
 
     try (CloseableResource<JobServiceBlockingStub> wrappedJobService =
         CloseableResource.of(jobService, unused -> jobServiceChannel.shutdown())) {
@@ -133,7 +137,9 @@ public class FlareRunner extends PipelineRunner<FlarePipelineJob> {
 
         ArtifactStagingService.offer(
             new ArtifactRetrievalService(new FlareArtifactResolver(options)),
-            ArtifactStagingServiceGrpc.newStub(artifactChannel.get()),
+            ArtifactStagingServiceGrpc.newStub(artifactChannel.get())
+                .withMaxInboundMessageSize(GRPC_MAX_MESSAGE_SIZE_BYTES)
+                .withMaxOutboundMessageSize(GRPC_MAX_MESSAGE_SIZE_BYTES),
             stagingSessionToken);
       } catch (CloseableResource.CloseException e) {
         LOG.warn("Error closing artifact staging channel", e);

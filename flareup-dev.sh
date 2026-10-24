@@ -11,13 +11,86 @@ FLAREDB_VERSION="0.1.8"
 
 # Build type (default: debug)
 BUILD_TYPE="debug"
+# Empty means: use RUST_LOG if set, otherwise the build-type default.
+LOG_LEVEL=""
 
-if [[ "${1:-}" == "--release" ]]; then
-    BUILD_TYPE="release"
-    shift
-elif [[ "${1:-}" == "--debug" ]]; then
-    BUILD_TYPE="debug"
-    shift
+usage() {
+    cat <<'EOF'
+Usage: ./flareup-dev.sh [--debug|--release] [--log-level LEVEL]
+
+  --debug          Use target/debug/flaredb (default)
+  --release        Use target/release/flaredb
+  --log-level L    Log level for the flaredb crate: debug, info, trace, ...
+                   Other crates stay at info. A value containing '=' or ','
+                   is passed to RUST_LOG as a full filter.
+  -h, --help       Show this help.
+
+The RUST_LOG environment variable is honoured when --log-level is not given.
+
+Environment:
+  FLAREDB_BASE_DIR  Base directory (default: ~/.flaredb). Use an isolated
+                    directory for test runs to avoid Paimon table collisions.
+  FLAREDB_SDF_MAX_IN_FLIGHT
+                    Concurrent residual bundles per Splittable DoFn stage
+                    (default: min(4, available CPUs); 1 disables concurrency).
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --release)
+            BUILD_TYPE="release"
+            shift
+            ;;
+        --debug)
+            BUILD_TYPE="debug"
+            shift
+            ;;
+        --log-level)
+            if [[ $# -lt 2 || -z "${2:-}" ]]; then
+                echo "--log-level requires a value (e.g. debug or info)" >&2
+                usage >&2
+                exit 2
+            fi
+            LOG_LEVEL="$2"
+            shift 2
+            ;;
+        --log-level=*)
+            LOG_LEVEL="${1#*=}"
+            if [[ -z "${LOG_LEVEL}" ]]; then
+                echo "--log-level requires a value (e.g. debug or info)" >&2
+                usage >&2
+                exit 2
+            fi
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "Unknown argument: $1" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+done
+
+# Log level precedence: --log-level, then RUST_LOG, then the build-type default.
+if [[ -n "${LOG_LEVEL}" ]]; then
+    if [[ "${LOG_LEVEL}" == *=* || "${LOG_LEVEL}" == *,* ]]; then
+        SERVER_RUST_LOG="${LOG_LEVEL}"
+    elif [[ "${LOG_LEVEL}" == "info" ]]; then
+        SERVER_RUST_LOG="info"
+    else
+        SERVER_RUST_LOG="flaredb=${LOG_LEVEL},info"
+    fi
+elif [[ -n "${RUST_LOG:-}" ]]; then
+    SERVER_RUST_LOG="${RUST_LOG}"
+elif [[ "${BUILD_TYPE}" == "debug" ]]; then
+    SERVER_RUST_LOG="flaredb=debug,info"
+else
+    SERVER_RUST_LOG="info"
 fi
 
 if ! command -v java >/dev/null 2>&1; then
@@ -42,7 +115,7 @@ trap cleanup EXIT INT TERM
 cd "${REPO_DIR}"
 
 # ensure default base directory exists and pass it to flaredb as first arg
-BASE_DIR="${HOME}/.flaredb"
+BASE_DIR="${FLAREDB_BASE_DIR:-${HOME}/.flaredb}"
 mkdir -p "${BASE_DIR}"
 
 # Setup bin/instances and worker jar
@@ -100,6 +173,7 @@ case "${BUILD_TYPE}" in
 esac
 
 echo "Using ${BUILD_TYPE} build: ${FLAREDB_BINARY}"
+echo "Server log level: ${SERVER_RUST_LOG}"
 
 # generate a new instance id every time the script runs
 if command -v uuidgen >/dev/null 2>&1; then
@@ -115,7 +189,7 @@ mkdir -p "${INSTANCE_LOG_DIR}"
 FLARE_LOG="${INSTANCE_LOG_DIR}/flare-server.log"
 
 # launch flaredb binary with the base dir arg and set FLAREDB_INSTANCE_ID and WORKER_JAR_PATH for the server process
-RUST_LOG=info FLAREDB_INSTANCE_ID="${INSTANCE_ID}" WORKER_JAR_PATH="${WORKER_JAR}" "${FLAREDB_BINARY}" "${BASE_DIR}" >"${FLARE_LOG}" 2>&1 &
+RUST_LOG="${SERVER_RUST_LOG}" FLAREDB_INSTANCE_ID="${INSTANCE_ID}" WORKER_JAR_PATH="${WORKER_JAR}" "${FLAREDB_BINARY}" "${BASE_DIR}" >"${FLARE_LOG}" 2>&1 &
 SERVER_PID=$!
 
 port_ready() {

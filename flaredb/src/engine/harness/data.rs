@@ -15,6 +15,8 @@ use tokio::sync::{
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Response, Status};
 
+use super::HarnessStatus;
+
 /// Shared gRPC channel state for data plane communication with the worker.
 /// Holds outgoing (Flare → worker) and incoming (worker → Flare) element streams.
 pub struct DataInner {
@@ -36,7 +38,9 @@ impl DataInner {
     }
 }
 
-pub async fn start_data_server() -> Result<(DataChannel, FlareDataService), anyhow::Error> {
+pub async fn start_data_server(
+    status: HarnessStatus,
+) -> Result<(DataChannel, FlareDataService), anyhow::Error> {
     let (tx, rx) = mpsc::channel::<Result<Elements, Status>>(32);
 
     let stream = Arc::new(DataInner {
@@ -53,6 +57,7 @@ pub async fn start_data_server() -> Result<(DataChannel, FlareDataService), anyh
         worker_stream: stream,
         runner_stream: Arc::new(ElementStreamMultiplexer::new()),
         stream_task: Arc::new(std::sync::Mutex::new(None)),
+        status,
     };
     Ok((channel, service))
 }
@@ -122,6 +127,7 @@ pub struct DataChannel {
     /// Handle to the background dispatcher task.
     /// Aborted on reset to prevent stale task from consuming new worker stream.
     stream_task: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    status: HarnessStatus,
 }
 
 impl DataChannel {
@@ -164,6 +170,7 @@ impl DataChannel {
         let worker_data_stream = self.worker_stream.clone();
         let runner_stream = self.runner_stream.clone();
         let task_slot = self.stream_task.clone();
+        let status = self.status.clone();
         info!("Streaming elements from worker");
 
         let join_handle = tokio::spawn(async move {
@@ -189,17 +196,37 @@ impl DataChannel {
                             route_elements(elements, &runner_stream);
                         }
                         Ok(None) => {
-                            info!("BeamFnData stream from worker closed cleanly");
+                            if status.is_intentional_shutdown() {
+                                debug!(
+                                    "BeamFnData stream closed during intentional worker shutdown"
+                                );
+                            } else {
+                                warn!("BeamFnData stream closed before the job completed");
+                                status.report_failure(
+                                    "BeamFnData",
+                                    "worker closed the stream cleanly",
+                                );
+                            }
                             break;
                         }
                         Err(e) => {
-                            warn!("BeamFnData stream error (worker gone?): {}", e);
+                            if status.is_intentional_shutdown() {
+                                debug!(
+                                    "BeamFnData stream closed during intentional worker shutdown: {}",
+                                    e
+                                );
+                            } else {
+                                warn!("BeamFnData stream error (worker gone?): {}", e);
+                                status.report_failure("BeamFnData", &e);
+                            }
                             break;
                         }
                     }
                 }
 
-                info!("BeamFnData stream from worker closed");
+                if status.is_intentional_shutdown() {
+                    debug!("BeamFnData stream from worker closed");
+                }
                 break;
             }
         });
@@ -397,6 +424,9 @@ pub struct TimerChunk {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use beam_model_rs::v1::beam_fn_data_client::BeamFnDataClient;
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::transport::{Endpoint, Server};
 
     fn timers_chunk(
         instruction_id: &str,
@@ -424,7 +454,9 @@ mod tests {
 
     #[tokio::test]
     async fn timer_chunks_route_to_their_instruction_transform_and_family() {
-        let (channel, _service) = start_data_server().await.expect("start data server");
+        let (channel, _service) = start_data_server(HarnessStatus::new())
+            .await
+            .expect("start data server");
         let receiver = channel.get_timer_receiver(timers_key("instr", "transform", "flush"));
 
         route_elements(
@@ -458,7 +490,9 @@ mod tests {
 
     #[tokio::test]
     async fn timer_routing_is_keyed_by_the_full_identity() {
-        let (channel, _service) = start_data_server().await.expect("start data server");
+        let (channel, _service) = start_data_server(HarnessStatus::new())
+            .await
+            .expect("start data server");
         let receiver = channel.get_timer_receiver(timers_key("instr", "t", "flush"));
 
         // Same instruction and transform, different timer family: the chunk must
@@ -483,7 +517,9 @@ mod tests {
 
     #[tokio::test]
     async fn data_and_timers_in_one_message_route_independently() {
-        let (channel, _service) = start_data_server().await.expect("start data server");
+        let (channel, _service) = start_data_server(HarnessStatus::new())
+            .await
+            .expect("start data server");
         let data_key = DataKey {
             instruction_id: "instr".to_string(),
             transform_id: "sink".to_string(),
@@ -520,5 +556,112 @@ mod tests {
             ElementStreamPayload::Timers(chunk) => assert_eq!(chunk.timers.timers, vec![4]),
             ElementStreamPayload::Data(_) => panic!("expected a timer payload"),
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ten_mib_data_round_trips_through_grpc_in_both_directions() {
+        const LIMIT: usize = 16 * 1024 * 1024;
+        const PAYLOAD_LEN: usize = 10 * 1024 * 1024;
+
+        let status = HarnessStatus::new();
+        let (channel, service) = start_data_server(status.clone())
+            .await
+            .expect("start data server");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server_task = tokio::spawn(
+            Server::builder()
+                .add_service(
+                    beam_model_rs::v1::beam_fn_data_server::BeamFnDataServer::new(service)
+                        .max_decoding_message_size(LIMIT)
+                        .max_encoding_message_size(LIMIT),
+                )
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                    let _ = shutdown_rx.await;
+                }),
+        );
+
+        let grpc_channel = Endpoint::from_shared(format!("http://{address}"))
+            .expect("valid endpoint")
+            .connect()
+            .await
+            .expect("connect to test server");
+        let mut client = BeamFnDataClient::new(grpc_channel)
+            .max_decoding_message_size(LIMIT)
+            .max_encoding_message_size(LIMIT);
+        let (request_tx, request_rx) = mpsc::channel::<Elements>(1);
+        let mut response_stream = client
+            .data(ReceiverStream::new(request_rx))
+            .await
+            .expect("open data stream")
+            .into_inner();
+        channel.stream_elements();
+
+        let request_data = vec![7; PAYLOAD_LEN];
+        request_tx
+            .send(Elements {
+                data: vec![Data {
+                    instruction_id: "large-request".to_string(),
+                    transform_id: "source".to_string(),
+                    data: request_data.clone(),
+                    is_last: false,
+                }],
+                timers: Vec::new(),
+            })
+            .await
+            .expect("send large request");
+
+        let receiver = channel.get_receiver(DataKey {
+            instruction_id: "large-request".to_string(),
+            transform_id: "source".to_string(),
+        });
+        let routed = tokio::time::timeout(Duration::from_secs(5), async {
+            receiver.lock().await.recv().await
+        })
+        .await
+        .expect("server decoded large request before timeout")
+        .expect("server routed large request");
+        match routed {
+            ElementStreamPayload::Data(chunk) => assert_eq!(chunk.data.data, request_data),
+            ElementStreamPayload::Timers(_) => panic!("expected a data payload"),
+        }
+
+        let response_data = vec![9; PAYLOAD_LEN];
+        channel
+            .send_elements(Elements {
+                data: vec![Data {
+                    instruction_id: "large-response".to_string(),
+                    transform_id: "sink".to_string(),
+                    data: response_data.clone(),
+                    is_last: false,
+                }],
+                timers: Vec::new(),
+            })
+            .await
+            .expect("send large response");
+        let response = tokio::time::timeout(Duration::from_secs(5), response_stream.message())
+            .await
+            .expect("client decoded large response before timeout")
+            .expect("large response stream")
+            .expect("large response message");
+        assert_eq!(response.data[0].data, response_data);
+
+        drop(request_tx);
+        let failure = tokio::time::timeout(Duration::from_secs(5), status.wait_for_failure())
+            .await
+            .expect("unexpected data stream close reported before timeout");
+        assert!(failure.contains("BeamFnData"), "failure was: {failure}");
+
+        drop(response_stream);
+        drop(client);
+        shutdown_tx.send(()).expect("request server shutdown");
+        tokio::time::timeout(Duration::from_secs(5), server_task)
+            .await
+            .expect("server shutdown before timeout")
+            .expect("server task")
+            .expect("server shutdown");
     }
 }
