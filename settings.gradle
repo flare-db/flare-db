@@ -14,6 +14,7 @@ def javaModules = [
     'sliding-window' : 'example/sliding-window',
     'timers-example' : 'example/timers-example',
     'test-stream'    : 'testing/test-stream',
+    'validates-runner': 'testing/validates-runner',
     'nexmark'        : 'benchmarks/nexmark',
 ]
 

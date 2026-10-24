@@ -1,0 +1,90 @@
+import groovy.json.JsonOutput
+
+plugins {
+    id 'java'
+    alias(libs.plugins.shadow)
+}
+
+configurations {
+    validatesRunner
+}
+
+dependencies {
+    implementation project(':flaredb-runner')
+    implementation libs.beam.core
+    implementation libs.beam.runners.core
+    implementation libs.beam.runners.portability
+    implementation "org.apache.beam:beam-sdks-java-core:${libs.versions.beam.get()}:tests"
+    implementation "org.apache.beam:beam-runners-core-java:${libs.versions.beam.get()}:tests"
+    implementation libs.junit
+    implementation libs.slf4j.simple
+
+    validatesRunner "org.apache.beam:beam-sdks-java-core:${libs.versions.beam.get()}:tests"
+    validatesRunner "org.apache.beam:beam-runners-core-java:${libs.versions.beam.get()}:tests"
+    validatesRunner project(':flaredb-runner')
+    validatesRunner project(':validates-runner')
+    validatesRunner libs.beam.core
+    validatesRunner libs.beam.runners.core
+    validatesRunner libs.beam.runners.portability
+    validatesRunner libs.junit
+    validatesRunner libs.slf4j.simple
+}
+
+shadowJar {
+    mergeServiceFiles()
+    zip64 = true
+}
+
+task validatesRunner(type: Test) {
+    group = "verification"
+    description = "Runs Apache Beam ValidatesRunner tests against FlareDB"
+    outputs.upToDateWhen { false }
+    dependsOn tasks.named('shadowJar')
+
+    classpath = configurations.validatesRunner
+
+    def testJarFiles = configurations.validatesRunner.filter { it.name.startsWith("beam-sdks-java-core") && it.name.endsWith("-tests.jar") }
+    testClassesDirs = files(testJarFiles.collect { zipTree(it) })
+
+    def shadowJarTask = tasks.named('shadowJar').get()
+    def uberJarFile = shadowJarTask.archiveFile.get().asFile.absolutePath
+
+    def jobEndpoint = project.findProperty('jobEndpoint') ?: '127.0.0.1:8099'
+
+    systemProperty "beamTestPipelineOptions", JsonOutput.toJson([
+        "--runner=TestFlareRunner",
+        "--jobEndpoint=${jobEndpoint}",
+        "--uberJar=${uberJarFile}",
+    ])
+
+    // Match beam ValidatesRunner category conventions
+    useJUnit {
+        includeCategories 'org.apache.beam.sdk.testing.ValidatesRunner'
+
+        // Features not supported or requiring special SDK harness/external environments
+        excludeCategories 'org.apache.beam.sdk.testing.UsesSdkHarnessEnvironment'
+        excludeCategories 'org.apache.beam.sdk.testing.UsesExternalService'
+        excludeCategories 'org.apache.beam.sdk.testing.FlattenWithHeterogeneousCoders'
+        excludeCategories 'org.apache.beam.sdk.testing.LargeKeys$Above10MB'
+        excludeCategories 'org.apache.beam.sdk.testing.UsesCommittedMetrics'
+        excludeCategories 'org.apache.beam.sdk.testing.UsesGaugeMetrics'
+        excludeCategories 'org.apache.beam.sdk.testing.UsesStringSetMetrics'
+        excludeCategories 'org.apache.beam.sdk.testing.UsesBoundedTrieMetrics'
+        excludeCategories 'org.apache.beam.sdk.testing.UsesCustomWindowMerging'
+        excludeCategories 'org.apache.beam.sdk.testing.UsesFailureMessage'
+        excludeCategories 'org.apache.beam.sdk.testing.UsesBundleFinalizer'
+        excludeCategories 'org.apache.beam.sdk.testing.UsesTriggeredSideInputs'
+        excludeCategories 'org.apache.beam.sdk.testing.UsesUnboundedSplittableParDo'
+        excludeCategories 'org.apache.beam.sdk.testing.UsesUnboundedPCollections'
+        excludeCategories 'org.apache.beam.sdk.testing.UsesPerKeyOrderedDelivery'
+        excludeCategories 'org.apache.beam.sdk.testing.UsesPerKeyOrderInBundle'
+    }
+
+    testLogging {
+        events "passed", "skipped", "failed", "standardOut", "standardError"
+        showExceptions true
+        exceptionFormat "full"
+        showCauses true
+        showStackTraces true
+    }
+}
