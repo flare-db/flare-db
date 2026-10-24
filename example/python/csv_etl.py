@@ -16,7 +16,7 @@ from flaredb_runner.flare_runner import FlareRunner
 
 LOG = logging.getLogger(__name__)
 
-INPUT_FILE = Path("test-data") / "scores4.csv"
+INPUT_FILE = Path("test-data") / "scores.csv"
 
 
 def parse_valid_score_records(line):

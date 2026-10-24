@@ -1352,16 +1352,6 @@ fn fire_state(
         AccumulationMode::Accumulating | AccumulationMode::Retracting => state.values.clone(),
     };
 
-    let output = WindowedValue {
-        value: BeamRecord::GBK(BeamGbk {
-            key: state.key.clone(),
-            value: IterableValue::from_records(values),
-        }),
-        timestamp_millis: end,
-        windows: vec![state.window.clone()],
-        pane,
-    };
-
     state.trigger.on_fire(trigger_ctx);
     state.pane_index += 1;
     state.fired = true;
@@ -1369,7 +1359,22 @@ fn fire_state(
     if expired {
         state.closed = true;
     }
-    Some(output)
+
+    // Beam's `EmitIfNonempty` closing behavior: a firing whose pane has no
+    // accumulated values carries no data and must not be emitted.
+    if values.is_empty() {
+        return None;
+    }
+
+    Some(WindowedValue {
+        value: BeamRecord::GBK(BeamGbk {
+            key: state.key.clone(),
+            value: IterableValue::from_records(values),
+        }),
+        timestamp_millis: end,
+        windows: vec![state.window.clone()],
+        pane,
+    })
 }
 
 #[cfg(test)]
@@ -2193,9 +2198,13 @@ mod tests {
     #[tokio::test]
     async fn state_backend_evaluates_each_group_at_most_once_per_run() {
         let backend = InMemoryGbkState::default();
+        // Accumulating keeps the values across firings, so a re-evaluation still
+        // has a non-empty pane to emit and the per-run paging behavior stays
+        // observable. (Discarding would emit nothing on the second run; see
+        // `always_trigger_does_not_emit_empty_discarding_panes`.)
         let spec = TriggerSpec {
             trigger: Trigger::Always,
-            accumulation: AccumulationMode::Discarding,
+            accumulation: AccumulationMode::Accumulating,
             allowed_lateness: 0,
         };
         backend.begin_run().await;
@@ -2234,6 +2243,151 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "paging ready groups must not re-fire them in the same run"
+        );
+    }
+
+    /// End-to-end regression for Nexmark Query14 (`Reshuffle`): a second run of
+    /// the same GroupByKey at a higher watermark re-evaluates an `Always` /
+    /// `Discarding` group whose values were already emitted. That must be a
+    /// no-op, not an empty group that changes the PCollection schema from
+    /// `List<Binary>` to `List<Boolean>` and fails the Paimon write.
+    #[tokio::test]
+    async fn always_trigger_rerun_keeps_the_output_schema_stable() {
+        use beam_model_rs::v1::{
+            Trigger as TriggerProto, accumulation_mode, trigger as trigger_proto,
+        };
+
+        let (_dir, store) = make_store().await;
+        let input = "gbk-in-reshuffle-rerun";
+        let output = "gbk-out-reshuffle-rerun";
+
+        let transform = GroupByKey::with(
+            "gbk-reshuffle".to_string(),
+            HashMap::from([("in".to_string(), input.to_string())]),
+            HashMap::from([("out".to_string(), output.to_string())]),
+            "GroupByKey".to_string(),
+        );
+
+        // What Beam's `Reshuffle` assigns: a 1 ms identity window, an `Always`
+        // trigger, discarding accumulation, and effectively infinite lateness.
+        let strategy = WindowingStrategy {
+            trigger: Some(TriggerProto {
+                trigger: Some(trigger_proto::Trigger::Always(trigger_proto::Always {})),
+            }),
+            accumulation_mode: accumulation_mode::Enum::Discarding as i32,
+            allowed_lateness: crate::coders::primitives::BEAM_MAX_TIMESTAMP_MILLIS,
+            ..WindowingStrategy::default()
+        };
+
+        store
+            .write_windowed_value_batch(
+                input,
+                vec![
+                    kv_bytes_windowed("a", b"one".to_vec(), vec![interval(1_000, 1_001)], 1_000),
+                    kv_bytes_windowed("b", b"two".to_vec(), vec![interval(1_000, 1_001)], 1_000),
+                ],
+            )
+            .await
+            .unwrap();
+
+        run_gbk_with_strategy(
+            &transform,
+            &store,
+            input,
+            output,
+            Some(strategy.clone()),
+            1_000,
+        )
+        .await;
+        assert_eq!(scan_output(&store, output).await.len(), 2);
+
+        // A watermark advance with no new input re-evaluates both groups. Before
+        // the fix this wrote two empty groups and failed the schema check.
+        run_gbk_with_strategy(
+            &transform,
+            &store,
+            input,
+            output,
+            Some(strategy),
+            crate::engine::watermark::MAX_TIMESTAMP,
+        )
+        .await;
+
+        let panes = scan_output(&store, output).await;
+        assert_eq!(panes.len(), 2, "the re-run must not emit extra panes");
+        for pane in &panes {
+            let BeamRecord::GBK(group) = &pane.value else {
+                panic!("expected GBK output, got {:?}", pane.value);
+            };
+            assert!(!group.value.list.is_empty(), "no pane may be empty");
+        }
+
+        let table = store
+            .get_existing_table(output)
+            .await
+            .unwrap()
+            .expect("output table exists");
+        let value_type = table
+            .schema()
+            .fields()
+            .iter()
+            .find(|field| field.name() == VALUE_COLUMN)
+            .expect("value column")
+            .data_type()
+            .clone();
+        assert!(
+            matches!(value_type, paimon::spec::DataType::Array(_)),
+            "group values must remain an array, got {value_type:?}"
+        );
+    }
+
+    /// Beam's `Reshuffle` (Nexmark Query14) groups on an `Always` trigger with
+    /// `Discarding` accumulation under an identity window whose allowed lateness
+    /// is effectively infinite. A later watermark advance therefore re-evaluates
+    /// every group, but the values were already consumed by the previous pane.
+    /// That re-evaluation must not emit an empty `KV<K, Iterable<V>>`: an empty
+    /// iterable loses the element type (schema inference guesses `Boolean`),
+    /// which then cannot be written to a table already typed `Array<VarBinary>`.
+    #[tokio::test]
+    async fn always_trigger_does_not_emit_empty_discarding_panes() {
+        let backend = InMemoryGbkState::default();
+        let spec = TriggerSpec {
+            trigger: Trigger::Always,
+            accumulation: AccumulationMode::Discarding,
+            // Beam's `Reshuffle` identity-window strategy uses an effectively
+            // infinite allowed lateness, so the group is never `expired` and the
+            // trigger re-fires on every evaluation.
+            allowed_lateness: crate::coders::primitives::BEAM_MAX_TIMESTAMP_MILLIS,
+        };
+
+        backend.begin_run().await;
+        let fired = backend
+            .apply_group(
+                PrimitiveValue::String("a".to_string()),
+                interval(0, 100),
+                vec![BeamRecord::PRIMITIVE(PrimitiveValue::Int64(1))],
+                &spec,
+                0,
+                10,
+            )
+            .await
+            .unwrap();
+        assert!(fired.is_some(), "the first pane carries the value");
+
+        // The next run re-evaluates the group, but there is nothing left to emit.
+        backend.begin_run().await;
+        let ready = backend
+            .take_ready(
+                &spec,
+                crate::engine::watermark::MAX_TIMESTAMP,
+                10,
+                OUTPUT_BATCH_SIZE,
+            )
+            .await
+            .unwrap();
+        assert!(
+            ready.is_empty(),
+            "a discarding re-fire must not emit an empty group, got {ready:?}"
         );
     }
 
