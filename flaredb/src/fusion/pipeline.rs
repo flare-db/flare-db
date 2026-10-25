@@ -899,7 +899,11 @@ impl QueryablePipeline {
         // it would be fused into an SDK stage and having no runner root the
         // executable graph would come out empty at runtime.
         if let Some(spec) = transform.spec.as_ref() {
-            if urns::beam_urns::FLARE.contains(&spec.urn.as_str()) {
+            let flatten_requires_sdk_transcoding = spec.urn == urns::beam_urns::FLATTEN_TRANSFORM
+                && self.flatten_has_different_input_and_output_coders(transform);
+            if urns::beam_urns::FLARE.contains(&spec.urn.as_str())
+                && !flatten_requires_sdk_transcoding
+            {
                 return None;
             }
         }
@@ -907,6 +911,31 @@ impl QueryablePipeline {
             .environments
             .get(&transform.environment_id)
             .cloned()
+    }
+
+    /// A native Flatten copies logical values unchanged. That is only valid when
+    /// the output uses the same coder as every input. If an SDK assigns a
+    /// different coder (for example an SDK-private `SerializableCoder`), the
+    /// harness must transcode the values so its input can decode them.
+    fn flatten_has_different_input_and_output_coders(&self, transform: &PTransform) -> bool {
+        let Some(output_id) = transform.outputs.values().next() else {
+            return false;
+        };
+        let Some(output_coder_id) = self
+            .components
+            .pcollections
+            .get(output_id)
+            .map(|pcollection| pcollection.coder_id.as_str())
+        else {
+            return false;
+        };
+
+        transform.inputs.values().any(|input_id| {
+            self.components
+                .pcollections
+                .get(input_id)
+                .is_some_and(|pcollection| pcollection.coder_id != output_coder_id)
+        })
     }
 
     pub fn get_side_inputs(

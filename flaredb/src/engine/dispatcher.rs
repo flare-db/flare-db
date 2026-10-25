@@ -300,7 +300,6 @@ impl ExecutorDispatcher {
                 in_flight.spawn(async move {
                     if let ExecutableNode::Splittable(stage) = node {
                         let mut executor = SplittableStageExecutor::new(runtime);
-                        let output_metadata = output_metadata.into_iter().next();
                         let run = match executor
                             .execute_bundle(
                                 &stage,

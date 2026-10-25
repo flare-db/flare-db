@@ -1199,6 +1199,12 @@ mod tests {
         }
     }
 
+    fn make_pcol_with_coder(id: &str, coder_id: &str) -> PCollectionNode {
+        let mut pcollection = make_pcol(id);
+        pcollection.collection.coder_id = coder_id.to_string();
+        pcollection
+    }
+
     /// Assemble a QueryablePipeline from transform nodes, pcollection nodes and environments.
     fn build_pipeline(
         transforms: Vec<PTransformNode>,
@@ -1403,6 +1409,68 @@ mod tests {
         assert!(
             !stage_transform_ids.contains("gbk"),
             "GBK should NOT be in the SDK stage"
+        );
+    }
+
+    /// A native Flatten cannot transcode between different coders. When an input
+    /// coder differs from the output coder, fusion must run Flatten in the SDK
+    /// harness so SDK-private coders are encoded by their owning SDK.
+    #[test]
+    fn flatten_with_different_coders_runs_in_sdk_stage() {
+        let env = make_env("env1");
+        let clean = clean_pardo_payload();
+        let impulse = make_transform(
+            "impulse",
+            beam_urns::IMPULSE_TRANSFORM,
+            &[],
+            &[("out", "p0")],
+            "",
+        );
+        let flatten = make_transform(
+            "flatten",
+            beam_urns::FLATTEN_TRANSFORM,
+            &[("0", "p0")],
+            &[("out", "p1")],
+            "env1",
+        );
+        let pardo = make_pardo_transform(
+            "pardo",
+            beam_urns::PAR_DO_TRANSFORM,
+            &[("in", "p1")],
+            &[("out", "p2")],
+            "env1",
+            &clean,
+        );
+        let pcols = vec![
+            make_pcol_with_coder("p0", "kv-coder"),
+            make_pcol_with_coder("p1", "sdk-coder"),
+            make_pcol_with_coder("p2", "string-coder"),
+        ];
+        let mut envs = HashMap::new();
+        envs.insert("env1".to_string(), env);
+
+        let pipeline = build_pipeline(vec![impulse, flatten, pardo], pcols, envs);
+        let fuser = GreedyPipelineFuser::with(pipeline);
+        let (initial_unfused, initial_consumers) = extract_initial_sets(&fuser.pipeline, &fuser);
+        let fused = fuser
+            .fuse_pipeline(initial_unfused, initial_consumers)
+            .unwrap();
+
+        assert_eq!(fused.sdk_stages().len(), 1);
+        let stage_transforms = fused.sdk_stages().iter().next().unwrap().transforms();
+        let stage_transform_ids: HashSet<&str> =
+            stage_transforms.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(
+            stage_transform_ids,
+            HashSet::from(["flatten", "pardo"]),
+            "coder-changing Flatten and its SDK consumer must share a worker stage"
+        );
+        assert!(
+            fused
+                .runner_stages()
+                .iter()
+                .all(|stage| stage.id != "flatten"),
+            "coder-changing Flatten must not be scheduled as a native stage"
         );
     }
 
