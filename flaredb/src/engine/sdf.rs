@@ -311,6 +311,23 @@ fn same_float(left: Option<f32>, right: Option<f32>) -> bool {
     }
 }
 
+fn output_endpoints(
+    stage: &ExecutableStage,
+    instruction_id: &str,
+    output_edge_metadata: Vec<ConsumerMetaData>,
+) -> Vec<(DataKey, ConsumerMetaData)> {
+    output_edge_metadata
+        .into_iter()
+        .map(|metadata| {
+            let data_key = DataKey {
+                instruction_id: instruction_id.to_string(),
+                transform_id: stage_sink_transform_id(stage, &metadata.produced_pcol_id),
+            };
+            (data_key, metadata)
+        })
+        .collect()
+}
+
 /// Executor for a `SplittableStage` node
 pub struct SplittableStageExecutor {
     runtime: BundleRuntime,
@@ -333,7 +350,7 @@ impl SplittableStageExecutor {
     pub async fn execute_bundle(
         &mut self,
         stage: &SplittableStage,
-        output_edge_metadata: Option<ConsumerMetaData>,
+        output_edge_metadata: Vec<ConsumerMetaData>,
         seed: Option<SdfWorkItem>,
         initialized: bool,
         registered: bool,
@@ -546,7 +563,7 @@ impl SplittableStageExecutor {
         &mut self,
         stage: &ExecutableStage,
         splittable_stage: &SplittableStage,
-        output_edge_metadata: Option<ConsumerMetaData>,
+        output_edge_metadata: Vec<ConsumerMetaData>,
         seed: Vec<u8>,
         register: bool,
         allow_split: bool,
@@ -682,21 +699,26 @@ impl SplittableStageExecutor {
                 Ok::<_, anyhow::Error>(response)
             };
 
-            if let Some(output_meta_data) = output_edge_metadata {
-                let data_key = DataKey {
-                    instruction_id: instruction_id.clone(),
-                    transform_id: stage_sink_transform_id(
-                        stage,
-                        &output_meta_data.produced_pcol_id,
-                    ),
-                };
-                let receiver = self.runtime.data_receiver(data_key);
-                let output_runtime = self.runtime.clone();
+            if !output_edge_metadata.is_empty() {
+                let endpoints = output_endpoints(stage, &instruction_id, output_edge_metadata);
+                let mut decode_tasks = Vec::with_capacity(endpoints.len());
+                for (data_key, output_meta_data) in endpoints {
+                    let receiver = self.runtime.data_receiver(data_key);
+                    let output_runtime = self.runtime.clone();
+
+                    decode_tasks.push(tokio::spawn(async move {
+                        output_runtime
+                            .process_output_elements(receiver, output_meta_data)
+                            .await
+                    }));
+                }
 
                 let decode_task = tokio::spawn(async move {
-                    output_runtime
-                        .process_output_elements(receiver, output_meta_data)
-                        .await
+                    for task in decode_tasks {
+                        task.await
+                            .map_err(|err| anyhow!("output decode task panicked: {err}"))??;
+                    }
+                    Ok::<(), anyhow::Error>(())
                 });
 
                 let timeout_id = instruction_id.clone();
@@ -705,7 +727,7 @@ impl SplittableStageExecutor {
                         match process_future.await {
                             Ok(response) => {
                                 decode_task.await.map_err(|err| {
-                                    anyhow!("output decode task failed: {}", err)
+                                    anyhow!("output decode tasks failed: {}", err)
                                 })??;
                                 Ok(response)
                             }
@@ -1454,6 +1476,43 @@ mod tests {
                 process_kind: SplittableProcessKind::ProcessElements,
             },
         )
+    }
+
+    fn output_metadata(pcollection_id: &str) -> ConsumerMetaData {
+        ConsumerMetaData {
+            producer_transform_id: "producer".to_string(),
+            produced_pcol_id: pcollection_id.to_string(),
+            coder_id: "coder".to_string(),
+            component_coder: None,
+            consumer_transfrom_id: "consumer".to_string(),
+        }
+    }
+
+    #[test]
+    fn every_sdf_boundary_output_gets_a_decoder_endpoint() {
+        let splittable = splittable_stage(
+            &["out-0", "out-1", "out-2"],
+            "multi-output",
+            &[("0", "out-0"), ("1", "out-1"), ("2", "out-2")],
+        );
+        let stage = splittable.plan().process_stage.clone();
+        let endpoints = output_endpoints(
+            &stage,
+            "instruction",
+            vec![
+                output_metadata("out-0"),
+                output_metadata("out-1"),
+                output_metadata("out-2"),
+            ],
+        );
+
+        assert_eq!(endpoints.len(), 3);
+        for pcollection_id in ["out-0", "out-1", "out-2"] {
+            assert!(endpoints.iter().any(|(key, metadata)| {
+                metadata.produced_pcol_id == pcollection_id
+                    && key.transform_id == stage_sink_transform_id(&stage, pcollection_id)
+            }));
+        }
     }
 
     fn residual(transform_id: &str, local_output: &str, millis: i64) -> DelayedBundleApplication {
