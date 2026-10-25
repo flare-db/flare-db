@@ -24,7 +24,8 @@ import org.joda.time.Duration;
  * {@link PipelineResult} contract.
  *
  * <p>{@link #getState()}, {@link #cancel()}, and {@link #metrics()} are backed by live calls to the
- * Job Service. {@link #waitUntilFinish} is not currently supported.
+ * Job Service. {@link #waitUntilFinish} polls the Job Service until the job reaches a terminal
+ * state.
  *
  * <p>Owns the job-service channel handed to it by {@link FlareRunner#run}; callers that want to
  * release it deterministically (rather than leaving it open for further {@link #getState()} or
@@ -32,9 +33,12 @@ import org.joda.time.Duration;
  */
 public class FlarePipelineJob implements PipelineResult, AutoCloseable {
 
+  private static final long POLL_INTERVAL_MILLIS = 3_000;
+
   private final String jobId;
   private final int jobServerTimeout;
   private final CloseableResource<JobServiceBlockingStub> jobService;
+  private volatile State terminalState;
 
   FlarePipelineJob(
       String jobId, int jobServerTimeout, CloseableResource<JobServiceBlockingStub> jobService) {
@@ -50,12 +54,15 @@ public class FlarePipelineJob implements PipelineResult, AutoCloseable {
 
   @Override
   public State getState() {
+    if (terminalState != null) {
+      return terminalState;
+    }
     JobStateEvent response =
         jobService
             .get()
             .withDeadlineAfter(jobServerTimeout, TimeUnit.SECONDS)
             .getState(GetJobStateRequest.newBuilder().setJobId(jobId).build());
-    return toPipelineState(response.getState());
+    return rememberTerminalState(toPipelineState(response.getState()));
   }
 
   @Override
@@ -65,17 +72,42 @@ public class FlarePipelineJob implements PipelineResult, AutoCloseable {
             .get()
             .withDeadlineAfter(jobServerTimeout, TimeUnit.SECONDS)
             .cancel(CancelJobRequest.newBuilder().setJobId(jobId).build());
-    return toPipelineState(response.getState());
+    return rememberTerminalState(toPipelineState(response.getState()));
   }
 
   @Override
   public State waitUntilFinish(Duration duration) {
-    throw new UnsupportedOperationException("Not supported yet.");
+    long timeoutMillis = duration.getMillis();
+    if (timeoutMillis <= 0) {
+      return waitUntilFinish();
+    }
+
+    long deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
+    while (true) {
+      State state = getState();
+      if (state.isTerminal()) {
+        return state;
+      }
+
+      long remainingNanos = deadlineNanos - System.nanoTime();
+      if (remainingNanos <= 0) {
+        return null;
+      }
+      sleepForPolling(
+          Math.min(
+              POLL_INTERVAL_MILLIS, Math.max(1, TimeUnit.NANOSECONDS.toMillis(remainingNanos))));
+    }
   }
 
   @Override
   public State waitUntilFinish() {
-    throw new UnsupportedOperationException("Not supported yet.");
+    while (true) {
+      State state = getState();
+      if (state.isTerminal()) {
+        return state;
+      }
+      sleepForPolling(POLL_INTERVAL_MILLIS);
+    }
   }
 
   @Override
@@ -99,6 +131,22 @@ public class FlarePipelineJob implements PipelineResult, AutoCloseable {
       jobService.close();
     } catch (CloseableResource.CloseException e) {
       throw new IOException("Error closing job service channel", e);
+    }
+  }
+
+  private State rememberTerminalState(State state) {
+    if (state.isTerminal()) {
+      terminalState = state;
+    }
+    return state;
+  }
+
+  private static void sleepForPolling(long millis) {
+    try {
+      Thread.sleep(millis);
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new RuntimeException("Interrupted while waiting for pipeline completion", e);
     }
   }
 
