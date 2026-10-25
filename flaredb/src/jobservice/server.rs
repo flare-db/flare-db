@@ -73,8 +73,7 @@ impl FlareJobService {
     /// Advances the published state for a job, if it is known.
     fn set_job_state(&self, job_id: &str, state: JobStateEnum) {
         if let Some(tx) = self.job_states.get(job_id) {
-            // `send` only fails when there are no receivers, which is fine.
-            let _ = tx.send(state);
+            tx.send_replace(state);
         }
     }
 
@@ -714,8 +713,9 @@ fn truncate_grpc_error(message: String) -> String {
 #[cfg(test)]
 mod metrics_tests {
     use super::{JobMetrics, build_job_metrics_response};
-    use beam_model_rs::v1::MonitoringInfo;
+    use beam_model_rs::v1::{MonitoringInfo, job_state::Enum as JobStateEnum};
     use std::sync::Arc;
+    use tokio::sync::watch;
 
     fn counter() -> MonitoringInfo {
         MonitoringInfo {
@@ -749,6 +749,16 @@ mod metrics_tests {
     fn unknown_jobs_return_not_found() {
         let error = build_job_metrics_response("missing", None).unwrap_err();
         assert_eq!(error.code(), tonic::Code::NotFound);
+    }
+
+    #[test]
+    fn job_state_is_retained_without_a_stream_subscriber() {
+        let (tx, receiver) = watch::channel(JobStateEnum::Starting);
+        drop(receiver);
+
+        tx.send_replace(JobStateEnum::Done);
+
+        assert_eq!(*tx.borrow(), JobStateEnum::Done);
     }
 }
 

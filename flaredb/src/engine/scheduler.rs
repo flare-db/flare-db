@@ -241,6 +241,15 @@ impl NodeScheduler {
     /// bundle committed, so each consumer's input watermark is clamped by its
     /// pending input until that input is consumed.
     pub fn mark_complete_with_min(&mut self, idx: NodeIndex, output_min_ts: Option<Timestamp>) {
+        self.mark_complete_with_min_and_input(idx, output_min_ts, None);
+    }
+
+    pub fn mark_complete_with_min_and_input(
+        &mut self,
+        idx: NodeIndex,
+        output_min_ts: Option<Timestamp>,
+        input_count: Option<usize>,
+    ) {
         let stage = self.graph.get_executable_graph()[idx].id();
         let source_finished =
             self.watermarks.is_source(&stage) && self.watermarks.source_auto_finishes(&stage);
@@ -249,7 +258,7 @@ impl NodeScheduler {
         }
         let newly_ready = self
             .watermarks
-            .complete_bundle_with_min(&stage, output_min_ts)
+            .complete_bundle_with_min_and_input(&stage, output_min_ts, input_count)
             .unwrap_or_default();
         let advanced = self.watermarks.refresh();
         if source_finished {
@@ -463,19 +472,32 @@ impl NodeScheduler {
         }
     }
 
+    /// Returns metadata for every distinct boundary output PCollection from `idx`.
+    ///
+    /// A worker stage may expose multiple boundary outputs from one fused bundle.
+    /// Each output needs its own SDK sink and backing PCollection writer.
+    pub fn output_edge_metadata_all(&self, idx: NodeIndex) -> Vec<ConsumerMetaData> {
+        let graph = self.graph.get_executable_graph();
+        let mut seen = std::collections::HashSet::new();
+        let mut outputs: Vec<ConsumerMetaData> = graph
+            .edges_directed(idx, Direction::Outgoing)
+            .map(|edge| edge.weight().clone())
+            .filter(|metadata| seen.insert(metadata.produced_pcol_id.clone()))
+            .collect();
+        for pcollection in graph[idx].output_pcols() {
+            if !seen.contains(&pcollection) {
+                if let Some(metadata) = self.graph.side_input_output_metadata(&pcollection) {
+                    seen.insert(pcollection);
+                    outputs.push(metadata);
+                }
+            }
+        }
+        outputs
+    }
+
     /// Returns metadata for the first outgoing edge from `idx`, if any.
     pub fn output_edge_metadata(&self, idx: NodeIndex) -> Option<ConsumerMetaData> {
-        let graph = self.graph.get_executable_graph();
-        graph
-            .edges_directed(idx, Direction::Outgoing)
-            .next()
-            .map(|edge| edge.weight().clone())
-            .or_else(|| {
-                graph[idx]
-                    .output_pcols()
-                    .into_iter()
-                    .find_map(|pcollection| self.graph.side_input_output_metadata(&pcollection))
-            })
+        self.output_edge_metadata_all(idx).into_iter().next()
     }
 
     /// Returns the root `ConsumerMetaData` for the graph.
@@ -697,6 +719,16 @@ mod tests {
 
         let executable_graph = graph_for_test(graph, dummy_metadata("root"));
         let mut scheduler = NodeScheduler::new(executable_graph);
+
+        let outputs = scheduler.output_edge_metadata_all(a);
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(
+            outputs
+                .into_iter()
+                .map(|metadata| metadata.produced_pcol_id)
+                .collect::<HashSet<_>>(),
+            HashSet::from(["pcol-ab".to_string(), "pcol-ac".to_string()])
+        );
 
         let ready = scheduler.next_nodes();
         assert_eq!(ready.len(), 1);
@@ -1085,6 +1117,7 @@ mod tests {
                         windowing_strategy: None,
                         processing_time: 0,
                         input_watermark: i64::MAX,
+                        input_is_bounded: true,
                         output_coder: None,
                         window_merger: None,
                         source_reports: None,

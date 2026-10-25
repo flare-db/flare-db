@@ -629,6 +629,10 @@ impl FlareElementStore {
         };
         let cursor = self.cursor(&reader_id, &pcollection_id).await?;
         let (inner, latest) = self.open_incremental_arrow(&pcollection_id, cursor).await?;
+        log::info!(
+            "Opening incremental PCollection read: reader_id={reader_id}, pcollection={pcollection_id}, cursor={cursor:?}, latest={latest:?}, has_batches={}",
+            inner.is_some()
+        );
         Ok(WindowedValueStream {
             store: Arc::clone(self),
             reader_id,
@@ -942,6 +946,12 @@ impl WindowedValueStream {
                         .table_schema
                         .as_ref()
                         .expect("schema is present whenever the stream has data");
+                    log::debug!(
+                        "Incremental PCollection read yielded {} rows: reader_id={}, pcollection={}",
+                        batch.num_rows(),
+                        self.reader_id,
+                        self.pcollection_id
+                    );
                     return Ok(Some(windowed_values_from_batch(&batch, schema)?));
                 }
                 Some(Err(err)) => return Err(err.into()),

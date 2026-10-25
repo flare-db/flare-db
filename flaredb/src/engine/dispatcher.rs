@@ -27,7 +27,7 @@ use tokio::task::JoinSet;
 /// the residual work items it produced and the holds of the item it consumed, so
 /// the dispatcher can queue them and clamp the stage's output watermark.
 enum StageRun {
-    Plain,
+    Plain { input_count: Option<usize> },
     Sdf { outcome: SdfBundleOutcome },
 }
 
@@ -254,7 +254,7 @@ impl ExecutorDispatcher {
             for (idx, node) in scheduler.next_nodes() {
                 let runtime = self.new_bundle_runtime();
                 let input_metadata = scheduler.input_edge_metadata(idx);
-                let output_metadata = scheduler.output_edge_metadata(idx);
+                let output_metadata = scheduler.output_edge_metadata_all(idx);
                 let stage_id = node.id();
                 let timers = pending_timers.remove(&stage_id).unwrap_or_default();
                 // The stage's input watermark at the start of this bundle, used by
@@ -300,6 +300,7 @@ impl ExecutorDispatcher {
                 in_flight.spawn(async move {
                     if let ExecutableNode::Splittable(stage) = node {
                         let mut executor = SplittableStageExecutor::new(runtime);
+                        let output_metadata = output_metadata.into_iter().next();
                         let run = match executor
                             .execute_bundle(
                                 &stage,
@@ -316,7 +317,7 @@ impl ExecutorDispatcher {
                                 Ok(ControlResponse::ProcessBundleSuccess(response)),
                                 StageRun::Sdf { outcome },
                             ),
-                            Err(err) => (Err(err), StageRun::Plain),
+                            Err(err) => (Err(err), StageRun::Plain { input_count: None }),
                         };
                         (idx, run.0, run.1)
                     } else {
@@ -330,7 +331,14 @@ impl ExecutorDispatcher {
                                 input_watermark,
                             )
                             .await;
-                        (idx, result, StageRun::Plain)
+                        let input_count = executor.last_input_count();
+                        (
+                            idx,
+                            result,
+                            StageRun::Plain {
+                                input_count: Some(input_count),
+                            },
+                        )
                     }
                 });
             }
@@ -371,6 +379,9 @@ impl ExecutorDispatcher {
                         self.warn_stranded_event_time_timers().await;
                         break;
                     }
+                    if scheduler.watermarks_mut().release_empty_input_holds() > 0 {
+                        continue;
+                    }
                     return Err(anyhow!(
                         "executable graph deadlocked: processing time is paused at {} with no due timers",
                         self.timer_service.now()
@@ -402,6 +413,9 @@ impl ExecutorDispatcher {
                         if scheduler.is_complete() {
                             self.warn_stranded_event_time_timers().await;
                             break;
+                        }
+                        if scheduler.watermarks_mut().release_empty_input_holds() > 0 {
+                            continue;
                         }
                         return Err(anyhow!(
                             "executable graph deadlocked: no ready nodes and no in-flight work"
@@ -449,57 +463,61 @@ impl ExecutorDispatcher {
                 // can only clamp a watermark that has not advanced yet, and the
                 // refresh inside completion would otherwise let the producer's output
                 // run ahead of the deferred work.
-                if let StageRun::Sdf { outcome } = run {
-                    remove_holds(&mut residual_holds, &stage_id, &outcome.consumed_holds);
-                    let queue = sdf_queues.entry(stage_id.clone()).or_default();
-                    queue.initialized = outcome.initialized;
-                    queue.registered = outcome.registered;
-                    queue.progress_tick = Some(outcome.progress_tick);
-                    let count = enqueue_sdf_items(
-                        scheduler,
-                        &mut sdf_queues,
-                        &mut residual_holds,
-                        &stage_id,
-                        outcome.items,
-                    )?;
-                    let queue = sdf_queues
-                        .get(&stage_id)
-                        .expect("SDF completion stage must have a queue");
-                    log::info!(
-                        "SDF stage '{stage_id}': queued {count} work item(s), queue_depth={}, \
-                         in_flight={}, holds={:?}",
-                        queue.items.len(),
-                        // This bundle has not been marked complete yet.
-                        scheduler
-                            .watermarks()
-                            .in_flight_bundles(&stage_id)
-                            .saturating_sub(1),
-                        residual_holds.get(&stage_id)
-                    );
-                    // Any split events sent just before the parent response are
-                    // already queued in this channel. Drain them before the parent
-                    // can be marked complete, otherwise an empty in-flight set could
-                    // briefly make the stage look finished.
-                    while let Ok((event_stage, item)) = immediate_sdf_rx.try_recv() {
+                let input_count = match run {
+                    StageRun::Sdf { outcome } => {
+                        remove_holds(&mut residual_holds, &stage_id, &outcome.consumed_holds);
+                        let queue = sdf_queues.entry(stage_id.clone()).or_default();
+                        queue.initialized = outcome.initialized;
+                        queue.registered = outcome.registered;
+                        queue.progress_tick = Some(outcome.progress_tick);
                         let count = enqueue_sdf_items(
                             scheduler,
                             &mut sdf_queues,
                             &mut residual_holds,
-                            &event_stage,
-                            [item],
+                            &stage_id,
+                            outcome.items,
                         )?;
                         let queue = sdf_queues
-                            .get(&event_stage)
-                            .expect("drained SDF stage must have a queue");
+                            .get(&stage_id)
+                            .expect("SDF completion stage must have a queue");
                         log::info!(
-                            "SDF stage '{event_stage}': queued {count} split work item before \
-                             parent completion, queue_depth={}, in_flight={}, holds={:?}",
+                            "SDF stage '{stage_id}': queued {count} work item(s), queue_depth={}, \
+                             in_flight={}, holds={:?}",
                             queue.items.len(),
-                            scheduler.watermarks().in_flight_bundles(&event_stage),
-                            residual_holds.get(&event_stage)
+                            // This bundle has not been marked complete yet.
+                            scheduler
+                                .watermarks()
+                                .in_flight_bundles(&stage_id)
+                                .saturating_sub(1),
+                            residual_holds.get(&stage_id)
                         );
+                        // Any split events sent just before the parent response are
+                        // already queued in this channel. Drain them before the parent
+                        // can be marked complete, otherwise an empty in-flight set could
+                        // briefly make the stage look finished.
+                        while let Ok((event_stage, item)) = immediate_sdf_rx.try_recv() {
+                            let count = enqueue_sdf_items(
+                                scheduler,
+                                &mut sdf_queues,
+                                &mut residual_holds,
+                                &event_stage,
+                                [item],
+                            )?;
+                            let queue = sdf_queues
+                                .get(&event_stage)
+                                .expect("drained SDF stage must have a queue");
+                            log::info!(
+                                "SDF stage '{event_stage}': queued {count} split work item before \
+                                 parent completion, queue_depth={}, in_flight={}, holds={:?}",
+                                queue.items.len(),
+                                scheduler.watermarks().in_flight_bundles(&event_stage),
+                                residual_holds.get(&event_stage)
+                            );
+                        }
+                        None
                     }
-                }
+                    StageRun::Plain { input_count } => input_count,
+                };
 
                 // Take the committed minimum only on the producer's last in-flight
                 // bundle (the end of a wave). Concurrent producer bundles fold into
@@ -509,13 +527,16 @@ impl ExecutorDispatcher {
                 let is_last_of_wave = scheduler.watermarks().in_flight_bundles(&stage_id) <= 1;
                 let output_min_ts = if is_last_of_wave {
                     scheduler
-                        .output_edge_metadata(idx)
-                        .map(|meta| meta.produced_pcol_id)
-                        .and_then(|pcollection| self.store.take_commit_min_timestamp(&pcollection))
+                        .output_edge_metadata_all(idx)
+                        .into_iter()
+                        .filter_map(|meta| {
+                            self.store.take_commit_min_timestamp(&meta.produced_pcol_id)
+                        })
+                        .min()
                 } else {
                     None
                 };
-                scheduler.mark_complete_with_min(idx, output_min_ts);
+                scheduler.mark_complete_with_min_and_input(idx, output_min_ts, input_count);
             }
         }
 

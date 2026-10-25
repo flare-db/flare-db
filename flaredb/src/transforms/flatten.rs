@@ -203,6 +203,7 @@ mod tests {
                 windowing_strategy: None,
                 processing_time: 0,
                 input_watermark: i64::MAX,
+                input_is_bounded: true,
                 output_coder: None,
                 window_merger: None,
                 source_reports: None,

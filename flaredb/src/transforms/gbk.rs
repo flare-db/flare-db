@@ -10,7 +10,7 @@ use std::{
 
 use anyhow::{Error, Result, anyhow};
 use arrow_array::{
-    Array, ArrayRef, BinaryArray, Int16Array, ListArray, RecordBatch, UInt32Array,
+    Array, ArrayRef, BinaryArray, Int16Array, Int64Array, ListArray, RecordBatch, UInt32Array,
     builder::BinaryBuilder,
 };
 use arrow_schema::{
@@ -40,8 +40,8 @@ use crate::{
     coders::primitives::{BeamWindow, WindowedValue},
     engine::{
         trigger::{
-            AccumulationMode, Trigger, TriggerContext, TriggerRunner, TriggerSpec, pane_info,
-            pane_timing,
+            AccumulationMode, OutputTime, Trigger, TriggerContext, TriggerRunner, TriggerSpec,
+            pane_info, pane_timing,
         },
         window::{MergedWindows, WindowMergeService},
     },
@@ -50,10 +50,10 @@ use crate::{
         KEY_COLUMN, VALUE_COLUMN,
         element_store::{
             FlareElementStore, PCollectionWriter, WINDOW_COUNT_COLUMN, WINDOW_EXTRA_KEYS_COLUMN,
-            WINDOW_KEY_COLUMN,
+            WINDOW_KEY_COLUMN, WINDOW_TIMESTAMP_COLUMN,
         },
         record::{
-            BeamGbk, BeamRecord, IterableValue, PrimitiveValue, RecordTableSchema,
+            BeamKV, BeamRecord, IterableValue, PrimitiveValue, RecordTableSchema,
             primitive_value_from_array_row, record_batch_to_beamrecords,
         },
     },
@@ -122,7 +122,8 @@ fn parse_env_u64(name: &str, default: u64) -> u64 {
 struct WindowState {
     key: PrimitiveValue,
     window: BeamWindow,
-    values: Vec<BeamRecord>,
+    elements: Vec<PaneElement>,
+    pane_timestamps: Vec<i64>,
     trigger: TriggerRunner,
     pane_index: i64,
     /// A firing has happened for this window.
@@ -144,7 +145,8 @@ impl WindowState {
         Self {
             key,
             window,
-            values: Vec::new(),
+            elements: Vec::new(),
+            pane_timestamps: Vec::new(),
             trigger,
             pane_index: 0,
             fired: false,
@@ -152,6 +154,12 @@ impl WindowState {
             evaluated_this_run: false,
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct PaneElement {
+    value: BeamRecord,
+    timestamp_millis: i64,
 }
 
 /// Storage boundary for accumulated GroupByKey state.
@@ -171,7 +179,7 @@ trait GbkStateBackend: Send + Sync {
         &self,
         key: PrimitiveValue,
         window: BeamWindow,
-        values: Vec<BeamRecord>,
+        elements: Vec<PaneElement>,
         spec: &TriggerSpec,
         input_watermark: i64,
         processing_time: i64,
@@ -226,7 +234,7 @@ impl GbkStateBackend for InMemoryGbkState {
         &self,
         key: PrimitiveValue,
         window: BeamWindow,
-        values: Vec<BeamRecord>,
+        elements: Vec<PaneElement>,
         spec: &TriggerSpec,
         input_watermark: i64,
         processing_time: i64,
@@ -239,12 +247,22 @@ impl GbkStateBackend for InMemoryGbkState {
             && spec.trigger == Trigger::Default
             && spec.accumulation == AccumulationMode::Discarding
         {
+            let timestamp_millis = output_timestamp(
+                spec.output_time,
+                &window,
+                &elements
+                    .iter()
+                    .map(|element| element.timestamp_millis)
+                    .collect::<Vec<_>>(),
+            );
             return Ok(Some(WindowedValue {
-                value: BeamRecord::GBK(BeamGbk {
+                value: BeamRecord::KV(BeamKV {
                     key,
-                    value: IterableValue::from_records(values),
+                    value: Box::new(BeamRecord::ITERABLE(IterableValue::from_records(
+                        elements.into_iter().map(|element| element.value).collect(),
+                    ))),
                 }),
-                timestamp_millis: end,
+                timestamp_millis,
                 windows: vec![window],
                 pane: pane_info(crate::coders::primitives::PaneTiming::OnTime, 0, true, true),
             }));
@@ -258,10 +276,13 @@ impl GbkStateBackend for InMemoryGbkState {
                 TriggerRunner::new(spec.trigger.clone()),
             )
         });
-        for _ in 0..values.len() {
+        for _ in 0..elements.len() {
             state.trigger.on_element(processing_time);
         }
-        state.values.extend(values);
+        state
+            .pane_timestamps
+            .extend(elements.iter().map(|element| element.timestamp_millis));
+        state.elements.extend(elements);
 
         let output = fire_state(state, spec, input_watermark, processing_time);
         if state.closed {
@@ -309,6 +330,22 @@ impl GbkStateBackend for InMemoryGbkState {
     }
 }
 
+fn output_timestamp(output_time: OutputTime, window: &BeamWindow, pane_timestamps: &[i64]) -> i64 {
+    match output_time {
+        OutputTime::LatestInPane => pane_timestamps
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or_else(|| window.max_timestamp_millis()),
+        OutputTime::EarliestInPane => pane_timestamps
+            .iter()
+            .copied()
+            .min()
+            .unwrap_or_else(|| window.max_timestamp_millis()),
+        OutputTime::EndOfWindow => window.max_timestamp_millis(),
+    }
+}
+
 /// Identity of a `(key, window)` group, used to key the state map.
 fn group_identity(key: &PrimitiveValue, window: &BeamWindow) -> GroupIdentity {
     GroupIdentity {
@@ -321,8 +358,10 @@ fn window_prune_cutoff(
     previous_watermark: Option<i64>,
     allowed_lateness: i64,
     needs_merge: bool,
+    is_global_window: bool,
+    input_is_bounded: bool,
 ) -> Option<i64> {
-    if needs_merge {
+    if needs_merge || is_global_window || input_is_bounded {
         return None;
     }
     previous_watermark.map(|watermark| watermark.saturating_sub(allowed_lateness))
@@ -388,13 +427,27 @@ impl FlareTransform for GroupByKey {
             .windowing_strategy
             .as_ref()
             .is_some_and(|strategy| strategy.merge_status == merge_status::Enum::NeedsMerge as i32);
+        let is_global_window = ctx
+            .windowing_strategy
+            .as_ref()
+            .and_then(|strategy| strategy.window_fn.as_ref())
+            .is_none_or(|window_fn| window_fn.urn == beam_urns::GLOBAL_WINDOWS_FN);
         let previous_watermark = self.state.last_evaluated_watermark().await;
-        let window_prune_before =
-            window_prune_cutoff(previous_watermark, spec.allowed_lateness, needs_merge);
+        let window_prune_before = window_prune_cutoff(
+            previous_watermark,
+            spec.allowed_lateness,
+            needs_merge,
+            is_global_window,
+            ctx.input_is_bounded,
+        );
         if let Some(cutoff) = window_prune_before {
             info!(
                 "GroupByKey: pruning finite windows ending at or before {cutoff} based on previously evaluated watermark {previous_watermark:?}"
             );
+        } else if ctx.input_is_bounded && previous_watermark.is_some() {
+            info!("GroupByKey: input pruning disabled for a bounded PCollection");
+        } else if is_global_window && previous_watermark.is_some() {
+            info!("GroupByKey: input pruning disabled for the global window");
         } else if needs_merge && previous_watermark.is_some() {
             info!(
                 "GroupByKey: input pruning disabled because the windowing strategy requires merging"
@@ -438,12 +491,12 @@ impl FlareTransform for GroupByKey {
             PCollectionWriter::new(ctx.store.clone(), ctx.output_pcollection_id.clone());
         let mut output = Vec::with_capacity(OUTPUT_BATCH_SIZE);
         let mut fired = 0usize;
+        let mut decoded_rows = 0usize;
 
         if let Some(mut sorted_input) = sorted_input {
             let sort_result: Result<()> = async {
             let mut decoder = SortedGroupDecoder::default();
             let sort_started = Instant::now();
-            let mut decoded_rows = 0usize;
             let mut next_progress = 1_000_000usize;
             let mut decode_time = std::time::Duration::ZERO;
             let mut group_time = std::time::Duration::ZERO;
@@ -541,9 +594,14 @@ impl FlareTransform for GroupByKey {
                 .set_cursor(&ctx.stage_id, &input_pcollection_id, latest)
                 .await?;
         }
-        self.state
-            .mark_watermark_evaluated(ctx.input_watermark)
-            .await;
+        // A runner stage can be scheduled once with no input at the bounded
+        // sentinel watermark. Recording that watermark would make rows produced
+        // afterward look late. Only arm pruning after input has been observed.
+        if decoded_rows > 0 || previous_watermark.is_some() {
+            self.state
+                .mark_watermark_evaluated(ctx.input_watermark)
+                .await;
+        }
 
         if fired == 0 {
             info!(
@@ -704,6 +762,7 @@ async fn open_sorted_input_stream(
     let projection = [
         KEY_COLUMN,
         VALUE_COLUMN,
+        WINDOW_TIMESTAMP_COLUMN,
         WINDOW_KEY_COLUMN,
         WINDOW_EXTRA_KEYS_COLUMN,
         WINDOW_COUNT_COLUMN,
@@ -815,6 +874,7 @@ fn gbk_input_schema(table_schema: &ArrowSchema) -> Result<Arc<ArrowSchema>> {
     let fields = [
         KEY_COLUMN,
         VALUE_COLUMN,
+        WINDOW_TIMESTAMP_COLUMN,
         WINDOW_KEY_COLUMN,
         WINDOW_EXTRA_KEYS_COLUMN,
         WINDOW_COUNT_COLUMN,
@@ -823,7 +883,13 @@ fn gbk_input_schema(table_schema: &ArrowSchema) -> Result<Arc<ArrowSchema>> {
     .map(|name| {
         table_schema
             .field_with_name(name)
-            .map(|field| Arc::new(field.clone()))
+            .map(|field| {
+                Arc::new(ArrowField::new(
+                    field.name(),
+                    normalize_paimon_list_data_type(field.data_type()),
+                    field.is_nullable(),
+                ))
+            })
             .map_err(|_| anyhow!("GroupByKey input is missing the '{name}' column"))
     })
     .collect::<Result<Vec<_>>>()?;
@@ -833,17 +899,49 @@ fn gbk_input_schema(table_schema: &ArrowSchema) -> Result<Arc<ArrowSchema>> {
     )))
 }
 
+/// Paimon materializes Arrow list children as `element`; the writer-side schema
+/// cached in FlareDB names them `item`. DataFusion compares the full list field
+/// identity, so normalize the transient GBK sort schema to match Paimon's reader.
+fn normalize_paimon_list_data_type(data_type: &ArrowDataType) -> ArrowDataType {
+    match data_type {
+        ArrowDataType::List(child) => ArrowDataType::List(Arc::new(ArrowField::new(
+            "element",
+            normalize_paimon_list_data_type(child.data_type()),
+            child.is_nullable(),
+        ))),
+        ArrowDataType::LargeList(child) => ArrowDataType::LargeList(Arc::new(ArrowField::new(
+            "element",
+            normalize_paimon_list_data_type(child.data_type()),
+            child.is_nullable(),
+        ))),
+        ArrowDataType::FixedSizeList(child, size) => ArrowDataType::FixedSizeList(
+            Arc::new(ArrowField::new(
+                "element",
+                normalize_paimon_list_data_type(child.data_type()),
+                child.is_nullable(),
+            )),
+            *size,
+        ),
+        other => other.clone(),
+    }
+}
+
 fn gbk_flattened_schema(input_schema: &ArrowSchema) -> SchemaRef {
-    let mut fields = [KEY_COLUMN, VALUE_COLUMN, WINDOW_KEY_COLUMN]
-        .into_iter()
-        .map(|name| {
-            input_schema
-                .field_with_name(name)
-                .expect("GBK input schema was validated")
-                .clone()
-        })
-        .map(Arc::new)
-        .collect::<Vec<_>>();
+    let mut fields = [
+        KEY_COLUMN,
+        VALUE_COLUMN,
+        WINDOW_TIMESTAMP_COLUMN,
+        WINDOW_KEY_COLUMN,
+    ]
+    .into_iter()
+    .map(|name| {
+        input_schema
+            .field_with_name(name)
+            .expect("GBK input schema was validated")
+            .clone()
+    })
+    .map(Arc::new)
+    .collect::<Vec<_>>();
     fields.push(Arc::new(ArrowField::new(
         GROUP_KEY_COLUMN,
         ArrowDataType::Binary,
@@ -951,12 +1049,16 @@ fn take_flattened_window_batch(
     let value = batch
         .column_by_name(VALUE_COLUMN)
         .ok_or_else(|| anyhow!("GBK input is missing '{VALUE_COLUMN}'"))?;
+    let timestamp = batch
+        .column_by_name(WINDOW_TIMESTAMP_COLUMN)
+        .ok_or_else(|| anyhow!("GBK input is missing '{WINDOW_TIMESTAMP_COLUMN}'"))?;
     let group_key = batch
         .column_by_name(GROUP_KEY_COLUMN)
         .ok_or_else(|| anyhow!("GBK input is missing '{GROUP_KEY_COLUMN}'"))?;
     let columns = vec![
         take(key.as_ref(), &indices, None)?,
         take(value.as_ref(), &indices, None)?,
+        take(timestamp.as_ref(), &indices, None)?,
         take(window_values, &window_indices, None)?,
         take(group_key.as_ref(), &indices, None)?,
     ];
@@ -964,6 +1066,11 @@ fn take_flattened_window_batch(
     let fields = vec![
         Arc::new(source_schema.field_with_name(KEY_COLUMN)?.clone()),
         Arc::new(source_schema.field_with_name(VALUE_COLUMN)?.clone()),
+        Arc::new(
+            source_schema
+                .field_with_name(WINDOW_TIMESTAMP_COLUMN)?
+                .clone(),
+        ),
         Arc::new(ArrowField::new(
             WINDOW_KEY_COLUMN,
             window_values.data_type().clone(),
@@ -1077,6 +1184,12 @@ impl SortedGroupDecoder {
             .as_any()
             .downcast_ref::<BinaryArray>()
             .ok_or_else(|| anyhow!("GroupByKey encoded key must be a Binary column"))?;
+        let timestamps = batch
+            .column_by_name(WINDOW_TIMESTAMP_COLUMN)
+            .ok_or_else(|| anyhow!("GroupByKey is missing '{WINDOW_TIMESTAMP_COLUMN}'"))?
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| anyhow!("GroupByKey timestamp must be an Int64 column"))?;
         let records = record_batch_to_beamrecords(batch, table_schema)?;
         let mut completed = Vec::new();
 
@@ -1091,7 +1204,10 @@ impl SortedGroupDecoder {
             let window_key = window_keys.value(row);
             let window = BeamWindow::from_binary_key(window_key)
                 .ok_or_else(|| anyhow!("GroupByKey encountered a malformed binary window key"))?;
-            let value = *kv.value;
+            let element = PaneElement {
+                value: *kv.value,
+                timestamp_millis: timestamps.value(row),
+            };
 
             let replace_key = self
                 .current
@@ -1113,9 +1229,9 @@ impl SortedGroupDecoder {
                 Some((current_window, values))
                     if current_window.to_binary_key() == window.to_binary_key() =>
                 {
-                    values.push(value);
+                    values.push(element);
                 }
-                _ => current.windows.push((window, vec![value])),
+                _ => current.windows.push((window, vec![element])),
             }
         }
         Ok(completed)
@@ -1129,13 +1245,13 @@ impl SortedGroupDecoder {
     }
 }
 
-type WindowValues = Vec<(BeamWindow, Vec<BeamRecord>)>;
+type WindowValues = Vec<(BeamWindow, Vec<PaneElement>)>;
 
 fn apply_merge_results(
     key: &PrimitiveValue,
-    original_groups: Vec<(BeamWindow, Vec<BeamRecord>)>,
+    original_groups: Vec<(BeamWindow, Vec<PaneElement>)>,
     merge_results: Vec<MergedWindows>,
-) -> Result<Vec<(PrimitiveValue, BeamWindow, Vec<BeamRecord>)>, Error> {
+) -> Result<Vec<(PrimitiveValue, BeamWindow, Vec<PaneElement>)>, Error> {
     let original_to_merged: HashMap<Vec<u8>, BeamWindow> = merge_results
         .into_iter()
         .flat_map(|result| {
@@ -1147,7 +1263,7 @@ fn apply_merge_results(
         })
         .collect();
 
-    let mut merged_groups: HashMap<Vec<u8>, (BeamWindow, Vec<BeamRecord>)> = HashMap::new();
+    let mut merged_groups: HashMap<Vec<u8>, (BeamWindow, Vec<PaneElement>)> = HashMap::new();
     for (original, values) in original_groups {
         let original_key = original.to_binary_key();
         let merged_window = original_to_merged.get(&original_key).ok_or_else(|| {
@@ -1250,9 +1366,9 @@ async fn process_key_groups_batch(
 /// key, merging is deterministic: sort by start time and combine every pair with
 /// a non-empty overlap. Opaque/custom windows still use the SDK WindowFn below.
 fn merge_interval_groups(
-    groups: Vec<(PrimitiveValue, BeamWindow, Vec<BeamRecord>)>,
-) -> Result<Vec<(PrimitiveValue, BeamWindow, Vec<BeamRecord>)>> {
-    let mut by_key: HashMap<String, (PrimitiveValue, Vec<(i64, i64, Vec<BeamRecord>)>)> =
+    groups: Vec<(PrimitiveValue, BeamWindow, Vec<PaneElement>)>,
+) -> Result<Vec<(PrimitiveValue, BeamWindow, Vec<PaneElement>)>> {
+    let mut by_key: HashMap<String, (PrimitiveValue, Vec<(i64, i64, Vec<PaneElement>)>)> =
         HashMap::new();
     for (key, window, values) in groups {
         let BeamWindow::Interval {
@@ -1347,10 +1463,12 @@ fn fire_state(
     let timing = pane_timing(end_of_window, is_first);
     let pane = pane_info(timing, state.pane_index, is_first, expired);
 
-    let values = match spec.accumulation {
-        AccumulationMode::Discarding => std::mem::take(&mut state.values),
-        AccumulationMode::Accumulating | AccumulationMode::Retracting => state.values.clone(),
+    let elements = match spec.accumulation {
+        AccumulationMode::Discarding => std::mem::take(&mut state.elements),
+        AccumulationMode::Accumulating | AccumulationMode::Retracting => state.elements.clone(),
     };
+    let pane_timestamps = std::mem::take(&mut state.pane_timestamps);
+    let timestamp_millis = output_timestamp(spec.output_time, &state.window, &pane_timestamps);
 
     state.trigger.on_fire(trigger_ctx);
     state.pane_index += 1;
@@ -1362,16 +1480,18 @@ fn fire_state(
 
     // Beam's `EmitIfNonempty` closing behavior: a firing whose pane has no
     // accumulated values carries no data and must not be emitted.
-    if values.is_empty() {
+    if elements.is_empty() {
         return None;
     }
 
     Some(WindowedValue {
-        value: BeamRecord::GBK(BeamGbk {
+        value: BeamRecord::KV(BeamKV {
             key: state.key.clone(),
-            value: IterableValue::from_records(values),
+            value: Box::new(BeamRecord::ITERABLE(IterableValue::from_records(
+                elements.into_iter().map(|element| element.value).collect(),
+            ))),
         }),
-        timestamp_millis: end,
+        timestamp_millis,
         windows: vec![state.window.clone()],
         pane,
     })
@@ -1491,6 +1611,7 @@ mod tests {
                 windowing_strategy: None,
                 processing_time: 0,
                 input_watermark,
+                input_is_bounded: true,
                 output_coder: None,
                 window_merger: None,
                 source_reports: None,
@@ -1519,6 +1640,7 @@ mod tests {
                 windowing_strategy: strategy,
                 processing_time: 0,
                 input_watermark,
+                input_is_bounded: true,
                 output_coder: None,
                 window_merger: None,
                 source_reports: None,
@@ -1541,10 +1663,10 @@ mod tests {
         output
             .iter()
             .map(|value| {
-                let BeamRecord::GBK(gbk) = &value.value else {
-                    panic!("expected GBK output, got {:?}", value.value);
+                let BeamRecord::KV(kv) = &value.value else {
+                    panic!("expected KV output, got {:?}", value.value);
                 };
-                let key = match &gbk.key {
+                let key = match &kv.key {
                     PrimitiveValue::String(s) => s.clone(),
                     other => panic!("expected string key, got {other:?}"),
                 };
@@ -1560,8 +1682,10 @@ mod tests {
                     } => (*start_millis, *end_millis),
                     other => panic!("expected interval window, got {other:?}"),
                 };
-                let mut values: Vec<i64> = gbk
-                    .value
+                let BeamRecord::ITERABLE(grouped) = kv.value.as_ref() else {
+                    panic!("expected iterable group values, got {:?}", kv.value);
+                };
+                let mut values: Vec<i64> = grouped
                     .list
                     .iter()
                     .map(|record| match record {
@@ -1575,136 +1699,301 @@ mod tests {
             .collect()
     }
 
-    fn custom_window(id: u8) -> BeamWindow {
-        BeamWindow::Opaque {
-            coder_id: "test-window-coder".to_string(),
-            bytes: vec![id],
-        }
-    }
-
-    #[test]
-    fn merging_windows_combines_consumed_original_groups() {
-        let first = custom_window(1);
-        let second = custom_window(2);
-        let third = custom_window(3);
-        let merged = BeamWindow::Opaque {
-            coder_id: "test-window-coder".to_string(),
-            bytes: vec![9],
-        };
-        let key = PrimitiveValue::String("alice".to_string());
-        let groups = apply_merge_results(
-            &key,
-            vec![
-                (
-                    first.clone(),
-                    vec![BeamRecord::PRIMITIVE(PrimitiveValue::Int64(10))],
-                ),
-                (
-                    second.clone(),
-                    vec![BeamRecord::PRIMITIVE(PrimitiveValue::Int64(20))],
-                ),
-                (
-                    third.clone(),
-                    vec![BeamRecord::PRIMITIVE(PrimitiveValue::Int64(30))],
-                ),
-            ],
-            vec![
-                MergedWindows {
-                    merged: merged.clone(),
-                    originals: vec![first, second],
-                },
-                MergedWindows {
-                    merged: third.clone(),
-                    originals: vec![third.clone()],
-                },
-            ],
-        )
-        .unwrap();
-
-        let by_window: HashMap<String, Vec<i64>> = groups
-            .into_iter()
-            .map(|(_, window, values)| {
-                let mut values: Vec<i64> = values
-                    .into_iter()
-                    .map(|record| match record {
-                        BeamRecord::PRIMITIVE(PrimitiveValue::Int64(value)) => value,
-                        other => panic!("expected int64 value, got {other:?}"),
-                    })
-                    .collect();
-                values.sort_unstable();
-                (window.canonical_key(), values)
-            })
-            .collect();
-
-        assert_eq!(by_window.get(&merged.canonical_key()), Some(&vec![10, 20]));
-        assert_eq!(by_window.get(&third.canonical_key()), Some(&vec![30]));
-    }
-
-    #[test]
-    fn native_interval_merge_combines_overlaps_without_touching_boundaries() {
-        let key = PrimitiveValue::String("alice".to_string());
-        let record = |value| BeamRecord::PRIMITIVE(PrimitiveValue::Int64(value));
-        let merged = merge_interval_groups(vec![
-            (key.clone(), interval(0, 10), vec![record(1)]),
-            (key.clone(), interval(5, 20), vec![record(2)]),
-            (key, interval(20, 30), vec![record(3)]),
-        ])
-        .unwrap();
-
-        let by_window: HashMap<String, Vec<i64>> = merged
-            .into_iter()
-            .map(|(_, window, values)| {
-                let values = values
-                    .into_iter()
-                    .map(|record| match record {
-                        BeamRecord::PRIMITIVE(PrimitiveValue::Int64(value)) => value,
-                        other => panic!("expected int64 value, got {other:?}"),
-                    })
-                    .collect();
-                (window.canonical_key(), values)
-            })
-            .collect();
-
-        assert_eq!(
-            by_window.get("interval:0:20"),
-            Some(&vec![1, 2]),
-            "overlapping sessions should merge"
-        );
-        assert_eq!(
-            by_window.get("interval:20:30"),
-            Some(&vec![3]),
-            "half-open sessions that only touch should remain separate"
-        );
-    }
-
     #[tokio::test]
-    async fn groups_same_key_separately_per_window_and_keeps_other_keys_apart() {
+    async fn default_group_emits_canonical_kv_with_iterable_values() {
         let (_dir, store) = make_store().await;
-        let input = "gbk-in";
-        let output = "gbk-out";
-
-        // "alice" appears in two adjacent windows; "bob" shares the first window.
-        let elements = vec![
-            kv_windowed("alice", 10, vec![interval(0, 60_000)], 1_000),
-            kv_windowed("alice", 20, vec![interval(0, 60_000)], 2_000),
-            kv_windowed("alice", 30, vec![interval(60_000, 120_000)], 61_000),
-            kv_windowed("bob", 40, vec![interval(0, 60_000)], 3_000),
-        ];
+        let input = "gbk-in-kv-output";
+        let output = "gbk-out-kv-output";
         store
-            .write_windowed_value_batch(input, elements)
+            .write_windowed_value_batch(
+                input,
+                vec![
+                    kv_windowed("a", 1, vec![BeamWindow::Global], 0),
+                    kv_windowed("a", 2, vec![BeamWindow::Global], 0),
+                    kv_windowed("b", 3, vec![BeamWindow::Global], 0),
+                ],
+            )
             .await
             .unwrap();
 
         run_gbk(&store, input, output).await;
 
-        let scanned = scan_output(&store, output).await;
-        let groups = collect_groups(&scanned);
+        let mut groups = HashMap::new();
+        for value in scan_output(&store, output).await {
+            assert_eq!(value.windows, vec![BeamWindow::Global]);
+            assert_eq!(value.pane.timing, PaneTiming::OnTime);
+            let BeamRecord::KV(kv) = value.value else {
+                panic!("GroupByKey must emit KV<K, Iterable<V>>");
+            };
+            let PrimitiveValue::String(key) = kv.key else {
+                panic!("expected string key");
+            };
+            let BeamRecord::ITERABLE(values) = *kv.value else {
+                panic!("GroupByKey value must be an iterable");
+            };
+            let values = values
+                .list
+                .into_iter()
+                .map(|record| match record {
+                    BeamRecord::PRIMITIVE(PrimitiveValue::Int64(value)) => value,
+                    other => panic!("expected int64 value, got {other:?}"),
+                })
+                .collect::<Vec<_>>();
+            let mut values = values;
+            values.sort_unstable();
+            groups.insert(key, values);
+        }
+        assert_eq!(groups.get("a"), Some(&vec![1, 2]));
+        assert_eq!(groups.get("b"), Some(&vec![3]));
+    }
 
-        assert_eq!(
-            groups.len(),
-            3,
-            "expected three (key, window) groups, got {groups:?}"
+    #[tokio::test]
+    async fn global_window_keeps_rows_appended_after_a_max_watermark_run() {
+        let (_dir, store) = make_store().await;
+        let input = "gbk-in-global-rerun";
+        let output = "gbk-out-global-rerun";
+        let transform = GroupByKey::with(
+            "gbk-global-rerun".to_string(),
+            HashMap::from([("in".to_string(), input.to_string())]),
+            HashMap::from([("out".to_string(), output.to_string())]),
+            "GroupByKey".to_string(),
         );
+
+        // This models the first bounded-pipeline run, which can observe an empty
+        // upstream while already at the sentinel watermark.
+        run_gbk_with(
+            &transform,
+            &store,
+            input,
+            output,
+            crate::engine::watermark::MIN_TIMESTAMP,
+        )
+        .await;
+        store
+            .write_windowed_value_batch(
+                input,
+                vec![
+                    kv_windowed("a", 1, vec![BeamWindow::Global], 0),
+                    kv_windowed("a", 2, vec![BeamWindow::Global], 0),
+                ],
+            )
+            .await
+            .unwrap();
+
+        run_gbk_with(
+            &transform,
+            &store,
+            input,
+            output,
+            crate::engine::watermark::MAX_TIMESTAMP,
+        )
+        .await;
+
+        let mut values = scan_output(&store, output)
+            .await
+            .into_iter()
+            .map(|value| {
+                let BeamRecord::KV(kv) = value.value else {
+                    panic!("expected KV output");
+                };
+                let BeamRecord::ITERABLE(values) = *kv.value else {
+                    panic!("expected iterable values");
+                };
+                values
+                    .list
+                    .into_iter()
+                    .map(|value| match value {
+                        BeamRecord::PRIMITIVE(PrimitiveValue::Int64(value)) => value,
+                        other => panic!("expected int64 value, got {other:?}"),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+        values.sort_unstable();
+        assert_eq!(values, vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn empty_first_run_does_not_arm_pruning_for_finite_windows() {
+        let (_dir, store) = make_store().await;
+        let input = "gbk-in-empty-then-finite";
+        let output = "gbk-out-empty-then-finite";
+        let transform = GroupByKey::with(
+            "gbk-empty-then-finite".to_string(),
+            HashMap::from([("in".to_string(), input.to_string())]),
+            HashMap::from([("out".to_string(), output.to_string())]),
+            "GroupByKey".to_string(),
+        );
+        let strategy = WindowingStrategy {
+            window_fn: Some(FunctionSpec {
+                urn: beam_urns::FIXED_WINDOWS_FN.to_string(),
+                payload: Vec::new(),
+            }),
+            ..WindowingStrategy::default()
+        };
+
+        // PAssert and other SDK-generated graph fragments can schedule a native
+        // GBK once before their upstream stage has committed any rows.
+        run_gbk_with_strategy(
+            &transform,
+            &store,
+            input,
+            output,
+            Some(strategy.clone()),
+            crate::engine::watermark::MAX_TIMESTAMP,
+        )
+        .await;
+        store
+            .write_windowed_value_batch(
+                input,
+                vec![kv_windowed("a", 1, vec![interval(100, 200)], 150)],
+            )
+            .await
+            .unwrap();
+
+        run_gbk_with_strategy(
+            &transform,
+            &store,
+            input,
+            output,
+            Some(strategy),
+            crate::engine::watermark::MAX_TIMESTAMP,
+        )
+        .await;
+
+        let groups = collect_groups(&scan_output(&store, output).await);
+        assert_eq!(groups.get(&("a".to_string(), 100, 200)), Some(&vec![1]));
+    }
+
+    #[test]
+    fn pruning_is_disabled_for_global_and_merging_windows() {
+        let maximum = crate::engine::watermark::MAX_TIMESTAMP;
+        assert_eq!(
+            window_prune_cutoff(Some(maximum), 0, false, true, false),
+            None
+        );
+        assert_eq!(
+            window_prune_cutoff(Some(maximum), 0, true, false, false),
+            None
+        );
+        assert_eq!(
+            window_prune_cutoff(Some(maximum), 0, false, false, true),
+            None
+        );
+        assert_eq!(
+            window_prune_cutoff(Some(maximum), 1_000, false, false, false),
+            Some(maximum - 1_000)
+        );
+    }
+
+    #[test]
+    fn gbk_sort_schema_uses_paimon_list_child_names() {
+        let table_schema = ArrowSchema::new(vec![
+            ArrowField::new(KEY_COLUMN, ArrowDataType::Utf8, false),
+            ArrowField::new(
+                VALUE_COLUMN,
+                ArrowDataType::List(Arc::new(ArrowField::new(
+                    "item",
+                    ArrowDataType::Binary,
+                    false,
+                ))),
+                true,
+            ),
+            ArrowField::new(WINDOW_TIMESTAMP_COLUMN, ArrowDataType::Int64, false),
+            ArrowField::new(WINDOW_KEY_COLUMN, ArrowDataType::Binary, true),
+            ArrowField::new(
+                WINDOW_EXTRA_KEYS_COLUMN,
+                ArrowDataType::List(Arc::new(ArrowField::new(
+                    "item",
+                    ArrowDataType::Binary,
+                    false,
+                ))),
+                true,
+            ),
+            ArrowField::new(WINDOW_COUNT_COLUMN, ArrowDataType::Int16, false),
+        ]);
+
+        let normalized = gbk_input_schema(&table_schema).unwrap();
+        let ArrowDataType::List(child) = normalized
+            .field_with_name(VALUE_COLUMN)
+            .unwrap()
+            .data_type()
+        else {
+            panic!("expected list value column");
+        };
+        assert_eq!(child.name(), "element");
+    }
+
+    #[tokio::test]
+    async fn output_time_uses_input_event_timestamps() {
+        use beam_model_rs::v1::output_time;
+
+        let (_dir, store) = make_store().await;
+        for (output_time, expected_timestamp) in [
+            (output_time::Enum::EarliestInPane, 100),
+            (output_time::Enum::LatestInPane, 900),
+            (output_time::Enum::EndOfWindow, 999),
+        ] {
+            let input = format!("gbk-in-output-time-{output_time:?}");
+            let output = format!("gbk-out-output-time-{output_time:?}");
+            store
+                .write_windowed_value_batch(
+                    &input,
+                    vec![
+                        kv_windowed("a", 1, vec![interval(0, 1_000)], 900),
+                        kv_windowed("a", 2, vec![interval(0, 1_000)], 100),
+                    ],
+                )
+                .await
+                .unwrap();
+            let strategy = WindowingStrategy {
+                output_time: output_time as i32,
+                ..WindowingStrategy::default()
+            };
+            let transform = GroupByKey::with(
+                format!("gbk-output-time-{output_time:?}"),
+                HashMap::from([("in".to_string(), input.clone())]),
+                HashMap::from([("out".to_string(), output.clone())]),
+                "GroupByKey".to_string(),
+            );
+            run_gbk_with_strategy(
+                &transform,
+                &store,
+                &input,
+                &output,
+                Some(strategy),
+                i64::MAX,
+            )
+            .await;
+
+            let panes = scan_output(&store, &output).await;
+            assert_eq!(panes.len(), 1);
+            assert_eq!(panes[0].timestamp_millis, expected_timestamp);
+        }
+    }
+
+    #[tokio::test]
+    async fn groups_are_separated_by_key_and_window() {
+        let (_dir, store) = make_store().await;
+        let input = "gbk-in-window-groups";
+        let output = "gbk-out-window-groups";
+        store
+            .write_windowed_value_batch(
+                input,
+                vec![
+                    kv_windowed("alice", 10, vec![interval(0, 60_000)], 1_000),
+                    kv_windowed("alice", 20, vec![interval(0, 60_000)], 2_000),
+                    kv_windowed("alice", 30, vec![interval(60_000, 120_000)], 61_000),
+                    kv_windowed("bob", 40, vec![interval(0, 60_000)], 3_000),
+                ],
+            )
+            .await
+            .unwrap();
+
+        run_gbk(&store, input, output).await;
+
+        let groups = collect_groups(&scan_output(&store, output).await);
         assert_eq!(
             groups.get(&("alice".to_string(), 0, 60_000)),
             Some(&vec![10, 20])
@@ -1717,63 +2006,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn output_metadata_is_derived_from_the_group_window() {
+    async fn an_element_in_multiple_windows_joins_each_group() {
         let (_dir, store) = make_store().await;
-        let input = "gbk-in-meta";
-        let output = "gbk-out-meta";
-
-        let elements = vec![
-            kv_windowed("alice", 1, vec![interval(0, 60_000)], 1_000),
-            kv_windowed("alice", 2, vec![interval(60_000, 120_000)], 61_000),
-        ];
+        let input = "gbk-in-multiple-windows";
+        let output = "gbk-out-multiple-windows";
         store
-            .write_windowed_value_batch(input, elements)
+            .write_windowed_value_batch(
+                input,
+                vec![kv_windowed(
+                    "alice",
+                    7,
+                    vec![interval(0, 60_000), interval(30_000, 90_000)],
+                    40_000,
+                )],
+            )
             .await
             .unwrap();
 
         run_gbk(&store, input, output).await;
 
-        let scanned = scan_output(&store, output).await;
-        assert_eq!(scanned.len(), 2);
-        for value in &scanned {
-            let BeamWindow::Interval { end_millis, .. } = value.windows[0] else {
-                panic!("expected interval window, got {:?}", value.windows[0]);
-            };
-            // Beam derives the GroupByKey output timestamp from the window.
-            assert_eq!(value.timestamp_millis, end_millis - 1);
-            assert_eq!(value.pane, PaneInfo::on_time_firing());
-            assert_eq!(value.pane.timing, PaneTiming::OnTime);
-        }
-    }
-
-    #[tokio::test]
-    async fn element_in_multiple_windows_contributes_to_each_window_group() {
-        let (_dir, store) = make_store().await;
-        let input = "gbk-in-sliding";
-        let output = "gbk-out-sliding";
-
-        // A sliding-window element belongs to two windows and must appear in both
-        // grouped outputs, matching Beam's GroupAlsoByWindow semantics.
-        let elements = vec![kv_windowed(
-            "alice",
-            7,
-            vec![interval(0, 60_000), interval(30_000, 90_000)],
-            40_000,
-        )];
-        store
-            .write_windowed_value_batch(input, elements)
-            .await
-            .unwrap();
-
-        run_gbk(&store, input, output).await;
-
-        let scanned = scan_output(&store, output).await;
-        let groups = collect_groups(&scanned);
-        assert_eq!(
-            groups.len(),
-            2,
-            "expected two window groups, got {groups:?}"
-        );
+        let groups = collect_groups(&scan_output(&store, output).await);
         assert_eq!(
             groups.get(&("alice".to_string(), 0, 60_000)),
             Some(&vec![7])
@@ -1785,468 +2037,82 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn global_window_groups_by_key_only() {
+    async fn void_values_remain_present_in_the_iterable() {
         let (_dir, store) = make_store().await;
-        let input = "gbk-in-global";
-        let output = "gbk-out-global";
-
-        let elements = vec![
-            kv_windowed("alice", 1, vec![BeamWindow::Global], 0),
-            kv_windowed("alice", 2, vec![BeamWindow::Global], 0),
-            kv_windowed("bob", 3, vec![BeamWindow::Global], 0),
-        ];
-        store
-            .write_windowed_value_batch(input, elements)
-            .await
-            .unwrap();
-
-        run_gbk(&store, input, output).await;
-
-        let scanned = scan_output(&store, output).await;
-
-        // Two key groups, each assigned to the global window with its max timestamp.
-        let mut by_key: HashMap<String, Vec<i64>> = HashMap::new();
-        for value in &scanned {
-            assert_eq!(value.windows, vec![BeamWindow::Global]);
-            assert_eq!(
-                value.timestamp_millis,
-                BeamWindow::Global.max_timestamp_millis()
-            );
-            let BeamRecord::GBK(gbk) = &value.value else {
-                panic!("expected GBK output, got {:?}", value.value);
-            };
-            let PrimitiveValue::String(key) = &gbk.key else {
-                panic!("expected string key");
-            };
-            let mut values: Vec<i64> = gbk
-                .value
-                .list
-                .iter()
-                .map(|record| match record {
-                    BeamRecord::PRIMITIVE(PrimitiveValue::Int64(v)) => *v,
-                    other => panic!("expected int64 value, got {other:?}"),
-                })
-                .collect();
-            values.sort_unstable();
-            by_key.insert(key.clone(), values);
-        }
-
-        assert_eq!(by_key.len(), 2, "expected two key groups, got {by_key:?}");
-        assert_eq!(by_key.get("alice"), Some(&vec![1, 2]));
-        assert_eq!(by_key.get("bob"), Some(&vec![3]));
-    }
-
-    #[tokio::test]
-    async fn void_valued_kv_groups_roundtrip_through_gbk() {
-        let (_dir, store) = make_store().await;
-        let input = "gbk-in-void";
-        let output = "gbk-out-void";
+        let input = "gbk-in-void-values";
+        let output = "gbk-out-void-values";
         store
             .write_windowed_value_batch(
                 input,
                 vec![
                     kv_void_windowed("a", 1),
-                    kv_void_windowed("b", 2),
-                    kv_void_windowed("a", 3),
+                    kv_void_windowed("a", 2),
+                    kv_void_windowed("b", 3),
                 ],
             )
             .await
             .unwrap();
 
         run_gbk(&store, input, output).await;
-        let values = scan_output(&store, output).await;
-        let mut grouped: HashMap<String, Vec<PrimitiveValue>> = HashMap::new();
-        for value in values {
-            let BeamRecord::GBK(gbk) = value.value else {
-                panic!("expected GBK output");
+
+        let mut sizes = HashMap::new();
+        for value in scan_output(&store, output).await {
+            let BeamRecord::KV(kv) = value.value else {
+                panic!("expected KV output");
             };
-            let PrimitiveValue::String(key) = gbk.key else {
+            let PrimitiveValue::String(key) = kv.key else {
                 panic!("expected string key");
             };
-            grouped.insert(
-                key,
-                gbk.value
+            let BeamRecord::ITERABLE(values) = *kv.value else {
+                panic!("expected iterable values");
+            };
+            assert!(
+                values
                     .list
-                    .into_iter()
-                    .map(|record| match record {
-                        BeamRecord::PRIMITIVE(value) => value,
-                        other => panic!("expected primitive value, got {other:?}"),
-                    })
-                    .collect(),
+                    .iter()
+                    .all(|value| matches!(value, BeamRecord::PRIMITIVE(PrimitiveValue::Void)))
             );
+            sizes.insert(key, values.list.len());
         }
-        assert_eq!(
-            grouped.get("a"),
-            Some(&vec![PrimitiveValue::Void, PrimitiveValue::Void])
-        );
-        assert_eq!(grouped.get("b"), Some(&vec![PrimitiveValue::Void]));
+        assert_eq!(sizes.get("a"), Some(&2));
+        assert_eq!(sizes.get("b"), Some(&1));
     }
 
     #[tokio::test]
-    async fn void_key_groups_roundtrip_through_gbk() {
+    async fn one_megabyte_keys_group_without_an_intermediate_gbk_shape() {
         let (_dir, store) = make_store().await;
-        let input = "gbk-in-void-key";
-        let output = "gbk-out-void-key";
-        store
-            .write_windowed_value_batch(
-                input,
-                vec![
-                    void_key_kv_windowed(vec![1, 2]),
-                    void_key_kv_windowed(vec![3, 4]),
-                ],
-            )
-            .await
-            .unwrap();
-
-        run_gbk(&store, input, output).await;
-        let values = scan_output(&store, output).await;
-        assert_eq!(values.len(), 1);
-        let BeamRecord::GBK(gbk) = &values[0].value else {
-            panic!("expected GBK output");
-        };
-        assert_eq!(gbk.key, PrimitiveValue::Void);
-        assert_eq!(
-            gbk.value.list,
-            vec![
-                BeamRecord::PRIMITIVE(PrimitiveValue::Bytes(vec![1, 2])),
-                BeamRecord::PRIMITIVE(PrimitiveValue::Bytes(vec![3, 4]))
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn empty_input_produces_empty_output() {
-        let (_dir, store) = make_store().await;
-        let input = "gbk-in-empty";
-        let output = "gbk-out-empty";
-
-        // No write happens for the input, so it has zero committed elements.
-        run_gbk(&store, input, output).await;
-
-        let scanned = scan_output(&store, output).await;
-        assert!(scanned.is_empty(), "expected empty output, got {scanned:?}");
-    }
-
-    #[tokio::test]
-    async fn drained_residual_batches_are_grouped_together_in_one_fire() {
-        let (_dir, store) = make_store().await;
-        let input = "gbk-in-drained-residuals";
-        let output = "gbk-out-drained-residuals";
-
-        // The two commits model the parent bundle output and a residual that
-        // completes later. The scheduler barrier ensures GBK first runs only after
-        // both are materialized.
-        store
-            .write_windowed_value_batch(
-                input,
-                vec![kv_windowed("a", 1, vec![BeamWindow::Global], 0)],
-            )
-            .await
-            .unwrap();
-        store
-            .write_windowed_value_batch(
-                input,
-                vec![kv_windowed("a", 2, vec![BeamWindow::Global], 0)],
-            )
-            .await
-            .unwrap();
-
-        run_gbk(&store, input, output).await;
-        let scanned = scan_output(&store, output).await;
-        assert_eq!(scanned.len(), 1, "one global-window group should fire");
-        let BeamRecord::GBK(group) = &scanned[0].value else {
-            panic!("expected GBK output, got {:?}", scanned[0].value);
-        };
-        let mut values = group
-            .value
-            .list
-            .iter()
-            .map(|record| {
-                let BeamRecord::PRIMITIVE(PrimitiveValue::Int64(value)) = record else {
-                    panic!("expected int64 group value, got {record:?}");
-                };
-                *value
-            })
-            .collect::<Vec<_>>();
-        values.sort_unstable();
-        assert_eq!(values, vec![1, 2]);
-    }
-
-    /// Beam's default trigger: a window emits only once the input watermark is
-    /// strictly after its maximum timestamp, and only once as the watermark advances.
-    #[tokio::test]
-    async fn emits_only_windows_the_input_watermark_has_reached() {
-        let (_dir, store) = make_store().await;
-        let input = "gbk-in-readiness";
-        let output = "gbk-out-readiness";
-
-        // Two interval windows: [0, 100) has max timestamp 99, [100, 200) has 199.
-        let elements = vec![
-            kv_windowed("a", 1, vec![interval(0, 100)], 10),
-            kv_windowed("a", 2, vec![interval(100, 200)], 150),
-        ];
-        store
-            .write_windowed_value_batch(input, elements)
-            .await
-            .unwrap();
-
-        let transform = GroupByKey::with(
-            "gbk-readiness".to_string(),
-            HashMap::from([("in".to_string(), input.to_string())]),
-            HashMap::from([("out".to_string(), output.to_string())]),
-            "GroupByKey".to_string(),
-        );
-
-        // WM = 98: below both window ends, nothing is ready.
-        run_gbk_with(&transform, &store, input, output, 98).await;
-        assert!(
-            scan_output(&store, output).await.is_empty(),
-            "no window should emit before its end"
-        );
-
-        // WM = 99: still inside [0, 100) because its max timestamp is 99.
-        run_gbk_with(&transform, &store, input, output, 99).await;
-        assert!(
-            scan_output(&store, output).await.is_empty(),
-            "watermark equal to maxTimestamp is still on time"
-        );
-
-        // WM = 100: the timer has advanced past maxTimestamp 99.
-        run_gbk_with(&transform, &store, input, output, 100).await;
-        let groups = collect_groups(&scan_output(&store, output).await);
-        assert_eq!(
-            groups.len(),
-            1,
-            "only the first window is ready, got {groups:?}"
-        );
-        assert_eq!(groups.get(&("a".to_string(), 0, 100)), Some(&vec![1]));
-
-        // WM = 200: the second window is now ready; the first is not re-emitted.
-        run_gbk_with(&transform, &store, input, output, 200).await;
-        let groups = collect_groups(&scan_output(&store, output).await);
-        assert_eq!(groups.len(), 2, "both windows ready, got {groups:?}");
-        assert_eq!(groups.get(&("a".to_string(), 100, 200)), Some(&vec![2]));
-
-        // Re-running at the same watermark emits nothing new (emit-once).
-        run_gbk_with(&transform, &store, input, output, 200).await;
-        assert_eq!(
-            collect_groups(&scan_output(&store, output).await).len(),
-            2,
-            "a re-run at the same watermark must not re-emit"
-        );
-    }
-
-    /// A non-default trigger emits multiple panes for one window: an on-time pane
-    /// when the watermark passes the window end, then a late pane when a late
-    /// element arrives and the late trigger is satisfied.
-    #[tokio::test]
-    async fn a_late_element_fires_a_second_late_pane() {
-        use beam_model_rs::v1::{
-            Trigger as TriggerProto, accumulation_mode, trigger as trigger_proto,
-        };
-
-        let (_dir, store) = make_store().await;
-        let input = "gbk-in-late";
-        let output = "gbk-out-late";
-
-        let transform = GroupByKey::with(
-            "gbk-late".to_string(),
-            HashMap::from([("in".to_string(), input.to_string())]),
-            HashMap::from([("out".to_string(), output.to_string())]),
-            "GroupByKey".to_string(),
-        );
-
-        // AfterEndOfWindow { late: AfterPane.elementCount(1) }, with lateness so the
-        // window stays open for the late element.
-        let late = TriggerProto {
-            trigger: Some(trigger_proto::Trigger::ElementCount(
-                trigger_proto::ElementCount { element_count: 1 },
-            )),
-        };
-        let strategy = WindowingStrategy {
-            trigger: Some(TriggerProto {
-                trigger: Some(trigger_proto::Trigger::AfterEndOfWindow(Box::new(
-                    trigger_proto::AfterEndOfWindow {
-                        early_firings: None,
-                        late_firings: Some(Box::new(late)),
-                    },
-                ))),
+        let input = "gbk-in-large-key";
+        let output = "gbk-out-large-key";
+        let key = "x".repeat(1024 * 1024);
+        let element = |value| WindowedValue {
+            value: BeamRecord::KV(BeamKV {
+                key: PrimitiveValue::String(key.clone()),
+                value: Box::new(BeamRecord::PRIMITIVE(PrimitiveValue::Int64(value))),
             }),
-            accumulation_mode: accumulation_mode::Enum::Discarding as i32,
-            allowed_lateness: 1_000,
-            ..WindowingStrategy::default()
+            timestamp_millis: 0,
+            windows: vec![BeamWindow::Global],
+            pane: PaneInfo::no_firing(),
         };
-
         store
-            .write_windowed_value_batch(
-                input,
-                vec![kv_windowed("a", 1, vec![interval(0, 100)], 10)],
-            )
+            .write_windowed_value_batch(input, vec![element(1), element(2)])
             .await
             .unwrap();
 
-        // Watermark reaches the window end: one on-time pane with the first value.
-        run_gbk_with_strategy(
-            &transform,
-            &store,
-            input,
-            output,
-            Some(strategy.clone()),
-            100,
-        )
-        .await;
-        let panes = scan_output(&store, output).await;
-        assert_eq!(panes.len(), 1, "expected one on-time pane");
-        assert_eq!(panes[0].pane.timing, PaneTiming::OnTime);
-        assert_eq!(
-            collect_groups(&panes).get(&("a".to_string(), 0, 100)),
-            Some(&vec![1])
-        );
-
-        // A late element arrives for the same window; the late trigger fires again.
-        store
-            .write_windowed_value_batch(
-                input,
-                vec![kv_windowed("a", 2, vec![interval(0, 100)], 20)],
-            )
-            .await
-            .unwrap();
-        run_gbk_with_strategy(&transform, &store, input, output, Some(strategy), 100).await;
+        run_gbk(&store, input, output).await;
 
         let panes = scan_output(&store, output).await;
-        assert_eq!(
-            panes.len(),
-            2,
-            "a late element must fire a second (late) pane"
-        );
-        assert_eq!(panes[1].pane.timing, PaneTiming::Late);
-    }
-
-    #[tokio::test]
-    async fn an_element_after_committed_window_expiry_is_pruned() {
-        let (_dir, store) = make_store().await;
-        let input = "gbk-in-too-late";
-        let output = "gbk-out-too-late";
-        let transform = GroupByKey::with(
-            "gbk-too-late".to_string(),
-            HashMap::from([("in".to_string(), input.to_string())]),
-            HashMap::from([("out".to_string(), output.to_string())]),
-            "GroupByKey".to_string(),
-        );
-
-        store
-            .write_windowed_value_batch(
-                input,
-                vec![kv_windowed("a", 1, vec![interval(0, 100)], 10)],
-            )
-            .await
-            .unwrap();
-        run_gbk_with(&transform, &store, input, output, 100).await;
-        assert_eq!(scan_output(&store, output).await.len(), 1);
-
-        // The first run committed watermark 100 and closed [0, 100), whose max
-        // timestamp is 99. A later element for that window is too late.
-        store
-            .write_windowed_value_batch(
-                input,
-                vec![kv_windowed("a", 2, vec![interval(0, 100)], 20)],
-            )
-            .await
-            .unwrap();
-        run_gbk_with(&transform, &store, input, output, 100).await;
-
-        assert_eq!(
-            scan_output(&store, output).await.len(),
-            1,
-            "too-late input must not create a new pane"
-        );
-    }
-
-    #[test]
-    fn encoded_sort_keys_match_primitive_key_equality() {
-        assert_eq!(
-            encoded_primitive_sort_key(&PrimitiveValue::String("key".to_string())),
-            encoded_primitive_sort_key(&PrimitiveValue::String("key".to_string()))
-        );
-        assert_ne!(
-            encoded_primitive_sort_key(&PrimitiveValue::String("key".to_string())),
-            encoded_primitive_sort_key(&PrimitiveValue::Bytes(b"key".to_vec()))
-        );
-        assert_ne!(
-            encoded_primitive_sort_key(&PrimitiveValue::Float64(0.0)),
-            encoded_primitive_sort_key(&PrimitiveValue::Float64(-0.0))
-        );
-        let same_nan = f64::from_bits(0x7ff8_0000_0000_0042);
-        let other_nan = f64::from_bits(0x7ff8_0000_0000_0043);
-        assert_eq!(
-            encoded_primitive_sort_key(&PrimitiveValue::Float64(same_nan)),
-            encoded_primitive_sort_key(&PrimitiveValue::Float64(same_nan))
-        );
-        assert_ne!(
-            encoded_primitive_sort_key(&PrimitiveValue::Float64(same_nan)),
-            encoded_primitive_sort_key(&PrimitiveValue::Float64(other_nan))
-        );
-    }
-
-    #[test]
-    fn window_pruning_requires_previous_watermark_and_no_merge() {
-        assert_eq!(window_prune_cutoff(None, 0, false), None);
-        assert_eq!(window_prune_cutoff(Some(1_000), 100, false), Some(900));
-        assert_eq!(window_prune_cutoff(Some(1_000), 100, true), None);
-    }
-
-    #[tokio::test]
-    async fn state_backend_evaluates_each_group_at_most_once_per_run() {
-        let backend = InMemoryGbkState::default();
-        // Accumulating keeps the values across firings, so a re-evaluation still
-        // has a non-empty pane to emit and the per-run paging behavior stays
-        // observable. (Discarding would emit nothing on the second run; see
-        // `always_trigger_does_not_emit_empty_discarding_panes`.)
-        let spec = TriggerSpec {
-            trigger: Trigger::Always,
-            accumulation: AccumulationMode::Accumulating,
-            allowed_lateness: 0,
+        assert_eq!(panes.len(), 1);
+        let BeamRecord::KV(kv) = &panes[0].value else {
+            panic!("expected KV output");
         };
-        backend.begin_run().await;
-
-        let fired = backend
-            .apply_group(
-                PrimitiveValue::String("a".to_string()),
-                interval(0, 100),
-                vec![BeamRecord::PRIMITIVE(PrimitiveValue::Int64(1))],
-                &spec,
-                0,
-                10,
-            )
-            .await
-            .unwrap();
-        assert!(fired.is_some(), "always trigger should fire immediately");
-        assert!(
-            backend
-                .take_ready(&spec, 0, 10, OUTPUT_BATCH_SIZE)
-                .await
-                .unwrap()
-                .is_empty(),
-            "a group evaluated during ingest must not fire twice in one run"
-        );
-
-        backend.begin_run().await;
-        let ready = backend
-            .take_ready(&spec, 0, 10, OUTPUT_BATCH_SIZE)
-            .await
-            .unwrap();
-        assert_eq!(ready.len(), 1, "the next run must evaluate the group again");
-        assert!(
-            backend
-                .take_ready(&spec, 0, 10, OUTPUT_BATCH_SIZE)
-                .await
-                .unwrap()
-                .is_empty(),
-            "paging ready groups must not re-fire them in the same run"
-        );
+        assert_eq!(kv.key, PrimitiveValue::String(key));
+        let BeamRecord::ITERABLE(values) = kv.value.as_ref() else {
+            panic!("expected iterable values");
+        };
+        assert_eq!(values.list.len(), 2);
     }
 
-    /// End-to-end regression for Nexmark Query14 (`Reshuffle`): a second run of
+    /// Regression test for Nexmark Query14 (`Reshuffle`): a second run of
     /// the same GroupByKey at a higher watermark re-evaluates an `Always` /
     /// `Discarding` group whose values were already emitted. That must be a
     /// no-op, not an empty group that changes the PCollection schema from
@@ -2316,29 +2182,14 @@ mod tests {
         let panes = scan_output(&store, output).await;
         assert_eq!(panes.len(), 2, "the re-run must not emit extra panes");
         for pane in &panes {
-            let BeamRecord::GBK(group) = &pane.value else {
-                panic!("expected GBK output, got {:?}", pane.value);
+            let BeamRecord::KV(kv) = &pane.value else {
+                panic!("expected KV output, got {:?}", pane.value);
             };
-            assert!(!group.value.list.is_empty(), "no pane may be empty");
+            let BeamRecord::ITERABLE(group) = kv.value.as_ref() else {
+                panic!("expected iterable output, got {:?}", kv.value);
+            };
+            assert!(!group.list.is_empty(), "no pane may be empty");
         }
-
-        let table = store
-            .get_existing_table(output)
-            .await
-            .unwrap()
-            .expect("output table exists");
-        let value_type = table
-            .schema()
-            .fields()
-            .iter()
-            .find(|field| field.name() == VALUE_COLUMN)
-            .expect("value column")
-            .data_type()
-            .clone();
-        assert!(
-            matches!(value_type, paimon::spec::DataType::Array(_)),
-            "group values must remain an array, got {value_type:?}"
-        );
     }
 
     /// Beam's `Reshuffle` (Nexmark Query14) groups on an `Always` trigger with
@@ -2354,6 +2205,7 @@ mod tests {
         let spec = TriggerSpec {
             trigger: Trigger::Always,
             accumulation: AccumulationMode::Discarding,
+            output_time: OutputTime::EndOfWindow,
             // Beam's `Reshuffle` identity-window strategy uses an effectively
             // infinite allowed lateness, so the group is never `expired` and the
             // trigger re-fires on every evaluation.
@@ -2365,7 +2217,10 @@ mod tests {
             .apply_group(
                 PrimitiveValue::String("a".to_string()),
                 interval(0, 100),
-                vec![BeamRecord::PRIMITIVE(PrimitiveValue::Int64(1))],
+                vec![PaneElement {
+                    value: BeamRecord::PRIMITIVE(PrimitiveValue::Int64(1)),
+                    timestamp_millis: 10,
+                }],
                 &spec,
                 0,
                 10,

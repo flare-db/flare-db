@@ -420,7 +420,7 @@ impl BundleRuntime {
         input_coder_id: String,
         input_component_coder_ids: Option<Vec<String>>,
         timer_endpoints: Vec<(String, String)>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<usize> {
         debug!("Spawned task to send stage's input elements to worker");
         debug!(
             "Sending input elements: instruction_id={}, transform_id={}",
@@ -467,6 +467,7 @@ impl BundleRuntime {
         let mut target_batch_size = batch_size_estimator.next_batch_size();
         let mut encoded = BytesMut::new();
         let mut batch_len = 0usize;
+        let mut total_sent = 0usize;
 
         while let Some(values) = input.next_batch().await? {
             for element in values {
@@ -487,6 +488,7 @@ impl BundleRuntime {
                     windowed_value_coder.encode(element, &mut encoded);
                 }
                 batch_len += 1;
+                total_sent += 1;
 
                 if batch_len >= target_batch_size {
                     let data = std::mem::take(&mut encoded).freeze().to_vec();
@@ -526,6 +528,9 @@ impl BundleRuntime {
                 .await?;
             batch_size_estimator.record(batch_len, start.elapsed());
         }
+        info!(
+            "Finished sending {total_sent} input elements for {input_pcollection_id} to worker stage {consumer_transform_id}"
+        );
 
         // Terminate the stage's inbound timer endpoints before the data
         // terminator, so the harness's awaited completion covers both.
@@ -563,7 +568,7 @@ impl BundleRuntime {
 
         self.data.send_elements(Elements { data, timers }).await?;
         debug!("Finished sending input elements to worker");
-        Ok(())
+        Ok(total_sent)
     }
 
     /// Terminate a bundle's input endpoints without sending any data.
