@@ -1,7 +1,7 @@
 package com.flaredb.runner;
 
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertThrows;
+import static org.junit.Assert.assertNull;
 
 import java.io.IOException;
 import java.util.Iterator;
@@ -38,7 +38,7 @@ import org.junit.Test;
 /**
  * {@link FlarePipelineJob#getState()}, {@link FlarePipelineJob#cancel()}, and {@link
  * FlarePipelineJob#metrics()} are backed by live Job Service calls, exercised here against an
- * in-process fake server. {@link FlarePipelineJob#waitUntilFinish} remains unimplemented.
+ * in-process fake server.
  */
 public class FlarePipelineJobTest {
 
@@ -168,17 +168,42 @@ public class FlarePipelineJobTest {
   }
 
   @Test
-  public void waitUntilFinishWithDurationIsNotSupported() throws Exception {
-    FlarePipelineJob job = newJob("job-1", new FakeJobService(JobState.Enum.RUNNING));
-    assertThrows(
-        UnsupportedOperationException.class,
-        () -> job.waitUntilFinish(Duration.standardSeconds(1)));
+  public void waitUntilFinishReturnsTheTerminalState() throws Exception {
+    FlarePipelineJob job = newJob("job-1", new FakeJobService(JobState.Enum.DONE));
+
+    assertEquals(State.DONE, job.waitUntilFinish());
   }
 
   @Test
-  public void waitUntilFinishIsNotSupported() throws Exception {
+  public void waitUntilFinishWithDurationReturnsTheTerminalState() throws Exception {
+    FlarePipelineJob job = newJob("job-1", new FakeJobService(JobState.Enum.DONE));
+
+    assertEquals(State.DONE, job.waitUntilFinish(Duration.standardSeconds(1)));
+  }
+
+  @Test
+  public void waitUntilFinishWithNonPositiveDurationWaitsIndefinitely() throws Exception {
+    FlarePipelineJob job = newJob("job-1", new FakeJobService(JobState.Enum.DONE));
+
+    assertEquals(State.DONE, job.waitUntilFinish(Duration.ZERO));
+  }
+
+  @Test
+  public void waitUntilFinishWithDurationReturnsNullOnTimeout() throws Exception {
     FlarePipelineJob job = newJob("job-1", new FakeJobService(JobState.Enum.RUNNING));
-    assertThrows(UnsupportedOperationException.class, job::waitUntilFinish);
+
+    assertNull(job.waitUntilFinish(Duration.millis(10)));
+  }
+
+  @Test
+  public void waitUntilFinishUsesCachedTerminalStateAfterChannelIsClosed() throws Exception {
+    FlarePipelineJob job = newJob("job-1", new FakeJobService(JobState.Enum.DONE));
+    assertEquals(State.DONE, job.getState());
+
+    job.close();
+    jobService = null;
+
+    assertEquals(State.DONE, job.waitUntilFinish());
   }
 
   @Test
