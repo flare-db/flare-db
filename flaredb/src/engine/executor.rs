@@ -1,4 +1,10 @@
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -31,11 +37,19 @@ use crate::{
 /// described by its own [`ConsumerMetaData`].
 pub struct StageExecutor {
     runtime: BundleRuntime,
+    last_input_count: usize,
 }
 
 impl StageExecutor {
     pub fn new(runtime: BundleRuntime) -> Self {
-        Self { runtime }
+        Self {
+            runtime,
+            last_input_count: usize::MAX,
+        }
+    }
+
+    pub fn last_input_count(&self) -> usize {
+        self.last_input_count
     }
 }
 
@@ -45,7 +59,7 @@ pub trait Executor {
         &mut self,
         node: ExecutableNode,
         input_edge_metadata: Vec<ConsumerMetaData>,
-        output_edge_metadata: Option<ConsumerMetaData>,
+        output_edge_metadata: Vec<ConsumerMetaData>,
         input_watermark: i64,
     ) -> anyhow::Result<ControlResponse>;
 }
@@ -56,7 +70,7 @@ impl Executor for StageExecutor {
         &mut self,
         node: ExecutableNode,
         input_edge_metadata: Vec<ConsumerMetaData>,
-        output_edge_metadata: Option<ConsumerMetaData>,
+        output_edge_metadata: Vec<ConsumerMetaData>,
         input_watermark: i64,
     ) -> anyhow::Result<ControlResponse> {
         self.execute_node(
@@ -77,7 +91,7 @@ impl StageExecutor {
         &mut self,
         node: ExecutableNode,
         input_edge_metadata: Vec<ConsumerMetaData>,
-        output_edge_metadata: Option<ConsumerMetaData>,
+        output_edge_metadata: Vec<ConsumerMetaData>,
         timers: Vec<TimerEntry>,
         input_watermark: i64,
     ) -> anyhow::Result<ControlResponse> {
@@ -121,7 +135,7 @@ impl StageExecutor {
         &mut self,
         node: ExecutableNode,
         input_edge_metadata: Vec<ConsumerMetaData>,
-        output_edge_metadata: Option<ConsumerMetaData>,
+        output_edge_metadata: Vec<ConsumerMetaData>,
         _instruction_id: Option<String>,
         timers: Vec<TimerEntry>,
         input_watermark: i64,
@@ -153,9 +167,8 @@ impl StageExecutor {
                             if !input_edge_metadata.is_empty() {
                                 info!("Input edge metadata: {:?}", input_edge_metadata);
                             }
-                            let output_meta_data = output_edge_metadata;
-                            if let Some(meta_data) = &output_meta_data {
-                                info!("Output edge metadata: {:?}", meta_data);
+                            if !output_edge_metadata.is_empty() {
+                                info!("Worker stage output metadata: {:?}", output_edge_metadata);
                             }
 
                             let instruction_id_log = instruction_id.clone();
@@ -214,8 +227,10 @@ impl StageExecutor {
                             // waiting out the idle timeout.
                             let (input_error_tx, mut input_error_rx) =
                                 tokio::sync::mpsc::channel::<anyhow::Error>(1);
+                            let input_count = Arc::new(AtomicUsize::new(0));
+                            let input_count_task = Arc::clone(&input_count);
                             tokio::spawn(async move {
-                                let result = if timer_only {
+                                let result: anyhow::Result<usize> = if timer_only {
                                     // A timer-only bundle must not re-deliver the
                                     // stage's input data.
                                     input_runtime
@@ -225,6 +240,7 @@ impl StageExecutor {
                                             input_timer_endpoints,
                                         )
                                         .await
+                                        .map(|()| 0)
                                 } else {
                                     input_runtime
                                         .process_input_elements(
@@ -237,12 +253,17 @@ impl StageExecutor {
                                         )
                                         .await
                                 };
-                                if let Err(err) = result {
-                                    error!(
-                                        "Failed to send input for instruction {}: {}",
-                                        instruction_id_log, err
-                                    );
-                                    let _ = input_error_tx.send(err).await;
+                                match result {
+                                    Ok(count) => {
+                                        input_count_task.store(count, Ordering::Relaxed);
+                                    }
+                                    Err(err) => {
+                                        error!(
+                                            "Failed to send input for instruction {}: {}",
+                                            instruction_id_log, err
+                                        );
+                                        let _ = input_error_tx.send(err).await;
+                                    }
                                 }
                             });
 
@@ -250,7 +271,8 @@ impl StageExecutor {
                             let bundle_response_future = control
                                 .recv_process_bundle_response(&instruction_id, bundle_response_rx);
 
-                            if let Some(output_meta_data) = output_meta_data {
+                            let mut decode_tasks = Vec::with_capacity(output_edge_metadata.len());
+                            for output_meta_data in output_edge_metadata {
                                 let data_key = DataKey {
                                     instruction_id: instruction_id.clone(),
                                     transform_id: stage_sink_transform_id(
@@ -264,10 +286,21 @@ impl StageExecutor {
 
                                 let output_runtime = self.runtime.clone();
 
-                                let mut decode_task = tokio::spawn(async move {
+                                decode_tasks.push(tokio::spawn(async move {
                                     output_runtime
                                         .process_output_elements(receiver, output_meta_data)
                                         .await
+                                }));
+                            }
+
+                            if !decode_tasks.is_empty() {
+                                let mut decode_task = tokio::spawn(async move {
+                                    for task in decode_tasks {
+                                        task.await.map_err(|err| {
+                                            anyhow!("output decode task panicked: {err}")
+                                        })??;
+                                    }
+                                    Ok::<(), anyhow::Error>(())
                                 });
 
                                 let timeout_id = instruction_id.clone();
@@ -322,6 +355,7 @@ impl StageExecutor {
                                 )
                                 .await?;
 
+                                self.last_input_count = input_count.load(Ordering::Relaxed);
                                 return Ok(self
                                     .finish_bundle(proces_bundle_response, timer_handles)
                                     .await);
@@ -356,6 +390,7 @@ impl StageExecutor {
                                 &format!("waiting for SDK bundle {} control response", timeout_id),
                             )
                             .await?;
+                            self.last_input_count = input_count.load(Ordering::Relaxed);
                             return Ok(self
                                 .finish_bundle(proces_bundle_response, timer_handles)
                                 .await);
@@ -373,7 +408,7 @@ impl StageExecutor {
             ExecutableNode::Runner(runner_transform) => {
                 info!("Executing runner node");
 
-                let output_metadata = output_edge_metadata.as_ref();
+                let output_metadata = output_edge_metadata.first();
 
                 // A runner transform may consume several PCollections (e.g. a
                 // Flatten). Map each incoming edge to its input PCollection id;
@@ -425,6 +460,13 @@ impl StageExecutor {
                                         .get(&pcol.windowing_strategy_id)
                                         .cloned()
                                 });
+                            let input_is_bounded = input_pcollection_ids
+                                .first()
+                                .and_then(|id| components.pcollections.get(id))
+                                .is_none_or(|pcollection| {
+                                    pcollection.is_bounded
+                                        != beam_model_rs::v1::is_bounded::Enum::Unbounded as i32
+                                });
 
                             // A runner source that replays pre-encoded elements
                             // (TestStream) needs the output PCollection's element
@@ -454,6 +496,7 @@ impl StageExecutor {
                                 windowing_strategy,
                                 processing_time: self.runtime.timer_service().now(),
                                 input_watermark,
+                                input_is_bounded,
                                 output_coder: output_coder.clone(),
                                 window_merger: self.runtime.window_merger(),
                                 source_reports: Some(SourceReportSink(

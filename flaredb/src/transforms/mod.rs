@@ -118,6 +118,10 @@ pub struct ExecutionContext {
     /// input watermark is strictly after its maximum timestamp, i.e.
     /// `window.max_timestamp_millis() < input_watermark`.
     pub input_watermark: i64,
+    /// Whether the primary input PCollection is bounded. Staged bounded input can
+    /// be appended by a producer rerun after an earlier bundle advanced the
+    /// watermark, so bounded aggregation must not discard such rows as late.
+    pub input_is_bounded: bool,
     /// The primary output PCollection's element coder, when the transform asked
     /// for it (see [`FlareTransform::needs_output_coder`]). A runner source decodes
     /// its pre-encoded elements with it.

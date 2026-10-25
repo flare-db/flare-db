@@ -263,6 +263,10 @@ struct StageState {
     /// [`StageKind::WatermarkGated`] stage runs again once its input watermark
     /// advances past this (so newly-ready windows can emit).
     watermark_at_last_run: Timestamp,
+    /// Main inputs whose latest producer completion had no rows. They may be
+    /// populated by a later producer run, so this stage's output cannot advance
+    /// until that specific input commits data.
+    pending_empty: BTreeSet<PCollectionId>,
 }
 
 impl StageState {
@@ -470,6 +474,7 @@ impl WatermarkManager {
                 kind: StageKind::default(),
                 required_watermark: MIN_TIMESTAMP,
                 watermark_at_last_run: MIN_TIMESTAMP,
+                pending_empty: BTreeSet::new(),
             },
         );
     }
@@ -892,6 +897,15 @@ impl WatermarkManager {
         stage: &str,
         output_min_ts: Option<Timestamp>,
     ) -> Result<Vec<StageId>> {
+        self.complete_bundle_with_min_and_input(stage, output_min_ts, None)
+    }
+
+    pub fn complete_bundle_with_min_and_input(
+        &mut self,
+        stage: &str,
+        output_min_ts: Option<Timestamp>,
+        input_count: Option<usize>,
+    ) -> Result<Vec<StageId>> {
         let outputs = {
             let stage_state = self
                 .stages
@@ -901,6 +915,17 @@ impl WatermarkManager {
                 bail!("stage '{stage}' has no bundle in flight");
             }
             stage_state.outputs.clone()
+        };
+        let stage_has_empty_inputs = self
+            .stages
+            .get(stage)
+            .is_some_and(|state| !state.pending_empty.is_empty());
+        let produced_nothing = output_min_ts.is_none() && input_count == Some(0);
+        let propagates_empty_input = produced_nothing || stage_has_empty_inputs;
+        let propagated_min = if stage_has_empty_inputs {
+            Some(MIN_TIMESTAMP)
+        } else {
+            output_min_ts
         };
 
         {
@@ -920,7 +945,12 @@ impl WatermarkManager {
                     if let Some(consumer_state) = self.stages.get_mut(&consumer) {
                         consumer_state.unproduced.remove(&pcollection);
                         consumer_state.pending.insert(pcollection.clone());
-                        if let Some(output_min_ts) = output_min_ts {
+                        if propagates_empty_input {
+                            consumer_state.pending_empty.insert(pcollection.clone());
+                        } else {
+                            consumer_state.pending_empty.remove(&pcollection);
+                        }
+                        if let Some(output_min_ts) = propagated_min {
                             consumer_state.pending_min =
                                 consumer_state.pending_min.min(output_min_ts);
                         }
@@ -969,6 +999,25 @@ impl WatermarkManager {
     pub fn mark_rerun(&mut self, stage: &str) -> Result<()> {
         self.stage_mut(stage)?.rerun_pending = true;
         Ok(())
+    }
+
+    /// Releases empty-input holds after the scheduler has reached quiescence.
+    ///
+    /// Empty branches are held while other stages may still populate them. Once
+    /// no stage is ready or in flight, no further rows can arrive in a bounded
+    /// run, so the empty branches are final and may advance watermarks normally.
+    pub fn release_empty_input_holds(&mut self) -> usize {
+        let mut released = 0;
+        for state in self.stages.values_mut() {
+            if !state.pending_empty.is_empty() {
+                state.pending_empty.clear();
+                released += 1;
+            }
+        }
+        if released > 0 {
+            self.refresh();
+        }
+        released
     }
 
     /// Advance every watermark to a fixpoint and return the stages whose input
@@ -1080,6 +1129,9 @@ impl WatermarkManager {
         // cannot regress that monotonic watermark.
         if !stage.completed && (stage.in_flight > 0 || stage.queued > 0) {
             watermark = watermark.min(stage.watermark_at_last_run);
+        }
+        if !stage.pending_empty.is_empty() {
+            watermark = watermark.min(MIN_TIMESTAMP);
         }
         if let Some(watermark_hold) = stage.min_hold() {
             watermark = watermark.min(watermark_hold);
@@ -2062,6 +2114,64 @@ mod tests {
         manager.refresh();
 
         assert_eq!(manager.effective_input_watermark("B"), Some(100));
+    }
+
+    #[test]
+    fn empty_worker_input_holds_output_until_a_later_bundle() {
+        let mut manager = manager(&[
+            ("A", &[], &[], &["p"]),
+            ("B", &["p"], &[], &["q"]),
+            ("C", &["q"], &[], &["r"]),
+        ]);
+
+        manager.start_bundle("A").unwrap();
+        manager
+            .complete_bundle_with_min_and_input("A", None, Some(0))
+            .unwrap();
+        manager.report_source_watermark("A", 100).unwrap();
+        manager.refresh();
+
+        manager.start_bundle("B").unwrap();
+        manager
+            .complete_bundle_with_min_and_input("B", Some(42), Some(1))
+            .unwrap();
+        manager.refresh();
+        assert_eq!(manager.output_watermark("B"), Some(MIN_TIMESTAMP));
+        assert!(manager.stages["C"].pending_empty.contains("q"));
+        assert_eq!(manager.output_watermark("C"), Some(MIN_TIMESTAMP));
+
+        manager.mark_rerun("A").unwrap();
+        manager.start_bundle("A").unwrap();
+        manager
+            .complete_bundle_with_min_and_input("A", Some(42), Some(1))
+            .unwrap();
+        assert!(manager.stages["B"].pending_empty.is_empty());
+        assert!(manager.ready_stages().contains(&"B".to_string()));
+        manager.start_bundle("B").unwrap();
+        manager
+            .complete_bundle_with_min_and_input("B", Some(42), Some(1))
+            .unwrap();
+        manager.refresh();
+        assert!(manager.stages["C"].pending_empty.is_empty());
+        assert_eq!(manager.output_watermark("B"), Some(100));
+    }
+
+    #[test]
+    fn quiescent_scheduler_releases_final_empty_inputs() {
+        let mut manager = manager(&[("A", &[], &[], &["p"]), ("B", &["p"], &[], &["q"])]);
+
+        manager.start_bundle("A").unwrap();
+        manager
+            .complete_bundle_with_min_and_input("A", None, Some(0))
+            .unwrap();
+        manager.report_source_watermark("A", 100).unwrap();
+        manager.refresh();
+        assert_eq!(manager.output_watermark("B"), Some(MIN_TIMESTAMP));
+
+        assert_eq!(manager.release_empty_input_holds(), 1);
+        manager.refresh();
+        assert_eq!(manager.output_watermark("B"), Some(100));
+        assert_eq!(manager.release_empty_input_holds(), 0);
     }
 
     fn runner_node(name: &str, outputs: &[&str]) -> ExecutableNode {

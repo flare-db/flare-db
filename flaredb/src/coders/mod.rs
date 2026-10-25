@@ -153,28 +153,16 @@ impl StandardBeamCoders {
                     "KvCoder requires exactly two component coders"
                 );
 
-                let key_coder = StandardBeamCoders::from_urn(&ids[0], None, pipeline_coders);
-                let val_coder = StandardBeamCoders::from_urn(&ids[1], None, pipeline_coders);
-
-                match val_coder {
-                    StandardBeamCoders::Iterable(iterable_coder) => {
-                        StandardBeamCoders::Gbk(Box::new(key_coder), iterable_coder)
-                    }
-                    _ => StandardBeamCoders::Kv(Box::new(key_coder), Box::new(val_coder)),
-                }
-                /*let ids = component_coder_ids
-                    .as_ref()
-                    .expect("KvCoder requires component coder ids");
-                assert_eq!(
-                    ids.len(),
-                    2,
-                    "KvCoder requires exactly two component coders"
-                );
-
+                // Beam's `KvCoder<K, V>` is a logical key/value pair even when V is
+                // itself an `IterableCoder<T>`. The iterable shape is part of the
+                // value payload; it does not turn the outer element into a
+                // `GroupByKey` record. `GBK` is a distinct runtime/transform shape and
+                // must be selected by the transform semantics, not inferred from the
+                // value coder alone.
                 StandardBeamCoders::Kv(
                     Box::new(StandardBeamCoders::from_urn(&ids[0], None, pipeline_coders)),
                     Box::new(StandardBeamCoders::from_urn(&ids[1], None, pipeline_coders)),
-                )*/
+                )
             }
             _ => panic!("Unknown URN: {}", urn),
         }
@@ -260,6 +248,21 @@ impl StandardBeamCoders {
             (StandardBeamCoders::Kv(key_coder, value_coder), BeamRecord::KV(kv)) => {
                 key_coder.encode_key(&kv.key, buf);
                 value_coder.encode(*kv.value, buf);
+            }
+
+            // GroupByKey output is logically `KV<K, Iterable<V>>` on the wire, but
+            // the runner materializes it as a grouped `GBK` record while sorting and
+            // emitting pane values. When the value coder is an iterable, the same
+            // `KvCoder` must accept the grouped form without being reinterpreted as a
+            // distinct `Gbk` coder.
+            (StandardBeamCoders::Kv(key_coder, value_coder), BeamRecord::GBK(gbk)) => {
+                let StandardBeamCoders::Iterable(iterable_coder) = value_coder.as_ref() else {
+                    panic!(
+                        "KvCoder with non-iterable value cannot encode a grouped BeamRecord::GBK"
+                    );
+                };
+                key_coder.encode_key(&gbk.key, buf);
+                iterable_coder.encode(gbk.value.list, buf);
             }
 
             (StandardBeamCoders::Gbk(key_coder, value_coder), BeamRecord::GBK(kv)) => {
@@ -573,6 +576,75 @@ mod tests {
             coders["fast_lp"].component_coder_ids,
             vec!["fast".to_string()]
         );
+    }
+
+    #[test]
+    fn kv_with_iterable_value_accepts_grouped_output_form() {
+        let mut coders = HashMap::new();
+        coders.insert("k".to_string(), coder(beam_urns::STRING_UTF8_CODER, &[]));
+        coders.insert("v".to_string(), coder(beam_urns::ITERABLE_CODER, &["b"]));
+        coders.insert("b".to_string(), coder(beam_urns::BYTES_CODER, &[]));
+        coders.insert("kv".to_string(), coder(beam_urns::KV_CODER, &["k", "v"]));
+
+        let kv = StandardBeamCoders::from_urn("kv", None, Some(&coders));
+        let grouped = BeamRecord::GBK(BeamGbk {
+            key: PrimitiveValue::String("alpha".to_string()),
+            value: IterableValue {
+                list: vec![
+                    BeamRecord::PRIMITIVE(PrimitiveValue::Bytes(b"one".to_vec())),
+                    BeamRecord::PRIMITIVE(PrimitiveValue::Bytes(b"two".to_vec())),
+                ],
+            },
+        });
+
+        let mut encoded = Vec::new();
+        kv.encode(grouped.clone(), &mut encoded);
+
+        let mut buf: &[u8] = &encoded;
+        let decoded = kv.decode(&mut buf).unwrap();
+        match decoded {
+            BeamRecord::KV(inner) => {
+                assert_eq!(inner.key, PrimitiveValue::String("alpha".to_string()));
+                match *inner.value {
+                    BeamRecord::ITERABLE(iterable) => {
+                        assert_eq!(iterable.list.len(), 2);
+                    }
+                    other => panic!("expected iterable value, got {other:?}"),
+                }
+            }
+            other => panic!("expected KV, got {other:?}"),
+        }
+        assert_eq!(buf.remaining(), 0);
+    }
+
+    #[test]
+    fn kv_with_iterable_value_stays_kv() {
+        let mut coders = HashMap::new();
+        coders.insert("k".to_string(), coder(beam_urns::STRING_UTF8_CODER, &[]));
+        coders.insert("v".to_string(), coder(beam_urns::ITERABLE_CODER, &["b"]));
+        coders.insert("b".to_string(), coder(beam_urns::BYTES_CODER, &[]));
+        coders.insert("kv".to_string(), coder(beam_urns::KV_CODER, &["k", "v"]));
+
+        let kv = StandardBeamCoders::from_urn("kv", None, Some(&coders));
+        assert!(matches!(kv, StandardBeamCoders::Kv(_, _)));
+
+        let original = BeamRecord::KV(BeamKV {
+            key: PrimitiveValue::String("alpha".to_string()),
+            value: Box::new(BeamRecord::ITERABLE(IterableValue {
+                list: vec![
+                    BeamRecord::PRIMITIVE(PrimitiveValue::Bytes(b"one".to_vec())),
+                    BeamRecord::PRIMITIVE(PrimitiveValue::Bytes(b"two".to_vec())),
+                ],
+            })),
+        });
+
+        let mut encoded = Vec::new();
+        kv.encode(original.clone(), &mut encoded);
+
+        let mut buf: &[u8] = &encoded;
+        let decoded = kv.decode(&mut buf).unwrap();
+        assert_eq!(decoded, original);
+        assert_eq!(buf.remaining(), 0);
     }
 
     #[test]

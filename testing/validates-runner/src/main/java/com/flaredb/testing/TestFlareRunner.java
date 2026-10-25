@@ -73,10 +73,18 @@ public class TestFlareRunner extends PipelineRunner<PipelineResult> {
   public PipelineResult run(Pipeline pipeline) {
     LOG.info("Running pipeline on TestFlareRunner with uberJar={}", options.getUberJar());
     FlarePipelineJob job = delegate.run(pipeline);
-    PipelineResult.State state = job.getState();
-    Assert.assertEquals("Pipeline execution was not DONE", PipelineResult.State.DONE, state);
-    TestPipeline.verifyPAssertsSucceeded(pipeline, job);
-    return job;
+    try {
+      PipelineResult.State state = job.getState();
+      Assert.assertEquals("Pipeline execution was not DONE", PipelineResult.State.DONE, state);
+      TestPipeline.verifyPAssertsSucceeded(pipeline, job);
+      return job;
+    } finally {
+      try {
+        job.close();
+      } catch (Exception e) {
+        LOG.warn("Failed to close FlareDB job channel", e);
+      }
+    }
   }
 
   public static class Registrar implements PipelineRunnerRegistrar {

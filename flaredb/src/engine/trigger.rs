@@ -29,8 +29,8 @@
 //!   always).
 
 use beam_model_rs::v1::{
-    Trigger as TriggerProto, WindowingStrategy, accumulation_mode, timestamp_transform,
-    trigger as trigger_proto,
+    Trigger as TriggerProto, WindowingStrategy, accumulation_mode, output_time,
+    timestamp_transform, trigger as trigger_proto,
 };
 
 use crate::coders::primitives::{PaneInfo, PaneTiming};
@@ -158,11 +158,36 @@ impl AccumulationMode {
     }
 }
 
+/// How a grouping transform derives the timestamp of an output pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutputTime {
+    /// Use the maximum timestamp contained by the output window.
+    #[default]
+    EndOfWindow,
+    /// Use the latest input timestamp observed since the preceding pane.
+    LatestInPane,
+    /// Use the earliest input timestamp observed since the preceding pane.
+    EarliestInPane,
+}
+
+impl OutputTime {
+    fn from_proto(value: i32) -> Self {
+        match output_time::Enum::try_from(value) {
+            Ok(output_time::Enum::LatestInPane) => Self::LatestInPane,
+            Ok(output_time::Enum::EarliestInPane) => Self::EarliestInPane,
+            Ok(output_time::Enum::EndOfWindow | output_time::Enum::Unspecified) | Err(_) => {
+                Self::EndOfWindow
+            }
+        }
+    }
+}
+
 /// The trigger-relevant parts of a windowing strategy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TriggerSpec {
     pub trigger: Trigger,
     pub accumulation: AccumulationMode,
+    pub output_time: OutputTime,
     /// Milliseconds past the end of a window before it becomes droppable.
     pub allowed_lateness: i64,
 }
@@ -175,11 +200,13 @@ impl TriggerSpec {
             None => Self {
                 trigger: Trigger::Default,
                 accumulation: AccumulationMode::Discarding,
+                output_time: OutputTime::EndOfWindow,
                 allowed_lateness: 0,
             },
             Some(strategy) => Self {
                 trigger: Trigger::from_proto(strategy.trigger.as_ref()),
                 accumulation: AccumulationMode::from_proto(strategy.accumulation_mode),
+                output_time: OutputTime::from_proto(strategy.output_time),
                 allowed_lateness: strategy.allowed_lateness,
             },
         }
