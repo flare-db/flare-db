@@ -87,15 +87,7 @@ flare down
 
 ## Current Status
 
-**FlareDB V0.1.0** is the first public release of FlareDB. It lays the foundation for a streaming database and its execution engine.
-
-The initial release supports:
-
-* Single-node execution of Apache Beam pipelines.
-* Bounded sources on the Global Window.
-* Native execution of core runner transforms, including `Impulse` and `GroupByKey`.
-* Portable `DoFn` execution through the Beam SDK Harness.
-* Apache Beam Portability Framework implementation.
+For details on supported features, see the [Apache Beam Capability Matrix](https://beam.apache.org/documentation/runners/capability-matrix/) and refer to the FlareDB section.
 
 ### Roadmap
 
