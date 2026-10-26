@@ -194,6 +194,11 @@ pub enum StageKind {
     /// [`MAX_TIMESTAMP`], so a bounded aggregation still runs exactly when its
     /// upstream completes.
     WatermarkGated,
+    /// A ParDo requiring time-sorted input is held until its global window is
+    /// complete so all pre-watermark elements can be sorted into one bundle.
+    /// Once it runs at the gate, later global-window elements are too late and
+    /// are dropped instead of being delivered out of timestamp order.
+    TimeSortedInputWatermarkGated,
 }
 
 /// Per-stage watermark, hold and pending/in-flight state.
@@ -256,8 +261,11 @@ struct StageState {
     /// fired timer). Only meaningful once `completed`.
     rerun_pending: bool,
     kind: StageKind,
+    /// The global-window deadline for time-sorted input has been reached and a
+    /// bundle has started. Appends after this point are late and must be dropped.
+    time_sorted_input_closed: bool,
     /// Input watermark the stage's work needs before it may run; only consulted
-    /// for [`StageKind::WatermarkGated`]. [`MIN_TIMESTAMP`] means no gate.
+    /// for watermark-gated stages. [`MIN_TIMESTAMP`] means no gate.
     required_watermark: Timestamp,
     /// The stage's input watermark when it last started a bundle. A completed
     /// [`StageKind::WatermarkGated`] stage runs again once its input watermark
@@ -326,7 +334,9 @@ impl StageState {
         }
         match self.kind {
             StageKind::Ordinary => true,
-            StageKind::WatermarkGated => self.input >= self.required_watermark,
+            StageKind::WatermarkGated | StageKind::TimeSortedInputWatermarkGated => {
+                self.input >= self.required_watermark
+            }
         }
     }
 }
@@ -408,6 +418,14 @@ impl WatermarkManager {
                 let id = node.id();
                 manager.set_stage_kind(&id, StageKind::WatermarkGated).ok();
                 manager.set_required_watermark(&id, required).ok();
+            } else if let Some(required) =
+                time_sorted_input_required_watermark(node, graph, index, &executable.components)
+            {
+                let id = node.id();
+                manager
+                    .set_stage_kind(&id, StageKind::TimeSortedInputWatermarkGated)
+                    .ok();
+                manager.set_required_watermark(&id, required).ok();
             }
         }
 
@@ -472,6 +490,7 @@ impl WatermarkManager {
                 completed: false,
                 rerun_pending: false,
                 kind: StageKind::default(),
+                time_sorted_input_closed: false,
                 required_watermark: MIN_TIMESTAMP,
                 watermark_at_last_run: MIN_TIMESTAMP,
                 pending_empty: BTreeSet::new(),
@@ -856,6 +875,11 @@ impl WatermarkManager {
         stage_state.in_flight += 1;
         stage_state.queued = stage_state.queued.saturating_sub(1);
         stage_state.rerun_pending = false;
+        if stage_state.kind == StageKind::TimeSortedInputWatermarkGated
+            && stage_state.input >= stage_state.required_watermark
+        {
+            stage_state.time_sorted_input_closed = true;
+        }
         // The first bundle of a wave consumes every input currently pending.
         // Anything a producer appends while a bundle is in flight re-populates
         // `pending` and re-arms the stage for another run.
@@ -944,15 +968,18 @@ impl WatermarkManager {
                 for consumer in consumers {
                     if let Some(consumer_state) = self.stages.get_mut(&consumer) {
                         consumer_state.unproduced.remove(&pcollection);
-                        consumer_state.pending.insert(pcollection.clone());
-                        if propagates_empty_input {
-                            consumer_state.pending_empty.insert(pcollection.clone());
-                        } else {
-                            consumer_state.pending_empty.remove(&pcollection);
-                        }
-                        if let Some(output_min_ts) = propagated_min {
-                            consumer_state.pending_min =
-                                consumer_state.pending_min.min(output_min_ts);
+                        let drop_closed_time_sorted_input = consumer_state.time_sorted_input_closed;
+                        if !drop_closed_time_sorted_input {
+                            consumer_state.pending.insert(pcollection.clone());
+                            if propagates_empty_input {
+                                consumer_state.pending_empty.insert(pcollection.clone());
+                            } else {
+                                consumer_state.pending_empty.remove(&pcollection);
+                            }
+                            if let Some(output_min_ts) = propagated_min {
+                                consumer_state.pending_min =
+                                    consumer_state.pending_min.min(output_min_ts);
+                            }
                         }
                     }
                     if self.stage_is_ready(&consumer) {
@@ -1190,7 +1217,9 @@ impl WatermarkManager {
 /// always clears this gate: a global-window aggregation becomes ready exactly
 /// when its upstream bounded input completes.
 pub fn global_window_completion_watermark(allowed_lateness: Timestamp) -> Timestamp {
-    GLOBAL_WINDOW_MAX_TIMESTAMP_MILLIS.saturating_add(allowed_lateness)
+    GLOBAL_WINDOW_MAX_TIMESTAMP_MILLIS
+        .saturating_add(allowed_lateness)
+        .min(MAX_TIMESTAMP)
 }
 
 /// The watermark an aggregation runner stage must reach before it may run, or
@@ -1254,14 +1283,66 @@ fn aggregation_required_watermark(
     }
 }
 
+/// Watermark gate for an SDK stage whose ParDo requires time-sorted input.
+///
+/// Global-window inputs are held until the window closes, so the runner can
+/// materialize, sort, and deliver every on-time element in one bundle. Finite
+/// windows retain ordinary per-bundle behavior for now; their trigger path still
+/// needs to coordinate ordering with window expiry.
+fn time_sorted_input_required_watermark(
+    node: &ExecutableNode,
+    graph: &petgraph::Graph<ExecutableNode, ConsumerMetaData>,
+    index: NodeIndex,
+    components: &Components,
+) -> Option<Timestamp> {
+    let ExecutableNode::Worker(stage) = node else {
+        return None;
+    };
+    if !stage.requires_time_sorted_input() {
+        return None;
+    }
+
+    let mut window_fn_urn: Option<String> = None;
+    let mut allowed_lateness = 0i64;
+    for edge in graph.edges_directed(index, Direction::Incoming) {
+        let Some(pcol) = components.pcollections.get(&edge.weight().produced_pcol_id) else {
+            continue;
+        };
+        let Some(strategy) = components
+            .windowing_strategies
+            .get(&pcol.windowing_strategy_id)
+        else {
+            continue;
+        };
+        allowed_lateness = allowed_lateness.max(strategy.allowed_lateness);
+        if let Some(window_fn) = strategy.window_fn.as_ref() {
+            window_fn_urn = Some(window_fn.urn.clone());
+        }
+    }
+
+    let is_global_window = match window_fn_urn.as_deref() {
+        Some(urn) => urn == beam_urns::GLOBAL_WINDOWS_FN,
+        None => true,
+    };
+    is_global_window.then(|| global_window_completion_watermark(allowed_lateness))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::fusion::pipeline::{ConsumerMetaData, ExecutableGraph, ExecutableNode};
+    use crate::fusion::pipeline::{PCollectionNode, PTransformNode};
+    use crate::fusion::stage::ExecutableStage;
     use crate::jobservice::urns::beam_urns;
     use crate::transforms::from_urn;
+    use beam_model_rs::v1::{
+        Components, Environment, FunctionSpec, PCollection, PTransform, ParDoPayload,
+        WindowingStrategy,
+    };
+    use indexmap::IndexSet;
     use petgraph::Graph;
-    use std::collections::HashMap;
+    use prost::Message;
+    use std::collections::{HashMap, HashSet};
 
     fn manager(stages: &[(&str, &[&str], &[&str], &[&str])]) -> WatermarkManager {
         let mut manager = WatermarkManager::new();
@@ -1295,6 +1376,45 @@ mod tests {
         manager.report_source_watermark("A", 300).unwrap();
         manager.refresh();
         assert_eq!(manager.input_watermark("C"), Some(200));
+    }
+
+    #[test]
+    fn time_sorted_input_waits_for_gate_and_drops_later_global_window_input() {
+        let mut manager = manager(&[
+            ("Source", &[], &[], &["p"]),
+            ("Sorted", &["p"], &[], &["q"]),
+        ]);
+        manager
+            .set_stage_kind("Sorted", StageKind::TimeSortedInputWatermarkGated)
+            .unwrap();
+        manager.set_required_watermark("Sorted", 100).unwrap();
+
+        manager.start_bundle("Source").unwrap();
+        manager.complete_bundle_with_min("Source", Some(1)).unwrap();
+        manager.report_source_watermark("Source", 50).unwrap();
+        manager.refresh();
+        assert!(!manager.ready_stages().contains(&"Sorted".to_string()));
+
+        manager.report_source_watermark("Source", 100).unwrap();
+        manager.refresh();
+        assert!(manager.ready_stages().contains(&"Sorted".to_string()));
+
+        manager.start_bundle("Sorted").unwrap();
+        manager.mark_rerun("Source").unwrap();
+        manager.start_bundle("Source").unwrap();
+        manager
+            .complete_bundle_with_min("Source", Some(99))
+            .unwrap();
+        assert!(
+            !manager.stages["Sorted"].pending.contains("p"),
+            "an append while the sorted ParDo is in flight is already too late"
+        );
+
+        manager.complete_bundle("Sorted").unwrap();
+        assert!(
+            !manager.ready_stages().contains(&"Sorted".to_string()),
+            "input appended after the global window closed must not re-arm the sorted ParDo"
+        );
     }
 
     #[test]
@@ -2314,6 +2434,60 @@ mod tests {
         }
     }
 
+    fn time_sorted_worker_stage(allowed_lateness: i64) -> (ExecutableStage, Components) {
+        let input = PCollectionNode {
+            id: "p".to_string(),
+            collection: PCollection {
+                unique_name: "p".to_string(),
+                windowing_strategy_id: "global".to_string(),
+                ..Default::default()
+            },
+        };
+        let transform = PTransform {
+            unique_name: "sorted".to_string(),
+            spec: Some(FunctionSpec {
+                urn: beam_urns::PAR_DO_TRANSFORM.to_string(),
+                payload: ParDoPayload {
+                    requires_time_sorted_input: true,
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            }),
+            ..Default::default()
+        };
+        let components = Components {
+            pcollections: HashMap::from([("p".to_string(), input.collection.clone())]),
+            windowing_strategies: HashMap::from([(
+                "global".to_string(),
+                WindowingStrategy {
+                    window_fn: Some(FunctionSpec {
+                        urn: beam_urns::GLOBAL_WINDOWS_FN.to_string(),
+                        payload: Vec::new(),
+                    }),
+                    allowed_lateness,
+                    ..Default::default()
+                },
+            )]),
+            transforms: HashMap::from([("sorted".to_string(), transform.clone())]),
+            ..Default::default()
+        };
+        let stage = ExecutableStage::from(
+            components.clone(),
+            Environment::default(),
+            HashSet::new(),
+            input,
+            IndexSet::new(),
+            IndexSet::new(),
+            IndexSet::new(),
+            IndexSet::new(),
+            IndexSet::from([PTransformNode {
+                id: "sorted".to_string(),
+                transform,
+            }]),
+        );
+        (stage, components)
+    }
+
     #[test]
     fn built_from_executable_graph_wires_inputs_outputs_and_sources() {
         let mut graph = Graph::new();
@@ -2360,6 +2534,25 @@ mod tests {
         assert_eq!(
             manager.required_watermark(&g_id),
             Some(global_window_completion_watermark(0))
+        );
+    }
+
+    #[test]
+    fn time_sorted_worker_stage_is_gated_by_global_allowed_lateness() {
+        let (stage, components) = time_sorted_worker_stage(5_000);
+        let mut graph = Graph::new();
+        let source = graph.add_node(runner_node("source", &["p"]));
+        let sorted = graph.add_node(ExecutableNode::Worker(stage));
+        graph.add_edge(source, sorted, metadata("p"));
+
+        assert_eq!(
+            time_sorted_input_required_watermark(&graph[sorted], &graph, sorted, &components),
+            Some(global_window_completion_watermark(5_000))
+        );
+        assert_eq!(
+            global_window_completion_watermark(i64::MAX),
+            MAX_TIMESTAMP,
+            "a bounded source must always be able to satisfy the global-window gate"
         );
     }
 }

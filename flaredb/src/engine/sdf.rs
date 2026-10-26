@@ -450,6 +450,7 @@ impl SplittableStageExecutor {
                     None,
                     timer_endpoints,
                     Vec::new(),
+                    false,
                 )
                 .await
             {

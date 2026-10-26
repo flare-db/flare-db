@@ -44,6 +44,10 @@ use crate::{
     utils::batch_size_estimator::{BatchConfig, BatchSizeEstimator},
 };
 
+fn sort_windowed_values_by_timestamp(values: &mut [WindowedValue]) {
+    values.sort_by_key(|value| value.timestamp_millis);
+}
+
 /// Resolve the window coder for a PCollection from its windowing strategy.
 pub(crate) fn resolve_window_coder(
     pipeline_components: &Components,
@@ -412,6 +416,11 @@ impl BundleRuntime {
     /// rows the upstream stage appended since. `consumer_transform_id` (the
     /// stage's `.../source` id) is the reader identity for that cursor, so a
     /// re-run never re-delivers elements the stage already saw.
+    ///
+    /// When `requires_time_sorted_input` is set, the input is materialized and
+    /// sorted by event timestamp before it is sent to the SDK harness. The
+    /// portable Fn API does not state that bundles are time ordered, so the
+    /// runner must provide this guarantee for `@RequiresTimeSortedInput`.
     pub async fn process_input_elements(
         &self,
         input_instruction_id: String,
@@ -421,6 +430,7 @@ impl BundleRuntime {
         input_component_coder_ids: Option<Vec<String>>,
         timer_endpoints: Vec<(String, String)>,
         window_expiration_timers: Vec<(String, String)>,
+        requires_time_sorted_input: bool,
     ) -> anyhow::Result<usize> {
         debug!("Spawned task to send stage's input elements to worker");
         debug!(
@@ -453,13 +463,31 @@ impl BundleRuntime {
         // encoding begins. Each decoded batch is then encoded and sent out in
         // dynamically-sized chunks via the batch-size estimator — mirroring
         // `process_output_elements` — rather than as one giant `Elements` message.
-        let mut input = self
-            .store
-            .stream_windowed_values_since(
-                consumer_transform_id.clone(),
-                input_pcollection_id.clone(),
+        //
+        // A time-sorted ParDo is the exception: ordering has to span all Arrow
+        // batches, so materialize that input once and sort it before encoding.
+        let mut ordered_input = if requires_time_sorted_input {
+            let mut values = self
+                .store
+                .scan_windowed_values_since(&consumer_transform_id, &input_pcollection_id)
+                .await?;
+            sort_windowed_values_by_timestamp(&mut values);
+            Some(values)
+        } else {
+            None
+        };
+        let mut input = if ordered_input.is_none() {
+            Some(
+                self.store
+                    .stream_windowed_values_since(
+                        consumer_transform_id.clone(),
+                        input_pcollection_id.clone(),
+                    )
+                    .await?,
             )
-            .await?;
+        } else {
+            None
+        };
 
         let mut batch_size_estimator = BatchSizeEstimator::new(BatchConfig {
             min_batch_size: 2,
@@ -470,7 +498,17 @@ impl BundleRuntime {
         let mut batch_len = 0usize;
         let mut total_sent = 0usize;
 
-        while let Some(values) = input.next_batch().await? {
+        loop {
+            let values = if let Some(values) = ordered_input.take() {
+                values
+            } else if let Some(input) = input.as_mut() {
+                let Some(values) = input.next_batch().await? else {
+                    break;
+                };
+                values
+            } else {
+                break;
+            };
             let mut window_expiration_entries = HashMap::new();
             for element in values {
                 for entry in window_expiration_timer_entries(
@@ -1206,6 +1244,35 @@ fn window_expiration_timer_entries(
         }
     }
     Ok(entries)
+}
+
+#[cfg(test)]
+mod input_ordering_tests {
+    use super::*;
+
+    fn value_at(timestamp_millis: i64) -> WindowedValue {
+        WindowedValue {
+            value: BeamRecord::PRIMITIVE(PrimitiveValue::Int64(timestamp_millis)),
+            timestamp_millis,
+            windows: vec![BeamWindow::Global],
+            pane: PaneInfo::no_firing(),
+        }
+    }
+
+    #[test]
+    fn sorts_time_sorted_input_across_storage_order() {
+        let mut values = vec![value_at(3), value_at(1), value_at(2)];
+
+        sort_windowed_values_by_timestamp(&mut values);
+
+        assert_eq!(
+            values
+                .iter()
+                .map(|value| value.timestamp_millis)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    }
 }
 
 #[cfg(test)]

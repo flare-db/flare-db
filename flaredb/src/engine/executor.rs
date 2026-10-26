@@ -185,6 +185,8 @@ impl StageExecutor {
                             let input_timer_endpoints = stage_timer_endpoints(&executable_stage);
                             let input_window_expiration_timers =
                                 stage_window_expiration_timers(&executable_stage);
+                            let requires_time_sorted_input =
+                                executable_stage.requires_time_sorted_input();
 
                             let timer_only = !timers.is_empty();
                             if timer_only || !input_timer_endpoints.is_empty() {
@@ -254,6 +256,7 @@ impl StageExecutor {
                                             None,
                                             input_timer_endpoints,
                                             input_window_expiration_timers,
+                                            requires_time_sorted_input,
                                         )
                                         .await
                                 };
