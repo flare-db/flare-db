@@ -1103,14 +1103,25 @@ impl WatermarkManager {
         if !stage.is_ready_without_upstream_barrier() {
             return false;
         }
-        if stage.kind != StageKind::WatermarkGated {
+        if stage.kind == StageKind::Ordinary {
             return true;
         }
 
         // A bounded aggregate must see the complete upstream PCollection, not
-        // whichever bundle happened to commit first. Queued/in-flight bundles and
-        // watermark holds are outstanding work even after a PCollection has its
-        // first committed output.
+        // whichever bundle happened to commit first. An intermediate transform
+        // can already have emitted a partial snapshot while a stage above it is
+        // still running (for example, a timer callback after an earlier input
+        // bundle). Checking only the immediate producer would release the
+        // aggregate against that snapshot before the upstream change propagates
+        // through the intermediate transform.
+        self.upstream_chain_is_quiescent(stage)
+    }
+
+    /// Whether every producer in this stage's upstream chain has no outstanding
+    /// work. This recursively walks the main and side inputs so a gated aggregate
+    /// cannot observe a partial result from a transform whose own producer still
+    /// has an in-flight bundle, pending input, timer, or re-arm.
+    fn upstream_chain_is_quiescent(&self, stage: &StageState) -> bool {
         stage
             .main_inputs
             .iter()
@@ -1125,6 +1136,7 @@ impl WatermarkManager {
                     && !producer.rerun_pending
                     && producer.pending_empty.is_empty()
                     && producer.min_hold().is_none()
+                    && self.upstream_chain_is_quiescent(producer)
             })
     }
 
@@ -1414,6 +1426,62 @@ mod tests {
         assert!(
             !manager.ready_stages().contains(&"Sorted".to_string()),
             "input appended after the global window closed must not re-arm the sorted ParDo"
+        );
+    }
+
+    #[test]
+    fn gated_stage_waits_for_the_entire_upstream_chain_to_quiesce() {
+        let mut manager = manager(&[
+            ("Source", &[], &[], &["p"]),
+            ("Intermediate", &["p"], &[], &["q"]),
+            ("Aggregate", &["q"], &[], &["r"]),
+        ]);
+        manager
+            .set_stage_kind("Aggregate", StageKind::WatermarkGated)
+            .unwrap();
+        manager
+            .set_required_watermark("Aggregate", MIN_TIMESTAMP)
+            .unwrap();
+
+        manager.start_bundle("Source").unwrap();
+        manager.complete_bundle_with_min("Source", Some(0)).unwrap();
+        manager.start_bundle("Intermediate").unwrap();
+        manager
+            .complete_bundle_with_min("Intermediate", Some(0))
+            .unwrap();
+        assert!(
+            manager.ready_stages().contains(&"Aggregate".to_string()),
+            "the aggregate should run once its immediate input is available"
+        );
+
+        // A timer callback re-runs the source while the intermediate transform's
+        // previous output is still in place. That output is only a partial
+        // snapshot, so the aggregate must wait for the whole chain to settle.
+        manager.mark_rerun("Source").unwrap();
+        manager.start_bundle("Source").unwrap();
+        assert!(
+            !manager.ready_stages().contains(&"Aggregate".to_string()),
+            "an in-flight upstream producer must hold the aggregate"
+        );
+
+        manager.complete_bundle_with_min("Source", Some(0)).unwrap();
+        assert!(
+            !manager.ready_stages().contains(&"Aggregate".to_string()),
+            "pending input in the intermediate transform must hold the aggregate"
+        );
+
+        manager.start_bundle("Intermediate").unwrap();
+        assert!(
+            !manager.ready_stages().contains(&"Aggregate".to_string()),
+            "an in-flight intermediate transform must hold the aggregate"
+        );
+
+        manager
+            .complete_bundle_with_min("Intermediate", Some(0))
+            .unwrap();
+        assert!(
+            manager.ready_stages().contains(&"Aggregate".to_string()),
+            "the aggregate should run after the upstream chain is quiescent"
         );
     }
 
