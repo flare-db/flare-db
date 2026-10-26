@@ -135,7 +135,12 @@ impl NodeScheduler {
         let stages = watermarks.stages();
         let gated: Vec<String> = stages
             .iter()
-            .filter(|stage| watermarks.stage_kind(stage) == Some(StageKind::WatermarkGated))
+            .filter(|stage| {
+                matches!(
+                    watermarks.stage_kind(stage),
+                    Some(StageKind::WatermarkGated | StageKind::TimeSortedInputWatermarkGated)
+                )
+            })
             .map(|stage| {
                 format!(
                     "{stage}@{}",

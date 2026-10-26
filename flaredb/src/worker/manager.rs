@@ -15,7 +15,6 @@ pub struct WorkerLaunchConfig {
     pub worker_jar: String,
     pub logs_dir: String,
     pub control_url: String,
-    pub pipeline_options: String,
     pub connect_timeout_secs: u64,
     /// Fallback interpreter used to launch a Python SDK harness when the job's
     /// PROCESS environment does not advertise one. `None` means `python3` from
@@ -55,6 +54,7 @@ impl WorkerManager {
         runtime: &WorkerRuntime,
         staging_dir: &str,
         instance_id: &str,
+        pipeline_options: &str,
     ) -> Result<(), Status> {
         let logs_dir = logs_dir(instance_id, job_id);
         tokio::fs::create_dir_all(&logs_dir)
@@ -124,7 +124,7 @@ impl WorkerManager {
                         "STATE_API_SERVICE_DESCRIPTOR",
                         format!(r#"url: "{}""#, self.config.control_url),
                     )
-                    .env("PIPELINE_OPTIONS", &self.config.pipeline_options)
+                    .env("PIPELINE_OPTIONS", pipeline_options)
                     .env("RUNNER_CAPABILITIES", runner_capabilities())
                     .stdout(Stdio::from(stdout_file))
                     .stderr(Stdio::from(stderr_file));
@@ -170,7 +170,7 @@ impl WorkerManager {
                         format!(r#"url: "{}""#, self.config.control_url),
                     )
                     .env("SEMI_PERSISTENT_DIRECTORY", staging_dir)
-                    .env("PIPELINE_OPTIONS", &self.config.pipeline_options)
+                    .env("PIPELINE_OPTIONS", pipeline_options)
                     .env("RUNNER_CAPABILITIES", runner_capabilities())
                     .env("PYTHONUNBUFFERED", "1")
                     .stdout(Stdio::from(stdout_file))
@@ -270,7 +270,6 @@ mod tests {
             worker_jar: String::new(),
             logs_dir: String::new(),
             control_url: String::new(),
-            pipeline_options: "{}".to_string(),
             connect_timeout_secs: 1,
             python_bin: None,
         });

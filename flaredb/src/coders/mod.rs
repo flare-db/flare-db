@@ -210,7 +210,7 @@ impl StandardBeamCoders {
     }
 
     /// Encode a KV/GBK **key**; the inverse of [`Self::decode_key`].
-    fn encode_key(&self, key: &PrimitiveValue, buf: &mut impl BufMut) {
+    pub(crate) fn encode_key(&self, key: &PrimitiveValue, buf: &mut impl BufMut) {
         if self.is_primitive() {
             self.encode_primitive(key.clone(), buf);
             return;
@@ -218,6 +218,15 @@ impl StandardBeamCoders {
         match key {
             PrimitiveValue::Bytes(raw) => buf.put_slice(raw),
             other => panic!("composite key coder requires opaque bytes, got {other:?}"),
+        }
+    }
+
+    pub(crate) fn key_coder(&self) -> &Self {
+        match self {
+            StandardBeamCoders::Kv(key_coder, _) | StandardBeamCoders::Gbk(key_coder, _) => {
+                key_coder
+            }
+            _ => self,
         }
     }
 

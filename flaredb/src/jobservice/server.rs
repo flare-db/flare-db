@@ -10,6 +10,8 @@ use beam_model_rs::v1::{
 };
 use dashmap::{DashMap, DashSet};
 use prost::Message;
+use prost_types::value::Kind as PipelineOptionValueKind;
+use prost_types::{Struct, Value as ProtoValue};
 use tokio::sync::{Mutex, watch};
 use tokio::time::timeout;
 use tokio_stream::wrappers::ReceiverStream;
@@ -184,13 +186,20 @@ impl JobService for FlareJobService {
                 log::warn!("prepare request rejected: pipeline is missing");
                 Status::invalid_argument("Pipeline is missing")
             })?;
+            let pipeline_options = pipeline_options_to_json(
+                request.get_ref().pipeline_options.as_ref(),
+            )
+            .map_err(|error| {
+                log::warn!("prepare request rejected: invalid pipeline options: {error}");
+                Status::invalid_argument(format!("invalid pipeline options: {error}"))
+            })?;
 
             let job = Job::new(&self.instance_id, pipeline);
             let job_id = job.job_id;
             if let Err(e) = record_job_state(&self.instance_id, &job_id) {
                 log::warn!("failed to record job state for {}: {}", job_id, e);
             }
-            self.job_store.add_job(&job_id, job.graph);
+            self.job_store.add_job(&job_id, job.graph, pipeline_options);
 
             let new_token = Uuid::new_v4().to_string();
 
@@ -242,13 +251,14 @@ impl JobService for FlareJobService {
                 return Err(Status::invalid_argument("preparation_id is required"));
             }
 
-            let job_graph = self.job_store.get_job(&preparation_id).ok_or_else(|| {
+            let prepared_job = self.job_store.get_job(&preparation_id).ok_or_else(|| {
                 log::warn!(
                     "run request rejected: unknown preparation_id={}",
                     preparation_id
                 );
                 Status::not_found(format!("unknown preparation_id: {}", preparation_id))
             })?;
+            let job_graph = Arc::clone(&prepared_job.graph);
             let job_metrics = self
                 .job_metrics
                 .get(&preparation_id)
@@ -310,7 +320,13 @@ impl JobService for FlareJobService {
             }
 
             self.worker_manager
-                .spawn_worker(&preparation_id, &runtime, staging_dir, &self.instance_id)
+                .spawn_worker(
+                    &preparation_id,
+                    &runtime,
+                    staging_dir,
+                    &self.instance_id,
+                    &prepared_job.pipeline_options,
+                )
                 .await?;
 
             let run_result = self.execute_spawned_job(&preparation_id, job_graph).await;
@@ -687,6 +703,46 @@ fn build_job_metrics_response(
     })
 }
 
+/// Convert Beam's namespaced pipeline-options Struct to the JSON consumed by
+/// the SDK harness's `PIPELINE_OPTIONS` environment variable.
+fn pipeline_options_to_json(options: Option<&Struct>) -> Result<String, String> {
+    let Some(options) = options else {
+        return Ok("{}".to_string());
+    };
+    serde_json::to_string(&protobuf_struct_to_json(options)?)
+        .map_err(|error| format!("failed to encode pipeline options as JSON: {error}"))
+}
+
+fn protobuf_struct_to_json(value: &Struct) -> Result<serde_json::Value, String> {
+    let fields = value
+        .fields
+        .iter()
+        .map(|(key, value)| Ok((key.clone(), protobuf_value_to_json(value)?)))
+        .collect::<Result<serde_json::Map<_, _>, String>>()?;
+    Ok(serde_json::Value::Object(fields))
+}
+
+fn protobuf_value_to_json(value: &ProtoValue) -> Result<serde_json::Value, String> {
+    match value.kind.as_ref() {
+        None => Err("pipeline option contains an unset value".to_string()),
+        Some(PipelineOptionValueKind::NullValue(_)) => Ok(serde_json::Value::Null),
+        Some(PipelineOptionValueKind::NumberValue(number)) => serde_json::Number::from_f64(*number)
+            .map(serde_json::Value::Number)
+            .ok_or_else(|| format!("non-finite pipeline option number: {number}")),
+        Some(PipelineOptionValueKind::StringValue(value)) => {
+            Ok(serde_json::Value::String(value.clone()))
+        }
+        Some(PipelineOptionValueKind::BoolValue(value)) => Ok(serde_json::Value::Bool(*value)),
+        Some(PipelineOptionValueKind::StructValue(value)) => protobuf_struct_to_json(value),
+        Some(PipelineOptionValueKind::ListValue(value)) => value
+            .values
+            .iter()
+            .map(protobuf_value_to_json)
+            .collect::<Result<Vec<_>, String>>()
+            .map(serde_json::Value::Array),
+    }
+}
+
 /// Bound the length of an error string carried back to the client.
 ///
 /// gRPC errors travel in the HTTP/2 `grpc-message` trailer, and the JVM runner's
@@ -764,7 +820,9 @@ mod metrics_tests {
 
 #[cfg(test)]
 mod truncate_tests {
-    use super::truncate_grpc_error;
+    use super::{pipeline_options_to_json, truncate_grpc_error};
+    use prost_types::value::Kind as PipelineOptionValueKind;
+    use prost_types::{Struct, Value as ProtoValue};
 
     #[test]
     fn keeps_short_messages_intact() {
@@ -784,5 +842,29 @@ mod truncate_tests {
         // 'é' is two bytes; cutting mid-codepoint would panic without the boundary check.
         let truncated = truncate_grpc_error("é".repeat(5_000));
         assert!(truncated.contains("truncated"));
+    }
+
+    #[test]
+    fn forwards_namespaced_pipeline_options_as_harness_json() {
+        let options = Struct {
+            fields: [(
+                "beam:option:fake_option:v1".to_string(),
+                ProtoValue {
+                    kind: Some(PipelineOptionValueKind::StringValue("my value".to_string())),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        };
+
+        let json = pipeline_options_to_json(Some(&options)).expect("serialize pipeline options");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+
+        assert_eq!(value["beam:option:fake_option:v1"], "my value");
+    }
+
+    #[test]
+    fn missing_pipeline_options_encode_as_an_empty_object() {
+        assert_eq!(pipeline_options_to_json(None).unwrap(), "{}");
     }
 }

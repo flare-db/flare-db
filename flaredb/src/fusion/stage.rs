@@ -1,7 +1,8 @@
 use beam_model_rs::v1::executable_stage_payload::WireCoderSetting;
-use beam_model_rs::v1::{Components, Environment, PTransform};
+use beam_model_rs::v1::{Components, Environment, PTransform, ParDoPayload};
 use indexmap::IndexSet;
 use petgraph::Graph;
+use prost::Message;
 use uuid::Uuid;
 
 use crate::fusion::pipeline::{ConsumerMetaData, ExecutableNode, PCollectionNode, PTransformNode};
@@ -140,6 +141,26 @@ impl ExecutableStage {
                 .unwrap_or(false)
         })
     }
+
+    /// Whether any ParDo in this stage requires ascending event-time input.
+    pub fn requires_time_sorted_input(&self) -> bool {
+        self.transforms
+            .iter()
+            .any(|transform| pardo_requires_time_sorted_input(&transform.transform))
+    }
+}
+
+fn pardo_requires_time_sorted_input(transform: &PTransform) -> bool {
+    let Some(spec) = transform.spec.as_ref() else {
+        return false;
+    };
+    if spec.urn != urns::beam_urns::PAR_DO_TRANSFORM {
+        return false;
+    }
+
+    ParDoPayload::decode(spec.payload.as_slice())
+        .map(|payload| payload.requires_time_sorted_input)
+        .unwrap_or(false)
 }
 
 #[derive(Eq, PartialEq, Clone, Hash)]
@@ -296,5 +317,31 @@ impl SplittableStage {
 
     pub fn plan(&self) -> &SplittableExecutionPlan {
         &self.plan
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use beam_model_rs::v1::FunctionSpec;
+
+    fn par_do(requires_time_sorted_input: bool) -> PTransform {
+        let payload = ParDoPayload {
+            requires_time_sorted_input,
+            ..Default::default()
+        };
+        PTransform {
+            spec: Some(FunctionSpec {
+                urn: urns::beam_urns::PAR_DO_TRANSFORM.to_string(),
+                payload: payload.encode_to_vec(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn detects_pardo_requires_time_sorted_input() {
+        assert!(pardo_requires_time_sorted_input(&par_do(true)));
+        assert!(!pardo_requires_time_sorted_input(&par_do(false)));
     }
 }

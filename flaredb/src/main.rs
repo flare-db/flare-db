@@ -58,7 +58,6 @@ async fn flare_up() -> Result<(), Box<dyn std::error::Error>> {
         worker_jar,
         logs_dir: artifact_root_str.to_string(),
         control_url: flaredb::DEFAULT_API_SERVICE_URL.to_string(),
-        pipeline_options: "{}".to_string(),
         connect_timeout_secs: 20,
         python_bin: std::env::var("FLAREDB_PYTHON_BIN").ok(),
     };

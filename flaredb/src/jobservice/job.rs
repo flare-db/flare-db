@@ -70,8 +70,14 @@ impl Job {
 }
 
 #[derive(Clone)]
+pub struct PreparedJob {
+    pub graph: Arc<ExecutableGraph>,
+    pub pipeline_options: String,
+}
+
+#[derive(Clone)]
 pub struct JobStore {
-    jobs: Arc<DashMap<String, Arc<ExecutableGraph>>>,
+    jobs: Arc<DashMap<String, Arc<PreparedJob>>>,
 }
 
 impl JobStore {
@@ -81,11 +87,17 @@ impl JobStore {
         }
     }
 
-    pub fn add_job(&self, id: &String, graph: ExecutableGraph) {
-        self.jobs.insert(id.clone(), Arc::new(graph));
+    pub fn add_job(&self, id: &str, graph: ExecutableGraph, pipeline_options: String) {
+        self.jobs.insert(
+            id.to_string(),
+            Arc::new(PreparedJob {
+                graph: Arc::new(graph),
+                pipeline_options,
+            }),
+        );
     }
 
-    pub fn get_job(&self, id: &String) -> Option<Arc<ExecutableGraph>> {
+    pub fn get_job(&self, id: &str) -> Option<Arc<PreparedJob>> {
         self.jobs.get(id).map(|entry| Arc::clone(entry.value()))
     }
     pub fn first_job_id(&self) -> Option<String> {

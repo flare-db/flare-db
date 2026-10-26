@@ -250,6 +250,12 @@ impl ExecutorDispatcher {
             scheduler
                 .watermarks_mut()
                 .set_residual_holds(&residual_holds);
+            // A completed bundle can persist a due timer and leave other stages
+            // ready. Promote before selecting those stages so the timer owner is
+            // marked for re-execution and downstream aggregates wait for its
+            // callback output instead of consuming an empty intermediate snapshot.
+            self.promote_due_event_time_timers(scheduler, &mut pending_timers)
+                .await?;
 
             for (idx, node) in scheduler.next_nodes() {
                 let runtime = self.new_bundle_runtime();
@@ -535,6 +541,12 @@ impl ExecutorDispatcher {
                 } else {
                     None
                 };
+                // Timers set by this bundle are already durable when the
+                // executor future completes. Install their holds before marking
+                // the bundle complete: `mark_complete` refreshes watermarks, and
+                // a hold cannot pull an output watermark back down after that
+                // refresh has advanced it to its bounded end.
+                self.sync_event_time_holds(scheduler).await?;
                 scheduler.mark_complete_with_min_and_input(idx, output_min_ts, input_count);
             }
         }
