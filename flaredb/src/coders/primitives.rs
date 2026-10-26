@@ -53,6 +53,24 @@ impl BeamCoder<Vec<u8>> for BytesCoder {
     }
 }
 
+/// Opaque bytes encoded by an SDK-private Java coder without standard Beam framing.
+///
+/// Java schema coders are intentionally not wrapped by `PortableCoderRewrites`, so
+/// their contents can be opaque to the runner. At a structured boundary the outer
+/// `LengthPrefixCoder` supplies the boundary, making the remaining bytes the value.
+#[derive(Debug, Clone)]
+pub struct JavaOpaqueCoder;
+
+impl BeamCoder<Vec<u8>> for JavaOpaqueCoder {
+    fn encode(&self, val: Vec<u8>, buf: &mut impl BufMut) {
+        buf.put_slice(val.as_slice());
+    }
+
+    fn decode(&self, buf: &mut impl Buf) -> Result<Vec<u8>, CodersError> {
+        Ok(buf.copy_to_bytes(buf.remaining()).to_vec())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct VarIntCoder;
 

@@ -225,9 +225,19 @@ impl BundleRuntime {
             edge_metadata.component_coder.clone(),
             pipeline_coders.as_ref(),
         );
+        let logical_element_coder = StandardBeamCoders::from_urn(
+            &edge_metadata.coder_id,
+            edge_metadata.component_coder.clone(),
+            Some(pipeline_coders.as_ref()),
+        );
+        let decode_structured_payload =
+            wire_coder_id != edge_metadata.coder_id && logical_element_coder.is_structured();
         debug!(
-            "Decoding with coder_id={}, wire_coder_id={}, component_coders={:?}",
-            edge_metadata.coder_id, wire_coder_id, edge_metadata.component_coder
+            "Decoding with coder_id={}, wire_coder_id={}, structured_payload={}, component_coders={:?}",
+            edge_metadata.coder_id,
+            wire_coder_id,
+            decode_structured_payload,
+            edge_metadata.component_coder
         );
 
         let window_coder = self.window_coder_for_pcollection(&edge_metadata.produced_pcol_id);
@@ -284,7 +294,7 @@ impl BundleRuntime {
                         }));
 
                         match decode_result {
-                            Ok(Ok(windowed_value)) => {
+                            Ok(Ok(mut windowed_value)) => {
                                 let consumed = cursor.position() as usize;
                                 drop(cursor);
                                 if consumed > stream_buffer.len() {
@@ -305,6 +315,13 @@ impl BundleRuntime {
                                     None
                                 };
                                 stream_buffer.advance(consumed);
+
+                                if decode_structured_payload {
+                                    decode_structured_boundary_value(
+                                        &logical_element_coder,
+                                        &mut windowed_value,
+                                    )?;
+                                }
 
                                 total_decoded += 1;
                                 if total_decoded >= next_progress {
@@ -452,6 +469,8 @@ impl BundleRuntime {
             input_component_coder_ids.clone(),
             Some(self.pipeline_coders.as_ref()),
         );
+        let encode_structured_payload =
+            wire_coder_id != input_coder_id && logical_element_coder.is_structured();
 
         let opaque_void = logical_element_coder.is_void();
         let window_coder = self.window_coder_for_pcollection(&input_pcollection_id);
@@ -517,7 +536,7 @@ impl BundleRuntime {
                 break;
             };
             let mut window_expiration_entries = HashMap::new();
-            for element in values {
+            for mut element in values {
                 for entry in window_expiration_timer_entries(
                     &element,
                     &logical_element_coder,
@@ -538,6 +557,9 @@ impl BundleRuntime {
                             ));
                         }
                     }
+                } else if encode_structured_payload {
+                    encode_structured_boundary_value(&logical_element_coder, &mut element)?;
+                    windowed_value_coder.encode(element, &mut encoded);
                 } else {
                     windowed_value_coder.encode(element, &mut encoded);
                 }
@@ -1018,6 +1040,38 @@ fn boundary_element_coder(
     (wire_coder_id, coder)
 }
 
+fn decode_structured_boundary_value(
+    logical_coder: &StandardBeamCoders,
+    value: &mut WindowedValue,
+) -> anyhow::Result<()> {
+    let BeamRecord::PRIMITIVE(PrimitiveValue::Bytes(payload)) = &value.value else {
+        return Err(anyhow!(
+            "length-prefixed boundary coder did not produce opaque bytes"
+        ));
+    };
+    let mut cursor = Cursor::new(payload.as_slice());
+    let decoded = logical_coder
+        .decode(&mut cursor)
+        .map_err(|err| anyhow!("logical boundary coder failed: {err}"))?;
+    if cursor.position() as usize != payload.len() {
+        return Err(anyhow!(
+            "logical boundary coder did not consume its complete payload"
+        ));
+    }
+    value.value = decoded;
+    Ok(())
+}
+
+fn encode_structured_boundary_value(
+    logical_coder: &StandardBeamCoders,
+    value: &mut WindowedValue,
+) -> anyhow::Result<()> {
+    let mut payload = Vec::new();
+    logical_coder.encode(value.value.clone(), &mut payload);
+    value.value = BeamRecord::PRIMITIVE(PrimitiveValue::Bytes(payload));
+    Ok(())
+}
+
 /// Adds a Beam `windowed_value:v1` coder whose components are the element
 /// coder followed by the PCollection's window coder.
 pub fn insert_windowed_value_coder(
@@ -1272,6 +1326,8 @@ fn window_expiration_timer_entries(
 #[cfg(test)]
 mod boundary_coder_tests {
     use super::*;
+    use crate::coders::primitives::{JavaOpaqueCoder, StringUtf8Coder, VarInt32Coder};
+    use crate::store::record::BeamKV;
 
     #[test]
     fn data_boundary_uses_length_prefixed_sibling() {
@@ -1301,6 +1357,62 @@ mod boundary_coder_tests {
 
         assert_eq!(wire_coder_id, "KvCoder1_lp");
         assert!(matches!(coder, StandardBeamCoders::LengthPrefix(_)));
+    }
+
+    #[test]
+    fn structured_boundary_payload_roundtrips_through_length_prefix() {
+        let logical_coder = StandardBeamCoders::Kv(
+            Box::new(StandardBeamCoders::StringUtf8(StringUtf8Coder)),
+            Box::new(StandardBeamCoders::VarInt32(VarInt32Coder)),
+        );
+        let original = BeamRecord::KV(BeamKV {
+            key: PrimitiveValue::String("key".to_string()),
+            value: Box::new(BeamRecord::PRIMITIVE(PrimitiveValue::Int64(7))),
+        });
+        let mut value = WindowedValue {
+            value: original.clone(),
+            timestamp_millis: 0,
+            windows: vec![BeamWindow::Global],
+            pane: PaneInfo::no_firing(),
+        };
+
+        encode_structured_boundary_value(&logical_coder, &mut value).unwrap();
+        let wire_coder = WindowedValueCoder::with_window_coder(
+            StandardBeamCoders::LengthPrefix(crate::coders::primitives::LengthPrefixCoder),
+            WindowCoder::Global,
+        );
+        let mut wire = BytesMut::new();
+        wire_coder.encode(value, &mut wire);
+
+        let mut wire = wire.freeze();
+        let mut decoded = wire_coder.decode(&mut wire).unwrap();
+        decode_structured_boundary_value(&logical_coder, &mut decoded).unwrap();
+        assert_eq!(decoded.value, original);
+    }
+
+    #[test]
+    fn opaque_java_value_consumes_the_remaining_kv_payload() {
+        let logical_coder = StandardBeamCoders::Kv(
+            Box::new(StandardBeamCoders::StringUtf8(StringUtf8Coder)),
+            Box::new(StandardBeamCoders::JavaOpaque(JavaOpaqueCoder)),
+        );
+        let original = BeamRecord::KV(BeamKV {
+            key: PrimitiveValue::String("key".to_string()),
+            value: Box::new(BeamRecord::PRIMITIVE(PrimitiveValue::Bytes(vec![
+                0x01, 0xfe, 0x7f, 0x00,
+            ]))),
+        });
+        let mut value = WindowedValue {
+            value: original.clone(),
+            timestamp_millis: 0,
+            windows: vec![BeamWindow::Global],
+            pane: PaneInfo::no_firing(),
+        };
+
+        encode_structured_boundary_value(&logical_coder, &mut value).unwrap();
+        decode_structured_boundary_value(&logical_coder, &mut value).unwrap();
+
+        assert_eq!(value.value, original);
     }
 }
 
