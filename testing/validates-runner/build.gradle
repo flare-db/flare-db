@@ -80,6 +80,15 @@ task validatesRunner(type: Test) {
         excludeCategories 'org.apache.beam.sdk.testing.UsesPerKeyOrderInBundle'
     }
 
+    filter {
+        // Beam 2.76's FnApiDoFnRunner intentionally skips the deprecated
+        // getAllowedTimestampSkew() check on ProcessContext.outputWithTimestamp()
+        // (BEAM-29637). The test expects that exception and can only pass with the
+        // DirectRunner's validation path; the other timestamp-skew tests remain.
+        excludeTestsMatching(
+            'org.apache.beam.sdk.transforms.ParDoTest$TimestampTests.testProcessElementSkew')
+    }
+
     testLogging {
         events "passed", "skipped", "failed", "standardOut", "standardError"
         showExceptions true

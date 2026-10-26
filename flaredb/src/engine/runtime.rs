@@ -420,6 +420,7 @@ impl BundleRuntime {
         input_coder_id: String,
         input_component_coder_ids: Option<Vec<String>>,
         timer_endpoints: Vec<(String, String)>,
+        window_expiration_timers: Vec<(String, String)>,
     ) -> anyhow::Result<usize> {
         debug!("Spawned task to send stage's input elements to worker");
         debug!(
@@ -438,7 +439,7 @@ impl BundleRuntime {
         let opaque_void = element_coder.is_void();
         let window_coder = self.window_coder_for_pcollection(&input_pcollection_id);
         let windowed_value_coder =
-            WindowedValueCoder::with_window_coder(element_coder, window_coder);
+            WindowedValueCoder::with_window_coder(element_coder.clone(), window_coder);
 
         if opaque_void {
             debug!(
@@ -470,7 +471,15 @@ impl BundleRuntime {
         let mut total_sent = 0usize;
 
         while let Some(values) = input.next_batch().await? {
+            let mut window_expiration_entries = HashMap::new();
             for element in values {
+                for entry in window_expiration_timer_entries(
+                    &element,
+                    &element_coder,
+                    &window_expiration_timers,
+                )? {
+                    window_expiration_entries.insert(entry.key.storage_key(), Some(entry));
+                }
                 if opaque_void {
                     match element.value {
                         BeamRecord::PRIMITIVE(PrimitiveValue::Bytes(raw)) => {
@@ -509,6 +518,7 @@ impl BundleRuntime {
                     batch_len = 0;
                 }
             }
+            self.timer_service.apply(&window_expiration_entries).await?;
         }
 
         // Flush any trailing elements, then terminate the stream.
@@ -1140,12 +1150,71 @@ pub fn stage_timer_endpoints(stage: &ExecutableStage) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Timer families whose expiry callback is managed by the runner rather than
+/// explicitly set by user code.
+pub fn stage_window_expiration_timers(stage: &ExecutableStage) -> Vec<(String, String)> {
+    stage
+        .transforms()
+        .iter()
+        .filter_map(|transform| {
+            let spec = transform.node().spec.as_ref()?;
+            let payload = ParDoPayload::decode(spec.payload.as_slice()).ok()?;
+            let timer_family = payload.on_window_expiration_timer_family_spec;
+            (!timer_family.is_empty()).then(|| (transform.id().clone(), timer_family))
+        })
+        .collect()
+}
+
+/// Build the runner-managed event-time timers required by
+/// `@OnWindowExpiration`. The SDK does not emit these timers; the runner creates
+/// one per input window at that window's maximum timestamp.
+fn window_expiration_timer_entries(
+    element: &WindowedValue,
+    element_coder: &StandardBeamCoders,
+    timers: &[(String, String)],
+) -> anyhow::Result<Vec<TimerEntry>> {
+    if timers.is_empty() {
+        return Ok(Vec::new());
+    }
+    let key = match &element.value {
+        BeamRecord::KV(kv) => &kv.key,
+        other => {
+            return Err(anyhow!(
+                "OnWindowExpiration requires keyed input, found {other:?}"
+            ));
+        }
+    };
+    let mut user_key = Vec::new();
+    element_coder.key_coder().encode_key(key, &mut user_key);
+
+    let mut entries = Vec::new();
+    for window in &element.windows {
+        let fire_timestamp = window.max_timestamp_millis();
+        for (transform_id, timer_family_id) in timers {
+            entries.push(TimerEntry {
+                key: TimerKey {
+                    transform_id: transform_id.clone(),
+                    timer_family_id: timer_family_id.clone(),
+                    tag: String::new(),
+                    window: window.canonical_key(),
+                    user_key: user_key.clone(),
+                },
+                domain: TimeDomain::EventTime,
+                fire_timestamp,
+                hold_timestamp: fire_timestamp,
+            });
+        }
+    }
+    Ok(entries)
+}
+
 #[cfg(test)]
 mod timer_tests {
     use super::*;
     use crate::coders::primitives::StringUtf8Coder;
     use crate::engine::harness::data::{TimerChunk, TimersKey};
     use crate::engine::timer::TimerStore;
+    use crate::store::record::BeamKV;
     use beam_model_rs::v1::TimerFamilySpec;
     use prost::Message;
     use tempfile::tempdir;
@@ -1401,5 +1470,43 @@ mod timer_tests {
         assert_eq!(entries[0].fire_timestamp, 10);
         assert_eq!(entries[1].key.user_key, encoded_string_key("bob"));
         assert_eq!(entries[1].fire_timestamp, 20);
+    }
+
+    #[test]
+    fn window_expiration_timer_uses_window_end_and_encoded_key() {
+        let element = WindowedValue {
+            value: BeamRecord::KV(BeamKV {
+                key: PrimitiveValue::String("key".to_string()),
+                value: Box::new(BeamRecord::PRIMITIVE(PrimitiveValue::String(
+                    "value".to_string(),
+                ))),
+            }),
+            timestamp_millis: 0,
+            windows: vec![BeamWindow::Interval {
+                start_millis: 0,
+                end_millis: 10,
+            }],
+            pane: PaneInfo::no_firing(),
+        };
+        let coder = StandardBeamCoders::Kv(
+            Box::new(StandardBeamCoders::StringUtf8(StringUtf8Coder)),
+            Box::new(StandardBeamCoders::StringUtf8(StringUtf8Coder)),
+        );
+
+        let entries = window_expiration_timer_entries(
+            &element,
+            &coder,
+            &[("pardo".to_string(), "onWindowExpiration0".to_string())],
+        )
+        .unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].key.transform_id, "pardo");
+        assert_eq!(entries[0].key.timer_family_id, "onWindowExpiration0");
+        assert_eq!(entries[0].key.window, "interval:0:10");
+        assert_eq!(entries[0].key.user_key, encoded_string_key("key"));
+        assert_eq!(entries[0].domain, TimeDomain::EventTime);
+        assert_eq!(entries[0].fire_timestamp, 9);
+        assert_eq!(entries[0].hold_timestamp, 9);
     }
 }

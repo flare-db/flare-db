@@ -1094,6 +1094,9 @@ impl WatermarkManager {
                 producer.completed
                     && producer.in_flight == 0
                     && producer.queued == 0
+                    && producer.pending.is_empty()
+                    && !producer.rerun_pending
+                    && producer.pending_empty.is_empty()
                     && producer.min_hold().is_none()
             })
     }
@@ -1837,6 +1840,50 @@ mod tests {
         manager.start_bundle("S").unwrap();
         manager.complete_bundle("S").unwrap();
         assert!(manager.is_complete());
+    }
+
+    #[test]
+    fn gated_consumer_waits_for_rearmed_upstream_work() {
+        let mut manager = manager(&[
+            ("Source", &[], &[], &["p"]),
+            ("Producer", &["p"], &[], &["q"]),
+            ("Aggregate", &["q"], &[], &["r"]),
+        ]);
+        manager
+            .set_stage_kind("Aggregate", StageKind::WatermarkGated)
+            .unwrap();
+        manager
+            .set_required_watermark("Aggregate", MIN_TIMESTAMP)
+            .unwrap();
+
+        manager.start_bundle("Source").unwrap();
+        manager.complete_bundle("Source").unwrap();
+        manager.start_bundle("Producer").unwrap();
+        manager
+            .complete_bundle_with_min_and_input("Producer", Some(10), Some(1))
+            .unwrap();
+        manager.mark_rerun("Producer").unwrap();
+
+        assert!(
+            !manager
+                .ready_stages()
+                .iter()
+                .any(|stage| stage == "Aggregate"),
+            "aggregate must not consume an upstream snapshot while its producer is rearmed"
+        );
+
+        manager.start_bundle("Producer").unwrap();
+        manager
+            .complete_bundle_with_min_and_input("Producer", Some(20), Some(1))
+            .unwrap();
+
+        assert!(
+            manager
+                .ready_stages()
+                .iter()
+                .any(|stage| stage == "Aggregate"),
+            "aggregate becomes ready after the producer drains its rearmed work"
+        );
     }
 
     #[test]

@@ -22,6 +22,7 @@ use crate::{
         runtime::{
             BundleRuntime, runner_consumer_transform_id, runner_output_pcollection_id,
             stage_sink_transform_id, stage_source_transform_id, stage_timer_endpoints,
+            stage_window_expiration_timers,
         },
     },
     fusion::pipeline::{ConsumerMetaData, ExecutableNode},
@@ -182,6 +183,8 @@ impl StageExecutor {
                             let input_consumer_transform_id =
                                 stage_source_transform_id(&executable_stage);
                             let input_timer_endpoints = stage_timer_endpoints(&executable_stage);
+                            let input_window_expiration_timers =
+                                stage_window_expiration_timers(&executable_stage);
 
                             let timer_only = !timers.is_empty();
                             if timer_only || !input_timer_endpoints.is_empty() {
@@ -250,6 +253,7 @@ impl StageExecutor {
                                             input_coder_id,
                                             None,
                                             input_timer_endpoints,
+                                            input_window_expiration_timers,
                                         )
                                         .await
                                 };
