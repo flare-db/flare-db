@@ -6,7 +6,11 @@ use crate::{
     engine::timer::{TimerEntry, build_timer_store},
     engine::{
         executor::StageExecutor,
-        harness::{Channels, HarnessStatus, control::ControlResponse, state::SideInputRegistry},
+        harness::{
+            Channels, HarnessStatus,
+            control::ControlResponse,
+            state::{SideInputRegistry, UserStateRegistry},
+        },
         runtime::BundleRuntime,
         scheduler::NodeScheduler,
         timer::TimerService,
@@ -177,6 +181,7 @@ impl ExecutorDispatcher {
         let mut coders = pipeline_graph.components.coders.clone();
         crate::coders::length_prefix_pickled_leaves(&mut coders);
         let side_inputs = SideInputRegistry::from_executable_graph(pipeline_graph, &coders)?;
+        let user_states = UserStateRegistry::from_components(&pipeline_graph.components, &coders)?;
 
         // Start data channel dispatcher to listen and demux incoming elements.
         self.channels.stream_elements();
@@ -186,7 +191,7 @@ impl ExecutorDispatcher {
         // iterable side inputs from the same job store.
         self.channels
             .state()
-            .stream_requests(self.store.clone(), side_inputs);
+            .stream_requests(self.store.clone(), side_inputs, user_states);
         self.pipeline_coders = Arc::new(coders);
         self.pipeline_components = Arc::new(pipeline_graph.components.clone());
         self.window_merger = Some(Arc::new(WindowMergeService::new(

@@ -220,17 +220,16 @@ impl BundleRuntime {
         let mut target_batch_size = batch_size_estimator.next_batch_size();
 
         debug!("Spawned task to process stage's output elements");
+        let (wire_coder_id, element_coder) = boundary_element_coder(
+            &edge_metadata.coder_id,
+            edge_metadata.component_coder.clone(),
+            pipeline_coders.as_ref(),
+        );
         debug!(
-            "Decoding with coder_id={}, component_coders={:?}",
-            edge_metadata.coder_id, edge_metadata.component_coder
+            "Decoding with coder_id={}, wire_coder_id={}, component_coders={:?}",
+            edge_metadata.coder_id, wire_coder_id, edge_metadata.component_coder
         );
 
-        let component_coder = edge_metadata.component_coder.clone();
-        let element_coder = StandardBeamCoders::from_urn(
-            &edge_metadata.coder_id,
-            component_coder,
-            Some(pipeline_coders.as_ref()),
-        );
         let window_coder = self.window_coder_for_pcollection(&edge_metadata.produced_pcol_id);
         // VoidCoder elements carry no payload, so round-tripping them through
         // `BeamRecord`/Arrow/Paimon is both unnecessary and lossy for the
@@ -438,18 +437,26 @@ impl BundleRuntime {
             input_instruction_id, consumer_transform_id,
         );
 
-        debug!("Input element coder: {}", input_coder_id);
+        let (wire_coder_id, wire_element_coder) = boundary_element_coder(
+            &input_coder_id,
+            input_component_coder_ids.clone(),
+            self.pipeline_coders.as_ref(),
+        );
+        debug!(
+            "Input element coder: {} (wire coder: {})",
+            input_coder_id, wire_coder_id
+        );
 
-        let element_coder = StandardBeamCoders::from_urn(
+        let logical_element_coder = StandardBeamCoders::from_urn(
             input_coder_id.as_str(),
             input_component_coder_ids.clone(),
             Some(self.pipeline_coders.as_ref()),
         );
 
-        let opaque_void = element_coder.is_void();
+        let opaque_void = logical_element_coder.is_void();
         let window_coder = self.window_coder_for_pcollection(&input_pcollection_id);
         let windowed_value_coder =
-            WindowedValueCoder::with_window_coder(element_coder.clone(), window_coder);
+            WindowedValueCoder::with_window_coder(wire_element_coder, window_coder);
 
         if opaque_void {
             debug!(
@@ -513,7 +520,7 @@ impl BundleRuntime {
             for element in values {
                 for entry in window_expiration_timer_entries(
                     &element,
-                    &element_coder,
+                    &logical_element_coder,
                     &window_expiration_timers,
                 )? {
                     window_expiration_entries.insert(entry.key.storage_key(), Some(entry));
@@ -995,6 +1002,22 @@ pub fn windowed_value_coder_id(stage: &ExecutableStage, pcollection_id: &str) ->
     format!("{}/windowed_value/{}", stage.id(), pcollection_id)
 }
 
+/// Resolve the coder used on an Fn Data boundary.
+///
+/// The logical PCollection coder remains attached to the PCollection for SDK schema/type
+/// introspection. When FlareDB adds a `_lp` sibling for opaque boundary framing, both sides of
+/// the Data channel must use that sibling.
+fn boundary_element_coder(
+    coder_id: &str,
+    component_coder_ids: Option<Vec<String>>,
+    pipeline_coders: &HashMap<String, Coder>,
+) -> (String, StandardBeamCoders) {
+    let wire_coder_id = resolve_length_prefixed_coder_id(coder_id, pipeline_coders);
+    let coder =
+        StandardBeamCoders::from_urn(&wire_coder_id, component_coder_ids, Some(pipeline_coders));
+    (wire_coder_id, coder)
+}
+
 /// Adds a Beam `windowed_value:v1` coder whose components are the element
 /// coder followed by the PCollection's window coder.
 pub fn insert_windowed_value_coder(
@@ -1244,6 +1267,41 @@ fn window_expiration_timer_entries(
         }
     }
     Ok(entries)
+}
+
+#[cfg(test)]
+mod boundary_coder_tests {
+    use super::*;
+
+    #[test]
+    fn data_boundary_uses_length_prefixed_sibling() {
+        let mut coders = HashMap::new();
+        coders.insert(
+            "KvCoder1".to_string(),
+            Coder {
+                spec: Some(FunctionSpec {
+                    urn: beam_urns::KV_CODER.to_string(),
+                    payload: Vec::new(),
+                }),
+                component_coder_ids: vec!["StringUtf8Coder".to_string(), "SchemaCoder".to_string()],
+            },
+        );
+        coders.insert(
+            "KvCoder1_lp".to_string(),
+            Coder {
+                spec: Some(FunctionSpec {
+                    urn: beam_urns::LENGTH_PREFIX_CODER.to_string(),
+                    payload: Vec::new(),
+                }),
+                component_coder_ids: vec!["KvCoder1".to_string()],
+            },
+        );
+
+        let (wire_coder_id, coder) = boundary_element_coder("KvCoder1", None, &coders);
+
+        assert_eq!(wire_coder_id, "KvCoder1_lp");
+        assert!(matches!(coder, StandardBeamCoders::LengthPrefix(_)));
+    }
 }
 
 #[cfg(test)]

@@ -32,10 +32,10 @@ impl BeamCoder<String> for StringUtf8Coder {
     }
 
     fn decode(&self, buf: &mut impl Buf) -> Result<String, CodersError> {
-        let len = decode_varint(buf) as usize;
-        let mut bytes = vec![0u8; len];
-        buf.copy_to_slice(&mut bytes);
-        Ok(String::from_utf8(bytes).unwrap())
+        let bytes = decode_length_delimited(buf, "StringUtf8Coder")?;
+        String::from_utf8(bytes).map_err(|err| {
+            CodersError::WhileDecoding(format!("StringUtf8Coder: invalid UTF-8: {err}"))
+        })
     }
 }
 
@@ -49,10 +49,7 @@ impl BeamCoder<Vec<u8>> for BytesCoder {
     }
 
     fn decode(&self, buf: &mut impl Buf) -> Result<Vec<u8>, CodersError> {
-        let len = decode_varint(buf) as usize;
-        let mut bytes = vec![0u8; len];
-        buf.copy_to_slice(&mut bytes);
-        Ok(bytes)
+        decode_length_delimited(buf, "BytesCoder")
     }
 }
 
@@ -258,10 +255,7 @@ impl BeamCoder<Vec<u8>> for PickleCoder {
     }
 
     fn decode(&self, buf: &mut impl Buf) -> Result<Vec<u8>, CodersError> {
-        let len = decode_varint(buf) as usize;
-        let mut bytes = vec![0u8; len];
-        buf.copy_to_slice(&mut bytes);
-        Ok(bytes)
+        decode_length_delimited(buf, "PickleCoder")
     }
 }
 
@@ -334,10 +328,7 @@ impl BeamCoder<Vec<u8>> for LengthPrefixCoder {
     }
 
     fn decode(&self, buf: &mut impl Buf) -> Result<Vec<u8>, CodersError> {
-        let len = decode_varint(buf) as usize;
-        let mut bytes = vec![0u8; len];
-        buf.copy_to_slice(&mut bytes);
-        Ok(bytes)
+        decode_length_delimited(buf, "LengthPrefixCoder")
     }
 }
 
@@ -1121,6 +1112,25 @@ pub(crate) fn decode_varint(buf: &mut impl Buf) -> u64 {
     result
 }
 
+fn decode_length_delimited(buf: &mut impl Buf, coder_name: &str) -> Result<Vec<u8>, CodersError> {
+    let encoded_len = decode_varint(buf);
+    let len = usize::try_from(encoded_len).map_err(|_| {
+        CodersError::WhileDecoding(format!(
+            "{coder_name}: declared length {encoded_len} does not fit in usize"
+        ))
+    })?;
+    let remaining = buf.remaining();
+    if len > remaining {
+        return Err(CodersError::WhileDecoding(format!(
+            "{coder_name}: declared length {len} exceeds remaining bytes {remaining}"
+        )));
+    }
+
+    let mut bytes = vec![0u8; len];
+    buf.copy_to_slice(&mut bytes);
+    Ok(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1177,6 +1187,16 @@ mod tests {
             }
             _ => panic!("expected bytes"),
         }
+    }
+
+    #[test]
+    fn length_prefixed_coders_reject_lengths_larger_than_the_buffer() {
+        let mut encoded = Bytes::from_static(&[0x80, 0x08, 0x00]);
+
+        let err = LengthPrefixCoder.decode(&mut encoded).unwrap_err();
+
+        assert!(format!("{err:?}").contains("declared length 1024 exceeds remaining bytes 1"));
+        assert_eq!(encoded.remaining(), 1);
     }
 
     #[test]

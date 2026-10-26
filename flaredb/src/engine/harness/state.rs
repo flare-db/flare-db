@@ -8,7 +8,7 @@ use anyhow::{Result, anyhow};
 use beam_model_rs::v1::{
     Coder, Components, ParDoPayload, StateAppendResponse, StateClearResponse, StateGetResponse,
     StateRequest, StateResponse, beam_fn_state_server::BeamFnState, state_key, state_request,
-    state_response,
+    state_response, state_spec,
 };
 use bytes::Buf;
 use log::{debug, error, info, warn};
@@ -30,7 +30,10 @@ use crate::{
     engine::{
         kv::SlateKvStore,
         runtime::resolve_window_coder,
-        state::{StateBackend, UserStateAddress, UserStateKind, UserStateStore},
+        state::{
+            StateBackend, UserStateAddress, UserStateKind, UserStateStore,
+            multimap::split_encoded_values,
+        },
     },
     fusion::{
         pipeline::{ExecutableGraph, ExecutableNode},
@@ -157,6 +160,81 @@ struct SideInputSpec {
 #[derive(Debug, Clone, Default)]
 pub struct SideInputRegistry {
     specs: Arc<HashMap<SideInputKey, SideInputSpec>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct UserStateKey {
+    transform_id: String,
+    user_state_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct UserStateCoders {
+    key: StandardBeamCoders,
+    value: StandardBeamCoders,
+}
+
+/// Resolve SDK `MapState` key/value coders from each ParDo's `MapSpec`.
+#[derive(Debug, Clone, Default)]
+pub struct UserStateRegistry {
+    map_coders: Arc<HashMap<UserStateKey, UserStateCoders>>,
+}
+
+impl UserStateRegistry {
+    pub fn from_components(
+        components: &Components,
+        pipeline_coders: &HashMap<String, Coder>,
+    ) -> Result<Self> {
+        let mut map_coders = HashMap::new();
+        for (transform_id, transform) in &components.transforms {
+            let Some(spec) = transform.spec.as_ref() else {
+                continue;
+            };
+            if spec.urn != beam_urns::PAR_DO_TRANSFORM {
+                continue;
+            }
+            let payload = ParDoPayload::decode(spec.payload.as_slice()).map_err(|err| {
+                anyhow!("failed to decode ParDoPayload for transform '{transform_id}': {err}")
+            })?;
+            for (user_state_id, state) in payload.state_specs {
+                let (key_coder_id, value_coder_id) = match state.spec {
+                    Some(state_spec::Spec::MapSpec(map)) => (map.key_coder_id, map.value_coder_id),
+                    Some(state_spec::Spec::MultimapSpec(map)) => {
+                        (map.key_coder_id, map.value_coder_id)
+                    }
+                    _ => continue,
+                };
+                map_coders.insert(
+                    UserStateKey {
+                        transform_id: transform_id.clone(),
+                        user_state_id,
+                    },
+                    UserStateCoders {
+                        key: StandardBeamCoders::from_urn(
+                            &key_coder_id,
+                            None,
+                            Some(pipeline_coders),
+                        ),
+                        value: StandardBeamCoders::from_urn(
+                            &value_coder_id,
+                            None,
+                            Some(pipeline_coders),
+                        ),
+                    },
+                );
+            }
+        }
+        Ok(Self {
+            map_coders: Arc::new(map_coders),
+        })
+    }
+
+    fn map_coders(&self, transform_id: &str, user_state_id: &str) -> Option<&UserStateCoders> {
+        self.map_coders.get(&UserStateKey {
+            transform_id: transform_id.to_string(),
+            user_state_id: user_state_id.to_string(),
+        })
+    }
 }
 
 impl SideInputRegistry {
@@ -670,7 +748,12 @@ impl StateChannel {
     /// Start a background task that services Beam Fn State requests against
     /// user state and materialized side-input PCollections until the stream ends
     /// or the channel is reset.
-    pub fn stream_requests(&self, store: Arc<FlareElementStore>, side_inputs: SideInputRegistry) {
+    pub fn stream_requests(
+        &self,
+        store: Arc<FlareElementStore>,
+        side_inputs: SideInputRegistry,
+        user_states: UserStateRegistry,
+    ) {
         let channel = self.clone();
         let task_slot = self.stream_task.clone();
 
@@ -678,7 +761,9 @@ impl StateChannel {
             match build_state_backend(store.clone()).await {
                 Ok(backend) => {
                     let side_inputs = SideInputResolver::new(store, side_inputs);
-                    channel.drive_state_requests(backend, side_inputs).await
+                    channel
+                        .drive_state_requests(backend, side_inputs, user_states)
+                        .await
                 }
                 Err(e) => {
                     if channel.status.is_intentional_shutdown() {
@@ -694,7 +779,12 @@ impl StateChannel {
         *task_slot.lock().unwrap() = Some(join_handle);
     }
 
-    async fn drive_state_requests(&self, backend: StateBackend, side_inputs: SideInputResolver) {
+    async fn drive_state_requests(
+        &self,
+        backend: StateBackend,
+        side_inputs: SideInputResolver,
+        user_states: UserStateRegistry,
+    ) {
         info!("state request driver started");
         loop {
             match self.recv_request().await {
@@ -702,8 +792,9 @@ impl StateChannel {
                     crate::engine::guard::touch();
                     let summary = describe_request(&request);
                     let started = std::time::Instant::now();
-                    let response = handle_state_request_with_side_inputs(
+                    let response = handle_state_request_with_registries(
                         &backend,
+                        Some(&user_states),
                         Some(&side_inputs),
                         request,
                     )
@@ -807,6 +898,28 @@ fn describe_request(request: &StateRequest) -> String {
             bag.window.len(),
             bag.key.len()
         ),
+        Some(state_key::Type::MultimapKeysUserState(state)) => format!(
+            "multimap_keys_user_state(transform_id={}, user_state_id={}, window={}B, key={}B)",
+            state.transform_id,
+            state.user_state_id,
+            state.window.len(),
+            state.key.len()
+        ),
+        Some(state_key::Type::MultimapEntriesUserState(state)) => format!(
+            "multimap_entries_user_state(transform_id={}, user_state_id={}, window={}B, key={}B)",
+            state.transform_id,
+            state.user_state_id,
+            state.window.len(),
+            state.key.len()
+        ),
+        Some(state_key::Type::MultimapUserState(state)) => format!(
+            "multimap_user_state(transform_id={}, user_state_id={}, window={}B, key={}B, map_key={}B)",
+            state.transform_id,
+            state.user_state_id,
+            state.window.len(),
+            state.key.len(),
+            state.map_key.len()
+        ),
         Some(state_key::Type::IterableSideInput(side_input)) => format!(
             "iterable_side_input(transform_id={}, side_input_id={}, window={}B)",
             side_input.transform_id,
@@ -862,7 +975,7 @@ async fn handle_state_request(
     backend: &StateBackend,
     request: StateRequest,
 ) -> std::result::Result<StateResponse, (String, String)> {
-    handle_state_request_with_side_inputs(backend, None, request).await
+    handle_state_request_with_registries(backend, None, None, request).await
 }
 
 /// Dispatch a single [`StateRequest`] through either user state or an iterable
@@ -870,8 +983,18 @@ async fn handle_state_request(
 ///
 /// `StateKey` is decoded here (transport concern). Unsupported key types return
 /// an error matching the original request id.
+#[cfg(test)]
 async fn handle_state_request_with_side_inputs(
     backend: &StateBackend,
+    side_inputs: Option<&SideInputResolver>,
+    request: StateRequest,
+) -> std::result::Result<StateResponse, (String, String)> {
+    handle_state_request_with_registries(backend, None, side_inputs, request).await
+}
+
+async fn handle_state_request_with_registries(
+    backend: &StateBackend,
+    user_states: Option<&UserStateRegistry>,
     side_inputs: Option<&SideInputResolver>,
     request: StateRequest,
 ) -> std::result::Result<StateResponse, (String, String)> {
@@ -889,7 +1012,7 @@ async fn handle_state_request_with_side_inputs(
 
     match target {
         StateTarget::UserState(address) => {
-            handle_user_state_request(backend, id, address, body).await
+            handle_user_state_request(backend, user_states, id, address, body).await
         }
         StateTarget::IterableSideInput(address) => {
             handle_iterable_side_input_request(side_inputs, id, address, body).await
@@ -902,6 +1025,7 @@ async fn handle_state_request_with_side_inputs(
 
 async fn handle_user_state_request(
     backend: &StateBackend,
+    user_states: Option<&UserStateRegistry>,
     id: String,
     address: UserStateAddress,
     body: Option<state_request::Request>,
@@ -924,15 +1048,57 @@ async fn handle_user_state_request(
                 Err(e) => Err((id, format!("get state failed: {e}"))),
             }
         }
-        Some(state_request::Request::Append(append)) => match user_state.append(&append.data).await
-        {
-            Ok(()) => Ok(StateResponse {
-                id,
-                error: String::new(),
-                response: Some(state_response::Response::Append(StateAppendResponse {})),
-            }),
-            Err(e) => Err((id, format!("append state failed: {e}"))),
-        },
+        Some(state_request::Request::Append(append)) => {
+            let append_result = match user_state.address().kind {
+                UserStateKind::Bag => user_state.append(&append.data).await,
+                UserStateKind::MultimapKeys => {
+                    let Some(coders) = user_states.and_then(|registry| {
+                        registry.map_coders(
+                            &user_state.address().transform_id,
+                            &user_state.address().user_state_id,
+                        )
+                    }) else {
+                        return Err((id, "multimap state key coder is not registered".to_string()));
+                    };
+                    let keys =
+                        split_encoded_values(&coders.key, &append.data).unwrap_or_else(|err| {
+                            debug!("treating opaque multimap key append as one key: {err}");
+                            vec![append.data.clone()]
+                        });
+                    user_state.append_multimap_keys(&keys).await
+                }
+                UserStateKind::MultimapValues => {
+                    let Some(coders) = user_states.and_then(|registry| {
+                        registry.map_coders(
+                            &user_state.address().transform_id,
+                            &user_state.address().user_state_id,
+                        )
+                    }) else {
+                        return Err((
+                            id,
+                            "multimap state value coder is not registered".to_string(),
+                        ));
+                    };
+                    let values =
+                        split_encoded_values(&coders.value, &append.data).unwrap_or_else(|err| {
+                            debug!("treating opaque multimap value append as one value: {err}");
+                            vec![append.data.clone()]
+                        });
+                    user_state.append_multimap_values(&values).await
+                }
+                UserStateKind::MultimapEntries => Err(anyhow!(
+                    "append is not supported for multimap entries state"
+                )),
+            };
+            match append_result {
+                Ok(()) => Ok(StateResponse {
+                    id,
+                    error: String::new(),
+                    response: Some(state_response::Response::Append(StateAppendResponse {})),
+                }),
+                Err(e) => Err((id, format!("append state failed: {e}"))),
+            }
+        }
         Some(state_request::Request::Clear(_)) => match user_state.clear().await {
             Ok(()) => Ok(StateResponse {
                 id,
@@ -1037,6 +1203,36 @@ fn state_target(key: state_key::Type) -> std::result::Result<StateTarget, String
             bag.window,
             bag.key,
         ))),
+        state_key::Type::MultimapKeysUserState(state) => {
+            Ok(StateTarget::UserState(UserStateAddress::new_multimap(
+                UserStateKind::MultimapKeys,
+                state.transform_id,
+                state.user_state_id,
+                state.window,
+                state.key,
+                Vec::new(),
+            )))
+        }
+        state_key::Type::MultimapEntriesUserState(state) => {
+            Ok(StateTarget::UserState(UserStateAddress::new_multimap(
+                UserStateKind::MultimapEntries,
+                state.transform_id,
+                state.user_state_id,
+                state.window,
+                state.key,
+                Vec::new(),
+            )))
+        }
+        state_key::Type::MultimapUserState(state) => {
+            Ok(StateTarget::UserState(UserStateAddress::new_multimap(
+                UserStateKind::MultimapValues,
+                state.transform_id,
+                state.user_state_id,
+                state.window,
+                state.key,
+                state.map_key,
+            )))
+        }
         state_key::Type::IterableSideInput(side_input) => {
             Ok(StateTarget::IterableSideInput(IterableSideInputAddress {
                 key: SideInputKey {
@@ -1077,7 +1273,7 @@ fn state_target(key: state_key::Type) -> std::result::Result<StateTarget, String
             }))
         }
         other => Err(format!(
-            "unsupported state key type '{}' (supported types: '{}', 'iterable_side_input', 'multimap_keys_side_input', 'multimap_side_input', and 'multimap_keys_values_side_input')",
+            "unsupported state key type '{}' (supported types: '{}', 'multimap_keys_user_state', 'multimap_entries_user_state', 'multimap_user_state', 'iterable_side_input', 'multimap_keys_side_input', 'multimap_side_input', and 'multimap_keys_values_side_input')",
             state_key_kind(&other),
             UserStateKind::Bag.wire_name(),
         )),
@@ -1370,6 +1566,47 @@ mod tests {
         }
     }
 
+    fn multimap_state_request(
+        id: &str,
+        kind: state_key::Type,
+        op: state_request::Request,
+    ) -> StateRequest {
+        StateRequest {
+            id: id.to_string(),
+            instruction_id: "instruction".to_string(),
+            state_key: Some(StateKey { r#type: Some(kind) }),
+            request: Some(op),
+        }
+    }
+
+    fn multimap_keys_state_key() -> state_key::Type {
+        state_key::Type::MultimapKeysUserState(state_key::MultimapKeysUserState {
+            transform_id: "transform".to_string(),
+            user_state_id: "map".to_string(),
+            window: b"window".to_vec(),
+            key: b"user-key".to_vec(),
+        })
+    }
+
+    fn multimap_entries_state_key() -> state_key::Type {
+        state_key::Type::MultimapEntriesUserState(state_key::MultimapEntriesUserState {
+            transform_id: "transform".to_string(),
+            user_state_id: "map".to_string(),
+            window: b"window".to_vec(),
+            key: b"user-key".to_vec(),
+        })
+    }
+
+    fn multimap_values_state_key(map_key: &[u8]) -> state_key::Type {
+        state_key::Type::MultimapUserState(state_key::MultimapUserState {
+            transform_id: "transform".to_string(),
+            user_state_id: "map".to_string(),
+            window: b"window".to_vec(),
+            key: b"user-key".to_vec(),
+            map_key: map_key.to_vec(),
+        })
+    }
+
     fn get_op() -> state_request::Request {
         state_request::Request::Get(beam_model_rs::v1::StateGetRequest {
             continuation_token: Vec::new(),
@@ -1408,6 +1645,142 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(get_response_data(response), b"ab");
+    }
+
+    #[tokio::test]
+    async fn multimap_user_state_serves_map_state_protocols() {
+        let (_dir, backend) = make_backend().await;
+        let user_states = UserStateRegistry {
+            map_coders: Arc::new(HashMap::from([(
+                UserStateKey {
+                    transform_id: "transform".to_string(),
+                    user_state_id: "map".to_string(),
+                },
+                UserStateCoders {
+                    key: StandardBeamCoders::StringUtf8(StringUtf8Coder),
+                    value: StandardBeamCoders::StringUtf8(StringUtf8Coder),
+                },
+            )])),
+        };
+
+        handle_state_request_with_registries(
+            &backend,
+            Some(&user_states),
+            None,
+            multimap_state_request(
+                "append-keys",
+                multimap_keys_state_key(),
+                append_op(b"\x01a\x01b"),
+            ),
+        )
+        .await
+        .unwrap();
+        handle_state_request_with_registries(
+            &backend,
+            Some(&user_states),
+            None,
+            multimap_state_request(
+                "append-values",
+                multimap_values_state_key(b"\x01a"),
+                append_op(b"\x03one"),
+            ),
+        )
+        .await
+        .unwrap();
+
+        let keys = get_response_data(
+            handle_state_request_with_registries(
+                &backend,
+                Some(&user_states),
+                None,
+                multimap_state_request("get-keys", multimap_keys_state_key(), get_op()),
+            )
+            .await
+            .unwrap(),
+        );
+        let values = get_response_data(
+            handle_state_request_with_registries(
+                &backend,
+                Some(&user_states),
+                None,
+                multimap_state_request("get-values", multimap_values_state_key(b"\x01a"), get_op()),
+            )
+            .await
+            .unwrap(),
+        );
+        let entries = get_response_data(
+            handle_state_request_with_registries(
+                &backend,
+                Some(&user_states),
+                None,
+                multimap_state_request("get-entries", multimap_entries_state_key(), get_op()),
+            )
+            .await
+            .unwrap(),
+        );
+
+        assert_eq!(keys, b"\x01a\x01b");
+        assert_eq!(values, b"\x03one");
+        assert_eq!(
+            entries,
+            b"\x01a\x00\x00\x00\x01\x03one\x01b\x00\x00\x00\x00"
+        );
+    }
+
+    #[test]
+    fn user_state_registry_resolves_map_state_coders() {
+        let payload = ParDoPayload {
+            state_specs: HashMap::from([(
+                "map".to_string(),
+                beam_model_rs::v1::StateSpec {
+                    spec: Some(state_spec::Spec::MapSpec(beam_model_rs::v1::MapStateSpec {
+                        key_coder_id: "key-coder".to_string(),
+                        value_coder_id: "value-coder".to_string(),
+                    })),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        let components = Components {
+            transforms: HashMap::from([(
+                "map-transform".to_string(),
+                beam_model_rs::v1::PTransform {
+                    spec: Some(beam_model_rs::v1::FunctionSpec {
+                        urn: beam_urns::PAR_DO_TRANSFORM.to_string(),
+                        payload: payload.encode_to_vec(),
+                    }),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        let coders = HashMap::from([
+            (
+                "key-coder".to_string(),
+                Coder {
+                    spec: Some(beam_model_rs::v1::FunctionSpec {
+                        urn: beam_urns::STRING_UTF8_CODER.to_string(),
+                        payload: Vec::new(),
+                    }),
+                    component_coder_ids: Vec::new(),
+                },
+            ),
+            (
+                "value-coder".to_string(),
+                Coder {
+                    spec: Some(beam_model_rs::v1::FunctionSpec {
+                        urn: beam_urns::VARINT_CODER.to_string(),
+                        payload: Vec::new(),
+                    }),
+                    component_coder_ids: Vec::new(),
+                },
+            ),
+        ]);
+
+        let registry = UserStateRegistry::from_components(&components, &coders).unwrap();
+
+        assert!(registry.map_coders("map-transform", "map").is_some());
     }
 
     #[tokio::test]
@@ -1493,13 +1866,13 @@ mod tests {
             id: "req-7".to_string(),
             instruction_id: "instruction".to_string(),
             state_key: Some(StateKey {
-                r#type: Some(state_key::Type::MultimapUserState(
-                    state_key::MultimapUserState {
+                r#type: Some(state_key::Type::OrderedListUserState(
+                    state_key::OrderedListUserState {
                         transform_id: "t".to_string(),
                         user_state_id: "s".to_string(),
                         window: b"w".to_vec(),
                         key: b"k".to_vec(),
-                        map_key: b"mk".to_vec(),
+                        range: None,
                     },
                 )),
             }),
@@ -1509,7 +1882,7 @@ mod tests {
         let (id, error) = handle_state_request(&backend, request).await.unwrap_err();
         assert_eq!(id, "req-7");
         assert!(
-            error.contains("multimap_user_state"),
+            error.contains("ordered_list_user_state"),
             "unexpected error: {error}"
         );
     }

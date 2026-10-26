@@ -5,6 +5,8 @@ pub use self::bag::BagState;
 
 use anyhow::Result;
 
+use self::multimap::MultimapState;
+
 /// Deterministic composite key for a user-state entry.
 ///
 /// Every component is length-prefixed (4-byte big-endian) so distinct
@@ -33,18 +35,21 @@ pub fn build_state_key(
 
 /// A Beam Fn user-state kind FlareDB can serve.
 ///
-/// The portable Fn API also defines `MultimapUserState`, `OrderedListUserState`,
-/// and side-input keys; those are not implemented yet and are rejected by the
-/// harness before reaching this layer.
-///
 /// Note that the SDK harness backs `ValueState`, `CombiningState`, and
 /// `SetState` with `BagUserState` on the wire (for example
 /// `BagUserState.java` asserts `stateKey.hasBagUserState()`), so `Bag` is the
-/// only kind needed to serve those DoFn state types today.
+/// wire kind for those DoFn state types. SDK `MapState` uses the multimap user
+/// state protocols below.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UserStateKind {
     /// `StateKey.BagUserState`.
     Bag,
+    /// `StateKey.MultimapKeysUserState`; enumerates and clears map keys.
+    MultimapKeys,
+    /// `StateKey.MultimapEntriesUserState`; reads all key/value groups.
+    MultimapEntries,
+    /// `StateKey.MultimapUserState`; reads or mutates values for one map key.
+    MultimapValues,
 }
 
 impl UserStateKind {
@@ -52,6 +57,9 @@ impl UserStateKind {
     pub fn wire_name(self) -> &'static str {
         match self {
             Self::Bag => "bag_user_state",
+            Self::MultimapKeys => "multimap_keys_user_state",
+            Self::MultimapEntries => "multimap_entries_user_state",
+            Self::MultimapValues => "multimap_user_state",
         }
     }
 }
@@ -72,6 +80,8 @@ pub struct UserStateAddress {
     pub window: Vec<u8>,
     /// The user key encoded in a nested context, exactly as received.
     pub key: Vec<u8>,
+    /// The map key for `MultimapUserState`; empty for other wire kinds.
+    pub map_key: Vec<u8>,
 }
 
 impl UserStateAddress {
@@ -89,6 +99,26 @@ impl UserStateAddress {
             user_state_id,
             window,
             key,
+            map_key: Vec::new(),
+        }
+    }
+
+    /// Build a multimap-state address, optionally selecting one encoded map key.
+    pub fn new_multimap(
+        kind: UserStateKind,
+        transform_id: String,
+        user_state_id: String,
+        window: Vec<u8>,
+        key: Vec<u8>,
+        map_key: Vec<u8>,
+    ) -> Self {
+        Self {
+            kind,
+            transform_id,
+            user_state_id,
+            window,
+            key,
+            map_key,
         }
     }
 
@@ -135,6 +165,17 @@ impl UserStateStore {
         let key = self.address.composite_key();
         match self.address.kind {
             UserStateKind::Bag => BagState::new(self.backend.clone()).get(&key).await,
+            UserStateKind::MultimapKeys => {
+                MultimapState::new(self.backend.clone()).keys(&key).await
+            }
+            UserStateKind::MultimapEntries => {
+                MultimapState::new(self.backend.clone()).entries(&key).await
+            }
+            UserStateKind::MultimapValues => {
+                MultimapState::new(self.backend.clone())
+                    .values(&key, &self.address.map_key)
+                    .await
+            }
         }
     }
 
@@ -143,6 +184,15 @@ impl UserStateStore {
         let key = self.address.composite_key();
         match self.address.kind {
             UserStateKind::Bag => BagState::new(self.backend.clone()).append(&key, data).await,
+            UserStateKind::MultimapKeys => Err(anyhow::anyhow!(
+                "multimap keys append requires parsed map keys"
+            )),
+            UserStateKind::MultimapEntries => Err(anyhow::anyhow!(
+                "append is not supported for multimap entries state"
+            )),
+            UserStateKind::MultimapValues => Err(anyhow::anyhow!(
+                "multimap value append requires parsed map values"
+            )),
         }
     }
 
@@ -151,7 +201,31 @@ impl UserStateStore {
         let key = self.address.composite_key();
         match self.address.kind {
             UserStateKind::Bag => BagState::new(self.backend.clone()).clear(&key).await,
+            UserStateKind::MultimapKeys | UserStateKind::MultimapEntries => {
+                MultimapState::new(self.backend.clone()).clear(&key).await
+            }
+            UserStateKind::MultimapValues => {
+                MultimapState::new(self.backend.clone())
+                    .clear_values(&key, &self.address.map_key)
+                    .await
+            }
         }
+    }
+
+    /// Append already-encoded map keys to multimap user state.
+    pub async fn append_multimap_keys(&self, keys: &[Vec<u8>]) -> Result<()> {
+        let key = self.address.composite_key();
+        MultimapState::new(self.backend.clone())
+            .append_keys(&key, keys)
+            .await
+    }
+
+    /// Append already-encoded values for this address's map key.
+    pub async fn append_multimap_values(&self, values: &[Vec<u8>]) -> Result<()> {
+        let key = self.address.composite_key();
+        MultimapState::new(self.backend.clone())
+            .append_values(&key, &self.address.map_key, values)
+            .await
     }
 }
 
@@ -746,6 +820,274 @@ pub mod bag {
             state.clear(&k1).await.unwrap();
             assert!(state.get(&k1).await.unwrap().is_empty());
             assert_eq!(state.get(&k2).await.unwrap(), b"two");
+        }
+    }
+}
+
+/// Beam `MapState` backing protocol.
+///
+/// The Java SDK exposes `MapState` through three Fn State wire protocols:
+/// `multimap_keys_user_state` for key enumeration, `multimap_entries_user_state`
+/// for all entries, and `multimap_user_state` for values under one map key. All
+/// three protocol views share one durable cell so their updates remain coherent.
+pub(crate) mod multimap {
+    use anyhow::{Result, anyhow};
+    use bytes::Buf;
+    use std::io::Cursor;
+
+    use super::backend::StateBackend;
+    use crate::coders::StandardBeamCoders;
+
+    #[derive(Debug, Default)]
+    struct Entry {
+        key: Vec<u8>,
+        values: Vec<Vec<u8>>,
+    }
+
+    /// Durable multimap state over the opaque [`StateBackend`].
+    #[derive(Clone)]
+    pub struct MultimapState {
+        backend: StateBackend,
+    }
+
+    impl MultimapState {
+        pub fn new(backend: StateBackend) -> Self {
+            Self { backend }
+        }
+
+        pub async fn keys(&self, state_key: &[u8]) -> Result<Vec<u8>> {
+            let mut out = Vec::new();
+            for entry in self.read(state_key).await? {
+                out.extend_from_slice(&entry.key);
+            }
+            Ok(out)
+        }
+
+        pub async fn values(&self, state_key: &[u8], map_key: &[u8]) -> Result<Vec<u8>> {
+            let mut out = Vec::new();
+            if let Some(entry) = self
+                .read(state_key)
+                .await?
+                .into_iter()
+                .find(|entry| entry.key == map_key)
+            {
+                for value in entry.values {
+                    out.extend_from_slice(&value);
+                }
+            }
+            Ok(out)
+        }
+
+        /// Encode entries as the concatenation of `KV<K, Iterable<V>>` values.
+        ///
+        /// The Java harness decodes this stream with `IterableCoder`, which
+        /// writes a four-byte big-endian collection size before the values.
+        pub async fn entries(&self, state_key: &[u8]) -> Result<Vec<u8>> {
+            let mut out = Vec::new();
+            for entry in self.read(state_key).await? {
+                out.extend_from_slice(&entry.key);
+                let value_count = i32::try_from(entry.values.len()).map_err(|_| {
+                    anyhow!("multimap state contains too many values for one map key")
+                })?;
+                out.extend_from_slice(&value_count.to_be_bytes());
+                for value in entry.values {
+                    out.extend_from_slice(&value);
+                }
+            }
+            Ok(out)
+        }
+
+        pub async fn append_keys(&self, state_key: &[u8], keys: &[Vec<u8>]) -> Result<()> {
+            let mut entries = self.read(state_key).await?;
+            for key in keys {
+                if !entries.iter().any(|entry| entry.key == *key) {
+                    entries.push(Entry {
+                        key: key.clone(),
+                        values: Vec::new(),
+                    });
+                }
+            }
+            self.write(state_key, entries).await
+        }
+
+        pub async fn append_values(
+            &self,
+            state_key: &[u8],
+            map_key: &[u8],
+            values: &[Vec<u8>],
+        ) -> Result<()> {
+            let mut entries = self.read(state_key).await?;
+            let entry = match entries.iter().position(|entry| entry.key == map_key) {
+                Some(index) => &mut entries[index],
+                None => {
+                    entries.push(Entry {
+                        key: map_key.to_vec(),
+                        values: Vec::new(),
+                    });
+                    entries.last_mut().expect("entry was just inserted")
+                }
+            };
+            entry.values.extend_from_slice(values);
+            self.write(state_key, entries).await
+        }
+
+        pub async fn clear_values(&self, state_key: &[u8], map_key: &[u8]) -> Result<()> {
+            let mut entries = self.read(state_key).await?;
+            entries.retain(|entry| entry.key != map_key);
+            self.write(state_key, entries).await
+        }
+
+        pub async fn clear(&self, state_key: &[u8]) -> Result<()> {
+            self.backend.delete(state_key).await
+        }
+
+        async fn read(&self, state_key: &[u8]) -> Result<Vec<Entry>> {
+            match self.backend.get(state_key).await? {
+                Some(data) => decode_entries(&data),
+                None => Ok(Vec::new()),
+            }
+        }
+
+        async fn write(&self, state_key: &[u8], entries: Vec<Entry>) -> Result<()> {
+            self.backend.put(state_key, &encode_entries(&entries)).await
+        }
+    }
+
+    /// Split concatenated nested-coder values without re-encoding them.
+    pub(crate) fn split_encoded_values(
+        coder: &StandardBeamCoders,
+        data: &[u8],
+    ) -> Result<Vec<Vec<u8>>> {
+        let mut cursor = Cursor::new(data);
+        let mut values = Vec::new();
+        while (cursor.position() as usize) < data.len() {
+            let start = cursor.position() as usize;
+            coder
+                .decode(&mut cursor)
+                .map_err(|err| anyhow!("failed to decode multimap state value: {err}"))?;
+            let end = cursor.position() as usize;
+            if end <= start {
+                return Err(anyhow!("multimap state coder consumed no bytes"));
+            }
+            values.push(data[start..end].to_vec());
+        }
+        Ok(values)
+    }
+
+    fn encode_entries(entries: &[Entry]) -> Vec<u8> {
+        let capacity = entries
+            .iter()
+            .map(|entry| {
+                8 + entry.key.len()
+                    + entry
+                        .values
+                        .iter()
+                        .map(|value| 4 + value.len())
+                        .sum::<usize>()
+            })
+            .sum();
+        let mut out = Vec::with_capacity(capacity);
+        put_u32(&mut out, entries.len());
+        for entry in entries {
+            put_bytes(&mut out, &entry.key);
+            put_u32(&mut out, entry.values.len());
+            for value in &entry.values {
+                put_bytes(&mut out, value);
+            }
+        }
+        out
+    }
+
+    fn decode_entries(data: &[u8]) -> Result<Vec<Entry>> {
+        let mut cursor = Cursor::new(data);
+        let count = read_u32(&mut cursor)?;
+        let mut entries = Vec::with_capacity(count);
+        for _ in 0..count {
+            let key = read_bytes(&mut cursor)?;
+            let value_count = read_u32(&mut cursor)?;
+            let mut values = Vec::with_capacity(value_count);
+            for _ in 0..value_count {
+                values.push(read_bytes(&mut cursor)?);
+            }
+            entries.push(Entry { key, values });
+        }
+        if cursor.position() as usize != data.len() {
+            return Err(anyhow!("multimap state cell has trailing bytes"));
+        }
+        Ok(entries)
+    }
+
+    fn put_u32(out: &mut Vec<u8>, value: usize) {
+        out.extend_from_slice(&(value as u32).to_be_bytes());
+    }
+
+    fn put_bytes(out: &mut Vec<u8>, value: &[u8]) {
+        put_u32(out, value.len());
+        out.extend_from_slice(value);
+    }
+
+    fn read_u32(cursor: &mut Cursor<&[u8]>) -> Result<usize> {
+        if cursor.remaining() < 4 {
+            return Err(anyhow!("multimap state cell has a truncated length"));
+        }
+        Ok(cursor.get_u32() as usize)
+    }
+
+    fn read_bytes(cursor: &mut Cursor<&[u8]>) -> Result<Vec<u8>> {
+        let len = read_u32(cursor)?;
+        if cursor.remaining() < len {
+            return Err(anyhow!("multimap state cell has a truncated value"));
+        }
+        let mut value = vec![0u8; len];
+        cursor.copy_to_slice(&mut value);
+        Ok(value)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::engine::kv::SlateKvStore;
+        use std::sync::Arc;
+        use tempfile::tempdir;
+
+        async fn make_state() -> (tempfile::TempDir, MultimapState) {
+            let dir = tempdir().expect("failed to create tempdir");
+            let kv = SlateKvStore::open(dir.path(), "state")
+                .await
+                .expect("failed to open state store");
+            (
+                dir,
+                MultimapState::new(StateBackend::with_store(Arc::new(kv))),
+            )
+        }
+
+        #[tokio::test]
+        async fn keys_values_entries_and_clear_share_one_cell() {
+            let (_dir, state) = make_state().await;
+            let cell = b"map-cell";
+            state
+                .append_keys(cell, &[b"\x01a".to_vec(), b"\x01b".to_vec()])
+                .await
+                .unwrap();
+            state
+                .append_values(cell, b"\x01a", &[b"\x02one".to_vec(), b"\x02two".to_vec()])
+                .await
+                .unwrap();
+
+            assert_eq!(state.keys(cell).await.unwrap(), b"\x01a\x01b".to_vec());
+            assert_eq!(
+                state.values(cell, b"\x01a").await.unwrap(),
+                b"\x02one\x02two".to_vec()
+            );
+            assert_eq!(
+                state.entries(cell).await.unwrap(),
+                b"\x01a\x00\x00\x00\x02\x02one\x02two\x01b\x00\x00\x00\x00".to_vec()
+            );
+
+            state.clear_values(cell, b"\x01a").await.unwrap();
+            assert_eq!(state.keys(cell).await.unwrap(), b"\x01b".to_vec());
+            state.clear(cell).await.unwrap();
+            assert!(state.keys(cell).await.unwrap().is_empty());
         }
     }
 }
