@@ -15,6 +15,8 @@ import org.apache.beam.sdk.coders.LengthPrefixCoder;
 import org.apache.beam.sdk.coders.StringUtf8Coder;
 import org.apache.beam.sdk.coders.VarIntCoder;
 import org.apache.beam.sdk.coders.VoidCoder;
+import org.apache.beam.sdk.schemas.Schema;
+import org.apache.beam.sdk.schemas.SchemaCoder;
 import org.apache.beam.sdk.transforms.join.RawUnionValue;
 import org.apache.beam.sdk.transforms.join.UnionCoder;
 import org.apache.beam.sdk.util.SerializableUtils;
@@ -29,17 +31,19 @@ public class PortableCoderRewritesTest {
     return UnionCoder.of(Arrays.asList(StringUtf8Coder.of(), VarIntCoder.of()));
   }
 
+  private static RunnerApi.Coder opaqueCoder(Coder<?> coder) {
+    return RunnerApi.Coder.newBuilder()
+        .setSpec(
+            RunnerApi.FunctionSpec.newBuilder()
+                .setUrn(PortableCoderRewrites.JAVA_SERIALIZED_CODER_URN)
+                .setPayload(ByteString.copyFrom(SerializableUtils.serializeToByteArray(coder))))
+        .build();
+  }
+
   /** A minimal pipeline whose coders map holds a single SDK-private coder under {@code coderId}. */
   private static RunnerApi.Pipeline pipelineWith(String coderId, Coder<?> coder) {
-    RunnerApi.Coder coderProto =
-        RunnerApi.Coder.newBuilder()
-            .setSpec(
-                RunnerApi.FunctionSpec.newBuilder()
-                    .setUrn(PortableCoderRewrites.JAVA_SERIALIZED_CODER_URN)
-                    .setPayload(ByteString.copyFrom(SerializableUtils.serializeToByteArray(coder))))
-            .build();
     return RunnerApi.Pipeline.newBuilder()
-        .setComponents(RunnerApi.Components.newBuilder().putCoders(coderId, coderProto))
+        .setComponents(RunnerApi.Components.newBuilder().putCoders(coderId, opaqueCoder(coder)))
         .build();
   }
 
@@ -89,6 +93,65 @@ public class PortableCoderRewritesTest {
     RunnerApi.Coder coder = rewritten.getComponents().getCodersOrThrow("VarIntCoder");
     assertEquals(PortableCoderRewrites.JAVA_SERIALIZED_CODER_URN, coder.getSpec().getUrn());
     assertFalse(rewritten.getComponents().containsCoders("VarIntCoder_inner"));
+  }
+
+  /**
+   * Schema-aware outputs use this opaque SDK coder in the Java portable representation. The harness
+   * must retain the original coder so a {@code Row} output receiver knows its schema, while Fn Data
+   * uses the length-prefixed sibling for opaque element framing.
+   */
+  @Test
+  public void leavesSchemaCoderUntouched() {
+    Schema schema = Schema.builder().addStringField("value").build();
+    RunnerApi.Pipeline rewritten =
+        PortableCoderRewrites.wrapOpaqueCoders(pipelineWith("SchemaCoder", SchemaCoder.of(schema)));
+
+    RunnerApi.Coder coder = rewritten.getComponents().getCodersOrThrow("SchemaCoder");
+    assertEquals(PortableCoderRewrites.JAVA_SERIALIZED_CODER_URN, coder.getSpec().getUrn());
+    assertFalse(rewritten.getComponents().containsCoders("SchemaCoder_inner"));
+
+    RunnerApi.Coder wireCoder =
+        rewritten
+            .getComponents()
+            .getCodersOrThrow("SchemaCoder" + PortableCoderRewrites.BOUNDARY_LENGTH_PREFIX_SUFFIX);
+    assertEquals(PortableCoderRewrites.LENGTH_PREFIX_CODER_URN, wireCoder.getSpec().getUrn());
+    assertEquals(Collections.singletonList("SchemaCoder"), wireCoder.getComponentCoderIdsList());
+  }
+
+  @Test
+  public void addsBoundaryWrapperForCompositeContainingSchemaCoder() {
+    Schema schema = Schema.builder().addStringField("value").build();
+    RunnerApi.Coder kvCoder =
+        RunnerApi.Coder.newBuilder()
+            .setSpec(RunnerApi.FunctionSpec.newBuilder().setUrn("beam:coder:kv:v1").build())
+            .addComponentCoderIds("StringUtf8Coder")
+            .addComponentCoderIds("SchemaCoder")
+            .build();
+    RunnerApi.Pipeline pipeline =
+        RunnerApi.Pipeline.newBuilder()
+            .setComponents(
+                RunnerApi.Components.newBuilder()
+                    .putCoders("SchemaCoder", opaqueCoder(SchemaCoder.of(schema)))
+                    .putCoders(
+                        "StringUtf8Coder",
+                        RunnerApi.Coder.newBuilder()
+                            .setSpec(
+                                RunnerApi.FunctionSpec.newBuilder()
+                                    .setUrn("beam:coder:string_utf8:v1")
+                                    .build())
+                            .build())
+                    .putCoders("KvCoder1", kvCoder))
+            .build();
+
+    RunnerApi.Pipeline rewritten = PortableCoderRewrites.wrapOpaqueCoders(pipeline);
+
+    assertEquals(kvCoder, rewritten.getComponents().getCodersOrThrow("KvCoder1"));
+    RunnerApi.Coder wireCoder =
+        rewritten
+            .getComponents()
+            .getCodersOrThrow("KvCoder1" + PortableCoderRewrites.BOUNDARY_LENGTH_PREFIX_SUFFIX);
+    assertEquals(PortableCoderRewrites.LENGTH_PREFIX_CODER_URN, wireCoder.getSpec().getUrn());
+    assertEquals(Collections.singletonList("KvCoder1"), wireCoder.getComponentCoderIdsList());
   }
 
   @Test

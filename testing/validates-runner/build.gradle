@@ -64,8 +64,10 @@ task validatesRunner(type: Test) {
         // Features not supported or requiring special SDK harness/external environments
         excludeCategories 'org.apache.beam.sdk.testing.UsesSdkHarnessEnvironment'
         excludeCategories 'org.apache.beam.sdk.testing.UsesExternalService'
+        // Lifecycle assertions inspect static fields in the test JVM. FlareRunner executes
+        // DoFns in an SDK harness process, where those process-local fields are not observable.
+        excludeCategories 'org.apache.beam.sdk.testing.UsesParDoLifecycle'
         excludeCategories 'org.apache.beam.sdk.testing.FlattenWithHeterogeneousCoders'
-        excludeCategories 'org.apache.beam.sdk.testing.LargeKeys$Above10MB'
         excludeCategories 'org.apache.beam.sdk.testing.UsesCommittedMetrics'
         excludeCategories 'org.apache.beam.sdk.testing.UsesGaugeMetrics'
         excludeCategories 'org.apache.beam.sdk.testing.UsesStringSetMetrics'
