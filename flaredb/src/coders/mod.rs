@@ -5,8 +5,9 @@ pub mod schema;
 use crate::store::record::{BeamGbk, BeamKV, BeamRecord, IterableValue, TupleValue};
 use crate::{
     coders::primitives::{
-        BoolCoder, BytesCoder, DoubleCoder, IterableCoder, LengthPrefixCoder, NullableCoder,
-        PickleCoder, StringUtf8Coder, TupleCoder, VarInt32Coder, VarIntCoder, VoidCoder,
+        BoolCoder, BytesCoder, DoubleCoder, IterableCoder, JavaOpaqueCoder, LengthPrefixCoder,
+        NullableCoder, PickleCoder, StringUtf8Coder, TupleCoder, VarInt32Coder, VarIntCoder,
+        VoidCoder,
     },
     jobservice::urns::beam_urns,
     store::record::PrimitiveValue,
@@ -36,6 +37,8 @@ pub trait BeamCoder<T> {
 pub enum StandardBeamCoders {
     StringUtf8(StringUtf8Coder),
     Bytes(BytesCoder),
+    /// SDK-private Java coder whose contents are opaque to the runner.
+    JavaOpaque(JavaOpaqueCoder),
     VarInt(VarIntCoder),
     /// Java's 32-bit `VarIntCoder`,
     VarInt32(VarInt32Coder),
@@ -91,7 +94,7 @@ impl StandardBeamCoders {
             beam_urns::JAVA_SDK_CODER => match id {
                 "VoidCoder" => StandardBeamCoders::Void(VoidCoder),
                 "VarIntCoder" => StandardBeamCoders::VarInt32(VarInt32Coder),
-                _ => StandardBeamCoders::Bytes(BytesCoder),
+                _ => StandardBeamCoders::JavaOpaque(JavaOpaqueCoder),
             },
             beam_urns::ITERABLE_CODER => {
                 let ids = component_coder_ids
@@ -177,6 +180,18 @@ impl StandardBeamCoders {
     /// stored and forwarded without ever materializing a [`BeamRecord`].
     pub fn is_void(&self) -> bool {
         matches!(self, StandardBeamCoders::Void(_))
+    }
+
+    /// Whether this coder produces a structured [`BeamRecord`] rather than opaque bytes.
+    pub(crate) fn is_structured(&self) -> bool {
+        match self {
+            StandardBeamCoders::Nullable(coder) => coder.inner().is_structured(),
+            StandardBeamCoders::Iterable(_)
+            | StandardBeamCoders::Tuple(_)
+            | StandardBeamCoders::Kv(_, _)
+            | StandardBeamCoders::Gbk(_, _) => true,
+            _ => false,
+        }
     }
 
     /// Whether decoding this coder always yields a [`BeamRecord::PRIMITIVE`].
@@ -301,6 +316,9 @@ impl StandardBeamCoders {
             (StandardBeamCoders::Bytes(coder), PrimitiveValue::Bytes(bytes)) => {
                 coder.encode(bytes, buf)
             }
+            (StandardBeamCoders::JavaOpaque(coder), PrimitiveValue::Bytes(bytes)) => {
+                coder.encode(bytes, buf)
+            }
             (StandardBeamCoders::VarInt(coder), PrimitiveValue::Int64(value)) => {
                 coder.encode(value, buf)
             }
@@ -374,6 +392,9 @@ impl StandardBeamCoders {
             StandardBeamCoders::Bytes(coder) => Ok(BeamRecord::PRIMITIVE(PrimitiveValue::Bytes(
                 coder.decode(buf)?,
             ))),
+            StandardBeamCoders::JavaOpaque(coder) => Ok(BeamRecord::PRIMITIVE(
+                PrimitiveValue::Bytes(coder.decode(buf)?),
+            )),
             StandardBeamCoders::VarInt(coder) => Ok(BeamRecord::PRIMITIVE(PrimitiveValue::Int64(
                 coder.decode(buf)?,
             ))),
@@ -530,10 +551,10 @@ mod tests {
             StandardBeamCoders::from_urn("VarIntCoder", None, Some(&coders)),
             StandardBeamCoders::VarInt32(_)
         ));
-        // Unrecognized java-sdk coders still fall back to opaque bytes.
+        // Unrecognized java-sdk coders are opaque and consume their boundary payload verbatim.
         assert!(matches!(
             StandardBeamCoders::from_urn("SomethingElseCoder", None, Some(&coders)),
-            StandardBeamCoders::Bytes(_)
+            StandardBeamCoders::JavaOpaque(_)
         ));
     }
 
