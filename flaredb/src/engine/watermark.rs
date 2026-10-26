@@ -963,7 +963,12 @@ impl WatermarkManager {
             if let Some(consumers) = self.side_input_consumers.get(&pcollection).cloned() {
                 for consumer in consumers {
                     if let Some(consumer_state) = self.stages.get_mut(&consumer) {
-                        consumer_state.unproduced_side_inputs.remove(&pcollection);
+                        if propagates_empty_input {
+                            consumer_state.pending_empty.insert(pcollection.clone());
+                        } else {
+                            consumer_state.pending_empty.remove(&pcollection);
+                            consumer_state.unproduced_side_inputs.remove(&pcollection);
+                        }
                     }
                     if self.stage_is_ready(&consumer) {
                         newly_ready.push(consumer);
@@ -1010,7 +1015,12 @@ impl WatermarkManager {
         let mut released = 0;
         for state in self.stages.values_mut() {
             if !state.pending_empty.is_empty() {
-                state.pending_empty.clear();
+                let empty_inputs = std::mem::take(&mut state.pending_empty);
+                for input in empty_inputs {
+                    if state.side_inputs.contains(&input) {
+                        state.unproduced_side_inputs.remove(&input);
+                    }
+                }
                 released += 1;
             }
         }
@@ -1372,6 +1382,66 @@ mod tests {
                 .any(|stage| stage == "Consumer"),
             "side-input producer completion must release the consumer"
         );
+    }
+
+    #[test]
+    fn empty_side_input_commit_does_not_release_the_consumer() {
+        let mut manager = manager(&[
+            ("Main", &[], &[], &["p"]),
+            ("Side", &[], &[], &["side"]),
+            ("Consumer", &["p"], &["side"], &["r"]),
+        ]);
+
+        manager.start_bundle("Main").unwrap();
+        manager.complete_bundle("Main").unwrap();
+        manager.start_bundle("Side").unwrap();
+        manager
+            .complete_bundle_with_min_and_input("Side", None, Some(0))
+            .unwrap();
+
+        assert!(!manager.side_inputs_produced("Consumer"));
+        assert!(
+            manager
+                .ready_stages()
+                .iter()
+                .all(|stage| stage != "Consumer"),
+            "an empty producer bundle must not release its side-input consumer"
+        );
+
+        manager.mark_rerun("Side").unwrap();
+        manager.start_bundle("Side").unwrap();
+        manager
+            .complete_bundle_with_min_and_input("Side", Some(42), Some(1))
+            .unwrap();
+
+        assert!(manager.side_inputs_produced("Consumer"));
+        assert!(
+            manager
+                .ready_stages()
+                .iter()
+                .any(|stage| stage == "Consumer"),
+            "a later non-empty side-input commit must release the consumer"
+        );
+    }
+
+    #[test]
+    fn quiescence_releases_an_actually_empty_side_input() {
+        let mut manager = manager(&[
+            ("Main", &[], &[], &["p"]),
+            ("Side", &[], &[], &["side"]),
+            ("Consumer", &["p"], &["side"], &["r"]),
+        ]);
+
+        manager.start_bundle("Main").unwrap();
+        manager.complete_bundle("Main").unwrap();
+        manager.start_bundle("Side").unwrap();
+        manager
+            .complete_bundle_with_min_and_input("Side", None, Some(0))
+            .unwrap();
+
+        assert!(!manager.side_inputs_produced("Consumer"));
+        assert_eq!(manager.release_empty_input_holds(), 1);
+        assert!(manager.side_inputs_produced("Consumer"));
     }
 
     #[test]
