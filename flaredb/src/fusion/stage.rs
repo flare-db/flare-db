@@ -271,7 +271,7 @@ pub enum SplittableProcessKind {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SplittableExecutionPlan {
-    pub initialization_stage: ExecutableStage,
+    pub initialization_stages: Vec<ExecutableStage>,
     pub process_stage: ExecutableStage,
     pub process_kind: SplittableProcessKind,
 }

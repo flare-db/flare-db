@@ -35,10 +35,7 @@ use crate::{
             multimap::split_encoded_values,
         },
     },
-    fusion::{
-        pipeline::{ExecutableGraph, ExecutableNode},
-        refs::SideInputRef,
-    },
+    fusion::{pipeline::ExecutableGraph, refs::SideInputRef},
     jobservice::urns::beam_urns,
     store::{
         element_store::{FlareElementStore, ScanCollectionRequest, slate_state_dir},
@@ -252,10 +249,12 @@ impl SideInputRegistry {
         let components: &Components = &graph.components;
         let mut specs = HashMap::new();
 
+        let mut worker_stages = Vec::new();
         for node in executable.node_weights() {
-            let ExecutableNode::Worker(stage) = node else {
-                continue;
-            };
+            worker_stages.extend(node.worker_stages());
+        }
+
+        for stage in worker_stages {
             for side_input in stage.side_inputs() {
                 let pcollection = side_input.collection();
                 let pcollection_id = pcollection.id().clone();
@@ -1301,13 +1300,24 @@ mod tests {
     use super::*;
     use crate::{
         coders::primitives::{LengthPrefixCoder, PaneInfo, StringUtf8Coder, VarIntCoder},
+        fusion::{
+            pipeline::{ConsumerMetaData, ExecutableNode, PCollectionNode, PTransformNode},
+            stage::{
+                ExecutableStage, SplittableExecutionPlan, SplittableProcessKind, SplittableStage,
+            },
+        },
         store::{
             element_store::FlareElementStore,
             record::{BeamKV, BeamRecord, PrimitiveValue},
         },
     };
-    use beam_model_rs::v1::{StateKey, state_key};
+    use beam_model_rs::v1::executable_stage_payload::SideInputId;
+    use beam_model_rs::v1::{
+        Environment, FunctionSpec, PCollection, PTransform, SideInput, StateKey, state_key,
+    };
     use bytes::BytesMut;
+    use indexmap::IndexSet;
+    use petgraph::Graph;
     use std::sync::Arc;
     use tempfile::tempdir;
 
@@ -1325,6 +1335,165 @@ mod tests {
             .await
             .expect("failed to build the state backend");
         (dir, backend)
+    }
+
+    #[test]
+    fn side_input_registry_includes_worker_stages_nested_in_splittable_runs() {
+        let pair_transform = PTransform {
+            unique_name: "pair".to_string(),
+            spec: Some(FunctionSpec {
+                urn: beam_urns::SPLITTABLE_PAIR_WITH_RESTRICTION_URN.to_string(),
+                payload: ParDoPayload {
+                    side_inputs: HashMap::from([(
+                        "side".to_string(),
+                        SideInput {
+                            access_pattern: Some(FunctionSpec {
+                                urn: beam_urns::ITERABLE_SIDE_INPUT_ACCESS.to_string(),
+                                payload: Vec::new(),
+                            }),
+                            view_fn: None,
+                            window_mapping_fn: None,
+                        },
+                    )]),
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            }),
+            inputs: HashMap::from([
+                ("main".to_string(), "main_pc".to_string()),
+                ("side".to_string(), "side_pc".to_string()),
+            ]),
+            outputs: HashMap::from([("out".to_string(), "out_pc".to_string())]),
+            environment_id: "env".to_string(),
+            ..Default::default()
+        };
+        let pair_node = PTransformNode {
+            id: "pair".to_string(),
+            transform: pair_transform.clone(),
+        };
+        let main_pc = PCollectionNode {
+            id: "main_pc".to_string(),
+            collection: PCollection {
+                unique_name: "main_pc".to_string(),
+                coder_id: "string".to_string(),
+                ..Default::default()
+            },
+        };
+        let side_pc = PCollectionNode {
+            id: "side_pc".to_string(),
+            collection: PCollection {
+                unique_name: "side_pc".to_string(),
+                coder_id: "string".to_string(),
+                ..Default::default()
+            },
+        };
+        let out_pc = PCollectionNode {
+            id: "out_pc".to_string(),
+            collection: PCollection {
+                unique_name: "out_pc".to_string(),
+                coder_id: "string".to_string(),
+                ..Default::default()
+            },
+        };
+        let components = Components {
+            transforms: HashMap::from([("pair".to_string(), pair_transform)]),
+            pcollections: HashMap::from([
+                ("main_pc".to_string(), main_pc.node().clone()),
+                ("side_pc".to_string(), side_pc.node().clone()),
+                ("out_pc".to_string(), out_pc.node().clone()),
+            ]),
+            coders: HashMap::from([(
+                "string".to_string(),
+                Coder {
+                    spec: Some(FunctionSpec {
+                        urn: beam_urns::STRING_UTF8_CODER.to_string(),
+                        payload: Vec::new(),
+                    }),
+                    component_coder_ids: Vec::new(),
+                },
+            )]),
+            ..Default::default()
+        };
+        let side_input = SideInputRef::from_id(
+            &SideInputId {
+                transform_id: "pair".to_string(),
+                local_name: "side".to_string(),
+            },
+            &components,
+        )
+        .unwrap();
+        let pair_stage = ExecutableStage::from(
+            components.clone(),
+            Environment::default(),
+            HashSet::new(),
+            main_pc,
+            [side_input].into_iter().collect(),
+            IndexSet::new(),
+            IndexSet::new(),
+            [out_pc].into_iter().collect(),
+            [pair_node].into_iter().collect(),
+        );
+        let mut nested = Graph::new();
+        nested.add_node(ExecutableNode::Worker(pair_stage.clone()));
+        let splittable = SplittableStage::new(
+            "splittable".to_string(),
+            nested,
+            HashSet::new(),
+            SplittableExecutionPlan {
+                initialization_stages: vec![pair_stage.clone()],
+                process_stage: pair_stage,
+                process_kind: SplittableProcessKind::ProcessElements,
+            },
+        );
+        let producer_stage = ExecutableStage::from(
+            components.clone(),
+            Environment::default(),
+            HashSet::new(),
+            PCollectionNode {
+                id: "side_pc".to_string(),
+                collection: components.pcollections["side_pc"].clone(),
+            },
+            IndexSet::new(),
+            IndexSet::new(),
+            IndexSet::new(),
+            [PCollectionNode {
+                id: "side_pc".to_string(),
+                collection: components.pcollections["side_pc"].clone(),
+            }]
+            .into_iter()
+            .collect(),
+            IndexSet::new(),
+        );
+        let mut executable = Graph::new();
+        executable.add_node(ExecutableNode::Worker(producer_stage));
+        executable.add_node(ExecutableNode::Splittable(splittable));
+        let executable = ExecutableGraph::from_graph_with_components_for_test(
+            executable,
+            components.clone(),
+            ConsumerMetaData {
+                producer_transform_id: "producer".to_string(),
+                produced_pcol_id: "side_pc".to_string(),
+                coder_id: "string".to_string(),
+                component_coder: None,
+                consumer_transfrom_id: "pair".to_string(),
+            },
+        );
+
+        let registry =
+            SideInputRegistry::from_executable_graph(&executable, &components.coders).unwrap();
+        let metadata = executable
+            .side_input_output_metadata("side_pc")
+            .expect("nested SDF side input must synthesize producer output metadata");
+        assert_eq!(metadata.consumer_transfrom_id, "pair");
+        assert!(
+            registry
+                .get(&SideInputKey {
+                    transform_id: "pair".to_string(),
+                    side_input_id: "side".to_string(),
+                })
+                .is_some(),
+            "nested SDF side inputs must be registered"
+        );
     }
 
     async fn make_side_input_resolver(

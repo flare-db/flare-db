@@ -369,8 +369,14 @@ impl SplittableStageExecutor {
         let bytes = if initialized {
             seed_bytes.unwrap_or_default()
         } else {
-            self.run_initialization_stage(&plan.initialization_stage)
-                .await?
+            let mut initialization_bytes = None;
+            for stage in &plan.initialization_stages {
+                initialization_bytes = Some(
+                    self.run_initialization_stage(stage, initialization_bytes)
+                        .await?,
+                );
+            }
+            initialization_bytes.unwrap_or_default()
         };
 
         // Dynamic split only applies to restriction-based SDF form.
@@ -410,6 +416,7 @@ impl SplittableStageExecutor {
     async fn run_initialization_stage(
         &mut self,
         stage: &ExecutableStage,
+        input: Option<Vec<u8>>,
     ) -> anyhow::Result<Vec<u8>> {
         let descriptor_id = stage.id().to_string();
         let bundle_status = self.runtime.register_bundle(stage).await?;
@@ -432,39 +439,54 @@ impl SplittableStageExecutor {
             descriptor_id, instruction_id
         );
 
-        let coder_id = stage.input_pcol().node().coder_id.clone();
-        let runtime = self.runtime.clone();
-        let instruction_id_clone = instruction_id.clone();
-        let pcollection_id = stage.input_pcol().id().clone();
-        let consumer_transform_id = stage_source_transform_id(stage);
         let timer_endpoints = stage_timer_endpoints(stage);
+        let source_transform_id = stage_source_transform_id(stage);
 
-        tokio::spawn(async move {
-            // Send the SDF's seed restrictions to the worker.
-            if let Err(err) = runtime
-                .process_input_elements(
-                    instruction_id_clone.clone(),
-                    consumer_transform_id,
-                    pcollection_id,
-                    coder_id,
-                    None,
-                    timer_endpoints,
-                    Vec::new(),
-                    false,
-                )
-                .await
-            {
-                error!(
-                    "failed to send SDF seed restrictions for instruction {}: {}",
-                    instruction_id_clone, err
-                );
-            }
-        });
+        if let Some(input) = input {
+            // A chained initialization step consumes the prior stage's raw
+            // WindowedValue bytes without re-encoding them.
+            self.send_raw_elements(
+                &instruction_id,
+                &source_transform_id,
+                input,
+                &timer_endpoints,
+            )
+            .await?;
+        } else {
+            let coder_id = stage.input_pcol().node().coder_id.clone();
+            let runtime = self.runtime.clone();
+            let instruction_id_clone = instruction_id.clone();
+            let pcollection_id = stage.input_pcol().id().clone();
+            let consumer_transform_id = source_transform_id;
+
+            tokio::spawn(async move {
+                // Send the first initialization stage's input from the
+                // materialized PCollection.
+                if let Err(err) = runtime
+                    .process_input_elements(
+                        instruction_id_clone.clone(),
+                        consumer_transform_id,
+                        pcollection_id,
+                        coder_id,
+                        None,
+                        timer_endpoints,
+                        Vec::new(),
+                        false,
+                    )
+                    .await
+                {
+                    error!(
+                        "failed to send SDF seed restrictions for instruction {}: {}",
+                        instruction_id_clone, err
+                    );
+                }
+            });
+        }
 
         // Collect initialization output elements as raw wire bytes in memory.
-        // The initialization stage is `PairWithRestriction → SplitAndSize`, which
-        // has exactly one output; anything else indicates incorrect fusion of an
-        // unrelated transform into the SDF initialization stage.
+        // Each initialization stage has exactly one output; anything else
+        // indicates incorrect fusion of an unrelated transform into the SDF
+        // initialization chain.
         let outputs = stage.output_pcols();
         if outputs.len() != 1 {
             return Err(anyhow!(
@@ -1473,7 +1495,7 @@ mod tests {
             Graph::new(),
             output_pcols,
             SplittableExecutionPlan {
-                initialization_stage: stage.clone(),
+                initialization_stages: vec![stage.clone()],
                 process_stage: stage,
                 process_kind: SplittableProcessKind::ProcessElements,
             },

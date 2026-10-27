@@ -252,6 +252,9 @@ impl GreedyStageFuser {
 
         let mut fused_pcols = IndexSet::<PCollectionNode>::new();
         let mut materialized_pcols = IndexSet::<PCollectionNode>::new();
+        let stage_contains_splittable_process = initial_nodes
+            .iter()
+            .any(transform_has_splittable_process_urn);
 
         let mut fusion_candidates = VecDeque::<PCollectionNode>::new();
         //fusion_candidates.push_back(input_pcol.clone());
@@ -279,7 +282,19 @@ impl GreedyStageFuser {
             }
             match can_fuse(&pipeline, &candidate, &env) {
                 PCollectionFusibility::FUSE => {
-                    for consumer in pipeline.get_per_element_consumers(&candidate) {
+                    let consumers = pipeline.get_per_element_consumers(&candidate);
+                    if stage_contains_splittable_process
+                        && consumers.iter().any(|consumer| {
+                            consumer.node().spec.as_ref().is_some_and(|spec| {
+                                urns::beam_urns::SPLITTABLE_PARDO_COMPONENTS
+                                    .contains(&spec.urn.as_str())
+                            })
+                        })
+                    {
+                        materialized_pcols.insert(candidate);
+                        continue;
+                    }
+                    for consumer in consumers {
                         fusion_candidates.extend(pipeline.get_output_pcol(&consumer));
                         side_inputs.extend(pipeline.get_side_inputs(&consumer)?);
                     }
@@ -308,6 +323,17 @@ impl GreedyStageFuser {
 
         Ok(sanitize_dangling_ptransform_inputs(stage))
     }
+}
+
+fn transform_has_splittable_process_urn(transform: &PTransformNode) -> bool {
+    transform.node().spec.as_ref().is_some_and(|spec| {
+        matches!(
+            spec.urn.as_str(),
+            urns::beam_urns::SPLITTABLE_PROCESS_ELEMENTS_URN
+                | urns::beam_urns::SPLITTABLE_PROCESS_KEYED_URN
+                | urns::beam_urns::SPLITTABLE_PROCESS_SIZED_ELEMENTS_AND_RESTRICTIONS_URN
+        )
+    })
 }
 
 struct GreedyCollectionFuser {}
@@ -2689,6 +2715,94 @@ mod tests {
                 .iter()
                 .map(|p| p.id.clone())
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn downstream_sdf_pair_is_materialized_outside_process_stage() {
+        let env = make_env("env1");
+        let clean = clean_pardo_payload();
+        let impulse = make_transform(
+            "impulse",
+            beam_urns::IMPULSE_TRANSFORM,
+            &[],
+            &[("out", "p0")],
+            "",
+        );
+        let pair = make_pardo_transform(
+            "pair",
+            beam_urns::SPLITTABLE_PAIR_WITH_RESTRICTION_URN,
+            &[("in", "p0")],
+            &[("out", "p1")],
+            "env1",
+            &clean,
+        );
+        let split = make_pardo_transform(
+            "split",
+            beam_urns::SPLITTABLE_SPLIT_AND_SIZE_RESTRICTIONS_URN,
+            &[("in", "p1")],
+            &[("out", "p2")],
+            "env1",
+            &clean,
+        );
+        let process = make_pardo_transform(
+            "process",
+            beam_urns::SPLITTABLE_PROCESS_SIZED_ELEMENTS_AND_RESTRICTIONS_URN,
+            &[("in", "p2")],
+            &[("out", "p3")],
+            "env1",
+            &clean,
+        );
+        let downstream_pair = make_pardo_transform(
+            "downstream_pair",
+            beam_urns::SPLITTABLE_PAIR_WITH_RESTRICTION_URN,
+            &[("in", "p3")],
+            &[("out", "p4")],
+            "env1",
+            &clean,
+        );
+        let pcols = vec![
+            make_pcol("p0"),
+            make_pcol("p1"),
+            make_pcol("p2"),
+            make_pcol("p3"),
+            make_pcol("p4"),
+        ];
+        let mut envs = HashMap::new();
+        envs.insert("env1".to_string(), env);
+        let pipeline = build_pipeline(
+            vec![impulse, pair, split, process, downstream_pair],
+            pcols,
+            envs,
+        );
+        let fuser = GreedyPipelineFuser::with(pipeline);
+        let (initial_unfused, initial_consumers) = extract_initial_sets(&fuser.pipeline, &fuser);
+        let fused = fuser
+            .fuse_pipeline(initial_unfused, initial_consumers)
+            .unwrap();
+        let stages = fused.sdk_stages();
+        let process_stage =
+            find_stage_with(&stages, "process").expect("process transform should be in a stage");
+        let ids: HashSet<String> = process_stage
+            .transforms()
+            .iter()
+            .map(|transform| transform.id.clone())
+            .collect();
+
+        assert!(
+            !ids.contains("downstream_pair"),
+            "a downstream SDF chain must not fuse into the upstream process stage"
+        );
+        assert!(
+            process_stage
+                .get_output_pcols()
+                .iter()
+                .any(|pcollection| pcollection.id == "p3"),
+            "the process output must be materialized for the downstream SDF"
+        );
+        assert!(
+            find_stage_with(&stages, "downstream_pair").is_some(),
+            "the downstream PairWithRestriction must live in its own initialization stage"
         );
     }
 }

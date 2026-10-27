@@ -85,6 +85,10 @@ pub struct FlareElementStore {
     /// Per-table-name locks that serialize table resolution and creation, so
     /// `get_table`/`get_or_create_table` are safe to call concurrently.
     table_create_locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Per-PCollection locks held for the lifetime of a bundle writer. Paimon
+    /// append commits must observe the previous writer's snapshot; concurrent
+    /// writers can otherwise drop another bundle's committed rows.
+    table_write_locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl FlareElementStore {
@@ -110,6 +114,7 @@ impl FlareElementStore {
             cursor_store,
             commit_min_ts: Arc::new(DashMap::new()),
             table_create_locks: Arc::new(DashMap::new()),
+            table_write_locks: Arc::new(DashMap::new()),
         })
     }
 
@@ -120,6 +125,7 @@ impl FlareElementStore {
         table_schema: Arc<RecordTableSchema>,
         batch: RecordBatch,
     ) -> Result<()> {
+        let _write_guard = self.table_write_lock(pcollection_id).lock_owned().await;
         let table = self.get_table(pcollection_id, &table_schema).await?;
         let builder = table.new_write_builder();
 
@@ -735,6 +741,14 @@ impl FlareElementStore {
             .clone()
     }
 
+    fn table_write_lock(&self, pcollection_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.table_write_locks
+            .entry(pcollection_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .value()
+            .clone()
+    }
+
     /// Resolve (or create) the Paimon table backing a PCollection.
     pub async fn get_table(
         &self,
@@ -852,6 +866,7 @@ pub struct PCollectionWriter {
     pcollection_id: String,
     table: Option<Table>,
     writer: Option<TableWrite>,
+    write_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
     /// Running minimum event-time across all batches written so far.
     min_ts: Option<i64>,
 }
@@ -864,6 +879,7 @@ impl PCollectionWriter {
             pcollection_id,
             table: None,
             writer: None,
+            write_guard: None,
             min_ts: None,
         }
     }
@@ -882,6 +898,12 @@ impl PCollectionWriter {
         }
 
         if self.writer.is_none() {
+            self.write_guard = Some(
+                self.store
+                    .table_write_lock(&self.pcollection_id)
+                    .lock_owned()
+                    .await,
+            );
             let table = self.store.get_table(&self.pcollection_id, &schema).await?;
             let writer = table.new_write_builder().new_write()?;
             self.table = Some(table);
@@ -1871,6 +1893,38 @@ mod element_store_tests {
             .await
             .unwrap();
         assert!(never.is_empty());
+    }
+
+    #[tokio::test]
+    async fn concurrent_bundle_writers_preserve_every_commit() {
+        let (_dir, store) = make_store().await;
+        let store = Arc::new(store);
+        let pc = "pc-concurrent-writers";
+
+        let handles: Vec<_> = (0..8)
+            .map(|value| {
+                let store = store.clone();
+                tokio::spawn(async move {
+                    let mut writer = PCollectionWriter::new(store, pc.to_string());
+                    writer
+                        .write(vec![windowed_int(value, value)])
+                        .await
+                        .unwrap();
+                    writer.commit().await.unwrap();
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        let scanned = store
+            .scan_windowed_values(ScanCollectionRequest {
+                pcollection_id: pc.to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(scanned.len(), 8);
     }
 
     #[tokio::test]

@@ -310,6 +310,9 @@ impl StandardBeamCoders {
     }
     fn encode_primitive(&self, value: PrimitiveValue, buf: &mut impl BufMut) {
         match (self, value) {
+            (StandardBeamCoders::Nullable(coder), value) => {
+                coder.encode(BeamRecord::PRIMITIVE(value), buf)
+            }
             (StandardBeamCoders::StringUtf8(coder), PrimitiveValue::String(s)) => {
                 coder.encode(s, buf)
             }
@@ -752,6 +755,33 @@ mod tests {
                 assert_eq!(*kv.value, BeamRecord::PRIMITIVE(PrimitiveValue::Int64(7)));
             }
             other => panic!("expected KV, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn kv_with_nullable_primitive_key_roundtrips() {
+        let mut coders = HashMap::new();
+        coders.insert("v".to_string(), coder(beam_urns::VARINT_CODER, &[]));
+        coders.insert("s".to_string(), coder(beam_urns::STRING_UTF8_CODER, &[]));
+        coders.insert("ns".to_string(), coder(beam_urns::NULLABLE_CODER, &["s"]));
+        coders.insert("kv".to_string(), coder(beam_urns::KV_CODER, &["ns", "v"]));
+        let kv = StandardBeamCoders::from_urn("kv", None, Some(&coders));
+
+        for key in [
+            PrimitiveValue::String("alpha".to_string()),
+            PrimitiveValue::Void,
+        ] {
+            let element = BeamRecord::KV(BeamKV {
+                key,
+                value: Box::new(BeamRecord::PRIMITIVE(PrimitiveValue::Int64(7))),
+            });
+
+            let mut encoded = Vec::new();
+            kv.encode(element.clone(), &mut encoded);
+
+            let mut buf: &[u8] = &encoded;
+            assert_eq!(kv.decode(&mut buf).unwrap(), element);
+            assert_eq!(buf.remaining(), 0);
         }
     }
 
