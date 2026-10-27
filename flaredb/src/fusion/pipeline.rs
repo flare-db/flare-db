@@ -28,6 +28,23 @@ struct ConsumerLink {
     transform_id: String,
 }
 
+fn splittable_process_kind(stage: &ExecutableStage) -> Option<SplittableProcessKind> {
+    stage.transforms().iter().find_map(|transform| {
+        match transform.node().spec.as_ref()?.urn.as_str() {
+            urns::beam_urns::SPLITTABLE_PROCESS_ELEMENTS_URN => {
+                Some(SplittableProcessKind::ProcessElements)
+            }
+            urns::beam_urns::SPLITTABLE_PROCESS_KEYED_URN => {
+                Some(SplittableProcessKind::ProcessKeyedElements)
+            }
+            urns::beam_urns::SPLITTABLE_PROCESS_SIZED_ELEMENTS_AND_RESTRICTIONS_URN => {
+                Some(SplittableProcessKind::ProcessSizedElementsAndRestrictions)
+            }
+            _ => None,
+        }
+    })
+}
+
 impl ExecutableGraph {
     pub fn from(
         sdk_stages: IndexSet<ExecutableStage>,
@@ -293,6 +310,15 @@ impl ExecutableGraph {
                 continue;
             }
 
+            // One SplittableStage execution runs exactly one
+            // PairWithRestriction/SplitAndSize stage followed by one process
+            // stage. A pipeline can contain consecutive chained SDFs (for
+            // example, BoundedSourceAsSDFWrapper feeding a user SDF). Treat the
+            // process output as a materialized boundary so the downstream SDF
+            // becomes its own SplittableStage instead of being folded into a
+            // run whose executor cannot represent it.
+            let completes_splittable_run = splittable_process_kind(&stage).is_some();
+
             let stage_node = ExecutableNode::Worker(stage.clone());
             let stage_index = *nested_indices
                 .entry(stage_id.clone())
@@ -305,7 +331,9 @@ impl ExecutableGraph {
                 if let Some(consumers) = consumer_map.get(&output_pcol) {
                     for consumer in consumers {
                         match &consumer.node {
-                            ExecutableNode::Worker(next_stage) if next_stage.is_splittable() => {
+                            ExecutableNode::Worker(next_stage)
+                                if next_stage.is_splittable() && !completes_splittable_run =>
+                            {
                                 let next_id = next_stage.id();
                                 let next_node = ExecutableNode::Worker(next_stage.clone());
                                 let next_index = *nested_indices
@@ -355,46 +383,32 @@ impl ExecutableGraph {
             );
         });
 
-        let mut initialization_stage = None;
+        let mut initialization_stages = Vec::new();
         let mut process_stage = None;
         let mut process_kind = None;
 
         for idx in sorted {
             let node = &nested_graph[idx];
             if let ExecutableNode::Worker(stage) = node {
-                let mut kind = None;
-                for t in stage.transforms() {
-                    if let Some(spec) = &t.node().spec {
-                        match spec.urn.as_str() {
-                        urns::beam_urns::SPLITTABLE_PROCESS_ELEMENTS_URN => {
-                            kind = Some(SplittableProcessKind::ProcessElements);
-                        }
-                        urns::beam_urns::SPLITTABLE_PROCESS_KEYED_URN => {
-                            kind = Some(SplittableProcessKind::ProcessKeyedElements);
-                        }
-                        urns::beam_urns::SPLITTABLE_PROCESS_SIZED_ELEMENTS_AND_RESTRICTIONS_URN => {
-                            kind = Some(SplittableProcessKind::ProcessSizedElementsAndRestrictions);
-                        }
-                        _ => {}
-                    }
-                    }
-                }
-
-                if let Some(k) = kind {
+                if let Some(kind) = splittable_process_kind(stage) {
                     process_stage = Some(stage.clone());
-                    process_kind = Some(k);
+                    process_kind = Some(kind);
                 } else {
-                    initialization_stage = Some(stage.clone());
+                    // Initialization may span more than one stage. In
+                    // particular, side-input-bearing SDFs keep
+                    // PairWithRestriction and SplitAndSize in separate SDK
+                    // stages, so both must run in topological order before the
+                    // restriction bytes are handed to the process stage.
+                    initialization_stages.push(stage.clone());
                 }
             }
         }
 
-        let initialization_stage = initialization_stage.unwrap_or_else(|| {
-            panic!(
-                "SDF splittable stage {} missing initialization stage",
-                stage_id
-            );
-        });
+        assert!(
+            !initialization_stages.is_empty(),
+            "SDF splittable stage {} missing initialization stage",
+            stage_id
+        );
         let process_stage = process_stage.unwrap_or_else(|| {
             panic!("SDF splittable stage {} missing process stage", stage_id);
         });
@@ -406,7 +420,7 @@ impl ExecutableGraph {
         });
 
         SplittableExecutionPlan {
-            initialization_stage,
+            initialization_stages,
             process_stage,
             process_kind,
         }
@@ -515,26 +529,25 @@ impl ExecutableGraph {
         pcollection_id: &str,
     ) -> Option<ConsumerMetaData> {
         for node in self.graph.node_weights() {
-            let ExecutableNode::Worker(stage) = node else {
-                continue;
-            };
-            if let Some(side_input) = stage
-                .side_inputs()
-                .iter()
-                .find(|side| side.collection().id == pcollection_id)
-            {
-                let pcollection = self.components.pcollections.get(pcollection_id)?;
-                return Some(ConsumerMetaData {
-                    producer_transform_id: node.id(),
-                    produced_pcol_id: pcollection_id.to_string(),
-                    coder_id: pcollection.coder_id.clone(),
-                    component_coder: self
-                        .components
-                        .coders
-                        .get(&pcollection.coder_id)
-                        .map(|coder| coder.component_coder_ids.clone()),
-                    consumer_transfrom_id: side_input.transform().node().unique_name.clone(),
-                });
+            for stage in node.worker_stages() {
+                if let Some(side_input) = stage
+                    .side_inputs()
+                    .iter()
+                    .find(|side| side.collection().id == pcollection_id)
+                {
+                    let pcollection = self.components.pcollections.get(pcollection_id)?;
+                    return Some(ConsumerMetaData {
+                        producer_transform_id: node.id(),
+                        produced_pcol_id: pcollection_id.to_string(),
+                        coder_id: pcollection.coder_id.clone(),
+                        component_coder: self
+                            .components
+                            .coders
+                            .get(&pcollection.coder_id)
+                            .map(|coder| coder.component_coder_ids.clone()),
+                        consumer_transfrom_id: side_input.transform().node().unique_name.clone(),
+                    });
+                }
             }
         }
         None
@@ -545,6 +558,15 @@ impl ExecutableGraph {
         graph: Graph<ExecutableNode, ConsumerMetaData>,
         root_metadata: ConsumerMetaData,
     ) -> Self {
+        Self::from_graph_with_components_for_test(graph, Components::default(), root_metadata)
+    }
+
+    #[cfg(test)]
+    pub fn from_graph_with_components_for_test(
+        graph: Graph<ExecutableNode, ConsumerMetaData>,
+        components: Components,
+        root_metadata: ConsumerMetaData,
+    ) -> Self {
         let mut node_indices = HashMap::new();
         for idx in graph.node_indices() {
             node_indices.insert(graph[idx].id(), idx);
@@ -553,7 +575,7 @@ impl ExecutableGraph {
         Self {
             graph,
             node_indices,
-            components: Components::default(),
+            components,
             root_metadata: Some(root_metadata),
         }
     }
@@ -622,6 +644,26 @@ impl ExecutableNode {
             ExecutableNode::Runner(r) => r.output_pcol_ids(),
             ExecutableNode::Splittable(s) => s.output_pcols().clone(),
         }
+    }
+
+    /// Worker stages represented by this executable node, including the stages
+    /// folded into a splittable run.
+    pub(crate) fn worker_stages(&self) -> Vec<&ExecutableStage> {
+        fn collect<'a>(node: &'a ExecutableNode, stages: &mut Vec<&'a ExecutableStage>) {
+            match node {
+                ExecutableNode::Worker(stage) => stages.push(stage),
+                ExecutableNode::Splittable(splittable) => {
+                    for nested in splittable.graph().node_weights() {
+                        collect(nested, stages);
+                    }
+                }
+                ExecutableNode::Runner(_) => {}
+            }
+        }
+
+        let mut stages = Vec::new();
+        collect(self, &mut stages);
+        stages
     }
 
     pub fn id(&self) -> String {
@@ -1159,4 +1201,199 @@ fn get_local_timer_names(transform: &PTransform) -> Result<HashSet<String>, Beam
         .map_err(|e| {
             BeamTranslationError::InvalidArgument(format!("Failed to decode ParDoPayload: {e}"))
         })
+}
+
+#[cfg(test)]
+mod sdf_execution_tests {
+    use super::*;
+    use beam_model_rs::v1::FunctionSpec;
+
+    fn pcollection(id: &str) -> PCollectionNode {
+        PCollectionNode {
+            id: id.to_string(),
+            collection: PCollection {
+                unique_name: id.to_string(),
+                coder_id: "coder".to_string(),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn transform(
+        id: &str,
+        urn: &str,
+        input: &PCollectionNode,
+        output: &PCollectionNode,
+    ) -> PTransformNode {
+        PTransformNode {
+            id: id.to_string(),
+            transform: PTransform {
+                unique_name: id.to_string(),
+                spec: Some(FunctionSpec {
+                    urn: urn.to_string(),
+                    payload: Vec::new(),
+                }),
+                inputs: HashMap::from([("in".to_string(), input.id.clone())]),
+                outputs: HashMap::from([("out".to_string(), output.id.clone())]),
+                environment_id: "env".to_string(),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn stage(
+        input: &PCollectionNode,
+        output: &PCollectionNode,
+        transform: PTransformNode,
+    ) -> ExecutableStage {
+        ExecutableStage::from(
+            Components::default(),
+            Environment::default(),
+            HashSet::new(),
+            input.clone(),
+            IndexSet::new(),
+            IndexSet::new(),
+            IndexSet::new(),
+            [output.clone()].into_iter().collect(),
+            [transform].into_iter().collect(),
+        )
+    }
+
+    fn link(stage: &ExecutableStage, transform_id: &str) -> ConsumerLink {
+        ConsumerLink {
+            node: ExecutableNode::Worker(stage.clone()),
+            transform_id: transform_id.to_string(),
+        }
+    }
+
+    #[test]
+    fn chained_sdfs_become_separate_runs_and_initialize_from_pair_stage() {
+        let p0 = pcollection("p0");
+        let p1 = pcollection("p1");
+        let p2 = pcollection("p2");
+        let p3 = pcollection("p3");
+        let p4 = pcollection("p4");
+        let p5 = pcollection("p5");
+        let p6 = pcollection("p6");
+
+        let pair1_transform = transform(
+            "pair1",
+            urns::beam_urns::SPLITTABLE_PAIR_WITH_RESTRICTION_URN,
+            &p0,
+            &p1,
+        );
+        let split1_transform = transform(
+            "split1",
+            urns::beam_urns::SPLITTABLE_SPLIT_AND_SIZE_RESTRICTIONS_URN,
+            &p1,
+            &p2,
+        );
+        let process1_transform = transform(
+            "process1",
+            urns::beam_urns::SPLITTABLE_PROCESS_SIZED_ELEMENTS_AND_RESTRICTIONS_URN,
+            &p2,
+            &p3,
+        );
+        let pair2_transform = transform(
+            "pair2",
+            urns::beam_urns::SPLITTABLE_PAIR_WITH_RESTRICTION_URN,
+            &p3,
+            &p4,
+        );
+        let split2_transform = transform(
+            "split2",
+            urns::beam_urns::SPLITTABLE_SPLIT_AND_SIZE_RESTRICTIONS_URN,
+            &p4,
+            &p5,
+        );
+        let process2_transform = transform(
+            "process2",
+            urns::beam_urns::SPLITTABLE_PROCESS_SIZED_ELEMENTS_AND_RESTRICTIONS_URN,
+            &p5,
+            &p6,
+        );
+
+        let pair1 = stage(&p0, &p1, pair1_transform);
+        let split1 = stage(&p1, &p2, split1_transform);
+        let process1 = stage(&p2, &p3, process1_transform);
+        let pair2 = stage(&p3, &p4, pair2_transform);
+        let split2 = stage(&p4, &p5, split2_transform);
+        let process2 = stage(&p5, &p6, process2_transform);
+
+        let sdk_stages: IndexSet<_> = [pair1.clone(), split1.clone(), process1.clone()]
+            .into_iter()
+            .collect();
+        let consumer_map = HashMap::from([
+            ("p1".to_string(), vec![link(&split1, "split1")]),
+            ("p2".to_string(), vec![link(&process1, "process1")]),
+            ("p3".to_string(), vec![link(&pair2, "pair2")]),
+            ("p4".to_string(), vec![link(&split2, "split2")]),
+            ("p5".to_string(), vec![link(&process2, "process2")]),
+        ]);
+        let components = Components {
+            pcollections: [p0, p1, p2, p3, p4, p5, p6]
+                .into_iter()
+                .map(|pcollection| (pcollection.id().clone(), pcollection.node().clone()))
+                .collect(),
+            ..Default::default()
+        };
+        let graph = ExecutableGraph {
+            graph: Graph::new(),
+            node_indices: HashMap::new(),
+            components,
+            root_metadata: None,
+        };
+
+        let (node, members) = graph.build_splittable_node(
+            &pair1,
+            &sdk_stages,
+            &IndexSet::new(),
+            &consumer_map,
+            &HashSet::new(),
+        );
+
+        assert_eq!(
+            members.len(),
+            3,
+            "only the first SDF chain should be folded"
+        );
+        let ExecutableNode::Splittable(splittable) = node else {
+            panic!("SDF chain should produce a Splittable node");
+        };
+        assert_eq!(splittable.graph().node_count(), 3);
+        assert_eq!(
+            splittable.plan().initialization_stages.len(),
+            2,
+            "PairWithRestriction and SplitAndSize must both initialize the SDF"
+        );
+        assert_eq!(
+            splittable.plan().initialization_stages[0].input_pcol().id(),
+            "p0"
+        );
+        assert!(
+            splittable.plan().initialization_stages[0]
+                .transforms()
+                .iter()
+                .any(|transform| transform.id() == "pair1"),
+            "the first initialization stage must be PairWithRestriction"
+        );
+        assert!(
+            splittable.plan().initialization_stages[1]
+                .transforms()
+                .iter()
+                .any(|transform| transform.id() == "split1"),
+            "the second initialization stage must be SplitAndSize"
+        );
+        assert_eq!(
+            splittable.plan().initialization_stages[1].input_pcol().id(),
+            "p1",
+            "SplitAndSize must consume PairWithRestriction output"
+        );
+        assert_eq!(splittable.plan().process_stage.input_pcol().id(), "p2");
+        assert_eq!(
+            splittable.output_pcols(),
+            &HashSet::from(["p3".to_string()]),
+            "the first process output must become the boundary to the next SDF"
+        );
+    }
 }

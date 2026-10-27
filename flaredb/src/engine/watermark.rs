@@ -382,14 +382,17 @@ impl WatermarkManager {
             main_inputs.sort();
             main_inputs.dedup();
 
-            let mut side_inputs: Vec<PCollectionId> = match node {
-                ExecutableNode::Worker(stage) => stage
-                    .side_inputs()
-                    .iter()
-                    .map(|side| side.collection().id.clone())
-                    .collect(),
-                _ => Vec::new(),
-            };
+            let mut side_inputs: Vec<PCollectionId> = node
+                .worker_stages()
+                .into_iter()
+                .flat_map(|stage| {
+                    stage
+                        .side_inputs()
+                        .into_iter()
+                        .map(|side| side.collection().id.clone())
+                        .collect::<Vec<_>>()
+                })
+                .collect();
             side_inputs.sort();
             side_inputs.dedup();
 
@@ -1344,11 +1347,15 @@ mod tests {
     use super::*;
     use crate::fusion::pipeline::{ConsumerMetaData, ExecutableGraph, ExecutableNode};
     use crate::fusion::pipeline::{PCollectionNode, PTransformNode};
-    use crate::fusion::stage::ExecutableStage;
+    use crate::fusion::refs::SideInputRef;
+    use crate::fusion::stage::{
+        ExecutableStage, SplittableExecutionPlan, SplittableProcessKind, SplittableStage,
+    };
     use crate::jobservice::urns::beam_urns;
     use crate::transforms::from_urn;
+    use beam_model_rs::v1::executable_stage_payload::SideInputId;
     use beam_model_rs::v1::{
-        Components, Environment, FunctionSpec, PCollection, PTransform, ParDoPayload,
+        Components, Environment, FunctionSpec, PCollection, PTransform, ParDoPayload, SideInput,
         WindowingStrategy,
     };
     use indexmap::IndexSet;
@@ -2578,6 +2585,136 @@ mod tests {
         assert_eq!(manager.output_watermark(&a_id), Some(100));
         assert_eq!(manager.input_watermark(&b_id), Some(100));
         assert_eq!(manager.pcollection_watermark("p"), Some(100));
+    }
+
+    #[test]
+    fn splittable_run_waits_for_side_inputs_declared_by_nested_workers() {
+        let main_pc = PCollectionNode {
+            id: "main".to_string(),
+            collection: PCollection {
+                unique_name: "main".to_string(),
+                ..Default::default()
+            },
+        };
+        let side_pc = PCollectionNode {
+            id: "side".to_string(),
+            collection: PCollection {
+                unique_name: "side".to_string(),
+                ..Default::default()
+            },
+        };
+        let out_pc = PCollectionNode {
+            id: "nested_out".to_string(),
+            collection: PCollection {
+                unique_name: "nested_out".to_string(),
+                ..Default::default()
+            },
+        };
+        let consumer = PTransform {
+            unique_name: "pair".to_string(),
+            spec: Some(FunctionSpec {
+                urn: beam_urns::SPLITTABLE_PAIR_WITH_RESTRICTION_URN.to_string(),
+                payload: ParDoPayload {
+                    side_inputs: HashMap::from([(
+                        "side".to_string(),
+                        SideInput {
+                            access_pattern: Some(FunctionSpec {
+                                urn: beam_urns::ITERABLE_SIDE_INPUT_ACCESS.to_string(),
+                                payload: Vec::new(),
+                            }),
+                            view_fn: None,
+                            window_mapping_fn: None,
+                        },
+                    )]),
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            }),
+            inputs: HashMap::from([
+                ("main".to_string(), "main".to_string()),
+                ("side".to_string(), "side".to_string()),
+            ]),
+            outputs: HashMap::from([("out".to_string(), "nested_out".to_string())]),
+            environment_id: "env".to_string(),
+            ..Default::default()
+        };
+        let components = Components {
+            pcollections: HashMap::from([
+                ("main".to_string(), main_pc.node().clone()),
+                ("side".to_string(), side_pc.node().clone()),
+                ("nested_out".to_string(), out_pc.node().clone()),
+            ]),
+            transforms: HashMap::from([("pair".to_string(), consumer.clone())]),
+            ..Default::default()
+        };
+        let side_input = SideInputRef::from_id(
+            &SideInputId {
+                transform_id: "pair".to_string(),
+                local_name: "side".to_string(),
+            },
+            &components,
+        )
+        .unwrap();
+        let pair_stage = ExecutableStage::from(
+            components,
+            Environment::default(),
+            HashSet::new(),
+            main_pc,
+            [side_input].into_iter().collect(),
+            IndexSet::new(),
+            IndexSet::new(),
+            [out_pc].into_iter().collect(),
+            [PTransformNode {
+                id: "pair".to_string(),
+                transform: consumer,
+            }]
+            .into_iter()
+            .collect(),
+        );
+        let mut nested = Graph::new();
+        nested.add_node(ExecutableNode::Worker(pair_stage.clone()));
+        let splittable = SplittableStage::new(
+            "splittable".to_string(),
+            nested,
+            ["nested_out".to_string()].into_iter().collect(),
+            SplittableExecutionPlan {
+                initialization_stages: vec![pair_stage.clone()],
+                process_stage: pair_stage,
+                process_kind: SplittableProcessKind::ProcessElements,
+            },
+        );
+
+        let mut graph = Graph::new();
+        let main_source = graph.add_node(runner_node("Main", &["main"]));
+        let side_source = graph.add_node(runner_node("Side", &["side"]));
+        let consumer = graph.add_node(ExecutableNode::Splittable(splittable));
+        graph.add_edge(main_source, consumer, metadata("main"));
+
+        let executable = ExecutableGraph::from_graph_for_test(graph, metadata("main"));
+        let mut manager = WatermarkManager::from_executable_graph(&executable);
+        let main_id = executable.get_executable_graph()[main_source].id();
+        let side_id = executable.get_executable_graph()[side_source].id();
+        let consumer_id = executable.get_executable_graph()[consumer].id();
+
+        manager.start_bundle(&main_id).unwrap();
+        manager.complete_bundle(&main_id).unwrap();
+        assert!(
+            manager
+                .ready_stages()
+                .iter()
+                .all(|stage| stage != &consumer_id),
+            "main input alone must not release a splittable side-input consumer"
+        );
+
+        manager.start_bundle(&side_id).unwrap();
+        manager.complete_bundle(&side_id).unwrap();
+        assert!(
+            manager
+                .ready_stages()
+                .iter()
+                .any(|stage| stage == &consumer_id),
+            "side-input producer completion must release the splittable consumer"
+        );
     }
 
     #[test]
