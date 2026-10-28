@@ -1,4 +1,7 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+};
 
 use anyhow::{Result, anyhow};
 use arrow_array::{
@@ -15,16 +18,36 @@ use paimon::{
 };
 use tokio_stream::StreamExt;
 
+use super::KEY_COLUMN;
 use crate::{
     coders::primitives::{BeamWindow, PaneInfo, PaneTiming, WindowedValue},
     engine::kv::{KvStore, SlateKvStore},
     engine::watermark::MIN_TIMESTAMP,
     store::record::{
-        BeamRecord, RecordTableSchema, WindowMetadata, arrow_fields_to_paimon,
+        BeamRecord, RecordTableSchema, TableType, WindowMetadata, arrow_fields_to_paimon,
         beamrecords_to_record_batch, derive_table_schema, materialize_void_columns,
         record_batch_to_beamrecords,
     },
 };
+
+const DEFAULT_PCOLLECTION_BUCKET_COUNT: i32 = 32;
+const PCOLLECTION_BUCKET_COUNT_ENV: &str = "FLAREDB_PCOLLECTION_BUCKET_COUNT";
+
+fn parse_pcollection_bucket_count(value: Option<&str>) -> Result<i32> {
+    let Some(value) = value else {
+        return Ok(DEFAULT_PCOLLECTION_BUCKET_COUNT);
+    };
+    let count = value.parse::<i32>().map_err(|_| {
+        anyhow!("{PCOLLECTION_BUCKET_COUNT_ENV} must be an integer, found {value:?}")
+    })?;
+    if count == 1 || (2..=1024).contains(&count) {
+        Ok(count)
+    } else {
+        Err(anyhow!(
+            "{PCOLLECTION_BUCKET_COUNT_ENV} must be 1 (disabled) or between 2 and 1024, found {count}"
+        ))
+    }
+}
 
 /// In-memory cache of [`RecordTableSchema`] per PCollection id.
 ///
@@ -89,6 +112,9 @@ pub struct FlareElementStore {
     /// append commits must observe the previous writer's snapshot; concurrent
     /// writers can otherwise drop another bundle's committed rows.
     table_write_locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Fixed bucket count for keyed PCollections. Paimon bucket layout is
+    /// immutable after table creation, so this is resolved once per store.
+    pcollection_bucket_count: i32,
 }
 
 impl FlareElementStore {
@@ -106,6 +132,9 @@ impl FlareElementStore {
             .join(&db_name);
         let cursor_store: Arc<dyn KvStore> =
             Arc::new(SlateKvStore::open(&cursor_dir, "cursors").await?);
+        let pcollection_bucket_count = parse_pcollection_bucket_count(
+            std::env::var(PCOLLECTION_BUCKET_COUNT_ENV).ok().as_deref(),
+        )?;
         Ok(Self {
             registry: FlareSchemaRegistry::new(),
             catalog,
@@ -115,6 +144,7 @@ impl FlareElementStore {
             commit_min_ts: Arc::new(DashMap::new()),
             table_create_locks: Arc::new(DashMap::new()),
             table_write_locks: Arc::new(DashMap::new()),
+            pcollection_bucket_count,
         })
     }
 
@@ -455,6 +485,7 @@ impl FlareElementStore {
     /// Rows with an unknown bound, including opaque SDK windows, are retained.
     /// Callers must separately prove that the supplied watermark/lateness
     /// horizon makes this pruning valid for their trigger and accumulation mode.
+    #[cfg(test)]
     pub(crate) async fn open_incremental_arrow_pruned_before(
         &self,
         pcollection_id: &str,
@@ -552,6 +583,69 @@ impl FlareElementStore {
         let read = read_builder.new_read()?;
         let stream = read.to_incremental_arrow(&plan)?;
         Ok((Some(stream), Some(latest)))
+    }
+
+    /// Open an incremental snapshot range grouped by Paimon bucket.
+    ///
+    /// The scan is planned once so every bucket observes the same snapshot and
+    /// filter. Each returned stream reads only the data splits assigned to that
+    /// bucket. Buckets are ordered by their integer id for deterministic runner
+    /// execution.
+    pub(crate) async fn open_incremental_arrow_by_bucket(
+        &self,
+        pcollection_id: &str,
+        cursor: Option<i64>,
+        projection: Option<&[&str]>,
+        window_prune_before: Option<i64>,
+    ) -> Result<(Vec<(i32, ArrowRecordBatchStream)>, Option<i64>)> {
+        let identifier = self.table_identifier(pcollection_id);
+        let table = match self.catalog.get_table(&identifier).await {
+            Ok(table) => table,
+            Err(paimon::Error::TableNotExist { .. }) => return Ok((Vec::new(), cursor)),
+            Err(err) => return Err(err.into()),
+        };
+
+        let manager = table.snapshot_manager();
+        let Some(latest) = manager.get_latest_snapshot_id().await? else {
+            return Ok((Vec::new(), cursor));
+        };
+        let earliest = manager.earliest_snapshot_id().await?.unwrap_or(latest);
+        let floor = earliest - 1;
+        let start = cursor.map(|cursor| cursor.max(floor)).unwrap_or(floor);
+        if start >= latest {
+            return Ok((Vec::new(), Some(latest)));
+        }
+
+        let mut read_builder = table.new_read_builder();
+        if let Some(projection) = projection {
+            read_builder.with_projection(projection)?;
+        }
+        if let Some(cutoff) = window_prune_before {
+            let predicate_builder = PredicateBuilder::new(table.schema().fields());
+            let finite_after =
+                predicate_builder.greater_than(WINDOW_MAX_END_COLUMN, Datum::Long(cutoff))?;
+            let unknown_end = predicate_builder.is_null(WINDOW_MAX_END_COLUMN)?;
+            read_builder.with_filter(Predicate::or(vec![finite_after, unknown_end]));
+        }
+
+        let plan = read_builder
+            .new_incremental_scan(IncrementalScanMode::Auto, start, latest)
+            .plan()
+            .await?;
+        let read = read_builder.new_read()?;
+        let mut splits_by_bucket: BTreeMap<i32, Vec<_>> = BTreeMap::new();
+        for split in plan.data_splits() {
+            splits_by_bucket
+                .entry(split.bucket())
+                .or_default()
+                .push(split);
+        }
+
+        let mut streams = Vec::with_capacity(splits_by_bucket.len());
+        for (bucket, splits) in splits_by_bucket {
+            streams.push((bucket, read.to_arrow(&splits)?));
+        }
+        Ok((streams, Some(latest)))
     }
 
     /// Read the [`WindowedValue`]s appended to `pcollection_id` since `reader_id`
@@ -763,14 +857,58 @@ impl FlareElementStore {
         let _guard = lock.lock().await;
 
         if let Some(table) = self.resolve_existing_table(&identifier).await? {
+            self.validate_pcollection_table_layout(&table, table_schema)?;
             return Ok(table);
         }
 
-        let paimon_schema = arrow_schema_to_paimon(&table_schema.arrow_schema)?;
+        let paimon_schema =
+            pcollection_schema_to_paimon(table_schema, self.pcollection_bucket_count)?;
         self.catalog
             .create_table(&identifier, paimon_schema, true)
             .await?;
-        Ok(self.catalog.get_table(&identifier).await?)
+        let table = self.catalog.get_table(&identifier).await?;
+        self.validate_pcollection_table_layout(&table, table_schema)?;
+        Ok(table)
+    }
+
+    fn validate_pcollection_table_layout(
+        &self,
+        table: &Table,
+        table_schema: &RecordTableSchema,
+    ) -> Result<()> {
+        if !matches!(table_schema.table_type, TableType::Kv | TableType::Gbk) {
+            return Ok(());
+        }
+
+        let schema = table.schema();
+        let actual_buckets = schema
+            .options()
+            .get("bucket")
+            .and_then(|value| value.parse::<i32>().ok())
+            .unwrap_or(-1);
+        let actual_bucket_keys = schema.bucket_keys();
+        let actual_bucket_function = schema
+            .options()
+            .get("bucket-function.type")
+            .map(String::as_str)
+            .unwrap_or("default");
+        let layout_matches = if self.pcollection_bucket_count <= 1 {
+            actual_buckets <= 1 && !schema.options().contains_key("bucket-key")
+        } else {
+            actual_buckets == self.pcollection_bucket_count
+                && actual_bucket_keys == vec![KEY_COLUMN.to_string()]
+                && actual_bucket_function == "default"
+        };
+        if !layout_matches {
+            return Err(anyhow!(
+                "PCollection table '{}' has immutable bucket layout bucket={actual_buckets}, \
+                 bucket-key={actual_bucket_keys:?}, bucket-function.type={actual_bucket_function}, \
+                 but this store requires bucket={} (1 disables bucketing)",
+                table.identifier().full_name(),
+                self.pcollection_bucket_count,
+            ));
+        }
+        Ok(())
     }
 
     /// Resolve an already-created Paimon table for a PCollection without
@@ -1366,6 +1504,37 @@ pub fn arrow_schema_to_paimon(schema: &ArrowSchema) -> Result<PaimonSchema> {
     Ok(schema)
 }
 
+/// Convert a PCollection schema into its physical Paimon layout.
+///
+/// Keyed PCollections use deterministic integer buckets based on the existing
+/// Beam `key` column. The key value itself never becomes a path component.
+fn pcollection_schema_to_paimon(
+    table_schema: &RecordTableSchema,
+    bucket_count: i32,
+) -> Result<PaimonSchema> {
+    let arrow_fields: Vec<ArrowField> = table_schema
+        .arrow_schema
+        .fields()
+        .iter()
+        .map(|field| field.as_ref().clone())
+        .collect();
+    let fields = arrow_fields_to_paimon(&arrow_fields)?;
+    let mut builder = fields
+        .into_iter()
+        .fold(PaimonSchema::builder(), |builder, field| {
+            builder.column(field.name().to_string(), field.data_type().clone())
+        });
+
+    if bucket_count > 1 && matches!(table_schema.table_type, TableType::Kv | TableType::Gbk) {
+        builder = builder
+            .option("bucket", bucket_count.to_string())
+            .option("bucket-key", KEY_COLUMN)
+            .option("bucket-function.type", "default");
+    }
+
+    Ok(builder.build()?)
+}
+
 /// Request to append logical [`BeamRecord`]s to a PCollection.
 #[derive(Debug)]
 pub struct NewCollectionRequest {
@@ -1483,6 +1652,89 @@ mod element_store_tests {
         FlareElementStore::new(warehouse, "testdb".to_string(), None)
             .await
             .unwrap();
+    }
+
+    #[test]
+    fn pcollection_bucket_count_defaults_and_validates_range() {
+        assert_eq!(
+            parse_pcollection_bucket_count(None).unwrap(),
+            DEFAULT_PCOLLECTION_BUCKET_COUNT
+        );
+        assert_eq!(parse_pcollection_bucket_count(Some("1")).unwrap(), 1);
+        assert_eq!(parse_pcollection_bucket_count(Some("2")).unwrap(), 2);
+        assert_eq!(parse_pcollection_bucket_count(Some("1024")).unwrap(), 1024);
+        assert!(parse_pcollection_bucket_count(Some("0")).is_err());
+        assert!(parse_pcollection_bucket_count(Some("1025")).is_err());
+        assert!(parse_pcollection_bucket_count(Some("many")).is_err());
+
+        let records = vec![BeamRecord::KV(BeamKV {
+            key: PrimitiveValue::String("a".into()),
+            value: Box::new(BeamRecord::PRIMITIVE(PrimitiveValue::Int64(1))),
+        })];
+        let schema = derive_table_schema("pc-disabled-buckets", &records).unwrap();
+        let paimon = pcollection_schema_to_paimon(&schema, 1).unwrap();
+        assert!(!paimon.options().contains_key("bucket"));
+        assert!(!paimon.options().contains_key("bucket-key"));
+    }
+
+    #[tokio::test]
+    async fn keyed_pcollections_use_fixed_key_buckets_without_partitions() {
+        let (_dir, store) = make_store().await;
+
+        store
+            .write_beamrecord_batch(NewCollectionRequest {
+                pcollection_id: "pc-bucketed-kv".to_string(),
+                elements: vec![BeamRecord::KV(BeamKV {
+                    key: PrimitiveValue::String("a".into()),
+                    value: Box::new(BeamRecord::PRIMITIVE(PrimitiveValue::Int64(1))),
+                })],
+            })
+            .await
+            .unwrap();
+        let table = store
+            .get_existing_table("pc-bucketed-kv")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(table.schema().partition_keys().is_empty());
+        assert_eq!(table.schema().bucket_keys(), vec![KEY_COLUMN.to_string()]);
+        assert_eq!(
+            table
+                .schema()
+                .options()
+                .get("bucket")
+                .and_then(|value| value.parse::<i32>().ok()),
+            Some(DEFAULT_PCOLLECTION_BUCKET_COUNT)
+        );
+        assert_eq!(
+            table
+                .schema()
+                .options()
+                .get("bucket-function.type")
+                .map(String::as_str),
+            Some("default")
+        );
+        assert!(
+            !table
+                .schema()
+                .options()
+                .contains_key("manifest.sidecar.enabled")
+        );
+
+        store
+            .write_beamrecord_batch(NewCollectionRequest {
+                pcollection_id: "pc-unbucketed-primitive".to_string(),
+                elements: vec![int_primitive(1)],
+            })
+            .await
+            .unwrap();
+        let table = store
+            .get_existing_table("pc-unbucketed-primitive")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(table.schema().partition_keys().is_empty());
+        assert!(!table.schema().options().contains_key("bucket-key"));
     }
 
     //  FlareSchemaRegistry (pure, no I/O)
@@ -1839,12 +2091,122 @@ mod element_store_tests {
         );
     }
 
+    #[tokio::test]
+    async fn incremental_bucket_streams_preserve_each_key_bucket_across_commits() {
+        let (_dir, store) = make_store().await;
+        let first_commit: Vec<_> = (0..32)
+            .map(|value| windowed_kv(&format!("key-{value:02}"), value, 1))
+            .collect();
+        let second_commit: Vec<_> = (32..64)
+            .map(|value| windowed_kv(&format!("key-{value:02}"), value, 2))
+            .chain((0..8).map(|value| windowed_kv(&format!("key-{value:02}"), value, 3)))
+            .collect();
+        store
+            .write_windowed_value_batch("pc-bucket-streams", first_commit)
+            .await
+            .unwrap();
+        store
+            .write_windowed_value_batch("pc-bucket-streams", second_commit)
+            .await
+            .unwrap();
+
+        let (streams, latest) = store
+            .open_incremental_arrow_by_bucket("pc-bucket-streams", None, Some(&[KEY_COLUMN]), None)
+            .await
+            .unwrap();
+        assert!(latest.is_some());
+        assert!(
+            streams.len() > 1,
+            "expected the fixture to populate more than one bucket"
+        );
+
+        let mut key_buckets = HashMap::new();
+        let mut rows = 0usize;
+        for (bucket, mut stream) in streams {
+            while let Some(batch) = stream.next().await {
+                let batch = batch.unwrap();
+                rows += batch.num_rows();
+                let key = batch.column_by_name(KEY_COLUMN).unwrap();
+                for row in 0..batch.num_rows() {
+                    let PrimitiveValue::String(key) =
+                        primitive_value_from_array_row(key.as_ref(), key.data_type(), row).unwrap()
+                    else {
+                        panic!("expected string key");
+                    };
+                    if let Some(previous) = key_buckets.insert(key.clone(), bucket) {
+                        assert_eq!(
+                            previous, bucket,
+                            "one Beam key was split across Paimon buckets"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(rows, 72);
+    }
+
+    #[tokio::test]
+    async fn incremental_bucket_streams_are_empty_for_unwritten_input() {
+        let (_dir, store) = make_store().await;
+        let (streams, latest) = store
+            .open_incremental_arrow_by_bucket("pc-never-written", None, None, None)
+            .await
+            .unwrap();
+        assert!(streams.is_empty());
+        assert!(latest.is_none());
+    }
+
+    #[tokio::test]
+    async fn ten_megabyte_key_uses_numeric_bucket_directory() {
+        let (_dir, store) = make_store().await;
+        let key = vec![0xab; 10 * 1024 * 1024];
+        store
+            .write_beamrecord_batch(NewCollectionRequest {
+                pcollection_id: "pc-large-key".to_string(),
+                elements: vec![BeamRecord::KV(BeamKV {
+                    key: PrimitiveValue::Bytes(key),
+                    value: Box::new(BeamRecord::PRIMITIVE(PrimitiveValue::Int64(1))),
+                })],
+            })
+            .await
+            .unwrap();
+
+        let table = store
+            .get_existing_table("pc-large-key")
+            .await
+            .unwrap()
+            .unwrap();
+        let bucket_dirs: Vec<String> = std::fs::read_dir(table.location())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| name.starts_with("bucket-"))
+            .collect();
+        assert_eq!(bucket_dirs.len(), 1);
+        assert!(
+            bucket_dirs[0].len() <= "bucket-1023".len(),
+            "bucket path must not contain the Beam key: {bucket_dirs:?}"
+        );
+    }
+
     fn windowed_int(value: i64, timestamp: i64) -> WindowedValue {
         WindowedValue {
             value: int_primitive(value),
             timestamp_millis: timestamp,
             windows: vec![crate::coders::primitives::BeamWindow::Global],
             pane: crate::coders::primitives::PaneInfo::no_firing(),
+        }
+    }
+
+    fn windowed_kv(key: &str, value: i64, timestamp: i64) -> WindowedValue {
+        WindowedValue {
+            value: BeamRecord::KV(BeamKV {
+                key: PrimitiveValue::String(key.to_string()),
+                value: Box::new(BeamRecord::PRIMITIVE(PrimitiveValue::Int64(value))),
+            }),
+            timestamp_millis: timestamp,
+            windows: vec![BeamWindow::Global],
+            pane: PaneInfo::no_firing(),
         }
     }
 
@@ -2281,9 +2643,13 @@ mod element_store_tests {
             })
             .await
             .unwrap();
-        let BeamRecord::GBK(k1) = &scanned[0] else {
-            panic!("expected GBK");
-        };
+        let k1 = scanned
+            .iter()
+            .find_map(|record| match record {
+                BeamRecord::GBK(gbk) if gbk.key == PrimitiveValue::String("k1".into()) => Some(gbk),
+                _ => None,
+            })
+            .expect("expected k1");
         assert_eq!(
             k1.value.list,
             vec![
@@ -2291,9 +2657,13 @@ mod element_store_tests {
                 BeamRecord::PRIMITIVE(PrimitiveValue::Void)
             ]
         );
-        let BeamRecord::GBK(k2) = &scanned[1] else {
-            panic!("expected GBK");
-        };
+        let k2 = scanned
+            .iter()
+            .find_map(|record| match record {
+                BeamRecord::GBK(gbk) if gbk.key == PrimitiveValue::String("k2".into()) => Some(gbk),
+                _ => None,
+            })
+            .expect("expected k2");
         assert!(k2.value.list.is_empty());
     }
 

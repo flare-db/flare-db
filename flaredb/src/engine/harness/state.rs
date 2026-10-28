@@ -2230,7 +2230,9 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(get_response_data(keys), vec![1, 2]);
+        let mut keys = get_response_data(keys);
+        keys.sort_unstable();
+        assert_eq!(keys, vec![1, 2]);
 
         let values = handle_state_request_with_side_inputs(
             &backend,
@@ -2257,16 +2259,24 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(
-            get_response_data(bulk),
-            vec![
-                0x01, // key 1
-                0x00, 0x00, 0x00, 0x02, // two values
-                0x01, b'a', 0x01, b'c', // nested UTF-8 values
-                0x02, // key 2
-                0x00, 0x00, 0x00, 0x01, // one value
-                0x01, b'b',
-            ]
+        let key_one = vec![
+            0x01, // key 1
+            0x00, 0x00, 0x00, 0x02, // two values
+            0x01, b'a', 0x01, b'c', // nested UTF-8 values
+        ];
+        let key_two = vec![
+            0x02, // key 2
+            0x00, 0x00, 0x00, 0x01, // one value
+            0x01, b'b',
+        ];
+        let mut expected_one_first = key_one.clone();
+        expected_one_first.extend_from_slice(&key_two);
+        let mut expected_two_first = key_two;
+        expected_two_first.extend_from_slice(&key_one);
+        let bulk = get_response_data(bulk);
+        assert!(
+            bulk == expected_one_first || bulk == expected_two_first,
+            "multimap key order is unspecified, got {bulk:?}"
         );
     }
 }
