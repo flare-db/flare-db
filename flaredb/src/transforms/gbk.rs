@@ -479,7 +479,7 @@ impl FlareTransform for GroupByKey {
             0
         };
         let config = GbkSortConfig::from_env();
-        let (sorted_input, latest) = open_sorted_input_stream(
+        let (sorted_inputs, latest) = open_sorted_input_streams(
             &ctx.store,
             &input_pcollection_id,
             cursor,
@@ -493,72 +493,75 @@ impl FlareTransform for GroupByKey {
         let mut fired = 0usize;
         let mut decoded_rows = 0usize;
 
-        if let Some(mut sorted_input) = sorted_input {
+        let sort_started = Instant::now();
+        let mut next_progress = 1_000_000usize;
+        let mut decode_time = std::time::Duration::ZERO;
+        let mut group_time = std::time::Duration::ZERO;
+        let mut write_time = std::time::Duration::ZERO;
+        for (bucket, mut sorted_input) in sorted_inputs {
+            info!("GroupByKey: processing bucket {bucket} for {input_pcollection_id}");
             let sort_result: Result<()> = async {
-            let mut decoder = SortedGroupDecoder::default();
-            let sort_started = Instant::now();
-            let mut next_progress = 1_000_000usize;
-            let mut decode_time = std::time::Duration::ZERO;
-            let mut group_time = std::time::Duration::ZERO;
-            let mut write_time = std::time::Duration::ZERO;
-            while let Some(batch) = sorted_input.stream.next().await {
-                let batch = batch?;
-                decoded_rows += batch.num_rows();
-                let decode_started = Instant::now();
-                let groups = decoder.push_batch(&batch, &sorted_input.table_schema)?;
-                decode_time += decode_started.elapsed();
-                let group_started = Instant::now();
-                fired += process_key_groups_batch(
-                    groups,
-                    needs_merge,
-                    ctx.window_merger.as_deref(),
-                    &input_pcollection_id,
-                    &spec,
-                    ctx.input_watermark,
-                    ctx.processing_time,
-                    &self.state,
-                    &mut output,
-                )
-                .await?;
-                group_time += group_started.elapsed();
-                let write_started = Instant::now();
-                flush_output_if_full(&mut writer, &mut output).await?;
-                write_time += write_started.elapsed();
-                if decoded_rows >= next_progress {
-                    info!(
-                        "GroupByKey: decoded {decoded_rows} rows, fired {fired} panes in {:?} (decode={decode_time:?}, group/merge={group_time:?}, output_write={write_time:?})",
-                        sort_started.elapsed(),
-                    );
-                    next_progress = (decoded_rows / 1_000_000 + 1) * 1_000_000;
+                let mut decoder = SortedGroupDecoder::default();
+                while let Some(batch) = sorted_input.stream.next().await {
+                    let batch = batch?;
+                    decoded_rows += batch.num_rows();
+                    let decode_started = Instant::now();
+                    let groups = decoder.push_batch(&batch, &sorted_input.table_schema)?;
+                    decode_time += decode_started.elapsed();
+                    let group_started = Instant::now();
+                    fired += process_key_groups_batch(
+                        groups,
+                        needs_merge,
+                        ctx.window_merger.as_deref(),
+                        &input_pcollection_id,
+                        &spec,
+                        ctx.input_watermark,
+                        ctx.processing_time,
+                        &self.state,
+                        &mut output,
+                    )
+                    .await?;
+                    group_time += group_started.elapsed();
+                    let write_started = Instant::now();
+                    flush_output_if_full(&mut writer, &mut output).await?;
+                    write_time += write_started.elapsed();
+                    if decoded_rows >= next_progress {
+                        info!(
+                            "GroupByKey: decoded {decoded_rows} rows, fired {fired} panes in {:?} (decode={decode_time:?}, group/merge={group_time:?}, output_write={write_time:?})",
+                            sort_started.elapsed(),
+                        );
+                        next_progress = (decoded_rows / 1_000_000 + 1) * 1_000_000;
+                    }
                 }
-            }
-            if let Some(key_group) = decoder.finish() {
-                fired += process_key_groups_batch(
-                    vec![key_group],
-                    needs_merge,
-                    ctx.window_merger.as_deref(),
-                    &input_pcollection_id,
-                    &spec,
-                    ctx.input_watermark,
-                    ctx.processing_time,
-                    &self.state,
-                    &mut output,
-                )
-                .await?;
-            }
-            Ok(())
+                if let Some(key_group) = decoder.finish() {
+                    fired += process_key_groups_batch(
+                        vec![key_group],
+                        needs_merge,
+                        ctx.window_merger.as_deref(),
+                        &input_pcollection_id,
+                        &spec,
+                        ctx.input_watermark,
+                        ctx.processing_time,
+                        &self.state,
+                        &mut output,
+                    )
+                    .await?;
+                }
+                Ok(())
             }
             .await;
             if let Err(error) = sort_result {
                 let actual_spill_bytes = directory_size_bytes(sorted_input._temp_dir.path());
                 let configured_spill_limit = GbkSortConfig::from_env().spill_limit_bytes;
                 warn!(
-                    "GroupByKey: external sort failed (configured_spill_limit={configured_spill_limit} \
-                     bytes, actual_spill_bytes={actual_spill_bytes}): {error:#}"
+                    "GroupByKey: external sort failed for bucket {bucket} \
+                     (configured_spill_limit={configured_spill_limit} bytes, \
+                     actual_spill_bytes={actual_spill_bytes}): {error:#}"
                 );
                 return Err(anyhow!(
-                    "GroupByKey external sort failed (configured_spill_limit={configured_spill_limit} \
-                     bytes, actual_spill_bytes={actual_spill_bytes}): {error:#}"
+                    "GroupByKey external sort failed for bucket {bucket} \
+                     (configured_spill_limit={configured_spill_limit} bytes, \
+                     actual_spill_bytes={actual_spill_bytes}): {error:#}"
                 ));
             }
         }
@@ -746,19 +749,21 @@ impl PartitionStream for OneShotPaimonPartition {
     }
 }
 
-/// Open a lazy Paimon incremental read and feed it directly into DataFusion.
+/// Open lazy Paimon incremental reads grouped by bucket and feed each bucket
+/// directly into its own DataFusion sort.
 ///
 /// The sort key is a deterministic binary encoding of the Beam key followed by
 /// the canonical window key. `value` is carried through the sort but never
 /// participates in comparison, because Beam does not define an order for a
-/// GroupByKey iterable.
-async fn open_sorted_input_stream(
+/// GroupByKey iterable. Bucketing by the original Beam key guarantees that a
+/// key's windows are not split across these sorts.
+async fn open_sorted_input_streams(
     store: &Arc<FlareElementStore>,
     pcollection_id: &str,
     cursor: Option<i64>,
     window_prune_before: Option<i64>,
     config: &GbkSortConfig,
-) -> Result<(Option<SortedInputStream>, Option<i64>)> {
+) -> Result<(Vec<(i32, SortedInputStream)>, Option<i64>)> {
     let projection = [
         KEY_COLUMN,
         VALUE_COLUMN,
@@ -767,26 +772,17 @@ async fn open_sorted_input_stream(
         WINDOW_EXTRA_KEYS_COLUMN,
         WINDOW_COUNT_COLUMN,
     ];
-    let (stream, latest) = match window_prune_before {
-        Some(cutoff) => {
-            store
-                .open_incremental_arrow_pruned_before(
-                    pcollection_id,
-                    cursor,
-                    Some(&projection),
-                    cutoff,
-                )
-                .await?
-        }
-        None => {
-            store
-                .open_incremental_arrow_projected(pcollection_id, cursor, Some(&projection))
-                .await?
-        }
-    };
-    let Some(stream) = stream else {
-        return Ok((None, latest));
-    };
+    let (streams, latest) = store
+        .open_incremental_arrow_by_bucket(
+            pcollection_id,
+            cursor,
+            Some(&projection),
+            window_prune_before,
+        )
+        .await?;
+    if streams.is_empty() {
+        return Ok((Vec::new(), latest));
+    }
 
     let table_schema = store.registry.get(pcollection_id).ok_or_else(|| {
         anyhow!("GroupByKey input PCollection {pcollection_id} has no registered schema")
@@ -795,56 +791,61 @@ async fn open_sorted_input_stream(
     let schema = gbk_flattened_schema(&input_schema);
     let spill_parent = Path::new(store.catalog.warehouse()).join(".gbk-spill");
     std::fs::create_dir_all(&spill_parent)?;
-    let temp_dir = tempfile::Builder::new()
-        .prefix("group-by-key-")
-        .tempdir_in(&spill_parent)?;
-    info!(
-        "GroupByKey: starting external sort for {pcollection_id} (memory={} bytes, spill_limit={} bytes, spill_reservation={} bytes)",
-        config.memory_limit_bytes, config.spill_limit_bytes, config.spill_reservation_bytes
-    );
+    let mut sorted_streams = Vec::with_capacity(streams.len());
+    for (bucket, stream) in streams {
+        let temp_dir = tempfile::Builder::new()
+            .prefix(&format!("group-by-key-bucket-{bucket}-"))
+            .tempdir_in(&spill_parent)?;
+        info!(
+            "GroupByKey: starting external sort for {pcollection_id} bucket {bucket} \
+             (memory={} bytes, spill_limit={} bytes, spill_reservation={} bytes)",
+            config.memory_limit_bytes, config.spill_limit_bytes, config.spill_reservation_bytes
+        );
 
-    let runtime = Arc::new(
-        RuntimeEnvBuilder::new()
-            .with_memory_pool(Arc::new(FairSpillPool::new(config.memory_limit_bytes)))
-            .with_temp_file_path(temp_dir.path())
-            .with_max_temp_directory_size(config.spill_limit_bytes)
-            .build()?,
-    );
-    let session = SessionContext::new_with_config_rt(
-        SessionConfig::new()
-            .with_target_partitions(1)
-            .with_sort_spill_reservation_bytes(config.spill_reservation_bytes),
-        runtime,
-    );
-    let partition: Arc<dyn PartitionStream> = Arc::new(OneShotPaimonPartition {
-        schema: Arc::clone(&schema),
-        stream: Mutex::new(Some(stream)),
-        rows_seen: Arc::new(AtomicU64::new(0)),
-        started: Instant::now(),
-    });
-    session.register_table(
-        "gbk_input",
-        Arc::new(StreamingTable::try_new(
-            Arc::clone(&schema),
-            vec![partition],
-        )?),
-    )?;
+        let runtime = Arc::new(
+            RuntimeEnvBuilder::new()
+                .with_memory_pool(Arc::new(FairSpillPool::new(config.memory_limit_bytes)))
+                .with_temp_file_path(temp_dir.path())
+                .with_max_temp_directory_size(config.spill_limit_bytes)
+                .build()?,
+        );
+        let session = SessionContext::new_with_config_rt(
+            SessionConfig::new()
+                .with_target_partitions(1)
+                .with_sort_spill_reservation_bytes(config.spill_reservation_bytes),
+            runtime,
+        );
+        let partition: Arc<dyn PartitionStream> = Arc::new(OneShotPaimonPartition {
+            schema: Arc::clone(&schema),
+            stream: Mutex::new(Some(stream)),
+            rows_seen: Arc::new(AtomicU64::new(0)),
+            started: Instant::now(),
+        });
+        session.register_table(
+            "gbk_input",
+            Arc::new(StreamingTable::try_new(
+                Arc::clone(&schema),
+                vec![partition],
+            )?),
+        )?;
 
-    let df = session.table("gbk_input").await?;
-    let df = df.sort(vec![
-        col(GROUP_KEY_COLUMN).sort(true, false),
-        col(WINDOW_KEY_COLUMN).sort(true, false),
-    ])?;
-    let stream = df.execute_stream().await?;
+        let df = session.table("gbk_input").await?;
+        let df = df.sort(vec![
+            col(GROUP_KEY_COLUMN).sort(true, false),
+            col(WINDOW_KEY_COLUMN).sort(true, false),
+        ])?;
+        let stream = df.execute_stream().await?;
+        sorted_streams.push((
+            bucket,
+            SortedInputStream {
+                stream,
+                table_schema: table_schema.clone(),
+                _temp_dir: temp_dir,
+            },
+        ));
+    }
 
-    Ok((
-        Some(SortedInputStream {
-            stream,
-            table_schema,
-            _temp_dir: temp_dir,
-        }),
-        latest,
-    ))
+    Ok((sorted_streams, latest))
 }
 
 fn directory_size_bytes(path: &Path) -> u64 {
@@ -1748,6 +1749,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn group_by_key_preserves_groups_across_multiple_buckets() {
+        let (_dir, store) = make_store().await;
+        let input = "gbk-in-many-buckets";
+        let output = "gbk-out-many-buckets";
+        let values = (0..64)
+            .flat_map(|index| {
+                let key = format!("key-{index:02}");
+                [
+                    kv_windowed(&key, index * 2, vec![BeamWindow::Global], 0),
+                    kv_windowed(&key, index * 2 + 1, vec![BeamWindow::Global], 0),
+                ]
+            })
+            .collect();
+        store
+            .write_windowed_value_batch(input, values)
+            .await
+            .unwrap();
+
+        let (streams, _) = store
+            .open_incremental_arrow_by_bucket(input, None, Some(&[crate::store::KEY_COLUMN]), None)
+            .await
+            .unwrap();
+        assert!(
+            streams.len() > 1,
+            "fixture must exercise multiple Paimon buckets"
+        );
+        drop(streams);
+
+        run_gbk(&store, input, output).await;
+
+        let groups = scan_output(&store, output).await;
+        assert_eq!(groups.len(), 64);
+        for value in groups {
+            let BeamRecord::KV(kv) = value.value else {
+                panic!("expected KV output");
+            };
+            let PrimitiveValue::String(key) = kv.key else {
+                panic!("expected string key");
+            };
+            let index = key.strip_prefix("key-").unwrap().parse::<i64>().unwrap();
+            let BeamRecord::ITERABLE(values) = *kv.value else {
+                panic!("expected iterable output");
+            };
+            let mut values: Vec<i64> = values
+                .list
+                .into_iter()
+                .map(|record| match record {
+                    BeamRecord::PRIMITIVE(PrimitiveValue::Int64(value)) => value,
+                    other => panic!("expected int64 value, got {other:?}"),
+                })
+                .collect();
+            values.sort_unstable();
+            assert_eq!(values, vec![index * 2, index * 2 + 1]);
+        }
+    }
+
+    #[tokio::test]
     async fn global_window_keeps_rows_appended_after_a_max_watermark_run() {
         let (_dir, store) = make_store().await;
         let input = "gbk-in-global-rerun";
@@ -2271,10 +2329,11 @@ mod tests {
             spill_limit_bytes: 128 * 1024 * 1024,
             spill_reservation_bytes: 256 * 1024,
         };
-        let (mut sorted, latest) = open_sorted_input_stream(&store, input, None, None, &config)
+        let (mut sorted, latest) = open_sorted_input_streams(&store, input, None, None, &config)
             .await
             .unwrap();
-        let sorted = sorted.as_mut().expect("spill input should open");
+        assert_eq!(sorted.len(), 1, "one hot key belongs to one bucket");
+        let sorted = &mut sorted[0].1;
         let mut observed = 0usize;
         while let Some(batch) = sorted.stream.next().await {
             let batch = batch.unwrap();
