@@ -43,7 +43,7 @@ async fn flare_up() -> Result<(), Box<dyn std::error::Error>> {
 
     let pool_config = PoolConfig::detect();
     log::info!(
-        "worker pool: workers={}, bundles_per_worker={}, total_bundle_slots={}, \
+        "worker pool: max_workers={}, worker_parallelism={}, total_bundle_slots={}, \
          sdf_queue_max_items={}, sdf_queue_max_bytes={}, sdf_max_split_depth={}",
         pool_config.worker_count,
         pool_config.bundles_per_worker,

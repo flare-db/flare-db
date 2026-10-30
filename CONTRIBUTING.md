@@ -73,6 +73,23 @@ python3 example/python/wordcount.py
 
 `flareup-dev.sh` is a developer launcher, not the normal user workflow. It requires Java and `wget`, may download the Beam worker JAR, and runs until interrupted. Stop it with `Ctrl-C`. Use the CLI for all other local-instance workflows, including CLI or SQL development that does not require the freshly built `flaredb` binary.
 
+### SDK worker pool configuration
+
+The Rust server creates a fixed SDK worker pool for each job. The default limits are:
+
+- `flare_max_workers=2` — maximum number of local SDK harness processes.
+- `flare_worker_parallelism=8` — concurrent bundle slots per worker process.
+
+The total execution-slot count is `flare_max_workers * flare_worker_parallelism`, so the default is 16 slots. Set the variables on the server process before launching it:
+
+```sh
+flare_max_workers=2 flare_worker_parallelism=8 ./flareup-dev.sh --debug
+```
+
+Uppercase variants (`FLARE_MAX_WORKERS` and `FLARE_WORKER_PARALLELISM`) are also accepted. The previous `FLAREDB_WORKER_COUNT` and `FLAREDB_BUNDLES_PER_WORKER` names remain compatibility aliases. Configuration precedence is lowercase, uppercase, then the legacy name. Values must be positive integers; invalid values are ignored with a warning.
+
+The worker pool is captured when the server starts, so restart the server after changing these variables. Execution begins as soon as the first worker's control stream connects; workers that connect later become available as additional capacity.
+
 ## Build systems
 
 FlareDB uses separate build systems for its Rust engine, Java SDK/I/O modules, and Python runner.

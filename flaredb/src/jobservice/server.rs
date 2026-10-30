@@ -104,8 +104,8 @@ impl FlareJobService {
         self.worker_manager.config().python_bin.clone()
     }
 
-    /// Wait for a connected harness pipeline, failing as soon as one of the Fn
-    /// transport streams reports an unexpected disconnect or decode error.
+    /// Wait for the first connected harness, then execute the prepared graph.
+    /// Active-worker transport failures fail the complete job.
     async fn execute_spawned_job(
         &self,
         job_id: &str,
@@ -121,19 +121,19 @@ impl FlareJobService {
         let connect_timeout_secs = self.worker_manager.config().connect_timeout_secs;
         timeout(Duration::from_secs(connect_timeout_secs), async {
             let dispatcher = self.dispatcher.lock().await;
-            dispatcher.wait_connected().await
+            dispatcher.wait_first_connected().await
         })
         .await
         .map_err(|_| {
             anyhow::anyhow!(
-                "harness did not connect within {}s for job {}",
+                "no harness connected within {}s for job {}",
                 connect_timeout_secs,
                 job_id
             )
         })?
         .map_err(|e| {
             anyhow::anyhow!(
-                "failed waiting for harness connection for job {}: {}",
+                "failed waiting for the first harness connection for job {}: {}",
                 job_id,
                 e
             )

@@ -13,7 +13,7 @@ use beam_model_rs::v1::{
     beam_fn_logging_server::BeamFnLoggingServer, beam_fn_state_server::BeamFnStateServer,
 };
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
@@ -38,15 +38,18 @@ impl WorkerLoads {
         }
     }
 
-    fn try_acquire(self: &Arc<Self>) -> Option<WorkerLease> {
+    fn try_acquire(self: &Arc<Self>, eligible: &[bool]) -> Option<WorkerLease> {
         let worker_count = self.loads.len();
-        if worker_count == 0 {
+        if worker_count == 0 || eligible.len() != worker_count {
             return None;
         }
         let start = self.cursor.fetch_add(1, Ordering::AcqRel) % worker_count;
         let mut best: Option<(usize, usize)> = None;
         for offset in 0..worker_count {
             let index = (start + offset) % worker_count;
+            if !eligible[index] {
+                continue;
+            }
             let load = self.loads[index].load(Ordering::Acquire);
             if load >= self.per_worker_limit {
                 continue;
@@ -68,7 +71,7 @@ impl WorkerLoads {
         } else {
             // A concurrent completion/start changed this slot. Retry once through
             // the same fair scan using the updated values.
-            self.try_acquire()
+            self.try_acquire(eligible)
         }
     }
 }
@@ -97,6 +100,7 @@ pub struct WorkerConnection {
     endpoint: String,
     channels: Channels,
     server_task: JoinHandle<()>,
+    connected_task: JoinHandle<()>,
     registered_stages: Arc<Mutex<HashSet<String>>>,
 }
 
@@ -137,6 +141,7 @@ impl WorkerConnection {
 impl Drop for WorkerConnection {
     fn drop(&mut self) {
         self.server_task.abort();
+        self.connected_task.abort();
     }
 }
 
@@ -145,16 +150,34 @@ pub struct HarnessPool {
     config: PoolConfig,
     workers: Vec<WorkerConnection>,
     loads: Arc<WorkerLoads>,
+    _readiness_tx: watch::Sender<u64>,
+    readiness_rx: watch::Receiver<u64>,
 }
 
 impl HarnessPool {
     pub async fn build(config: PoolConfig, max_message_size: usize) -> Result<Self> {
         let mut workers = Vec::with_capacity(config.worker_count);
+        let (readiness_tx, readiness_rx) = watch::channel(0u64);
         for index in 0..config.worker_count {
             let (channels, services) = Channels::builder()
                 .build()
                 .await
                 .with_context(|| format!("starting Fn channels for worker {index}"))?;
+            let mut connected = channels.control().connected_watch();
+            let worker_readiness_tx = readiness_tx.clone();
+            let connected_task = tokio::spawn(async move {
+                loop {
+                    if connected.changed().await.is_err() {
+                        return;
+                    }
+                    if *connected.borrow_and_update() {
+                        log::info!("SDK worker control stream ready: worker_id={index}");
+                        worker_readiness_tx.send_modify(|generation| {
+                            *generation = generation.wrapping_add(1);
+                        });
+                    }
+                }
+            });
             let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
                 .await
                 .with_context(|| format!("binding Fn endpoint for worker {index}"))?;
@@ -196,6 +219,7 @@ impl HarnessPool {
                 endpoint: address.to_string(),
                 channels,
                 server_task,
+                connected_task,
                 registered_stages: Arc::new(Mutex::new(HashSet::new())),
             });
         }
@@ -207,6 +231,8 @@ impl HarnessPool {
                 config.worker_count,
                 config.bundles_per_worker,
             )),
+            _readiness_tx: readiness_tx,
+            readiness_rx,
         })
     }
 
@@ -215,7 +241,51 @@ impl HarnessPool {
     }
 
     pub fn try_lease(&self) -> Option<WorkerLease> {
-        self.loads.try_acquire()
+        let eligible = self
+            .workers
+            .iter()
+            .map(|worker| worker.control().is_connected())
+            .collect::<Vec<_>>();
+        self.loads.try_acquire(&eligible)
+    }
+
+    /// Reserve every currently available bundle slot on connected workers.
+    pub fn try_lease_all_ready(&self) -> Vec<WorkerLease> {
+        std::iter::from_fn(|| self.try_lease()).collect()
+    }
+
+    /// Return a generation that advances whenever another worker connects.
+    pub fn connection_generation(&self) -> u64 {
+        *self.readiness_rx.borrow()
+    }
+
+    /// Wait until at least one configured worker has a connected control stream.
+    pub async fn wait_first_connected(&self) -> Result<()> {
+        if self.workers.is_empty() {
+            return Err(anyhow::anyhow!("worker pool has no configured workers"));
+        }
+        let futures = self
+            .workers
+            .iter()
+            .map(|worker| Box::pin(worker.channels().wait_connected()));
+        let (connected, index, _) = futures::future::select_all(futures).await;
+        connected?;
+        log::info!("first SDK worker connected: worker_id={index}");
+        Ok(())
+    }
+
+    /// Wait for a connection transition after `generation`.
+    pub async fn wait_for_connection_after(&self, generation: u64) -> Result<()> {
+        let mut readiness = self.readiness_rx.clone();
+        loop {
+            if *readiness.borrow_and_update() > generation {
+                return Ok(());
+            }
+            readiness
+                .changed()
+                .await
+                .map_err(|_| anyhow::anyhow!("worker readiness channel closed"))?;
+        }
     }
 
     pub fn worker(&self, lease: &WorkerLease) -> &WorkerConnection {
@@ -243,12 +313,40 @@ mod tests {
 
     #[tokio::test]
     async fn pool_uses_distinct_endpoints_and_per_worker_leases() {
-        let config = PoolConfig::for_logical_cpus(4);
+        let config = PoolConfig::for_concurrency(2, 1);
         let pool = HarnessPool::build(config, 1024 * 1024)
             .await
             .expect("build harness pool");
         assert_eq!(pool.workers().len(), 2);
         assert_ne!(pool.workers()[0].endpoint(), pool.workers()[1].endpoint());
+
+        let mut clients = Vec::new();
+        let mut streams = Vec::new();
+        let mut response_senders = Vec::new();
+        for worker in pool.workers() {
+            let mut client = BeamFnControlClient::connect(format!("http://{}", worker.endpoint()))
+                .await
+                .expect("connect control client");
+            let (response_tx, response_rx) = mpsc::channel::<InstructionResponse>(1);
+            let responses = client
+                .control(ReceiverStream::new(response_rx))
+                .await
+                .expect("open control stream")
+                .into_inner();
+            clients.push(client);
+            streams.push(responses);
+            response_senders.push(response_tx);
+        }
+        pool.worker_by_index(0)
+            .channels()
+            .wait_connected()
+            .await
+            .expect("worker zero connects");
+        pool.worker_by_index(1)
+            .channels()
+            .wait_connected()
+            .await
+            .expect("worker one connects");
 
         let first = pool.try_lease().expect("first worker lease");
         let second = pool.try_lease().expect("second worker lease");
@@ -269,8 +367,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn leases_and_connection_generation_follow_worker_readiness() {
+        let config = PoolConfig::for_concurrency(2, 1);
+        let pool = HarnessPool::build(config, 1024 * 1024)
+            .await
+            .expect("build harness pool");
+        assert!(
+            pool.try_lease().is_none(),
+            "unconnected workers are not leasable"
+        );
+
+        let generation = pool.connection_generation();
+        let waiter = tokio::spawn({
+            let pool_readiness = pool.readiness_rx.clone();
+            async move {
+                let mut readiness = pool_readiness;
+                loop {
+                    if *readiness.borrow_and_update() > generation {
+                        return;
+                    }
+                    readiness
+                        .changed()
+                        .await
+                        .expect("readiness channel remains open");
+                }
+            }
+        });
+
+        let mut first_client =
+            BeamFnControlClient::connect(format!("http://{}", pool.workers()[0].endpoint()))
+                .await
+                .expect("connect first control client");
+        let (first_response_tx, first_response_rx) = mpsc::channel::<InstructionResponse>(1);
+        let _first_responses = first_client
+            .control(ReceiverStream::new(first_response_rx))
+            .await
+            .expect("open first control stream")
+            .into_inner();
+        pool.workers()[0]
+            .channels()
+            .wait_connected()
+            .await
+            .expect("first worker connects");
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("connection generation waiter should wake")
+            .expect("connection generation task should not panic");
+
+        let first = pool.try_lease().expect("first ready worker lease");
+        assert_eq!(first.worker_index(), 0);
+        assert!(
+            pool.try_lease().is_none(),
+            "second worker is still unavailable"
+        );
+
+        let mut second_client =
+            BeamFnControlClient::connect(format!("http://{}", pool.workers()[1].endpoint()))
+                .await
+                .expect("connect second control client");
+        let (second_response_tx, second_response_rx) = mpsc::channel::<InstructionResponse>(1);
+        let _second_responses = second_client
+            .control(ReceiverStream::new(second_response_rx))
+            .await
+            .expect("open second control stream")
+            .into_inner();
+        pool.workers()[1]
+            .channels()
+            .wait_connected()
+            .await
+            .expect("second worker connects");
+
+        let second = pool.try_lease().expect("late worker becomes leasable");
+        assert_eq!(second.worker_index(), 1);
+        drop((first_response_tx, second_response_tx));
+    }
+
+    #[tokio::test]
     async fn control_instructions_do_not_cross_worker_endpoints() {
-        let config = PoolConfig::for_logical_cpus(4);
+        let config = PoolConfig::for_concurrency(2, 1);
         let pool = HarnessPool::build(config, 1024 * 1024)
             .await
             .expect("build harness pool");

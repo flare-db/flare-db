@@ -30,6 +30,12 @@ The RUST_LOG environment variable is honoured when --log-level is not given.
 Environment:
   FLAREDB_BASE_DIR  Base directory (default: ~/.flaredb). Use an isolated
                     directory for test runs to avoid Paimon table collisions.
+  flare_max_workers
+                    Override the maximum number of SDK worker processes.
+  flare_worker_parallelism
+                    Override concurrent bundle slots per SDK worker process.
+                    Uppercase variants and the previous FLAREDB_* names are also
+                    accepted.
 EOF
 }
 

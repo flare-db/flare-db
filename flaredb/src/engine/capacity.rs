@@ -9,12 +9,15 @@ const MIB: u64 = 1024 * 1024;
 const MIN_QUEUE_BYTES: u64 = 64 * MIB;
 const MAX_QUEUE_BYTES: u64 = 512 * MIB;
 const QUEUE_BYTES_PER_SLOT: u64 = 8 * MIB;
+const DEFAULT_MAX_WORKERS: usize = 2;
+const DEFAULT_WORKER_PARALLELISM: usize = 8;
 
 /// Fixed execution limits for one job.
 ///
-/// FlareDB derives the worker pool from the logical CPUs visible to the
-/// process. These values are deliberately not configurable while the scheduling
-/// policy is being established.
+/// FlareDB keeps the number of JVMs bounded and uses per-worker bundle
+/// concurrency to fill the CPU budget. `flare_max_workers` and
+/// `flare_worker_parallelism` can override the defaults; uppercase variants and
+/// the previous `FLAREDB_*` names are accepted as compatibility aliases.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PoolConfig {
     pub worker_count: usize,
@@ -26,10 +29,13 @@ pub struct PoolConfig {
 }
 
 impl PoolConfig {
-    pub fn for_logical_cpus(logical_cpus: usize) -> Self {
-        let logical_cpus = logical_cpus.max(1);
-        let worker_count = (logical_cpus / 2).max(1);
-        let bundles_per_worker = (worker_count / 2).max(1);
+    pub fn for_logical_cpus(_logical_cpus: usize) -> Self {
+        Self::for_concurrency(DEFAULT_MAX_WORKERS, DEFAULT_WORKER_PARALLELISM)
+    }
+
+    pub fn for_concurrency(worker_count: usize, bundles_per_worker: usize) -> Self {
+        let worker_count = worker_count.max(1);
+        let bundles_per_worker = bundles_per_worker.max(1);
         let total_bundle_slots = worker_count * bundles_per_worker;
         let sdf_queue_max_items = (2 * total_bundle_slots).max(2);
         let sdf_queue_max_bytes = QUEUE_BYTES_PER_SLOT
@@ -47,11 +53,35 @@ impl PoolConfig {
     }
 
     pub fn detect() -> Self {
-        let logical_cpus = std::thread::available_parallelism()
-            .map(|parallelism| parallelism.get())
-            .unwrap_or(1);
-        Self::for_logical_cpus(logical_cpus)
+        let max_workers = positive_env_usize_from(&[
+            "flare_max_workers",
+            "FLARE_MAX_WORKERS",
+            "FLAREDB_WORKER_COUNT",
+        ])
+        .unwrap_or(DEFAULT_MAX_WORKERS);
+        let worker_parallelism = positive_env_usize_from(&[
+            "flare_worker_parallelism",
+            "FLARE_WORKER_PARALLELISM",
+            "FLAREDB_BUNDLES_PER_WORKER",
+        ])
+        .unwrap_or(DEFAULT_WORKER_PARALLELISM);
+        Self::for_concurrency(max_workers, worker_parallelism)
     }
+}
+
+fn positive_env_usize_from(names: &[&str]) -> Option<usize> {
+    for name in names {
+        let Ok(value) = std::env::var(name) else {
+            continue;
+        };
+        match value.parse::<usize>() {
+            Ok(parsed) if parsed > 0 => return Some(parsed),
+            _ => {
+                log::warn!("ignoring invalid {name}={value:?}; expected a positive integer");
+            }
+        }
+    }
+    None
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -264,36 +294,52 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fixed_pool_configuration_matches_the_approved_formula() {
+    fn default_pool_configuration_bounds_process_and_bundle_concurrency() {
         let one = PoolConfig::for_logical_cpus(1);
-        assert_eq!((one.worker_count, one.bundles_per_worker), (1, 1));
-        assert_eq!(one.total_bundle_slots, 1);
+        assert_eq!((one.worker_count, one.bundles_per_worker), (2, 8));
+        assert_eq!(one.total_bundle_slots, 16);
 
         let four = PoolConfig::for_logical_cpus(4);
-        assert_eq!((four.worker_count, four.bundles_per_worker), (2, 1));
-        assert_eq!(four.total_bundle_slots, 2);
+        assert_eq!((four.worker_count, four.bundles_per_worker), (2, 8));
+        assert_eq!(four.total_bundle_slots, 16);
 
         let eight = PoolConfig::for_logical_cpus(8);
-        assert_eq!((eight.worker_count, eight.bundles_per_worker), (4, 2));
-        assert_eq!(eight.total_bundle_slots, 8);
-        assert_eq!(eight.sdf_queue_max_items, 16);
-        assert_eq!(eight.sdf_queue_max_bytes, 64 * MIB);
+        assert_eq!((eight.worker_count, eight.bundles_per_worker), (2, 8));
+        assert_eq!(eight.total_bundle_slots, 16);
+        assert_eq!(eight.sdf_queue_max_items, 32);
+        assert_eq!(eight.sdf_queue_max_bytes, 128 * MIB);
         assert_eq!(eight.sdf_max_split_depth, 16);
 
+        let sixteen = PoolConfig::for_logical_cpus(16);
+        assert_eq!((sixteen.worker_count, sixteen.bundles_per_worker), (2, 8));
+        assert_eq!(sixteen.total_bundle_slots, 16);
+
         let large = PoolConfig::for_logical_cpus(64);
-        assert_eq!(large.total_bundle_slots, 512);
-        assert_eq!(large.sdf_queue_max_bytes, MAX_QUEUE_BYTES);
+        assert_eq!((large.worker_count, large.bundles_per_worker), (2, 8));
+        assert_eq!(large.total_bundle_slots, 16);
+        assert_eq!(large.sdf_queue_max_bytes, 128 * MIB);
+    }
+
+    #[test]
+    fn explicit_concurrency_recomputes_all_derived_limits() {
+        let config = PoolConfig::for_concurrency(2, 3);
+        assert_eq!(config.worker_count, 2);
+        assert_eq!(config.bundles_per_worker, 3);
+        assert_eq!(config.total_bundle_slots, 6);
+        assert_eq!(config.sdf_queue_max_items, 12);
+        assert_eq!(config.sdf_queue_max_bytes, MIN_QUEUE_BYTES);
     }
 
     #[test]
     fn bundle_and_split_admission_share_one_budget() {
-        let capacity = Arc::new(ExecutionCapacity::new(PoolConfig::for_logical_cpus(8)));
-        for _ in 0..8 {
+        let config = PoolConfig::for_logical_cpus(8);
+        let capacity = Arc::new(ExecutionCapacity::new(config));
+        for _ in 0..config.total_bundle_slots {
             assert!(capacity.try_acquire_bundle());
         }
         assert!(!capacity.try_acquire_bundle());
         assert!(!capacity.has_split_capacity());
-        for _ in 0..8 {
+        for _ in 0..config.total_bundle_slots {
             capacity.finish_bundle();
         }
         assert!(capacity.try_reserve_split().is_some());
@@ -322,7 +368,8 @@ mod tests {
         assert!(capacity.try_acquire_bundle());
 
         let mut reservations = Vec::new();
-        for _ in 0..config.sdf_queue_max_items {
+        let expected_reservations = (config.total_bundle_slots - 1).min(config.sdf_queue_max_items);
+        for _ in 0..expected_reservations {
             reservations.push(capacity.try_reserve_split().expect("split reservation"));
         }
         assert!(
@@ -337,7 +384,7 @@ mod tests {
 
     #[tokio::test]
     async fn releasing_a_split_ticket_wakes_the_capacity_waiter() {
-        let config = PoolConfig::for_logical_cpus(1);
+        let config = PoolConfig::for_concurrency(1, 1);
         let capacity = Arc::new(ExecutionCapacity::new(config));
         assert!(capacity.try_acquire_bundle());
         let waiter_capacity = capacity.clone();

@@ -14,7 +14,7 @@ use beam_model_rs::v1::{
 };
 use dashmap::DashMap;
 use log::{debug, info, warn};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Response, Status};
 
@@ -33,6 +33,10 @@ pub struct ControlInner {
 
     // Incoming gRPC stream from the worker (InstructionResponses).
     pub incoming: Mutex<Option<tonic::Streaming<InstructionResponse>>>,
+
+    // Readiness of the current worker control stream. This is set only after
+    // the incoming stream and outgoing instruction stream are both installed.
+    connected_tx: watch::Sender<bool>,
 
     // ProcessBundleDescriptors registered with the worker.
     pub descriptors: Mutex<HashMap<String, ProcessBundleDescriptor>>,
@@ -61,11 +65,13 @@ pub async fn start_control_server(
     status: HarnessStatus,
 ) -> Result<(ControlChannel, FlareControlService)> {
     let (tx, rx) = mpsc::channel::<Result<InstructionRequest, Status>>(32);
+    let (connected_tx, _) = watch::channel(false);
 
     let stream = Arc::new(ControlInner {
         outgoing_tx: Mutex::new(Some(tx)),
         outgoing_rx: Mutex::new(Some(rx)),
         incoming: Mutex::new(None),
+        connected_tx,
         descriptors: Mutex::new(HashMap::new()),
         pending: DashMap::new(),
         metrics: StdMutex::new(None),
@@ -149,6 +155,7 @@ impl BeamFnControl for FlareControlService {
                     .expect("control outgoing receiver must be initialized")
             };
 
+            self.inner.connected_tx.send_replace(true);
             Ok(Response::new(ReceiverStream::new(rx)))
         })
     }
@@ -218,15 +225,31 @@ pub struct ControlChannel {
 }
 
 impl ControlChannel {
-    // wait for worker to connect
-    // poll until control() fires and stores the incoming stream
+    /// Subscribe to control-stream readiness transitions.
+    pub fn connected_watch(&self) -> watch::Receiver<bool> {
+        self.stream.connected_tx.subscribe()
+    }
+
+    /// Return whether a control stream is currently installed.
+    pub fn is_connected(&self) -> bool {
+        *self.stream.connected_tx.borrow()
+    }
+
     /// Wait for the worker to connect its control stream.
     pub async fn wait_connected(&self) -> Result<()> {
+        let mut connected = self.connected_watch();
+        if *connected.borrow_and_update() {
+            return Ok(());
+        }
+
         loop {
-            if self.stream.incoming.lock().await.is_some() {
+            connected
+                .changed()
+                .await
+                .map_err(|_| anyhow!("control readiness channel closed"))?;
+            if *connected.borrow_and_update() {
                 return Ok(());
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 
@@ -247,6 +270,7 @@ impl ControlChannel {
         *self.stream.outgoing_tx.lock().await = Some(tx);
         *self.stream.outgoing_rx.lock().await = Some(rx);
         *self.stream.incoming.lock().await = None;
+        self.stream.connected_tx.send_replace(false);
         self.stream.descriptors.lock().await.clear();
         self.stream.pending.clear();
         *self
@@ -647,5 +671,24 @@ mod tests {
         deliver_bundle_response(&channel, "bundle-1", Some(counter_info())).await;
 
         assert!(metrics.snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn readiness_wakes_waiters_and_resets_between_jobs() {
+        let (channel, _service) = start_control_server(HarnessStatus::new()).await.unwrap();
+        assert!(!channel.is_connected());
+
+        let waiter = channel.clone();
+        let wait = tokio::spawn(async move { waiter.wait_connected().await });
+        channel.stream.connected_tx.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(1), wait)
+            .await
+            .expect("readiness waiter should wake")
+            .expect("readiness task should not panic")
+            .expect("worker should be ready");
+        assert!(channel.is_connected());
+
+        channel.reset().await;
+        assert!(!channel.is_connected());
     }
 }

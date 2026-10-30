@@ -182,12 +182,9 @@ impl ExecutorDispatcher {
         Ok(())
     }
 
-    /// Wait for the worker to connect its control stream.
-    pub async fn wait_connected(&self) -> anyhow::Result<()> {
-        for worker in self.workers.workers() {
-            worker.channels().wait_connected().await?;
-        }
-        Ok(())
+    /// Wait for the first worker to connect its control stream.
+    pub async fn wait_first_connected(&self) -> anyhow::Result<()> {
+        self.workers.wait_first_connected().await
     }
 
     /// Wait until any worker reports a fatal Fn transport failure.
@@ -324,11 +321,16 @@ impl ExecutorDispatcher {
             self.promote_due_event_time_timers(scheduler, &mut pending_timers)
                 .await?;
 
-            for (idx, node) in scheduler.next_nodes() {
-                let lease = self
-                    .workers
-                    .try_lease()
-                    .ok_or_else(|| anyhow!("worker pool exhausted while scheduling a bundle"))?;
+            // Reserve connected worker slots before asking the scheduler to mark
+            // nodes in flight. A stage that is ready while the remaining harnesses
+            // are still starting must not consume scheduler capacity that has no
+            // place to execute.
+            let worker_generation = self.workers.connection_generation();
+            let mut leases = self.workers.try_lease_all_ready();
+            let scheduled = scheduler.next_nodes_with_limit(leases.len());
+            leases.truncate(scheduled.len());
+
+            for ((idx, node), lease) in scheduled.into_iter().zip(leases) {
                 let runtime = self.new_bundle_runtime(&lease);
                 let input_metadata = scheduler.input_edge_metadata(idx);
                 let output_metadata = scheduler.output_edge_metadata_all(idx);
@@ -523,6 +525,11 @@ impl ExecutorDispatcher {
                         scheduler.watermarks().in_flight_bundles(&stage_id),
                         residual_holds.get(&stage_id)
                     );
+                    continue;
+                }
+                connection = self.workers.wait_for_connection_after(worker_generation) => {
+                    connection?;
+                    log::info!("additional SDK worker connected; adding execution capacity");
                     continue;
                 }
                 joined = in_flight.join_next() => joined

@@ -165,6 +165,21 @@ impl NodeScheduler {
     /// watermark gate (if any) is satisfied. Nodes returned by this method are
     /// marked in-flight.
     pub fn next_nodes(&mut self) -> Vec<(NodeIndex, ExecutableNode)> {
+        self.next_nodes_with_limit(usize::MAX)
+    }
+
+    /// Return at most `max_bundles` ready nodes.
+    ///
+    /// The dispatcher uses this bound to reserve one connected worker slot for
+    /// every node before the scheduler marks it in flight.
+    pub fn next_nodes_with_limit(
+        &mut self,
+        max_bundles: usize,
+    ) -> Vec<(NodeIndex, ExecutableNode)> {
+        if max_bundles == 0 {
+            return Vec::new();
+        }
+
         self.watermarks.refresh();
         let ready = self.watermarks.ready_stages();
 
@@ -225,6 +240,9 @@ impl NodeScheduler {
                     next.push((index, self.graph.get_executable_graph()[index].clone()));
                     self.round_robin_cursor = (ready_index + 1) % stage_count;
                     made_progress = true;
+                    if next.len() >= max_bundles {
+                        return next;
+                    }
                 } else {
                     self.capacity.finish_bundle();
                 }
@@ -726,11 +744,11 @@ mod tests {
         graph.add_node(source_node("C", "pc"));
 
         let executable_graph = graph_for_test(graph, dummy_metadata("root"));
-        let capacity = Arc::new(ExecutionCapacity::new(PoolConfig::for_logical_cpus(4)));
+        let capacity = Arc::new(ExecutionCapacity::new(PoolConfig::for_concurrency(1, 2)));
         let mut scheduler = NodeScheduler::new_with_capacity(executable_graph, capacity.clone());
 
         let first = scheduler.next_nodes();
-        assert_eq!(first.len(), 2, "the fixed 4-CPU default has two slots");
+        assert_eq!(first.len(), 2, "the test capacity has two slots");
         assert_eq!(capacity.snapshot().in_flight_bundles, 2);
         assert!(scheduler.next_nodes().is_empty());
 
@@ -1224,14 +1242,31 @@ mod tests {
             .enqueue_bundles(&stateful_id, 3)
             .unwrap();
 
+        assert!(
+            scheduler.next_nodes_with_limit(0).is_empty(),
+            "zero worker slots must not mark work in flight"
+        );
+        assert_eq!(scheduler.watermarks().in_flight_bundles(&stateful_id), 0);
+        assert_eq!(scheduler.watermarks().queued_bundles(&stateful_id), 3);
+
+        let first_batch = scheduler.next_nodes_with_limit(2);
+        assert_eq!(
+            first_batch.len(),
+            2,
+            "worker availability bounds scheduler admission"
+        );
+        assert!(first_batch.iter().all(|(idx, _)| *idx == stateful));
+        assert_eq!(scheduler.watermarks().in_flight_bundles(&stateful_id), 2);
+        assert_eq!(scheduler.watermarks().queued_bundles(&stateful_id), 1);
+
         let batch = scheduler.next_nodes();
-        assert_eq!(batch.len(), 3, "one entry per started bundle");
+        assert_eq!(batch.len(), 1);
         assert!(batch.iter().all(|(idx, _)| *idx == stateful));
         assert_eq!(scheduler.watermarks().in_flight_bundles(&stateful_id), 3);
         assert_eq!(scheduler.watermarks().queued_bundles(&stateful_id), 0);
 
         // Finishing them one at a time drains the stage; the last one completes it.
-        for (idx, _) in batch {
+        for (idx, _) in first_batch.into_iter().chain(batch) {
             scheduler.mark_complete(idx);
         }
         assert_eq!(scheduler.watermarks().in_flight_bundles(&stateful_id), 0);

@@ -13,9 +13,10 @@ blocks and hands the rest back as a residual, which the runner schedules on the
 least-loaded worker. FlareDB pauses new split requests while all execution slots
 are busy and resumes when capacity becomes available.
 
-The fixed pool uses half the available logical CPUs as the worker count and half
-the worker count as each worker's bundle limit, with both values floored to a
-minimum of one.
+The default pool uses two worker processes, each with eight concurrent bundle
+slots. This keeps the number of per-job JVMs bounded while retaining per-worker
+parallelism. Both dimensions can be overridden with
+`flare_max_workers` and `flare_worker_parallelism`.
 
 Each claimed block is logged, so a run shows the work divided across several
 bundles. After the pipeline finishes, the claimed blocks are read back and

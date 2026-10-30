@@ -99,11 +99,13 @@ There is no Tonbo implementation in the active code path. The current catalog cr
 ### Run and materialization
 
 5. `FlareJobService::run` detects Python process environments or defaults to Java,
-   then spawns a fixed worker pool through `WorkerManager`. Worker count is half
-   the available logical CPUs (minimum one); each worker runs half that many
-   bundles concurrently (minimum one). The job waits for every control stream,
-   prepares shared registries/state/metrics plus per-worker Fn channels, and
-   invokes `ExecutorDispatcher::run_pipeline`.
+   then spawns a fixed worker pool through `WorkerManager`. The default budget is
+   two worker processes with eight concurrent bundle slots per worker;
+   `flare_max_workers` and `flare_worker_parallelism` override those dimensions.
+   The job starts after the first control stream connects, prepares shared
+   registries/state/metrics plus per-worker Fn channels, and invokes
+   `ExecutorDispatcher::run_pipeline`. Workers that join later become available
+   as additional capacity without blocking initial work.
 6. `NodeScheduler` releases nodes only after every main predecessor completes and every side-input producer has committed at least one bundle. Side-input completion removes a first-run barrier but does not add main-input pending work or clamp the consumer's output watermark. `ExecutorDispatcher` runs ready nodes concurrently and marks them complete after success.
 
    Scheduling uses one fixed global execution budget shared by all bundles.
