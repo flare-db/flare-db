@@ -749,6 +749,10 @@ mod tests {
 
         let first = scheduler.next_nodes();
         assert_eq!(first.len(), 2, "the test capacity has two slots");
+        assert_ne!(
+            first[0].0, first[1].0,
+            "round-robin gives distinct ready stages a turn before repeating one"
+        );
         assert_eq!(capacity.snapshot().in_flight_bundles, 2);
         assert!(scheduler.next_nodes().is_empty());
 

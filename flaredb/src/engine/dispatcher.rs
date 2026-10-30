@@ -1,5 +1,7 @@
 use crate::engine::metrics::JobMetrics;
-use crate::engine::sdf::{SdfBundleOutcome, SdfWorkItem, SplittableStageExecutor};
+use crate::engine::sdf::{
+    SdfBundleOutcome, SdfSplitProposal, SdfWorkItem, SplittableStageExecutor,
+};
 use crate::engine::window::WindowMergeService;
 use crate::transforms::SourceProgress;
 use crate::{
@@ -299,6 +301,8 @@ impl ExecutorDispatcher {
         // running so the scheduler can fill the stage's remaining bundle slots.
         let (immediate_sdf_tx, mut immediate_sdf_rx) =
             mpsc::channel::<(String, SdfWorkItem)>(self.workers.config().sdf_queue_max_items);
+        let (split_proposals_tx, mut split_proposals_rx) =
+            mpsc::channel::<SdfSplitProposal>(self.workers.config().sdf_queue_max_items);
         // Drop any stale reports left by a previous job over the same dispatcher.
         while self.source_reports_rx.try_recv().is_ok() {}
 
@@ -362,6 +366,9 @@ impl ExecutorDispatcher {
                         };
                         if let Some(item) = &seed {
                             self.capacity.consume_sdf_item(item.seed.len());
+                            if let Some(enqueued_at) = item.enqueued_at() {
+                                self.capacity.record_residual_wait(enqueued_at.elapsed());
+                            }
                         }
                         log::info!(
                             "SDF stage '{stage_id}': starting bundle, initialized={initialized}, \
@@ -376,6 +383,7 @@ impl ExecutorDispatcher {
                 };
 
                 let immediate_sdf_tx = immediate_sdf_tx.clone();
+                let split_proposals_tx = split_proposals_tx.clone();
                 let scheduler_capacity = scheduler.capacity().clone();
                 in_flight.spawn(async move {
                     let _lease = lease;
@@ -390,6 +398,7 @@ impl ExecutorDispatcher {
                                 sdf_initialized,
                                 sdf_progress_tick,
                                 immediate_sdf_tx,
+                                split_proposals_tx,
                             )
                             .await
                         {
@@ -506,6 +515,12 @@ impl ExecutorDispatcher {
 
             let joined = tokio::select! {
                 biased;
+                joined = in_flight.join_next() => joined,
+                connection = self.workers.wait_for_connection_after(worker_generation) => {
+                    connection?;
+                    log::info!("additional SDK worker connected; adding execution capacity");
+                    continue;
+                }
                 Some((stage_id, item)) = immediate_sdf_rx.recv() => {
                     let count = enqueue_sdf_items(
                         scheduler,
@@ -527,12 +542,19 @@ impl ExecutorDispatcher {
                     );
                     continue;
                 }
-                connection = self.workers.wait_for_connection_after(worker_generation) => {
-                    connection?;
-                    log::info!("additional SDK worker connected; adding execution capacity");
+                Some(proposal) = split_proposals_rx.recv() => {
+                    let reservation = self.capacity.try_reserve_split();
+                    let no_capacity = reservation.is_none();
+                    let _ = proposal.grant.send(reservation);
+                    if no_capacity {
+                        log::debug!(
+                            "SDF split proposal deferred: no capacity after fair scheduling; \
+                             outstanding={:?}",
+                            self.capacity.snapshot()
+                        );
+                    }
                     continue;
                 }
-                joined = in_flight.join_next() => joined
             };
 
             if let Some(joined) = joined {

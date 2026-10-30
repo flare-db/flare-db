@@ -6,12 +6,13 @@ the initial restriction stays one big range: the only way the work can be
 divided is for the runner to ask the SDK to split a *running* bundle, which is
 what makes this a dynamic split.
 
-While a bundle runs, FlareDB polls its progress. When the bundle is making
-progress or has been quiet for five seconds, FlareDB asks the SDK to split it
-if the fixed worker pool has spare capacity. The SDK keeps part of the remaining
-blocks and hands the rest back as a residual, which the runner schedules on the
-least-loaded worker. FlareDB pauses new split requests while all execution slots
-are busy and resumes when capacity becomes available.
+While a bundle runs, FlareDB polls its progress with a jittered adaptive
+interval. It estimates the remaining runtime and the cost of starting a
+residual, then asks the SDK to split only when doing so should finish the tail
+sooner. Work that is already near completion is left alone. The SDK keeps part
+of the remaining blocks and hands the rest back as a residual, which the runner
+schedules on the least-loaded worker. FlareDB pauses polling while all execution
+slots are busy and resumes when capacity becomes available.
 
 The default pool uses two worker processes, each with eight concurrent bundle
 slots. This keeps the number of per-job JVMs bounded while retaining per-worker

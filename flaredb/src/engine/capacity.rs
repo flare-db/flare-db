@@ -1,7 +1,8 @@
 use std::sync::{
-    Arc,
+    Arc, Mutex, MutexGuard,
     atomic::{AtomicUsize, Ordering},
 };
+use std::time::Duration;
 
 use tokio::sync::Notify;
 
@@ -11,6 +12,7 @@ const MAX_QUEUE_BYTES: u64 = 512 * MIB;
 const QUEUE_BYTES_PER_SLOT: u64 = 8 * MIB;
 const DEFAULT_MAX_WORKERS: usize = 2;
 const DEFAULT_WORKER_PARALLELISM: usize = 8;
+const SPLIT_COST_EWMA_ALPHA: f64 = 0.25;
 
 /// Fixed execution limits for one job.
 ///
@@ -92,6 +94,12 @@ pub struct CapacitySnapshot {
     pub split_reservations: usize,
 }
 
+#[derive(Debug, Default)]
+struct SplitCostFeedback {
+    rpc_ewma: Option<Duration>,
+    residual_wait_ewma: Option<Duration>,
+}
+
 /// Shared accounting for bundles and deferred SDF work.
 ///
 /// `in_flight`, queued residuals, and split reservations all consume the same
@@ -104,6 +112,7 @@ pub struct ExecutionCapacity {
     queued_sdf_items: AtomicUsize,
     queued_sdf_bytes: AtomicUsize,
     split_reservations: AtomicUsize,
+    split_cost: Mutex<SplitCostFeedback>,
     changed: Notify,
 }
 
@@ -115,6 +124,7 @@ impl ExecutionCapacity {
             queued_sdf_items: AtomicUsize::new(0),
             queued_sdf_bytes: AtomicUsize::new(0),
             split_reservations: AtomicUsize::new(0),
+            split_cost: Mutex::new(SplitCostFeedback::default()),
             changed: Notify::new(),
         }
     }
@@ -129,6 +139,10 @@ impl ExecutionCapacity {
         self.queued_sdf_items.store(0, Ordering::Release);
         self.queued_sdf_bytes.store(0, Ordering::Release);
         self.split_reservations.store(0, Ordering::Release);
+        *self
+            .split_cost
+            .lock()
+            .expect("split cost feedback mutex poisoned") = SplitCostFeedback::default();
         self.changed.notify_waiters();
     }
 
@@ -245,6 +259,30 @@ impl ExecutionCapacity {
             && snapshot.queued_sdf_bytes < self.config.sdf_queue_max_bytes
     }
 
+    /// Return the current split-overhead estimate, using `cold_start` until the
+    /// first observations arrive. RPC and residual-startup costs are learned
+    /// separately so a short control request cannot hide worker startup cost.
+    pub fn split_overhead(&self, cold_start: Duration) -> Duration {
+        let feedback = self.split_cost();
+        let rpc = feedback.rpc_ewma.unwrap_or_default();
+        let residual_wait = feedback.residual_wait_ewma.unwrap_or_default();
+        if rpc.is_zero() && residual_wait.is_zero() {
+            cold_start
+        } else {
+            (rpc + residual_wait).max(cold_start / 2)
+        }
+    }
+
+    pub fn record_split_rpc(&self, elapsed: Duration) {
+        let mut feedback = self.split_cost();
+        feedback.rpc_ewma = Some(ewma_duration(feedback.rpc_ewma, elapsed));
+    }
+
+    pub fn record_residual_wait(&self, elapsed: Duration) {
+        let mut feedback = self.split_cost();
+        feedback.residual_wait_ewma = Some(ewma_duration(feedback.residual_wait_ewma, elapsed));
+    }
+
     pub async fn wait_for_split_capacity(&self) {
         loop {
             let notified = self.changed.notified();
@@ -264,6 +302,21 @@ impl ExecutionCapacity {
     fn reservation_became_item(&self, bytes: usize) {
         self.split_reservations.fetch_sub(1, Ordering::AcqRel);
         self.enqueue_sdf_item(bytes);
+    }
+
+    fn split_cost(&self) -> MutexGuard<'_, SplitCostFeedback> {
+        self.split_cost
+            .lock()
+            .expect("split cost feedback mutex poisoned")
+    }
+}
+
+fn ewma_duration(previous: Option<Duration>, observed: Duration) -> Duration {
+    match previous {
+        Some(previous) => {
+            previous.mul_f64(1.0 - SPLIT_COST_EWMA_ALPHA) + observed.mul_f64(SPLIT_COST_EWMA_ALPHA)
+        }
+        None => observed,
     }
 }
 
@@ -403,7 +456,43 @@ mod tests {
         assert!(capacity.try_acquire_bundle());
         capacity.enqueue_sdf_item(42);
         assert!(capacity.try_reserve_split().is_some());
+        capacity.record_split_rpc(Duration::from_millis(50));
+        capacity.record_residual_wait(Duration::from_millis(25));
         capacity.reset();
         assert_eq!(capacity.snapshot(), CapacitySnapshot::default());
+        assert_eq!(
+            capacity.split_overhead(Duration::from_millis(200)),
+            Duration::from_millis(200)
+        );
+    }
+
+    #[test]
+    fn split_overhead_combines_rpc_and_residual_startup_feedback() {
+        let capacity = ExecutionCapacity::new(PoolConfig::for_logical_cpus(8));
+        let cold_start = Duration::from_millis(200);
+        assert_eq!(capacity.split_overhead(cold_start), cold_start);
+
+        capacity.record_split_rpc(Duration::from_millis(1));
+        capacity.record_residual_wait(Duration::from_millis(1));
+        assert_eq!(
+            capacity.split_overhead(cold_start),
+            Duration::from_millis(100),
+            "measured overhead keeps a conservative floor"
+        );
+
+        let capacity = ExecutionCapacity::new(PoolConfig::for_logical_cpus(8));
+        capacity.record_split_rpc(Duration::from_millis(80));
+        capacity.record_residual_wait(Duration::from_millis(40));
+        assert_eq!(
+            capacity.split_overhead(cold_start),
+            Duration::from_millis(120)
+        );
+
+        capacity.record_split_rpc(Duration::from_millis(160));
+        capacity.record_residual_wait(Duration::from_millis(80));
+        assert_eq!(
+            capacity.split_overhead(cold_start),
+            Duration::from_millis(150)
+        );
     }
 }

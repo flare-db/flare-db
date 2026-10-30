@@ -20,6 +20,7 @@ from flaredb_runner.flare_runner import FlareRunner
 
 BLOCKS = 24
 BLOCK_SECONDS = 0.25
+SHORT_BLOCK_SECONDS = 0.01
 REPETITIONS = 2
 JOB_ENDPOINT = "127.0.0.1:8099"
 BUILD_DIR = Path("build")
@@ -35,9 +36,9 @@ def append_claim(path, block):
         handle.write("%d\n" % block)
 
 
-def timed_sleep(path, block):
+def timed_sleep(path, block, block_seconds):
     started = time.monotonic()
-    time.sleep(BLOCK_SECONDS)
+    time.sleep(block_seconds)
     finished = time.monotonic()
     append_json_line(path, {"start": started, "finish": finished})
     append_claim(claims_path_for(path), block)
@@ -48,11 +49,12 @@ def claims_path_for(timeline_path):
 
 
 class SlowMap(beam.DoFn):
-    def __init__(self, timeline_path):
+    def __init__(self, timeline_path, block_seconds):
         self.timeline_path = timeline_path
+        self.block_seconds = block_seconds
 
     def process(self, block):
-        timed_sleep(self.timeline_path, block)
+        timed_sleep(self.timeline_path, block, self.block_seconds)
         yield block
 
 
@@ -68,8 +70,9 @@ class BlockRangeProvider(beam.RestrictionProvider):
 
 
 class SlowRestriction(beam.DoFn):
-    def __init__(self, timeline_path):
+    def __init__(self, timeline_path, block_seconds):
         self.timeline_path = timeline_path
+        self.block_seconds = block_seconds
 
     def process(
         self,
@@ -79,12 +82,12 @@ class SlowRestriction(beam.DoFn):
         restriction = tracker.current_restriction()
         offset = restriction.start
         while tracker.try_claim(offset):
-            timed_sleep(self.timeline_path, offset)
+            timed_sleep(self.timeline_path, offset, self.block_seconds)
             yield offset
             offset += 1
 
 
-def run_pipeline(kind):
+def run_pipeline(kind, block_seconds=BLOCK_SECONDS):
     timeline_path = BUILD_DIR / ("%s-timeline.jsonl" % kind)
     claims_path = Path(claims_path_for(timeline_path))
     for path in (timeline_path, claims_path):
@@ -100,13 +103,14 @@ def run_pipeline(kind):
             _ = (
                 pipeline
                 | "CreateBlocks" >> beam.Create(range(BLOCKS))
-                | "SlowMap" >> beam.ParDo(SlowMap(str(timeline_path)))
+                | "SlowMap" >> beam.ParDo(SlowMap(str(timeline_path), block_seconds))
             )
         else:
             _ = (
                 pipeline
                 | "CreateRestriction" >> beam.Create([BLOCKS])
-                | "SlowRestriction" >> beam.ParDo(SlowRestriction(str(timeline_path)))
+                | "SlowRestriction"
+                >> beam.ParDo(SlowRestriction(str(timeline_path), block_seconds))
             )
     elapsed = time.monotonic() - started
 
@@ -140,7 +144,7 @@ def run_pipeline(kind):
         "kind": kind,
         "elapsed_seconds": elapsed,
         "blocks": BLOCKS,
-        "block_seconds": BLOCK_SECONDS,
+        "block_seconds": block_seconds,
         "max_concurrency": max_concurrency,
         "throughput_blocks_per_second": BLOCKS / elapsed,
     }
@@ -150,10 +154,13 @@ def main():
     BUNDLE = BUILD_DIR
     BUNDLE.mkdir(parents=True, exist_ok=True)
 
-    results = {"serial": [], "sdf": []}
+    results = {"serial": [], "sdf": [], "short-sdf": []}
     for _ in range(REPETITIONS):
-        for kind in ("serial", "sdf"):
-            result = run_pipeline(kind)
+        for kind in ("serial", "sdf", "short-sdf"):
+            block_seconds = (
+                SHORT_BLOCK_SECONDS if kind == "short-sdf" else BLOCK_SECONDS
+            )
+            result = run_pipeline(kind, block_seconds)
             results[kind].append(result)
             print(json.dumps(result, sort_keys=True))
 

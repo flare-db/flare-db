@@ -14,11 +14,11 @@ use beam_model_rs::v1::{
 };
 use bytes::Buf;
 use log::{debug, error, info, warn};
-use tokio::sync::mpsc::Sender;
+use tokio::sync::{mpsc::Sender, oneshot};
 
 use crate::coders::primitives::{VarIntCoder, WindowedValueCoder};
 use crate::coders::{BeamCoder, StandardBeamCoders};
-use crate::engine::capacity::{ExecutionCapacity, PoolConfig};
+use crate::engine::capacity::{ExecutionCapacity, PoolConfig, SplitReservation};
 use crate::engine::harness::control::ControlChannel;
 use crate::fusion::stage::SplittableProcessKind;
 use crate::jobservice::urns::beam_urns;
@@ -48,11 +48,16 @@ const MAX_PROGRESS_TICK: Duration = Duration::from_secs(30);
 const DEFAULT_SPLIT_FRACTION_OF_REMAINDER: f64 = 0.5;
 /// Minimum interval between progress-driven split requests for one bundle.
 const DEFAULT_SPLIT_COOLDOWN: Duration = MIN_PROGRESS_TICK;
+/// Multiplicative factor used when a poll does not reveal useful split work.
+const PROGRESS_TICK_BACKOFF_FACTOR: u32 = 2;
+/// Keep concurrent bundles from polling in lockstep.
+const MIN_PROGRESS_TICK_JITTER: f64 = 0.5;
+const PROGRESS_RATE_EWMA_ALPHA: f64 = 0.25;
 /// Default no-progress window before the fallback stall detector asks to split.
 ///
-/// SDK output counters can be buffered for seconds, so this is intentionally
-/// longer than the time-based trigger. SDK work-progress metrics take precedence
-/// whenever the harness reports them.
+/// SDK output counters can be buffered for seconds, so the fallback is
+/// intentionally longer than adaptive polling. SDK work-progress metrics take
+/// precedence whenever the harness reports them.
 const DEFAULT_STALL_AFTER: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug)]
@@ -84,6 +89,7 @@ pub struct SdfWorkItem {
     pub holds: Vec<Timestamp>,
     split_depth: usize,
     pub(crate) queued_bytes_accounted: bool,
+    enqueued_at: Option<Instant>,
 }
 
 impl SdfWorkItem {
@@ -93,13 +99,27 @@ impl SdfWorkItem {
             holds,
             split_depth,
             queued_bytes_accounted: false,
+            enqueued_at: Some(Instant::now()),
         }
+    }
+
+    pub(crate) fn enqueued_at(&self) -> Option<Instant> {
+        self.enqueued_at
     }
 }
 
 /// A split residual routed to the dispatcher while its parent bundle is still
 /// running.
 pub type SdfWorkItemSender = Sender<(String, SdfWorkItem)>;
+
+/// A request from a running SDF bundle for permission to query the SDK for a
+/// split. The dispatcher grants capacity only after its current scheduling round
+/// has had a chance to place ordinary and queued work.
+pub struct SdfSplitProposal {
+    pub grant: oneshot::Sender<Option<SplitReservation>>,
+}
+
+pub type SdfSplitProposalSender = Sender<SdfSplitProposal>;
 
 /// The byte span of one windowed input element plus the event-time metadata needed
 /// to hold back downstream watermarks while that element is deferred.
@@ -159,6 +179,13 @@ struct SplitMonitor {
     split_depth: usize,
     max_split_depth: usize,
     waiting_for_capacity: bool,
+    /// Monotonic progress coordinate sampled from the best available metric.
+    last_progress: Option<(ProgressSource, f64)>,
+    /// Smoothed fraction-of-work completed per second.
+    progress_rate: Option<f64>,
+    /// Time of the previous progress-coordinate sample.
+    last_sample_at: Option<Instant>,
+    last_progress_at: Instant,
     config: SdfSplitConfig,
 }
 
@@ -196,6 +223,10 @@ impl SplitMonitor {
             split_depth: 0,
             max_split_depth: PoolConfig::detect().sdf_max_split_depth,
             waiting_for_capacity: false,
+            last_progress: None,
+            progress_rate: None,
+            last_sample_at: None,
+            last_progress_at: Instant::now(),
             config,
         }
     }
@@ -217,14 +248,51 @@ struct ProgressMetrics {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProgressSource {
+    SdkWorkFraction,
+    InputIndex,
+}
+
+impl ProgressSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::SdkWorkFraction => "sdk-work-fraction",
+            Self::InputIndex => "input-index",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ProgressSample {
+    source: ProgressSource,
+    completed_fraction: f64,
+    remaining_fraction: f64,
+}
+
+#[derive(Debug)]
+struct ProgressObservation {
+    first_sample: bool,
+    material: bool,
+    estimate: Option<RemainingTimeEstimate>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RemainingTimeEstimate {
+    seconds: f64,
+    source: ProgressSource,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SplitDecision {
     Poll,
     SkipDisabled,
     SkipNoInput,
     SkipNoRemainingWork,
     SkipMaxDepth,
+    SkipNoNetSavings,
+    WaitForCapacity,
     WaitForProgress,
-    RequestTime,
+    RequestPredictedSavings,
     RequestStall,
 }
 
@@ -236,19 +304,28 @@ impl SplitDecision {
             Self::SkipNoInput => "skip-no-input-elements",
             Self::SkipNoRemainingWork => "skip-no-remaining-work",
             Self::SkipMaxDepth => "skip-max-split-depth",
+            Self::SkipNoNetSavings => "backoff-no-useful-split",
+            Self::WaitForCapacity => "wait-for-capacity",
             Self::WaitForProgress => "wait-for-progress",
-            Self::RequestTime => "request-split-time",
+            Self::RequestPredictedSavings => "request-predicted-savings",
             Self::RequestStall => "request-split-stall",
         }
     }
 
     fn requests_split(self) -> bool {
-        matches!(self, Self::RequestTime | Self::RequestStall)
+        matches!(self, Self::RequestPredictedSavings | Self::RequestStall)
     }
 }
 
 impl SplitMonitor {
-    fn decision(&self, metrics: &ProgressMetrics, now: Instant) -> SplitDecision {
+    fn decision(
+        &self,
+        metrics: &ProgressMetrics,
+        observation: &ProgressObservation,
+        now: Instant,
+        capacity_available: bool,
+        split_overhead: Duration,
+    ) -> SplitDecision {
         if !self.can_split {
             return SplitDecision::SkipDisabled;
         }
@@ -264,45 +341,166 @@ impl SplitMonitor {
         {
             return SplitDecision::SkipNoRemainingWork;
         }
+        if !capacity_available {
+            return SplitDecision::WaitForCapacity;
+        }
 
-        let has_baseline = self.prev_index != -2;
-        if !has_baseline {
+        if observation.first_sample {
             return SplitDecision::Poll;
         }
 
-        let counters_changed = metrics.read_index != self.prev_index
-            || metrics.output_element_count_sum != self.prev_output_element_count_sum;
-        let work_changed = !same_float(self.prev_work_completed, metrics.work_completed)
-            || !same_float(self.prev_work_remaining, metrics.work_remaining);
-        let observed_progress = counters_changed || work_changed;
-        let elapsed = now.duration_since(self.started);
-
-        if observed_progress {
-            let time_split_due = match self.last_split {
-                Some(last_split) => now.duration_since(last_split) >= self.config.split_cooldown,
-                None => elapsed >= self.config.split_cooldown,
+        if observation.material {
+            let Some(estimate) = observation.estimate else {
+                return SplitDecision::SkipNoNetSavings;
             };
-            if time_split_due {
-                SplitDecision::RequestTime
+            let minimum_profitable_remaining = split_overhead.as_secs_f64() * 4.0;
+            if estimate.seconds < minimum_profitable_remaining {
+                return SplitDecision::SkipNoNetSavings;
+            }
+            let cooldown_elapsed = self
+                .last_split
+                .map_or(now.duration_since(self.started), |last| {
+                    now.duration_since(last)
+                });
+            if cooldown_elapsed >= self.config.split_cooldown {
+                SplitDecision::RequestPredictedSavings
             } else {
                 SplitDecision::Poll
             }
-        } else if elapsed >= self.config.stall_after {
+        } else if now.duration_since(self.last_progress_at) >= self.config.stall_after {
             SplitDecision::RequestStall
         } else {
             SplitDecision::WaitForProgress
         }
     }
 
-    fn record_poll(&mut self, metrics: &ProgressMetrics) {
+    fn observe_progress(&mut self, metrics: &ProgressMetrics, now: Instant) -> ProgressObservation {
+        let first_sample = self.prev_index == -2;
+        let counters_changed = metrics.read_index != self.prev_index
+            || metrics.output_element_count_sum != self.prev_output_element_count_sum;
+        let work_changed = !same_float(self.prev_work_completed, metrics.work_completed)
+            || !same_float(self.prev_work_remaining, metrics.work_remaining);
+        let material = counters_changed || work_changed;
+        if material {
+            self.last_progress_at = now;
+        }
+
+        let sample = self.progress_sample(metrics);
+        if let Some(sample) = sample {
+            if let Some((previous_source, previous_coordinate)) = self.last_progress {
+                let delta = sample.completed_fraction - previous_coordinate;
+                if previous_source == sample.source && delta > 0.0 {
+                    let poll_elapsed = now
+                        .saturating_duration_since(self.last_sample_at.unwrap_or(self.started))
+                        .as_secs_f64();
+                    if poll_elapsed > 0.0 {
+                        let instantaneous_rate = delta / poll_elapsed;
+                        self.progress_rate = Some(match self.progress_rate {
+                            Some(previous) => {
+                                previous * (1.0 - PROGRESS_RATE_EWMA_ALPHA)
+                                    + instantaneous_rate * PROGRESS_RATE_EWMA_ALPHA
+                            }
+                            None => instantaneous_rate,
+                        });
+                    }
+                } else if previous_source != sample.source || delta < 0.0 {
+                    self.progress_rate = None;
+                }
+            }
+            self.last_progress = Some((sample.source, sample.completed_fraction));
+            self.last_sample_at = Some(now);
+        } else {
+            self.last_progress = None;
+            self.progress_rate = None;
+            self.last_sample_at = None;
+        }
+
+        let estimate = sample.and_then(|sample| {
+            self.progress_rate
+                .filter(|rate| *rate > 0.0)
+                .map(|rate| RemainingTimeEstimate {
+                    seconds: sample.remaining_fraction / rate,
+                    source: sample.source,
+                })
+        });
+
         self.prev_index = metrics.read_index;
         self.prev_output_element_count_sum = metrics.output_element_count_sum;
         self.prev_work_completed = metrics.work_completed;
         self.prev_work_remaining = metrics.work_remaining;
+
+        ProgressObservation {
+            first_sample,
+            material,
+            estimate,
+        }
+    }
+
+    fn progress_sample(&self, metrics: &ProgressMetrics) -> Option<ProgressSample> {
+        if let Some(completed) = metrics.work_completed.map(f64::from).or_else(|| {
+            metrics
+                .work_remaining
+                .map(|remaining| 1.0 - f64::from(remaining))
+        }) {
+            let completed_fraction = completed.clamp(0.0, 1.0);
+            return Some(ProgressSample {
+                source: ProgressSource::SdkWorkFraction,
+                completed_fraction,
+                remaining_fraction: 1.0 - completed_fraction,
+            });
+        }
+
+        if self.estimated_input_elements > 0 {
+            let total = self.estimated_input_elements as f64;
+            let completed = (metrics.read_index.max(0) as f64 / total).clamp(0.0, 1.0);
+            return Some(ProgressSample {
+                source: ProgressSource::InputIndex,
+                completed_fraction: completed,
+                remaining_fraction: 1.0 - completed,
+            });
+        }
+
+        None
     }
 
     fn record_split(&mut self, now: Instant) {
         self.last_split = Some(now);
+        self.last_progress_at = now;
+        self.last_progress = None;
+        self.progress_rate = None;
+        self.last_sample_at = None;
+        self.prev_index = -2;
+        self.prev_output_element_count_sum = -2;
+        self.prev_work_completed = None;
+        self.prev_work_remaining = None;
+        self.expedite_polling();
+    }
+
+    fn next_poll_delay(&self) -> Duration {
+        jittered_progress_tick(self.tick)
+    }
+
+    fn backoff_polling(&mut self) {
+        self.tick = clamp_progress_tick(self.tick * PROGRESS_TICK_BACKOFF_FACTOR);
+    }
+
+    fn expedite_polling(&mut self) {
+        self.tick = clamp_progress_tick(self.tick / PROGRESS_TICK_BACKOFF_FACTOR);
+    }
+
+    fn adapt_polling(&mut self, decision: SplitDecision) {
+        match decision {
+            SplitDecision::RequestPredictedSavings
+            | SplitDecision::RequestStall
+            | SplitDecision::SkipNoNetSavings
+            | SplitDecision::WaitForProgress => self.backoff_polling(),
+            SplitDecision::WaitForCapacity => self.tick = MAX_PROGRESS_TICK,
+            SplitDecision::Poll => {}
+            SplitDecision::SkipDisabled
+            | SplitDecision::SkipNoInput
+            | SplitDecision::SkipNoRemainingWork
+            | SplitDecision::SkipMaxDepth => {}
+        }
     }
 }
 
@@ -372,6 +570,7 @@ impl SplittableStageExecutor {
         initialized: bool,
         progress_tick: Option<Duration>,
         immediate_items: SdfWorkItemSender,
+        split_proposals: SdfSplitProposalSender,
     ) -> anyhow::Result<(ProcessBundleResponse, SdfBundleOutcome)> {
         let plan = stage.plan();
 
@@ -413,6 +612,7 @@ impl SplittableStageExecutor {
                 split_depth,
                 self.capacity.clone(),
                 immediate_items,
+                split_proposals,
             )
             .await?;
 
@@ -612,6 +812,7 @@ impl SplittableStageExecutor {
         split_depth: usize,
         capacity: Arc<ExecutionCapacity>,
         immediate_items: SdfWorkItemSender,
+        split_proposals: SdfSplitProposalSender,
     ) -> anyhow::Result<(ProcessBundleResponse, Duration)> {
         let descriptor_id = stage.id().to_string();
         if register {
@@ -708,7 +909,7 @@ impl SplittableStageExecutor {
                 tokio::pin!(response_future);
 
                 let response = loop {
-                    let ticker = tokio::time::sleep(monitor.tick);
+                    let ticker = tokio::time::sleep(monitor.next_poll_delay());
                     tokio::pin!(ticker);
 
                     tokio::select! {
@@ -737,6 +938,7 @@ impl SplittableStageExecutor {
                                 &mut split_residual_roots,
                                 &mut channel_items,
                                 &immediate_items,
+                                &split_proposals,
                                 &capacity,
                             ).await {
                                 // Progress error stops further splitting.
@@ -958,6 +1160,7 @@ async fn poll_progress_and_maybe_split(
     split_residual_roots: &mut Vec<DelayedBundleApplication>,
     channel_items: &mut Vec<SdfWorkItem>,
     immediate_items: &SdfWorkItemSender,
+    split_proposals: &SdfSplitProposalSender,
     capacity: &Arc<ExecutionCapacity>,
 ) -> anyhow::Result<()> {
     monitor.ticked = true;
@@ -969,14 +1172,31 @@ async fn poll_progress_and_maybe_split(
     let metrics = extract_progress_metrics(&progress);
     let now = Instant::now();
     let first_poll = monitor.prev_index == -2;
-    let decision = monitor.decision(&metrics, now);
-    monitor.record_poll(&metrics);
+    let observation = monitor.observe_progress(&metrics, now);
+    let split_overhead = capacity.split_overhead(MIN_PROGRESS_TICK * 2);
+    let capacity_available = capacity.has_split_capacity();
+    let decision = monitor.decision(
+        &metrics,
+        &observation,
+        now,
+        capacity_available,
+        split_overhead,
+    );
+    monitor.adapt_polling(decision);
     let action = decision.action();
+    let remaining_seconds = observation.estimate.map_or_else(
+        || "unknown".to_string(),
+        |estimate| format!("{:.3}", estimate.seconds),
+    );
+    let progress_source = observation
+        .estimate
+        .map_or("counters-or-stall", |estimate| estimate.source.label());
     let poll_message = format!(
         "SDF progress: instruction_id={bundle_instruction_id}, read_index={}, \
          output_element_count_sum={}, work_completed={:?}, work_remaining={:?}, \
          action={action}, polls={}, can_split={}, estimated_input_elements={}, \
-         tick_ms={}",
+         remaining_seconds={remaining_seconds}, progress_source={progress_source}, \
+         split_overhead_ms={}, base_tick_ms={}, next_delay_ms={}",
         metrics.read_index,
         metrics.output_element_count_sum,
         metrics.work_completed,
@@ -984,7 +1204,9 @@ async fn poll_progress_and_maybe_split(
         monitor.polls,
         monitor.can_split,
         monitor.estimated_input_elements,
-        monitor.tick.as_millis()
+        split_overhead.as_millis(),
+        monitor.tick.as_millis(),
+        monitor.next_poll_delay().as_millis()
     );
     // Keep routine polls at DEBUG. The first sample and actual split decisions
     // are operator-visible without enabling a log firehose.
@@ -995,16 +1217,19 @@ async fn poll_progress_and_maybe_split(
     }
 
     if !decision.requests_split() {
-        if !matches!(
-            decision,
-            SplitDecision::SkipDisabled | SplitDecision::SkipMaxDepth
-        ) {
-            monitor.waiting_for_capacity = false;
-        }
+        monitor.waiting_for_capacity = decision == SplitDecision::WaitForCapacity;
         return Ok(());
     }
 
-    let Some(reservation) = capacity.try_reserve_split() else {
+    let (grant_tx, grant_rx) = oneshot::channel();
+    split_proposals
+        .send(SdfSplitProposal { grant: grant_tx })
+        .await
+        .map_err(|_| anyhow!("SDF split proposal dispatcher closed"))?;
+    let reservation = grant_rx
+        .await
+        .map_err(|_| anyhow!("SDF split proposal grant was canceled"))?;
+    let Some(reservation) = reservation else {
         monitor.waiting_for_capacity = true;
         monitor.tick = MAX_PROGRESS_TICK;
         debug!(
@@ -1045,9 +1270,11 @@ async fn poll_progress_and_maybe_split(
     );
 
     monitor.split_requests += 1;
+    let split_started = Instant::now();
     let split = control
         .send_process_bundle_split_request(bundle_instruction_id, desired_splits)
         .await?;
+    capacity.record_split_rpc(split_started.elapsed());
     let channel_splits = split.channel_splits.len();
     let reported_roots = split.residual_roots.len();
     let residual_roots_before = split_residual_roots.len();
@@ -1164,16 +1391,11 @@ async fn poll_progress_and_maybe_split(
                 .map_err(|_| anyhow!("SDF residual dispatcher closed"))?;
         }
 
-        // While there is spare capacity, keep probing quickly so newly-created
-        // residuals can fill the pool. Saturation changes the next tick to the
-        // maximum backoff and waits for a capacity notification.
-        monitor.tick = if capacity.has_split_capacity() {
-            MIN_PROGRESS_TICK
-        } else {
-            MAX_PROGRESS_TICK
-        };
         monitor.splits += 1;
         monitor.record_split(now);
+        if !capacity.has_split_capacity() {
+            monitor.tick = MAX_PROGRESS_TICK;
+        }
     }
     info!(
         "SDF split response: instruction_id={bundle_instruction_id}, \
@@ -1329,6 +1551,11 @@ fn channel_item_holds(splittable_stage: &SplittableStage) -> Vec<Timestamp> {
 
 fn clamp_progress_tick(tick: Duration) -> Duration {
     tick.max(MIN_PROGRESS_TICK).min(MAX_PROGRESS_TICK)
+}
+
+fn jittered_progress_tick(base_tick: Duration) -> Duration {
+    let factor = rand::random_range(MIN_PROGRESS_TICK_JITTER..=1.0);
+    base_tick.mul_f64(factor)
 }
 
 /// The stage-shared progress tick to carry forward after a bundle.
@@ -1912,22 +2139,45 @@ mod tests {
     fn sdk_work_progress_prevents_a_false_stall_while_outputs_are_buffered() {
         let mut monitor = SplitMonitor::with_config(100, None, split_config());
         let now = Instant::now();
-        monitor.record_poll(&ProgressMetrics {
-            read_index: 0,
-            output_element_count_sum: 0,
-            work_completed: Some(0.1),
-            work_remaining: Some(0.9),
-        });
-        let decision = monitor.decision(
+        let first = monitor.observe_progress(
             &ProgressMetrics {
                 read_index: 0,
                 output_element_count_sum: 0,
-                work_completed: Some(0.2),
-                work_remaining: Some(0.8),
+                work_completed: Some(0.1),
+                work_remaining: Some(0.9),
             },
-            now + Duration::from_secs(3),
+            now,
         );
-        assert_eq!(decision, SplitDecision::RequestTime);
+        assert_eq!(
+            monitor.decision(
+                &ProgressMetrics {
+                    read_index: 0,
+                    output_element_count_sum: 0,
+                    work_completed: Some(0.1),
+                    work_remaining: Some(0.9),
+                },
+                &first,
+                now,
+                true,
+                Duration::from_millis(200),
+            ),
+            SplitDecision::Poll
+        );
+        let metrics = ProgressMetrics {
+            read_index: 0,
+            output_element_count_sum: 0,
+            work_completed: Some(0.2),
+            work_remaining: Some(0.8),
+        };
+        let second = monitor.observe_progress(&metrics, now + Duration::from_secs(3));
+        let decision = monitor.decision(
+            &metrics,
+            &second,
+            now + Duration::from_secs(3),
+            true,
+            Duration::from_millis(200),
+        );
+        assert_eq!(decision, SplitDecision::RequestPredictedSavings);
         assert!(
             !matches!(decision, SplitDecision::RequestStall),
             "SDK work progress must not be classified as a stall"
@@ -1937,14 +2187,30 @@ mod tests {
     #[test]
     fn fallback_stall_detection_waits_for_the_configured_quiet_window() {
         let mut monitor = SplitMonitor::with_config(100, None, split_config());
-        monitor.record_poll(&ProgressMetrics::default());
         let now = Instant::now();
+        let first = monitor.observe_progress(&ProgressMetrics::default(), now);
+        assert!(first.material);
+        let quiet = ProgressMetrics::default();
+        let observation = monitor.observe_progress(&quiet, now + Duration::from_secs(1));
         assert_eq!(
-            monitor.decision(&ProgressMetrics::default(), now + Duration::from_secs(1)),
+            monitor.decision(
+                &quiet,
+                &observation,
+                now + Duration::from_secs(1),
+                true,
+                Duration::from_millis(200),
+            ),
             SplitDecision::WaitForProgress
         );
+        let observation = monitor.observe_progress(&quiet, now + Duration::from_secs(6));
         assert_eq!(
-            monitor.decision(&ProgressMetrics::default(), now + Duration::from_secs(6)),
+            monitor.decision(
+                &quiet,
+                &observation,
+                now + Duration::from_secs(6),
+                true,
+                Duration::from_millis(200),
+            ),
             SplitDecision::RequestStall
         );
     }
@@ -1952,13 +2218,21 @@ mod tests {
     #[test]
     fn completed_sdk_work_skips_a_redundant_split_request() {
         let monitor = SplitMonitor::with_config(1, None, split_config());
+        let observation = ProgressObservation {
+            first_sample: false,
+            material: true,
+            estimate: None,
+        };
         let decision = monitor.decision(
             &ProgressMetrics {
                 work_completed: Some(1.0),
                 work_remaining: Some(0.0),
                 ..Default::default()
             },
+            &observation,
             Instant::now() + Duration::from_secs(10),
+            true,
+            Duration::from_millis(200),
         );
         assert_eq!(decision, SplitDecision::SkipNoRemainingWork);
     }
@@ -1967,14 +2241,169 @@ mod tests {
     fn split_lineage_stops_at_the_fixed_depth_limit() {
         let mut monitor = SplitMonitor::with_config(100, None, split_config());
         monitor.split_depth = monitor.max_split_depth;
+        let observation = ProgressObservation {
+            first_sample: false,
+            material: true,
+            estimate: None,
+        };
         let decision = monitor.decision(
             &ProgressMetrics {
                 read_index: 5,
                 ..Default::default()
             },
+            &observation,
             Instant::now() + Duration::from_secs(10),
+            true,
+            Duration::from_millis(200),
         );
         assert_eq!(decision, SplitDecision::SkipMaxDepth);
+    }
+
+    #[test]
+    fn fast_near_complete_work_does_not_justify_a_split() {
+        let mut monitor = SplitMonitor::with_config(100, None, split_config());
+        let now = Instant::now();
+        monitor.observe_progress(
+            &ProgressMetrics {
+                work_completed: Some(0.1),
+                work_remaining: Some(0.9),
+                ..Default::default()
+            },
+            now,
+        );
+        let metrics = ProgressMetrics {
+            work_completed: Some(0.9),
+            work_remaining: Some(0.1),
+            ..Default::default()
+        };
+        let observation = monitor.observe_progress(&metrics, now + Duration::from_secs(1));
+        assert_eq!(
+            monitor.decision(
+                &metrics,
+                &observation,
+                now + Duration::from_secs(1),
+                true,
+                Duration::from_millis(200),
+            ),
+            SplitDecision::SkipNoNetSavings
+        );
+    }
+
+    #[test]
+    fn profitable_split_waits_when_worker_capacity_is_unavailable() {
+        let mut monitor = SplitMonitor::with_config(100, None, split_config());
+        let now = Instant::now();
+        monitor.observe_progress(
+            &ProgressMetrics {
+                work_completed: Some(0.1),
+                work_remaining: Some(0.9),
+                ..Default::default()
+            },
+            now,
+        );
+        let metrics = ProgressMetrics {
+            work_completed: Some(0.2),
+            work_remaining: Some(0.8),
+            ..Default::default()
+        };
+        let observation = monitor.observe_progress(&metrics, now + Duration::from_secs(1));
+        assert_eq!(
+            monitor.decision(
+                &metrics,
+                &observation,
+                now + Duration::from_secs(1),
+                false,
+                Duration::from_millis(200),
+            ),
+            SplitDecision::WaitForCapacity
+        );
+    }
+
+    #[test]
+    fn full_pool_pauses_even_before_the_first_progress_sample() {
+        let mut monitor = SplitMonitor::with_config(100, None, split_config());
+        let now = Instant::now();
+        let observation = monitor.observe_progress(&ProgressMetrics::default(), now);
+        assert_eq!(
+            monitor.decision(
+                &ProgressMetrics::default(),
+                &observation,
+                now,
+                false,
+                Duration::from_millis(200),
+            ),
+            SplitDecision::WaitForCapacity
+        );
+    }
+
+    #[test]
+    fn input_index_is_used_when_sdk_work_fractions_are_absent() {
+        let mut monitor = SplitMonitor::with_config(10, None, split_config());
+        let now = Instant::now();
+        monitor.observe_progress(
+            &ProgressMetrics {
+                read_index: 1,
+                ..Default::default()
+            },
+            now,
+        );
+        let metrics = ProgressMetrics {
+            read_index: 2,
+            ..Default::default()
+        };
+        let observation = monitor.observe_progress(&metrics, now + Duration::from_secs(1));
+        let estimate = observation.estimate.expect("input-index estimate");
+        assert_eq!(estimate.source, ProgressSource::InputIndex);
+        assert!((estimate.seconds - 8.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn adaptive_polling_backs_off_and_expedites_without_breaking_bounds() {
+        let mut monitor = SplitMonitor::with_config(100, None, split_config());
+        assert_eq!(monitor.tick, MIN_PROGRESS_TICK);
+        monitor.adapt_polling(SplitDecision::WaitForProgress);
+        assert_eq!(monitor.tick, Duration::from_millis(200));
+        monitor.adapt_polling(SplitDecision::WaitForProgress);
+        assert_eq!(monitor.tick, Duration::from_millis(400));
+        monitor.expedite_polling();
+        assert_eq!(monitor.tick, Duration::from_millis(200));
+        monitor.expedite_polling();
+        monitor.expedite_polling();
+        assert_eq!(monitor.tick, MIN_PROGRESS_TICK);
+
+        monitor.tick = MAX_PROGRESS_TICK;
+        monitor.adapt_polling(SplitDecision::WaitForProgress);
+        assert_eq!(monitor.tick, MAX_PROGRESS_TICK);
+    }
+
+    #[test]
+    fn progress_poll_jitter_stays_between_half_and_all_of_the_base_tick() {
+        let base = Duration::from_secs(2);
+        for _ in 0..64 {
+            let delay = jittered_progress_tick(base);
+            assert!(delay >= Duration::from_secs(1));
+            assert!(delay <= base);
+        }
+    }
+
+    #[test]
+    fn successful_split_resets_progress_baselines_and_polling() {
+        let mut monitor =
+            SplitMonitor::with_config(100, Some(Duration::from_secs(8)), split_config());
+        let now = Instant::now();
+        monitor.observe_progress(
+            &ProgressMetrics {
+                work_completed: Some(0.4),
+                work_remaining: Some(0.6),
+                ..Default::default()
+            },
+            now,
+        );
+        monitor.record_split(now);
+        assert_eq!(monitor.tick, Duration::from_secs(4));
+        assert!(monitor.progress_rate.is_none());
+        assert!(monitor.last_progress.is_none());
+        assert_eq!(monitor.prev_index, -2);
     }
 
     #[test]
