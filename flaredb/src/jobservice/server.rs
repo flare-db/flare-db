@@ -142,13 +142,26 @@ impl FlareJobService {
         let mut dispatcher = self.dispatcher.lock().await;
         dispatcher
             .prepare_pipeline(job_graph.as_ref())
+            .await
             .map_err(|e| anyhow::anyhow!("failed to prepare pipeline for job {}: {}", job_id, e))?;
 
-        let status = dispatcher.harness_status();
-        let mut scheduler = NodeScheduler::new((*job_graph).clone());
+        let worker_statuses = dispatcher.worker_statuses();
+        let capacity = dispatcher.execution_capacity();
+        let mut scheduler = NodeScheduler::new_with_capacity((*job_graph).clone(), capacity);
+        let failure = async move {
+            let futures = worker_statuses
+                .into_iter()
+                .map(|(index, status)| {
+                    Box::pin(async move {
+                        format!("worker {index}: {}", status.wait_for_failure().await)
+                    })
+                })
+                .collect::<Vec<_>>();
+            futures::future::select_all(futures).await.0
+        };
         tokio::select! {
             result = dispatcher.run_pipeline(&mut scheduler) => result,
-            failure = status.wait_for_failure() => Err(anyhow::anyhow!(failure)),
+            failure = failure => Err(anyhow::anyhow!(failure)),
         }
     }
 }
@@ -303,8 +316,8 @@ impl JobService for FlareJobService {
                 dispatcher.set_job_metrics(job_metrics);
             }
 
-            // Route SDK worker log entries into this job's flare-worker.log
-            // before the harness starts, so early startup logs are captured.
+            // Route each SDK worker into its own job log before the harness
+            // starts, so early startup logs are captured.
             if let Err(e) = self
                 .dispatcher
                 .lock()
@@ -319,31 +332,43 @@ impl JobService for FlareJobService {
                 );
             }
 
-            self.worker_manager
-                .spawn_worker(
-                    &preparation_id,
-                    &runtime,
-                    staging_dir,
-                    &self.instance_id,
-                    &prepared_job.pipeline_options,
-                )
-                .await?;
+            let worker_endpoints = self.dispatcher.lock().await.worker_endpoints();
+            for (worker_id, endpoint) in worker_endpoints {
+                if let Err(error) = self
+                    .worker_manager
+                    .spawn_worker(
+                        &preparation_id,
+                        worker_id,
+                        &runtime,
+                        staging_dir,
+                        &self.instance_id,
+                        &endpoint,
+                        &prepared_job.pipeline_options,
+                    )
+                    .await
+                {
+                    let _ = self.worker_manager.stop_workers(&preparation_id).await;
+                    self.set_job_state(&preparation_id, JobStateEnum::Failed);
+                    return Err(error);
+                }
+            }
 
             let run_result = self.execute_spawned_job(&preparation_id, job_graph).await;
 
             // Any stream closures caused by this cleanup are expected. Mark the
             // shutdown before killing the process so their BrokenPipe/h2 errors
             // stay at DEBUG and cannot be mistaken for another worker death.
-            self.dispatcher
-                .lock()
-                .await
-                .harness_status()
-                .begin_intentional_shutdown();
-            let stop_result = self.worker_manager.stop_worker(&preparation_id).await;
+            {
+                let dispatcher = self.dispatcher.lock().await;
+                for (_, status) in dispatcher.worker_statuses() {
+                    status.begin_intentional_shutdown();
+                }
+            }
+            let stop_result = self.worker_manager.stop_workers(&preparation_id).await;
 
             if let Err(error) = run_result {
                 let message = match stop_result {
-                    Ok(()) => format!("job {} failed: {error}; worker terminated", preparation_id),
+                    Ok(()) => format!("job {} failed: {error}; workers terminated", preparation_id),
                     Err(stop_error) => format!(
                         "job {} failed: {error}; worker cleanup also failed: {stop_error}",
                         preparation_id
@@ -476,12 +501,13 @@ impl JobService for FlareJobService {
         Box::pin(async move {
             let job_id = request.into_inner().job_id;
             log::info!("cancel request received for job_id={}", job_id);
-            self.dispatcher
-                .lock()
-                .await
-                .harness_status()
-                .begin_intentional_shutdown();
-            self.worker_manager.stop_worker(&job_id).await?;
+            {
+                let dispatcher = self.dispatcher.lock().await;
+                for (_, status) in dispatcher.worker_statuses() {
+                    status.begin_intentional_shutdown();
+                }
+            }
+            self.worker_manager.stop_workers(&job_id).await?;
             self.set_job_state(&job_id, JobStateEnum::Cancelled);
             Ok(Response::new(CancelJobResponse {
                 state: beam_model_rs::v1::job_state::Enum::Cancelled as i32,

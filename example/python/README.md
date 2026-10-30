@@ -40,6 +40,11 @@ python3 example/python/sliding_window.py
 python3 example/python/timers.py
 python3 example/python/dynamic_split.py
 python3 example/python/csv_etl.py
+
+python3 example/python/air.py \
+  --input=/home/ganesh/testdata/india_air_quality_10m.csv \
+  --output=output/air_quality_hourly
+  
 ```
 
 All examples target the local job service at `127.0.0.1:8099`; override it with

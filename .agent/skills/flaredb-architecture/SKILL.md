@@ -52,14 +52,18 @@ beam-model-rs/                   Proto build project and checked-in Rust binding
 example/                         Submission/integration examples
 ```
 
-`flaredb/src/main.rs` is the composition root. Its single Tonic server exposes Job Service, Artifact Staging, Fn Control/Data/Logging/State, and Flight SQL at the same endpoint.
+`flaredb/src/main.rs` is the composition root. The public Tonic server exposes
+Job Service, Artifact Staging, and Flight SQL. Each job also gets a fixed pool of
+local SDK workers, and every worker has its own loopback Fn
+Control/Data/Logging/State endpoint so instructions, data streams, descriptors,
+state caches, and logs cannot cross worker boundaries.
 
 ## Components and boundaries
 
 | Component | Responsibility | Relationship / boundary |
 |---|---|---|
 | Beam SDK + Flare runner SDK | Convert user pipeline to Runner API; prepare, stage artifacts, run | gRPC Beam Job API; Java rewrites opaque join coders before submission |
-| `FlareJobService` | Stores prepared `ExecutableGraph`, chooses harness, drives a job | `prepare` calls `Job::new`; `run` spawns harness then dispatches graph |
+| `FlareJobService` | Stores prepared `ExecutableGraph`, chooses harness, drives a job | `prepare` calls `Job::new`; `run` starts a worker pool then dispatches the graph |
 | `fusion` | Normalizes, represents, and fuses Runner API transforms | `QueryablePipeline` → `FusedPipeline` → `ExecutableGraph` |
 | `ExecutableGraph` | Petgraph DAG of `Runner`, `Worker`, or `Splittable` nodes | Edges carry `ConsumerMetaData`: PCollection, coder, producer/consumer IDs |
 | `engine` + `harness` | Dependency scheduling and Fn bundle/data orchestration | Tonic Fn APIs are a protocol boundary; do not invent a second transport |
@@ -94,9 +98,26 @@ There is no Tonbo implementation in the active code path. The current catalog cr
 
 ### Run and materialization
 
-5. `FlareJobService::run` detects Python process environments or defaults to Java, spawns that SDK harness through `WorkerManager`, waits for its Fn connection, then invokes `ExecutorDispatcher::prepare_pipeline` and `run_pipeline`.
+5. `FlareJobService::run` detects Python process environments or defaults to Java,
+   then spawns a fixed worker pool through `WorkerManager`. Worker count is half
+   the available logical CPUs (minimum one); each worker runs half that many
+   bundles concurrently (minimum one). The job waits for every control stream,
+   prepares shared registries/state/metrics plus per-worker Fn channels, and
+   invokes `ExecutorDispatcher::run_pipeline`.
 6. `NodeScheduler` releases nodes only after every main predecessor completes and every side-input producer has committed at least one bundle. Side-input completion removes a first-run barrier but does not add main-input pending work or clamp the consumer's output watermark. `ExecutorDispatcher` runs ready nodes concurrently and marks them complete after success.
-7. A **worker node** calls `BundleRuntime::register_bundle`, which adds Runner API source/sink data boundaries and sends a `ProcessBundleDescriptor` over Fn Control. `StageExecutor` sends stored input through Fn Data, receives output, decodes each WindowedValue with `StandardBeamCoders`, and writes `BeamRecord` batches to the output PCollection table.
+
+   Scheduling uses one fixed global execution budget shared by all bundles.
+   Ready stages are served round-robin, queued SDF residuals are started before
+   requesting more work, and no more than the pool's total bundle slots may be in
+   flight. Dynamic split requests are admitted only when the global budget and
+   bounded residual queue have headroom.
+7. A **worker node** is leased to the least-loaded harness. `BundleRuntime`
+   registers its descriptor once per `(worker, stage)`, adds Runner API
+   source/sink data boundaries, and sends `ProcessBundle` over that worker's Fn
+   Control stream. `StageExecutor` sends stored input through the same worker's
+   Fn Data stream, receives output, decodes each WindowedValue with
+   `StandardBeamCoders`, and writes `BeamRecord` batches to the output
+   PCollection table.
 8. A **runner node** builds/registers a descriptor, then invokes `FlareTransform::execute`. Its `ExecutionContext` identifies input and output PCollections in the same `FlareElementStore`.
 9. `FlareElementStore` derives a `RecordTableSchema` from a PCollection’s first output batch, converts records to Arrow, commits them to Paimon, and scans them back for the next stage. PCollection tables are therefore the inter-stage exchange medium, not merely an output sink.
 10. Successful SDK bundle responses feed monitoring infos into the active per-job metrics accumulator. `GetJobMetrics` returns those infos as attempted and committed metric results for the Java and Python runners.

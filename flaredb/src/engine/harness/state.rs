@@ -761,7 +761,7 @@ impl StateChannel {
                 Ok(backend) => {
                     let side_inputs = SideInputResolver::new(store, side_inputs);
                     channel
-                        .drive_state_requests(backend, side_inputs, user_states)
+                        .drive_state_requests(Arc::new(backend), side_inputs, user_states)
                         .await
                 }
                 Err(e) => {
@@ -778,9 +778,33 @@ impl StateChannel {
         *task_slot.lock().unwrap() = Some(join_handle);
     }
 
+    /// Service a worker's State stream using a job-wide backend.
+    ///
+    /// Multiple SDK workers share the same write-back cache and lock, so user
+    /// state updates remain atomic across workers.
+    pub fn stream_requests_with_backend(
+        &self,
+        store: Arc<FlareElementStore>,
+        backend: Arc<StateBackend>,
+        side_inputs: SideInputRegistry,
+        user_states: UserStateRegistry,
+    ) {
+        let channel = self.clone();
+        let task_slot = self.stream_task.clone();
+
+        let join_handle = tokio::spawn(async move {
+            let side_inputs = SideInputResolver::new(store, side_inputs);
+            channel
+                .drive_state_requests(backend, side_inputs, user_states)
+                .await
+        });
+
+        *task_slot.lock().unwrap() = Some(join_handle);
+    }
+
     async fn drive_state_requests(
         &self,
-        backend: StateBackend,
+        backend: Arc<StateBackend>,
         side_inputs: SideInputResolver,
         user_states: UserStateRegistry,
     ) {
@@ -792,7 +816,7 @@ impl StateChannel {
                     let summary = describe_request(&request);
                     let started = std::time::Instant::now();
                     let response = handle_state_request_with_registries(
-                        &backend,
+                        backend.as_ref(),
                         Some(&user_states),
                         Some(&side_inputs),
                         request,
@@ -863,7 +887,7 @@ impl StateChannel {
                 }
             }
         }
-        flush_state_on_exit(&backend).await;
+        flush_state_on_exit(backend.as_ref()).await;
         info!("state request driver stopped");
     }
 }
@@ -880,7 +904,7 @@ async fn flush_state_on_exit(backend: &StateBackend) {
 
 /// Construct a job's state backend in the `state` database under
 /// `<warehouse>/.slate_state/<db>/`.
-async fn build_state_backend(store: Arc<FlareElementStore>) -> Result<StateBackend> {
+pub(crate) async fn build_state_backend(store: Arc<FlareElementStore>) -> Result<StateBackend> {
     let dir = slate_state_dir(&store);
     let kv = SlateKvStore::open(&dir, "state").await?;
     info!("using SlateDB state backend at {}", dir.display());

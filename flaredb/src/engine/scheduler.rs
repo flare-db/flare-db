@@ -17,8 +17,8 @@
 //! initialization single-threaded.
 //!
 //! ## Splittable DoFns
-//! An SDF stage may run several residual bundles at once (up to
-//! `splittable_max_in_flight`, overridable with `FLAREDB_SDF_MAX_IN_FLIGHT`).
+//! An SDF stage may run several residual bundles at once, bounded by the fixed
+//! job-wide worker-pool capacity.
 //! Residuals are independent work items; their holds clamp the stage's output
 //! watermark until each bundle completes.
 //!
@@ -31,13 +31,15 @@
 //! scheduling state lives here and is updated one completion at a time.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use petgraph::Direction;
 use petgraph::graph::NodeIndex;
 use petgraph::visit::EdgeRef;
 
-use log::{debug, info, warn};
+use log::{debug, info};
 
+use crate::engine::capacity::{ExecutionCapacity, PoolConfig};
 use crate::engine::timer::{TimeDomain, TimerEntry};
 use crate::engine::watermark::{
     MIN_TIMESTAMP, StageKind, Timestamp, WatermarkManager, format_timestamp,
@@ -61,37 +63,19 @@ pub struct NodeScheduler {
     /// Owning stage id for each transform inside an SDK stage, used to route a
     /// fired timer back to the stage that must run its `@OnTimer`.
     transform_to_stage: HashMap<String, String>,
-}
-
-/// Maximum number of concurrent bundles for one splittable stage.
-///
-/// Splittable DoFns publish independent residual work items and the SDK harness
-/// runs `ProcessBundle` instructions on a worker thread pool, so a bounded number
-/// of them may be in flight at once. The default follows the machine's available
-/// parallelism (capped at four so one job does not monopolise a large host), and
-/// `FLAREDB_SDF_MAX_IN_FLIGHT` overrides it.
-fn splittable_max_in_flight() -> usize {
-    splittable_max_in_flight_from(std::env::var("FLAREDB_SDF_MAX_IN_FLIGHT").ok().as_deref())
-}
-
-fn splittable_max_in_flight_from(configured: Option<&str>) -> usize {
-    if let Some(value) = configured {
-        match value.trim().parse::<usize>() {
-            Ok(parsed) => return parsed.max(1),
-            Err(_) => warn!(
-                "ignoring invalid FLAREDB_SDF_MAX_IN_FLIGHT={value:?};
-                 using the CPU-derived default"
-            ),
-        }
-    }
-    std::thread::available_parallelism()
-        .map(|parallelism| parallelism.get())
-        .unwrap_or(1)
-        .clamp(1, 4)
+    capacity: Arc<ExecutionCapacity>,
+    round_robin_cursor: usize,
 }
 
 impl NodeScheduler {
     pub fn new(graph: ExecutableGraph) -> Self {
+        Self::new_with_capacity(
+            graph,
+            Arc::new(ExecutionCapacity::new(PoolConfig::detect())),
+        )
+    }
+
+    pub fn new_with_capacity(graph: ExecutableGraph, capacity: Arc<ExecutionCapacity>) -> Self {
         let mut watermarks = WatermarkManager::from_executable_graph(&graph);
         let mut index_of = HashMap::new();
         let mut transform_to_stage = HashMap::new();
@@ -110,7 +94,7 @@ impl NodeScheduler {
         // slots pull from that queue. Only element-based residuals are
         // independent (the runner does not support keyed SDFs), so other process
         // kinds stay at one bundle.
-        let splittable_concurrency = splittable_max_in_flight();
+        let splittable_concurrency = capacity.config().total_bundle_slots;
         let mut splittable_stages = 0usize;
         for index in graph.get_executable_graph().node_indices() {
             let node = &graph.get_executable_graph()[index];
@@ -164,7 +148,13 @@ impl NodeScheduler {
             watermarks,
             index_of,
             transform_to_stage,
+            capacity,
+            round_robin_cursor: 0,
         }
+    }
+
+    pub fn capacity(&self) -> &Arc<ExecutionCapacity> {
+        &self.capacity
     }
 
     /// Returns the next ready nodes to execute, ordered by stage id.
@@ -205,25 +195,38 @@ impl NodeScheduler {
         self.debug_assert_eligibility_matches_dependency_rule(&ready);
 
         let mut next = Vec::new();
+        if ready.is_empty() {
+            return next;
+        }
 
-        for stage in ready {
-            let Some(&index) = self.index_of.get(&stage) else {
-                continue;
-            };
-            let node = self.graph.get_executable_graph()[index].clone();
-            // Start one bundle, and keep going while the stage still has declared
-            // work items (SDF residuals) and is under its concurrency ceiling. For
-            // the common `max_in_flight == 1` case this starts exactly one bundle.
-            //
-            // The first start may be justified by newly-available input rather
-            // than by a work item (the first run, pending input, a timer, or a
-            // watermark advance). Once the declared work items are exhausted, stop:
-            // otherwise a re-polled stage with `pending` still set would start
-            // duplicate wave bundles.
-            while self.watermarks.start_bundle(&stage).is_ok() {
-                next.push((index, node.clone()));
-                if self.watermarks.queued_bundles(&stage) == 0 {
-                    break;
+        // Deficit round-robin over ready stages. Starting at most one bundle per
+        // turn prevents a large residual queue on one stage from monopolising
+        // every global slot.
+        let mut made_progress = true;
+        while made_progress {
+            made_progress = false;
+            let stage_count = ready.len();
+            for offset in 0..stage_count {
+                let ready_index = (self.round_robin_cursor + offset) % stage_count;
+                let stage = &ready[ready_index];
+                let Some(&index) = self.index_of.get(stage) else {
+                    continue;
+                };
+                let starts_queued_work = self.watermarks.queued_bundles(stage) > 0;
+                let admitted = if starts_queued_work {
+                    self.capacity.try_acquire_queued_bundle()
+                } else {
+                    self.capacity.try_acquire_bundle()
+                };
+                if !admitted {
+                    continue;
+                }
+                if self.watermarks.start_bundle(stage).is_ok() {
+                    next.push((index, self.graph.get_executable_graph()[index].clone()));
+                    self.round_robin_cursor = (ready_index + 1) % stage_count;
+                    made_progress = true;
+                } else {
+                    self.capacity.finish_bundle();
                 }
             }
         }
@@ -265,6 +268,7 @@ impl NodeScheduler {
             .watermarks
             .complete_bundle_with_min_and_input(&stage, output_min_ts, input_count)
             .unwrap_or_default();
+        self.capacity.finish_bundle();
         let advanced = self.watermarks.refresh();
         if source_finished {
             info!(
@@ -519,10 +523,12 @@ impl NodeScheduler {
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
 
     use petgraph::Graph;
 
-    use crate::engine::scheduler::{NodeScheduler, splittable_max_in_flight_from};
+    use crate::engine::capacity::{ExecutionCapacity, PoolConfig};
+    use crate::engine::scheduler::NodeScheduler;
     use crate::engine::timer::{TimeDomain, TimerEntry, TimerKey};
     use crate::engine::watermark::MIN_TIMESTAMP;
     use crate::fusion::pipeline::{ConsumerMetaData, ExecutableGraph, ExecutableNode};
@@ -710,6 +716,31 @@ mod tests {
         let ready = scheduler.next_nodes();
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].0, c);
+    }
+
+    #[test]
+    fn next_nodes_never_exceeds_the_global_pool_capacity() {
+        let mut graph = Graph::<ExecutableNode, ConsumerMetaData>::new();
+        graph.add_node(source_node("A", "pa"));
+        graph.add_node(source_node("B", "pb"));
+        graph.add_node(source_node("C", "pc"));
+
+        let executable_graph = graph_for_test(graph, dummy_metadata("root"));
+        let capacity = Arc::new(ExecutionCapacity::new(PoolConfig::for_logical_cpus(4)));
+        let mut scheduler = NodeScheduler::new_with_capacity(executable_graph, capacity.clone());
+
+        let first = scheduler.next_nodes();
+        assert_eq!(first.len(), 2, "the fixed 4-CPU default has two slots");
+        assert_eq!(capacity.snapshot().in_flight_bundles, 2);
+        assert!(scheduler.next_nodes().is_empty());
+
+        scheduler.mark_complete(first[0].0);
+        assert_eq!(capacity.snapshot().in_flight_bundles, 1);
+        assert_eq!(
+            scheduler.next_nodes().len(),
+            1,
+            "one source remained ready and the released slot became available"
+        );
     }
 
     #[test]
@@ -1316,18 +1347,5 @@ mod tests {
             1,
             "GBK runs exactly once after the producer drains"
         );
-    }
-
-    #[test]
-    fn splittable_concurrency_honours_the_environment_override() {
-        assert_eq!(splittable_max_in_flight_from(Some("3")), 3);
-        assert_eq!(splittable_max_in_flight_from(Some(" 2 ")), 2);
-        // A ceiling below one is clamped so a stage can always run.
-        assert_eq!(splittable_max_in_flight_from(Some("0")), 1);
-
-        let default = splittable_max_in_flight_from(None);
-        assert!((1..=4).contains(&default), "default is {default}");
-        // An unparsable value falls back to the same CPU-derived default.
-        assert_eq!(splittable_max_in_flight_from(Some("nope")), default);
     }
 }

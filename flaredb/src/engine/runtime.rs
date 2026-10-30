@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     io::Cursor,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::Arc,
@@ -89,6 +89,8 @@ pub struct BundleRuntime {
     window_merger: Option<Arc<WindowMergeService>>,
     timer_service: Arc<TimerService>,
     source_reports: tokio::sync::mpsc::UnboundedSender<SourceProgress>,
+    endpoint: ApiServiceDescriptor,
+    registered_stages: Arc<Mutex<HashSet<String>>>,
 }
 
 impl BundleRuntime {
@@ -102,6 +104,8 @@ impl BundleRuntime {
         window_merger: Option<Arc<WindowMergeService>>,
         timer_service: Arc<TimerService>,
         source_reports: tokio::sync::mpsc::UnboundedSender<SourceProgress>,
+        endpoint: ApiServiceDescriptor,
+        registered_stages: Arc<Mutex<HashSet<String>>>,
     ) -> Self {
         Self {
             control,
@@ -112,12 +116,18 @@ impl BundleRuntime {
             window_merger,
             timer_service,
             source_reports,
+            endpoint,
+            registered_stages,
         }
     }
 
     /// Sender for runner-source progress reports (used by `TestStream`).
     pub fn source_reports(&self) -> &tokio::sync::mpsc::UnboundedSender<SourceProgress> {
         &self.source_reports
+    }
+
+    pub fn endpoint(&self) -> &ApiServiceDescriptor {
+        &self.endpoint
     }
 
     pub fn timer_service(&self) -> &Arc<TimerService> {
@@ -168,10 +178,13 @@ impl BundleRuntime {
         &mut self,
         stage: &ExecutableStage,
     ) -> anyhow::Result<ControlResponse> {
-        let endpoint = ApiServiceDescriptor {
-            url: crate::DEFAULT_API_SERVICE_URL.to_string(),
-            ..Default::default()
-        };
+        let mut registered_stages = self.registered_stages.lock().await;
+        let stage_id = stage.id().to_string();
+        if registered_stages.contains(&stage_id) {
+            return Ok(ControlResponse::BundleRegistered);
+        }
+
+        let endpoint = self.endpoint.clone();
 
         let transforms = stage_transforms_with_data_boundaries(stage, endpoint.clone());
         let mut components = stage.components();
@@ -198,6 +211,9 @@ impl BundleRuntime {
         };
 
         let response = self.control.register_bundle(descriptor).await;
+        if response.is_ok() {
+            registered_stages.insert(stage_id);
+        }
         info!(
             "Registered bundle at worker for descriptor id {}",
             stage.id()

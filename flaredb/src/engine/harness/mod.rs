@@ -16,6 +16,7 @@ use ::log::info;
 pub mod control;
 pub mod data;
 pub mod log;
+pub mod pool;
 pub mod state;
 
 /// Job-scoped health of the SDK harness transport streams.
@@ -189,8 +190,13 @@ impl Channels {
 
     /// Route SDK worker log entries for a job into that job's per-job
     /// `flare-worker.log`.
-    pub async fn set_log_target(&self, instance_id: &str, job_id: &str) -> Result<()> {
-        self.log.set_target(instance_id, job_id).await
+    pub async fn set_log_target(
+        &self,
+        instance_id: &str,
+        job_id: &str,
+        worker_id: usize,
+    ) -> Result<()> {
+        self.log.set_target(instance_id, job_id, worker_id).await
     }
 }
 

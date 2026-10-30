@@ -6,12 +6,16 @@ the initial restriction stays one big range: the only way the work can be
 divided is for the runner to ask the SDK to split a *running* bundle, which is
 what makes this a dynamic split.
 
-While a bundle runs, FlareDB polls its progress on a short interval. When two
-consecutive polls show no new input index and no new output elements, the
-bundle is treated as stalled and FlareDB asks the SDK to split it. The SDK
-keeps part of the remaining blocks and hands the rest back as a residual, which
-the runner schedules as a new bundle. Making a block slower than the poll
-interval is what causes the split.
+While a bundle runs, FlareDB polls its progress. When the bundle is making
+progress or has been quiet for five seconds, FlareDB asks the SDK to split it
+if the fixed worker pool has spare capacity. The SDK keeps part of the remaining
+blocks and hands the rest back as a residual, which the runner schedules on the
+least-loaded worker. FlareDB pauses new split requests while all execution slots
+are busy and resumes when capacity becomes available.
+
+The fixed pool uses half the available logical CPUs as the worker count and half
+the worker count as each worker's bundle limit, with both values floored to a
+minimum of one.
 
 Each claimed block is logged, so a run shows the work divided across several
 bundles. After the pipeline finishes, the claimed blocks are read back and
@@ -40,9 +44,7 @@ from flaredb_runner.flare_runner import FlareRunner
 
 LOG = logging.getLogger(__name__)
 
-# Number of blocks in the single job, and how long each block takes. Keep
-# BLOCK_SECONDS above the runner's progress-poll interval so the bundle looks
-# stalled and is split.
+# Number of blocks in the single job, and how long each block takes.
 BLOCKS = 24
 BLOCK_SECONDS = 0.5
 

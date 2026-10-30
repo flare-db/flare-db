@@ -1748,6 +1748,60 @@ mod tests {
     }
 
     #[test]
+    fn channel_residual_hold_prevents_downstream_inf_before_deferred_work_finishes() {
+        let mut manager = manager(&[
+            ("A", &[], &[], &["p"]),
+            ("B", &["p"], &[], &["q"]),
+            ("C", &["q"], &[], &["r"]),
+        ]);
+
+        manager.start_bundle("A").unwrap();
+        manager
+            .complete_bundle_with_min("A", Some(MIN_TIMESTAMP))
+            .unwrap();
+        manager.report_source_finished("A").unwrap();
+        manager.refresh();
+
+        // B produces a first partial result and declares deferred channel work
+        // before completing the parent bundle.
+        manager.start_bundle("B").unwrap();
+        manager.enqueue_bundles("B", 1).unwrap();
+        manager.set_residual_holds(&HashMap::from([("B".to_string(), vec![MIN_TIMESTAMP])]));
+        manager
+            .complete_bundle_with_min("B", Some(MIN_TIMESTAMP))
+            .unwrap();
+        manager.refresh();
+
+        assert_eq!(manager.input_watermark("C"), Some(MIN_TIMESTAMP));
+        let c_bundle = manager
+            .ready_stages()
+            .into_iter()
+            .find(|stage| stage == "C")
+            .expect("ordinary downstream is ready from the partial output");
+        let captured = manager
+            .bundle_input_watermark(&c_bundle)
+            .expect("captured downstream watermark");
+        assert_eq!(captured, MIN_TIMESTAMP);
+        assert!(
+            manager
+                .validate_bundle_input_watermark(&c_bundle, captured)
+                .is_ok()
+        );
+        manager.start_bundle(&c_bundle).unwrap();
+        manager.complete_bundle(&c_bundle).unwrap();
+
+        // Draining the deferred work releases the Beam default MIN hold and only
+        // then may the downstream input watermark advance to +inf.
+        manager.start_bundle("B").unwrap();
+        manager
+            .complete_bundle_with_min("B", Some(MIN_TIMESTAMP))
+            .unwrap();
+        manager.set_residual_holds(&HashMap::new());
+        manager.refresh();
+        assert_eq!(manager.input_watermark("C"), Some(MAX_TIMESTAMP));
+    }
+
+    #[test]
     fn gated_consumer_waits_for_queued_residual_output() {
         let mut manager = manager(&[
             ("A", &[], &[], &["p"]),

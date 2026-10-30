@@ -5,10 +5,12 @@ use crate::transforms::SourceProgress;
 use crate::{
     engine::timer::{TimerEntry, build_timer_store},
     engine::{
+        capacity::{ExecutionCapacity, PoolConfig},
         executor::StageExecutor,
         harness::{
-            Channels, HarnessStatus,
+            HarnessStatus,
             control::ControlResponse,
+            pool::{HarnessPool, WorkerLease},
             state::{SideInputRegistry, UserStateRegistry},
         },
         runtime::BundleRuntime,
@@ -40,8 +42,6 @@ enum StageRun {
 struct SdfQueue {
     /// The initialization bundle has run (carried forward across bundles).
     initialized: bool,
-    /// The descriptors are registered with the worker.
-    registered: bool,
     /// Residual work items awaiting a bundle, oldest first.
     items: VecDeque<SdfWorkItem>,
     /// Stage-specific duration between two consecutive `progress + split_evaluation` runs.
@@ -77,12 +77,17 @@ fn enqueue_sdf_items(
     scheduler: &mut NodeScheduler,
     sdf_queues: &mut HashMap<String, SdfQueue>,
     residual_holds: &mut HashMap<String, Vec<Timestamp>>,
+    capacity: &ExecutionCapacity,
     stage_id: &str,
     items: impl IntoIterator<Item = SdfWorkItem>,
 ) -> anyhow::Result<usize> {
     let queue = sdf_queues.entry(stage_id.to_string()).or_default();
     let mut count = 0usize;
-    for item in items {
+    for mut item in items {
+        if !item.queued_bytes_accounted {
+            capacity.enqueue_sdf_item(item.seed.len());
+            item.queued_bytes_accounted = true;
+        }
         add_holds(residual_holds, stage_id, &item.holds);
         queue.items.push_back(item);
         count += 1;
@@ -92,7 +97,6 @@ fn enqueue_sdf_items(
         // had to initialize and register the process descriptor before the SDK
         // could produce a residual, so these flags are valid immediately.
         queue.initialized = true;
-        queue.registered = true;
         scheduler
             .watermarks_mut()
             .set_residual_holds(residual_holds);
@@ -106,11 +110,12 @@ fn enqueue_sdf_items(
 /// Owns the harness channels and per-job state needed to prepare a pipeline for
 /// execution. A [`StageExecutor`] is built from this prepared state.
 pub struct ExecutorDispatcher {
-    channels: Channels,
+    workers: HarnessPool,
+    capacity: Arc<ExecutionCapacity>,
     store: Arc<FlareElementStore>,
     pipeline_coders: Arc<HashMap<String, Coder>>,
     pipeline_components: Arc<Components>,
-    window_merger: Option<Arc<WindowMergeService>>,
+    window_mergers: Vec<Option<Arc<WindowMergeService>>>,
     timer_service: Arc<TimerService>,
     /// Runner-source progress reports (TestStream) sent from bundle execution.
     source_reports_tx: mpsc::UnboundedSender<SourceProgress>,
@@ -118,7 +123,9 @@ pub struct ExecutorDispatcher {
 }
 
 impl ExecutorDispatcher {
-    pub async fn new(channels: Channels) -> anyhow::Result<Self> {
+    pub async fn new(workers: HarnessPool) -> anyhow::Result<Self> {
+        let config = workers.config();
+        let capacity = Arc::new(ExecutionCapacity::new(config));
         let store_path = crate::utils::path::warehouse_dir();
         let store_base = store_path.to_str().unwrap_or(".").to_string();
         let store =
@@ -126,11 +133,12 @@ impl ExecutorDispatcher {
         let timer_service = Arc::new(TimerService::new(build_timer_store(store.clone()).await?));
         let (source_reports_tx, source_reports_rx) = mpsc::unbounded_channel();
         Ok(Self {
-            channels,
+            workers,
+            capacity,
             store,
             pipeline_coders: Arc::new(HashMap::new()),
             pipeline_components: Arc::new(Components::default()),
-            window_merger: None,
+            window_mergers: (0..config.worker_count).map(|_| None).collect(),
             timer_service,
             source_reports_tx,
             source_reports_rx,
@@ -139,18 +147,28 @@ impl ExecutorDispatcher {
 
     /// Reset all channels so a new worker can connect.
     pub async fn reset_channels(&self) {
-        self.channels.reset().await;
+        for worker in self.workers.workers() {
+            worker.channels().reset().await;
+            worker.clear_registered_stages().await;
+        }
     }
 
-    /// Route SDK worker log entries for a job into that job's per-job
-    /// `flare-worker.log`.
+    /// Route each SDK worker's log entries into its per-worker job log.
     pub async fn set_log_target(&self, instance_id: &str, job_id: &str) -> anyhow::Result<()> {
-        self.channels.set_log_target(instance_id, job_id).await
+        for worker in self.workers.workers() {
+            worker
+                .channels()
+                .set_log_target(instance_id, job_id, worker.index())
+                .await?;
+        }
+        Ok(())
     }
 
     /// Install the metrics accumulator for the job that is about to run.
     pub(crate) fn set_job_metrics(&self, metrics: Arc<JobMetrics>) {
-        self.channels.control().set_job_metrics(metrics);
+        for worker in self.workers.workers() {
+            worker.control().set_job_metrics(Arc::clone(&metrics));
+        }
     }
 
     /// Point the element store (and timer store) at the job's warehouse database.
@@ -160,56 +178,100 @@ impl ExecutorDispatcher {
         let store = Arc::new(FlareElementStore::new(store_base, job_id.to_string(), None).await?);
         self.timer_service = Arc::new(TimerService::new(build_timer_store(store.clone()).await?));
         self.store = store;
+        self.capacity.reset();
         Ok(())
     }
 
     /// Wait for the worker to connect its control stream.
     pub async fn wait_connected(&self) -> anyhow::Result<()> {
-        self.channels.wait_connected().await
+        for worker in self.workers.workers() {
+            worker.channels().wait_connected().await?;
+        }
+        Ok(())
     }
 
-    /// Job-scoped health signal shared with the Fn API stream handlers.
-    pub fn harness_status(&self) -> HarnessStatus {
-        self.channels.status()
+    /// Wait until any worker reports a fatal Fn transport failure.
+    pub async fn wait_for_worker_failure(&self) -> String {
+        let futures = self
+            .workers
+            .workers()
+            .iter()
+            .map(|worker| {
+                let index = worker.index();
+                let status = worker.status();
+                Box::pin(
+                    async move { format!("worker {index}: {}", status.wait_for_failure().await) },
+                )
+            })
+            .collect::<Vec<_>>();
+        futures::future::select_all(futures).await.0
+    }
+
+    pub fn pool_config(&self) -> PoolConfig {
+        self.workers.config()
+    }
+
+    pub fn execution_capacity(&self) -> Arc<ExecutionCapacity> {
+        self.capacity.clone()
+    }
+
+    pub fn worker_statuses(&self) -> Vec<(usize, HarnessStatus)> {
+        self.workers
+            .workers()
+            .iter()
+            .map(|worker| (worker.index(), worker.status()))
+            .collect()
+    }
+
+    pub fn worker_endpoints(&self) -> Vec<(usize, String)> {
+        self.workers
+            .workers()
+            .iter()
+            .map(|worker| (worker.index(), worker.endpoint().to_string()))
+            .collect()
     }
 
     /// Start dispatcher tasks and cache the pipeline coders/components used to
     /// build a [`StageExecutor`].
-    pub fn prepare_pipeline(&mut self, pipeline_graph: &ExecutableGraph) -> anyhow::Result<()> {
+    pub async fn prepare_pipeline(
+        &mut self,
+        pipeline_graph: &ExecutableGraph,
+    ) -> anyhow::Result<()> {
         // Resolve `pickled_python` leaves through length-prefixed wrappers so the
         // runner's decoder sees the same coder graph the SDK is asked to emit.
         let mut coders = pipeline_graph.components.coders.clone();
         crate::coders::length_prefix_pickled_leaves(&mut coders);
         let side_inputs = SideInputRegistry::from_executable_graph(pipeline_graph, &coders)?;
         let user_states = UserStateRegistry::from_components(&pipeline_graph.components, &coders)?;
+        let state_backend =
+            Arc::new(crate::engine::harness::state::build_state_backend(self.store.clone()).await?);
 
-        // Start data channel dispatcher to listen and demux incoming elements.
-        self.channels.stream_elements();
-        // Start control channel dispatcher to route responses to waiting futures.
-        self.channels.stream_responses();
-        // Start state channel dispatcher to service user state and materialized
-        // iterable side inputs from the same job store.
-        self.channels
-            .state()
-            .stream_requests(self.store.clone(), side_inputs, user_states);
         self.pipeline_coders = Arc::new(coders);
         self.pipeline_components = Arc::new(pipeline_graph.components.clone());
-        self.window_merger = Some(Arc::new(WindowMergeService::new(
-            self.channels.control(),
-            self.channels.data(),
-            self.pipeline_coders.clone(),
-            self.pipeline_components.clone(),
-            ApiServiceDescriptor {
-                url: crate::DEFAULT_API_SERVICE_URL.to_string(),
-                ..Default::default()
-            },
-        )));
+        self.window_mergers.clear();
+        for worker in self.workers.workers() {
+            let channels = worker.channels();
+            channels.stream_elements();
+            channels.stream_responses();
+            channels.state().stream_requests_with_backend(
+                self.store.clone(),
+                state_backend.clone(),
+                side_inputs.clone(),
+                user_states.clone(),
+            );
+            self.window_mergers
+                .push(Some(Arc::new(WindowMergeService::new(
+                    channels.control(),
+                    channels.data(),
+                    self.pipeline_coders.clone(),
+                    self.pipeline_components.clone(),
+                    ApiServiceDescriptor {
+                        url: worker.endpoint().to_string(),
+                        ..Default::default()
+                    },
+                ))));
+        }
         Ok(())
-    }
-
-    /// Build a [`StageExecutor`] from the currently prepared state.
-    pub fn new_executor(&self) -> StageExecutor {
-        StageExecutor::new(self.new_bundle_runtime())
     }
 
     /// Run the executable graph to completion.
@@ -239,7 +301,7 @@ impl ExecutorDispatcher {
         // Split residuals are announced while their parent bundle is still
         // running so the scheduler can fill the stage's remaining bundle slots.
         let (immediate_sdf_tx, mut immediate_sdf_rx) =
-            mpsc::unbounded_channel::<(String, SdfWorkItem)>();
+            mpsc::channel::<(String, SdfWorkItem)>(self.workers.config().sdf_queue_max_items);
         // Drop any stale reports left by a previous job over the same dispatcher.
         while self.source_reports_rx.try_recv().is_ok() {}
 
@@ -263,7 +325,11 @@ impl ExecutorDispatcher {
                 .await?;
 
             for (idx, node) in scheduler.next_nodes() {
-                let runtime = self.new_bundle_runtime();
+                let lease = self
+                    .workers
+                    .try_lease()
+                    .ok_or_else(|| anyhow!("worker pool exhausted while scheduling a bundle"))?;
+                let runtime = self.new_bundle_runtime(&lease);
                 let input_metadata = scheduler.input_edge_metadata(idx);
                 let output_metadata = scheduler.output_edge_metadata_all(idx);
                 let stage_id = node.id();
@@ -281,15 +347,20 @@ impl ExecutorDispatcher {
                 // A splittable stage runs one bundle per queued work item. Take
                 // the next item here (the initialization bundle has no item), so
                 // each started bundle gets distinct seed bytes.
-                let (sdf_seed, sdf_initialized, sdf_registered, sdf_progress_tick) = match &node {
+                let (sdf_seed, sdf_initialized, sdf_progress_tick) = match &node {
                     ExecutableNode::Splittable(_) => {
                         let queue = sdf_queues.entry(stage_id.clone()).or_default();
                         let initialized = queue.initialized;
                         let seed = if initialized {
-                            queue.items.pop_front()
+                            Some(queue.items.pop_front().ok_or_else(|| {
+                                anyhow!("SDF stage '{stage_id}' was scheduled without queued work")
+                            })?)
                         } else {
                             None
                         };
+                        if let Some(item) = &seed {
+                            self.capacity.consume_sdf_item(item.seed.len());
+                        }
                         log::info!(
                             "SDF stage '{stage_id}': starting bundle, initialized={initialized}, \
                              queue_depth={}, in_flight={}, seed_bytes={}",
@@ -297,27 +368,24 @@ impl ExecutorDispatcher {
                             scheduler.watermarks().in_flight_bundles(&stage_id),
                             seed.as_ref().map_or(0, |item| item.seed.len())
                         );
-                        (
-                            seed,
-                            queue.initialized,
-                            queue.registered,
-                            queue.progress_tick,
-                        )
+                        (seed, queue.initialized, queue.progress_tick)
                     }
-                    _ => (None, false, false, None),
+                    _ => (None, false, None),
                 };
 
                 let immediate_sdf_tx = immediate_sdf_tx.clone();
+                let scheduler_capacity = scheduler.capacity().clone();
                 in_flight.spawn(async move {
+                    let _lease = lease;
                     if let ExecutableNode::Splittable(stage) = node {
-                        let mut executor = SplittableStageExecutor::new(runtime);
+                        let mut executor =
+                            SplittableStageExecutor::new(runtime, scheduler_capacity.clone());
                         let run = match executor
                             .execute_bundle(
                                 &stage,
                                 output_metadata,
                                 sdf_seed,
                                 sdf_initialized,
-                                sdf_registered,
                                 sdf_progress_tick,
                                 immediate_sdf_tx,
                             )
@@ -441,6 +509,7 @@ impl ExecutorDispatcher {
                         scheduler,
                         &mut sdf_queues,
                         &mut residual_holds,
+                        &self.capacity,
                         &stage_id,
                         [item],
                     )?;
@@ -478,12 +547,12 @@ impl ExecutorDispatcher {
                         remove_holds(&mut residual_holds, &stage_id, &outcome.consumed_holds);
                         let queue = sdf_queues.entry(stage_id.clone()).or_default();
                         queue.initialized = outcome.initialized;
-                        queue.registered = outcome.registered;
                         queue.progress_tick = Some(outcome.progress_tick);
                         let count = enqueue_sdf_items(
                             scheduler,
                             &mut sdf_queues,
                             &mut residual_holds,
+                            &self.capacity,
                             &stage_id,
                             outcome.items,
                         )?;
@@ -510,6 +579,7 @@ impl ExecutorDispatcher {
                                 scheduler,
                                 &mut sdf_queues,
                                 &mut residual_holds,
+                                &self.capacity,
                                 &event_stage,
                                 [item],
                             )?;
@@ -626,16 +696,25 @@ impl ExecutorDispatcher {
         Ok(promoted)
     }
 
-    fn new_bundle_runtime(&self) -> BundleRuntime {
+    fn new_bundle_runtime(&self, lease: &WorkerLease) -> BundleRuntime {
+        let worker = self.workers.worker(lease);
+        let index = worker.index();
         BundleRuntime::new(
-            self.channels.control(),
-            self.channels.data(),
+            worker.control(),
+            worker.data(),
             self.store.clone(),
             self.pipeline_coders.clone(),
             self.pipeline_components.clone(),
-            self.window_merger.clone(),
+            self.window_mergers
+                .get(index)
+                .and_then(std::clone::Clone::clone),
             self.timer_service.clone(),
             self.source_reports_tx.clone(),
+            ApiServiceDescriptor {
+                url: worker.endpoint().to_string(),
+                ..Default::default()
+            },
+            worker.registered_stages(),
         )
     }
 

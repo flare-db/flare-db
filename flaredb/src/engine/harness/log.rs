@@ -15,9 +15,8 @@ use tonic::{Response, Status};
 use crate::utils::path;
 
 /// Destination for SDK worker log entries flowing in over the Beam Fn Logging
-/// API. Entries are appended to a per-job `flare-worker.log`, the same file the
-/// harness process writes its stdout/stderr to, so a single file captures the
-/// whole worker log for a job.
+/// API. Entries are appended to a per-worker `flare-worker-N.log`, the same file
+/// that worker's harness process writes its stdout/stderr to.
 #[derive(Default)]
 struct LogSink {
     path: Option<PathBuf>,
@@ -190,8 +189,14 @@ impl LogChannel {
 
     /// Route SDK worker log entries for `job_id` into that job's
     /// `flare-worker.log`, alongside the harness process stdout/stderr.
-    pub async fn set_target(&self, instance_id: &str, job_id: &str) -> Result<()> {
-        let path = path::logs_dir(instance_id, job_id).join("flare-worker.log");
+    pub async fn set_target(
+        &self,
+        instance_id: &str,
+        job_id: &str,
+        worker_id: usize,
+    ) -> Result<()> {
+        let path =
+            path::logs_dir(instance_id, job_id).join(format!("flare-worker-{worker_id}.log"));
         self.stream
             .sink
             .lock()

@@ -1,5 +1,5 @@
 use flaredb::{
-    engine::{dispatcher::ExecutorDispatcher, harness::Channels},
+    engine::{capacity::PoolConfig, dispatcher::ExecutorDispatcher, harness::pool::HarnessPool},
     io::server::FlareIO,
     jobservice::{
         artifact::{ArtifactStore, FlareArtifactStagingService},
@@ -13,8 +13,6 @@ use tonic::transport::Server;
 
 use beam_model_rs::v1::{
     artifact_staging_service_server::ArtifactStagingServiceServer,
-    beam_fn_control_server::BeamFnControlServer, beam_fn_data_server::BeamFnDataServer,
-    beam_fn_logging_server::BeamFnLoggingServer, beam_fn_state_server::BeamFnStateServer,
     org::apache::beam::model::job_management::v1::job_service_server::JobServiceServer,
 };
 
@@ -43,9 +41,19 @@ async fn flare_up() -> Result<(), Box<dyn std::error::Error>> {
     let artifact_store =
         Arc::new(ArtifactStore::from(artifact_root_str, "pipeline-artifact").await?);
 
-    let (channels, services) = Channels::builder().build().await?;
-
-    let dispatcher = Arc::new(Mutex::new(ExecutorDispatcher::new(channels).await?));
+    let pool_config = PoolConfig::detect();
+    log::info!(
+        "worker pool: workers={}, bundles_per_worker={}, total_bundle_slots={}, \
+         sdf_queue_max_items={}, sdf_queue_max_bytes={}, sdf_max_split_depth={}",
+        pool_config.worker_count,
+        pool_config.bundles_per_worker,
+        pool_config.total_bundle_slots,
+        pool_config.sdf_queue_max_items,
+        pool_config.sdf_queue_max_bytes,
+        pool_config.sdf_max_split_depth
+    );
+    let workers = HarnessPool::build(pool_config, flaredb::grpc_max_message_size_bytes()).await?;
+    let dispatcher = Arc::new(Mutex::new(ExecutorDispatcher::new(workers).await?));
 
     let worker_jar = std::env::var("WORKER_JAR_PATH").unwrap_or_else(|_| {
         format!(
@@ -56,8 +64,6 @@ async fn flare_up() -> Result<(), Box<dyn std::error::Error>> {
 
     let worker_cfg = WorkerLaunchConfig {
         worker_jar,
-        logs_dir: artifact_root_str.to_string(),
-        control_url: flaredb::DEFAULT_API_SERVICE_URL.to_string(),
         connect_timeout_secs: 20,
         python_bin: std::env::var("FLAREDB_PYTHON_BIN").ok(),
     };
@@ -84,26 +90,6 @@ async fn flare_up() -> Result<(), Box<dyn std::error::Error>> {
         )
         .add_service(
             ArtifactStagingServiceServer::new(artifact_service)
-                .max_decoding_message_size(grpc_max_message_size)
-                .max_encoding_message_size(grpc_max_message_size),
-        )
-        .add_service(
-            BeamFnControlServer::new(services.control)
-                .max_decoding_message_size(grpc_max_message_size)
-                .max_encoding_message_size(grpc_max_message_size),
-        )
-        .add_service(
-            BeamFnDataServer::new(services.data)
-                .max_decoding_message_size(grpc_max_message_size)
-                .max_encoding_message_size(grpc_max_message_size),
-        )
-        .add_service(
-            BeamFnLoggingServer::new(services.log)
-                .max_decoding_message_size(grpc_max_message_size)
-                .max_encoding_message_size(grpc_max_message_size),
-        )
-        .add_service(
-            BeamFnStateServer::new(services.state)
                 .max_decoding_message_size(grpc_max_message_size)
                 .max_encoding_message_size(grpc_max_message_size),
         )

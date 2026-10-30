@@ -1,3 +1,4 @@
+pub mod capacity;
 pub mod dispatcher;
 pub mod executor;
 pub mod guard;

@@ -8,7 +8,7 @@ use std::{
 
 use anyhow::anyhow;
 use async_trait::async_trait;
-use beam_model_rs::v1::{ApiServiceDescriptor, ProcessBundleDescriptor};
+use beam_model_rs::v1::ProcessBundleDescriptor;
 use log::{error, info, warn};
 
 use crate::{
@@ -433,10 +433,7 @@ impl StageExecutor {
                 info!("Runner node input metadata: {:?}", input_edge_metadata);
                 info!("Runner node output metadata: {:?}", output_edge_metadata);
 
-                let endpoint = ApiServiceDescriptor {
-                    url: crate::DEFAULT_API_SERVICE_URL.to_string(),
-                    ..Default::default()
-                };
+                let endpoint = self.runtime.endpoint().clone();
 
                 let descriptor = ProcessBundleDescriptor {
                     id: runner_transform.id(),

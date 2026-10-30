@@ -13,8 +13,6 @@ fn runner_capabilities() -> &'static str {
 #[derive(Clone, Debug)]
 pub struct WorkerLaunchConfig {
     pub worker_jar: String,
-    pub logs_dir: String,
-    pub control_url: String,
     pub connect_timeout_secs: u64,
     /// Fallback interpreter used to launch a Python SDK harness when the job's
     /// PROCESS environment does not advertise one. `None` means `python3` from
@@ -51,9 +49,11 @@ impl WorkerManager {
     pub async fn spawn_worker(
         &self,
         job_id: &str,
+        worker_id: usize,
         runtime: &WorkerRuntime,
         staging_dir: &str,
         instance_id: &str,
+        fn_endpoint: &str,
         pipeline_options: &str,
     ) -> Result<(), Status> {
         let logs_dir = logs_dir(instance_id, job_id);
@@ -61,7 +61,13 @@ impl WorkerManager {
             .await
             .map_err(|e| Status::internal(format!("failed to create logs dir: {}", e)))?;
 
-        let log_path = format!("{}/flare-worker.log", logs_dir.display());
+        let log_path = format!("{}/flare-worker-{worker_id}.log", logs_dir.display());
+        let harness_id = format!("{job_id}-worker-{worker_id}");
+        let worker_key = worker_key(job_id, worker_id);
+        let worker_staging_dir = format!("{staging_dir}/worker-{worker_id}");
+        tokio::fs::create_dir_all(&worker_staging_dir)
+            .await
+            .map_err(|e| Status::internal(format!("failed to create worker staging dir: {e}")))?;
         let stdout_file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -107,22 +113,22 @@ impl WorkerManager {
                     .arg("-cp")
                     .arg(&classpath)
                     .arg("org.apache.beam.fn.harness.FnHarness")
-                    .env("HARNESS_ID", job_id)
+                    .env("HARNESS_ID", &harness_id)
                     .env(
                         "CONTROL_API_SERVICE_DESCRIPTOR",
-                        format!(r#"url: "{}""#, self.config.control_url),
+                        format!(r#"url: "{fn_endpoint}""#),
                     )
                     .env(
                         "LOGGING_API_SERVICE_DESCRIPTOR",
-                        format!(r#"url: "{}""#, self.config.control_url),
+                        format!(r#"url: "{fn_endpoint}""#),
                     )
                     .env(
                         "DATA_API_SERVICE_DESCRIPTOR",
-                        format!(r#"url: "{}""#, self.config.control_url),
+                        format!(r#"url: "{fn_endpoint}""#),
                     )
                     .env(
                         "STATE_API_SERVICE_DESCRIPTOR",
-                        format!(r#"url: "{}""#, self.config.control_url),
+                        format!(r#"url: "{fn_endpoint}""#),
                     )
                     .env("PIPELINE_OPTIONS", pipeline_options)
                     .env("RUNNER_CAPABILITIES", runner_capabilities())
@@ -135,14 +141,15 @@ impl WorkerManager {
 
                 let pid = child.id();
                 log::info!(
-                    "spawned java harness: job_id={}, pid={:?}, classpath={}, log={}",
+                    "spawned java harness: job_id={}, worker_id={}, pid={:?}, classpath={}, log={}",
                     job_id,
+                    worker_id,
                     pid,
                     classpath,
                     log_path
                 );
 
-                self.active_workers.insert(job_id.to_string(), child);
+                self.active_workers.insert(worker_key, child);
                 Ok(())
             }
             WorkerRuntime::Python { python_bin } => {
@@ -151,25 +158,25 @@ impl WorkerManager {
 
                 cmd.arg("-m")
                     .arg("apache_beam.runners.worker.sdk_worker_main")
-                    .env("HARNESS_ID", job_id)
-                    .env("WORKER_ID", job_id)
+                    .env("HARNESS_ID", &harness_id)
+                    .env("WORKER_ID", &harness_id)
                     .env(
                         "CONTROL_API_SERVICE_DESCRIPTOR",
-                        format!(r#"url: "{}""#, self.config.control_url),
+                        format!(r#"url: "{fn_endpoint}""#),
                     )
                     .env(
                         "LOGGING_API_SERVICE_DESCRIPTOR",
-                        format!(r#"url: "{}""#, self.config.control_url),
+                        format!(r#"url: "{fn_endpoint}""#),
                     )
                     .env(
                         "DATA_API_SERVICE_DESCRIPTOR",
-                        format!(r#"url: "{}""#, self.config.control_url),
+                        format!(r#"url: "{fn_endpoint}""#),
                     )
                     .env(
                         "STATE_API_SERVICE_DESCRIPTOR",
-                        format!(r#"url: "{}""#, self.config.control_url),
+                        format!(r#"url: "{fn_endpoint}""#),
                     )
-                    .env("SEMI_PERSISTENT_DIRECTORY", staging_dir)
+                    .env("SEMI_PERSISTENT_DIRECTORY", &worker_staging_dir)
                     .env("PIPELINE_OPTIONS", pipeline_options)
                     .env("RUNNER_CAPABILITIES", runner_capabilities())
                     .env("PYTHONUNBUFFERED", "1")
@@ -185,15 +192,16 @@ impl WorkerManager {
 
                 let pid = child.id();
                 log::info!(
-                    "spawned python harness: job_id={}, pid={:?}, python={}, staging_dir={}, log={}",
+                    "spawned python harness: job_id={}, worker_id={}, pid={:?}, python={}, staging_dir={}, log={}",
                     job_id,
+                    worker_id,
                     pid,
                     py_bin,
-                    staging_dir,
+                    worker_staging_dir,
                     log_path
                 );
 
-                self.active_workers.insert(job_id.to_string(), child);
+                self.active_workers.insert(worker_key, child);
                 Ok(())
             }
             WorkerRuntime::Docker { image } => {
@@ -217,11 +225,13 @@ impl WorkerManager {
         }
     }
 
-    pub async fn stop_worker(&self, job_id: &str) -> Result<(), Status> {
-        if let Some((_, mut child)) = self.active_workers.remove(job_id) {
+    pub async fn stop_worker(&self, job_id: &str, worker_id: usize) -> Result<(), Status> {
+        let key = worker_key(job_id, worker_id);
+        if let Some((_, mut child)) = self.active_workers.remove(&key) {
             log::info!(
-                "stopping worker for job_id={}, pid={:?}",
+                "stopping worker for job_id={}, worker_id={}, pid={:?}",
                 job_id,
+                worker_id,
                 child.id()
             );
             child.kill().await.map_err(|e| {
@@ -231,9 +241,41 @@ impl WorkerManager {
                 ))
             })?;
         } else {
-            log::warn!("stop_worker called for unknown job_id={}", job_id);
+            log::warn!(
+                "stop_worker called for unknown job_id={}, worker_id={}",
+                job_id,
+                worker_id
+            );
         }
         Ok(())
+    }
+
+    pub async fn stop_workers(&self, job_id: &str) -> Result<(), Status> {
+        let prefix = format!("{job_id}:");
+        let keys: Vec<String> = self
+            .active_workers
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .key()
+                    .starts_with(&prefix)
+                    .then(|| entry.key().clone())
+            })
+            .collect();
+        let mut first_error = None;
+        for key in keys {
+            if let Some((_, mut child)) = self.active_workers.remove(&key) {
+                log::info!("stopping worker process {key}, pid={:?}", child.id());
+                if let Err(error) = child.kill().await
+                    && first_error.is_none()
+                {
+                    first_error = Some(Status::internal(format!(
+                        "failed to kill worker process {key}: {error}"
+                    )));
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     pub async fn stop_all(&self) {
@@ -249,6 +291,10 @@ impl WorkerManager {
             }
         }
     }
+}
+
+fn worker_key(job_id: &str, worker_id: usize) -> String {
+    format!("{job_id}:{worker_id}")
 }
 
 #[cfg(test)]
@@ -268,8 +314,6 @@ mod tests {
     async fn stop_worker_reaps_the_harness_process() {
         let manager = WorkerManager::new(WorkerLaunchConfig {
             worker_jar: String::new(),
-            logs_dir: String::new(),
-            control_url: String::new(),
             connect_timeout_secs: 1,
             python_bin: None,
         });
@@ -281,16 +325,49 @@ mod tests {
         let pid = child.id().expect("test worker pid");
         manager
             .active_workers
-            .insert("job-with-broken-stream".to_string(), child);
+            .insert(worker_key("job-with-broken-stream", 0), child);
 
         assert!(Path::new(&format!("/proc/{pid}")).exists());
         manager
-            .stop_worker("job-with-broken-stream")
+            .stop_worker("job-with-broken-stream", 0)
             .await
             .expect("stop worker");
         assert!(
             !Path::new(&format!("/proc/{pid}")).exists(),
             "worker process {pid} remained after cleanup"
         );
+    }
+
+    #[tokio::test]
+    async fn stop_workers_reaps_every_process_for_a_job() {
+        let manager = WorkerManager::new(WorkerLaunchConfig {
+            worker_jar: String::new(),
+            connect_timeout_secs: 1,
+            python_bin: None,
+        });
+        let mut pids = Vec::new();
+        for worker_id in 0..2 {
+            let child = Command::new("sh")
+                .arg("-c")
+                .arg("sleep 60")
+                .spawn()
+                .expect("spawn test worker");
+            pids.push(child.id().expect("test worker pid"));
+            manager
+                .active_workers
+                .insert(worker_key("job-with-pool", worker_id), child);
+        }
+
+        manager
+            .stop_workers("job-with-pool")
+            .await
+            .expect("stop worker pool");
+        assert!(manager.active_workers.is_empty());
+        for pid in pids {
+            assert!(
+                !Path::new(&format!("/proc/{pid}")).exists(),
+                "worker process {pid} remained after pool cleanup"
+            );
+        }
     }
 }

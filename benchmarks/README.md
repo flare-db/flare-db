@@ -25,6 +25,10 @@ The `:nexmark` Gradle module ports batch-based queries with default global windo
 
 ## Running Benchmarks
 
+The fixed-worker-pool SDF comparison lives in
+[`sdf_work_pool/`](sdf_work_pool/README.md). It compares serial ParDo work with
+the same workload expressed as a dynamically split restriction.
+
 ### 1. Build Module & Fat JAR
 ```bash
 ./gradlew :nexmark:shadowJar
