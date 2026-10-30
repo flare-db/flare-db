@@ -15,18 +15,20 @@ use tonic::{Response, Status};
 use crate::utils::path;
 
 /// Destination for SDK worker log entries flowing in over the Beam Fn Logging
-/// API. Entries are appended to a per-worker `flare-worker-N.log`, the same file
-/// that worker's harness process writes its stdout/stderr to.
+/// API. Every worker appends to the job's single `flare-worker.log`, and each
+/// entry carries the worker id.
 #[derive(Default)]
 struct LogSink {
     path: Option<PathBuf>,
     file: Option<std::fs::File>,
+    worker_id: Option<usize>,
 }
 
 impl LogSink {
     /// Point the sink at `path`, opening it for appending. No-op when the sink
     /// is already writing to the same file.
-    fn set_target(&mut self, path: PathBuf) -> std::io::Result<()> {
+    fn set_target(&mut self, path: PathBuf, worker_id: usize) -> std::io::Result<()> {
+        self.worker_id = Some(worker_id);
         if self.file.is_some() && self.path.as_deref() == Some(path.as_path()) {
             return Ok(());
         }
@@ -57,6 +59,7 @@ impl LogSink {
     fn clear(&mut self) {
         self.path = None;
         self.file = None;
+        self.worker_id = None;
     }
 }
 
@@ -128,10 +131,8 @@ impl BeamFnLogging for FlareLogService {
                 while let Ok(Some(list)) = stream.message().await {
                     let mut sink = inner.sink.lock().await;
                     for entry in list.log_entries {
-                        let line = format!(
-                            "[FLARE WORKER LOG] level={:?} message={}\n",
-                            entry.severity, entry.message
-                        );
+                        let line =
+                            format_worker_log_line(sink.worker_id, &entry.severity, &entry.message);
                         if !sink.write_line(&line) {
                             // No per-job target configured yet; keep the entry in
                             // the server log rather than dropping it.
@@ -161,6 +162,17 @@ impl BeamFnLogging for FlareLogService {
     }
 }
 
+fn format_worker_log_line(
+    worker_id: Option<usize>,
+    severity: &impl std::fmt::Debug,
+    message: &str,
+) -> String {
+    let worker_id = worker_id
+        .map(|worker_id| worker_id.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    format!("[FLARE WORKER LOG] worker_id={worker_id} level={severity:?} message={message}\n")
+}
+
 pub struct LogChannel {
     stream: Arc<LogInner>,
 }
@@ -187,21 +199,20 @@ impl LogChannel {
         log::info!("log channel reset for next harness");
     }
 
-    /// Route SDK worker log entries for `job_id` into that job's
-    /// `flare-worker.log`, alongside the harness process stdout/stderr.
+    /// Route SDK worker log entries for `job_id` into that job's single
+    /// `flare-worker.log`, alongside the prefixed harness process stdout/stderr.
     pub async fn set_target(
         &self,
         instance_id: &str,
         job_id: &str,
         worker_id: usize,
     ) -> Result<()> {
-        let path =
-            path::logs_dir(instance_id, job_id).join(format!("flare-worker-{worker_id}.log"));
+        let path = path::logs_dir(instance_id, job_id).join("flare-worker.log");
         self.stream
             .sink
             .lock()
             .await
-            .set_target(path.clone())
+            .set_target(path.clone(), worker_id)
             .map_err(|e| anyhow!("failed to open worker log {}: {}", path.display(), e))?;
         log::info!(
             "routing SDK worker logs for job {} to {}",
@@ -231,5 +242,38 @@ impl LogChannel {
             .await
             .map_err(|e| anyhow!("log stream error: {}", e))?
             .ok_or_else(|| anyhow!("harness disconnected"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worker_log_entries_share_one_file_and_carry_worker_ids() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("flare-worker.log");
+        let mut first = LogSink::default();
+        let mut second = LogSink::default();
+        first
+            .set_target(path.clone(), 3)
+            .expect("open first worker sink");
+        second
+            .set_target(path.clone(), 7)
+            .expect("open second worker sink");
+
+        assert!(first.write_line(&format_worker_log_line(Some(3), &"INFO", "first worker")));
+        assert!(second.write_line(&format_worker_log_line(Some(7), &"WARN", "second worker")));
+
+        let contents = std::fs::read_to_string(&path).expect("read worker log");
+        assert!(contents.contains("worker_id=3 level=\"INFO\" message=first worker"));
+        assert!(contents.contains("worker_id=7 level=\"WARN\" message=second worker"));
+        assert_eq!(
+            std::fs::read_dir(temp.path())
+                .expect("read temp dir")
+                .count(),
+            1,
+            "only the job-level worker log is created"
+        );
     }
 }

@@ -155,7 +155,7 @@ impl ExecutorDispatcher {
         }
     }
 
-    /// Route each SDK worker's log entries into its per-worker job log.
+    /// Route each SDK worker's log entries into the job's shared worker log.
     pub async fn set_log_target(&self, instance_id: &str, job_id: &str) -> anyhow::Result<()> {
         for worker in self.workers.workers() {
             worker

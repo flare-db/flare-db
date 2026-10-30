@@ -1,6 +1,8 @@
 use dashmap::DashMap;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tonic::Status;
 
@@ -8,6 +10,70 @@ use crate::{jobservice::urns::beam_urns, utils::path::logs_dir};
 
 fn runner_capabilities() -> &'static str {
     beam_urns::MULTIMAP_KEYS_VALUES_SIDE_INPUT_PROTOCOL
+}
+
+fn worker_log_path(logs_dir: &Path) -> PathBuf {
+    logs_dir.join("flare-worker.log")
+}
+
+fn spawn_process_log_forwarders(child: &mut Child, log_path: PathBuf, worker_id: usize) {
+    if let Some(stdout) = child.stdout.take() {
+        spawn_process_log_forwarder(stdout, log_path.clone(), worker_id, "stdout");
+    }
+    if let Some(stderr) = child.stderr.take() {
+        spawn_process_log_forwarder(stderr, log_path, worker_id, "stderr");
+    }
+}
+
+fn spawn_process_log_forwarder<R>(
+    reader: R,
+    log_path: PathBuf,
+    worker_id: usize,
+    stream_name: &'static str,
+) where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        if let Err(error) = forward_process_output(reader, &log_path, worker_id, stream_name).await
+        {
+            log::warn!(
+                "failed to forward worker process {stream_name}: worker_id={worker_id}, \
+                 log={}, error={error}",
+                log_path.display()
+            );
+        }
+    });
+}
+
+async fn forward_process_output<R>(
+    reader: R,
+    log_path: &Path,
+    worker_id: usize,
+    stream_name: &str,
+) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut reader = BufReader::new(reader);
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .await?;
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line).await? == 0 {
+            return Ok(());
+        }
+        let message = String::from_utf8_lossy(&line);
+        let message = message.trim_end_matches(['\r', '\n']);
+        let formatted = format!(
+            "[FLARE WORKER PROCESS] worker_id={worker_id} stream={stream_name} message={message}\n"
+        );
+        file.write_all(formatted.as_bytes()).await?;
+        file.flush().await?;
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -61,22 +127,9 @@ impl WorkerManager {
             .await
             .map_err(|e| Status::internal(format!("failed to create logs dir: {}", e)))?;
 
-        let log_path = format!("{}/flare-worker-{worker_id}.log", logs_dir.display());
+        let log_path = worker_log_path(&logs_dir);
         let harness_id = format!("{job_id}-worker-{worker_id}");
         let worker_key = worker_key(job_id, worker_id);
-        let worker_staging_dir = format!("{staging_dir}/worker-{worker_id}");
-        tokio::fs::create_dir_all(&worker_staging_dir)
-            .await
-            .map_err(|e| Status::internal(format!("failed to create worker staging dir: {e}")))?;
-        let stdout_file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-            .map_err(|e| Status::internal(format!("failed to open harness log file: {}", e)))?;
-        let stderr_file = stdout_file
-            .try_clone()
-            .map_err(|e| Status::internal(format!("failed to clone harness log handle: {}", e)))?;
-
         match runtime {
             WorkerRuntime::Java { staged_jar } => {
                 let worker_jar = &self.config.worker_jar;
@@ -132,12 +185,13 @@ impl WorkerManager {
                     )
                     .env("PIPELINE_OPTIONS", pipeline_options)
                     .env("RUNNER_CAPABILITIES", runner_capabilities())
-                    .stdout(Stdio::from(stdout_file))
-                    .stderr(Stdio::from(stderr_file));
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
 
-                let child = cmd
+                let mut child = cmd
                     .spawn()
                     .map_err(|e| Status::internal(format!("failed to spawn harness: {}", e)))?;
+                spawn_process_log_forwarders(&mut child, log_path.clone(), worker_id);
 
                 let pid = child.id();
                 log::info!(
@@ -146,7 +200,7 @@ impl WorkerManager {
                     worker_id,
                     pid,
                     classpath,
-                    log_path
+                    log_path.display()
                 );
 
                 self.active_workers.insert(worker_key, child);
@@ -176,19 +230,23 @@ impl WorkerManager {
                         "STATE_API_SERVICE_DESCRIPTOR",
                         format!(r#"url: "{fn_endpoint}""#),
                     )
-                    .env("SEMI_PERSISTENT_DIRECTORY", &worker_staging_dir)
+                    // Python workers load the same staged main session from the
+                    // shared artifact root. Creating one directory per worker is
+                    // unnecessary and leaves empty job/instance artifacts behind.
+                    .env("SEMI_PERSISTENT_DIRECTORY", staging_dir)
                     .env("PIPELINE_OPTIONS", pipeline_options)
                     .env("RUNNER_CAPABILITIES", runner_capabilities())
                     .env("PYTHONUNBUFFERED", "1")
-                    .stdout(Stdio::from(stdout_file))
-                    .stderr(Stdio::from(stderr_file));
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
 
-                let child = cmd.spawn().map_err(|e| {
+                let mut child = cmd.spawn().map_err(|e| {
                     Status::internal(format!(
                         "failed to spawn python harness ({}) : {}",
                         py_bin, e
                     ))
                 })?;
+                spawn_process_log_forwarders(&mut child, log_path.clone(), worker_id);
 
                 let pid = child.id();
                 log::info!(
@@ -197,8 +255,8 @@ impl WorkerManager {
                     worker_id,
                     pid,
                     py_bin,
-                    worker_staging_dir,
-                    log_path
+                    staging_dir,
+                    log_path.display()
                 );
 
                 self.active_workers.insert(worker_key, child);
@@ -301,12 +359,57 @@ fn worker_key(job_id: &str, worker_id: usize) -> String {
 mod tests {
     use super::*;
     use std::path::Path;
+    use tokio::io::{AsyncWriteExt, duplex};
 
     #[test]
     fn advertises_multimap_keys_values_protocol() {
         assert_eq!(
             runner_capabilities(),
             "beam:protocol:multimap_keys_values_side_input:v1"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_output_is_prefixed_and_shared_across_workers() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let log_path = worker_log_path(temp.path());
+
+        let (mut first_writer, first_reader) = duplex(256);
+        first_writer
+            .write_all(b"first stdout line\nsecond stdout line\n")
+            .await
+            .expect("write first process output");
+        drop(first_writer);
+        forward_process_output(first_reader, &log_path, 2, "stdout")
+            .await
+            .expect("forward first process output");
+
+        let (mut second_writer, second_reader) = duplex(256);
+        second_writer
+            .write_all(b"second worker stderr line\n")
+            .await
+            .expect("write second process output");
+        drop(second_writer);
+        forward_process_output(second_reader, &log_path, 5, "stderr")
+            .await
+            .expect("forward second process output");
+
+        let contents = std::fs::read_to_string(&log_path).expect("read worker log");
+        assert!(contents.contains(
+            "[FLARE WORKER PROCESS] worker_id=2 stream=stdout message=first stdout line"
+        ));
+        assert!(contents.contains(
+            "[FLARE WORKER PROCESS] worker_id=2 stream=stdout message=second stdout line"
+        ));
+        assert!(contents.contains(
+            "[FLARE WORKER PROCESS] worker_id=5 stream=stderr message=second worker stderr line"
+        ));
+        assert_eq!(
+            std::fs::read_dir(temp.path())
+                .expect("read temp dir")
+                .count(),
+            1,
+            "workers must share one job-level log file"
         );
     }
 
