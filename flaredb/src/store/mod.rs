@@ -1,4 +1,5 @@
 pub mod element_store;
+pub mod provider;
 pub mod record;
 
 pub(crate) const KEY_COLUMN: &str = "key";

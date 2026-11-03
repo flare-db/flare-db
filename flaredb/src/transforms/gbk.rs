@@ -1,10 +1,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     path::Path,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex},
     time::Instant,
 };
 
@@ -24,17 +21,20 @@ use beam_model_rs::v1::{
 };
 use datafusion::{
     catalog::streaming::StreamingTable,
+    datasource::TableProvider,
     error::DataFusionError,
-    execution::{TaskContext, memory_pool::FairSpillPool, runtime_env::RuntimeEnvBuilder},
+    execution::TaskContext,
+    logical_expr::Expr,
     physical_plan::{
-        SendableRecordBatchStream, stream::RecordBatchStreamAdapter, streaming::PartitionStream,
+        ExecutionPlan, ExecutionPlanProperties, SendableRecordBatchStream, common::spawn_buffered,
+        sorts::sort::SortExec, stream::RecordBatchStreamAdapter, streaming::PartitionStream,
     },
-    prelude::{SessionConfig, SessionContext, col},
+    prelude::{col, lit},
 };
+use futures::StreamExt;
 use log::{info, warn};
-use paimon::table::ArrowRecordBatchStream;
+
 use tempfile::TempDir;
-use tokio_stream::StreamExt;
 
 use crate::{
     coders::primitives::{BeamWindow, WindowedValue},
@@ -50,8 +50,9 @@ use crate::{
         KEY_COLUMN, VALUE_COLUMN,
         element_store::{
             FlareElementStore, PCollectionWriter, WINDOW_COUNT_COLUMN, WINDOW_EXTRA_KEYS_COLUMN,
-            WINDOW_KEY_COLUMN, WINDOW_TIMESTAMP_COLUMN,
+            WINDOW_KEY_COLUMN, WINDOW_MAX_END_COLUMN, WINDOW_TIMESTAMP_COLUMN,
         },
+        provider::{FlareTableProvider, SnapshotRange, gbk_session},
         record::{
             BeamKV, BeamRecord, IterableValue, PrimitiveValue, RecordTableSchema,
             primitive_value_from_array_row, record_batch_to_beamrecords,
@@ -175,6 +176,12 @@ trait GbkStateBackend: Send + Sync {
 
     async fn mark_watermark_evaluated(&self, watermark: i64);
 
+    async fn pending_range(&self) -> Option<SnapshotRange>;
+
+    async fn pin_range(&self, range: SnapshotRange);
+
+    async fn clear_range(&self);
+
     async fn apply_group(
         &self,
         key: PrimitiveValue,
@@ -199,6 +206,7 @@ struct InMemoryGbkStateInner {
     states: HashMap<GroupIdentity, WindowState>,
     ready_scan: Option<VecDeque<GroupIdentity>>,
     last_evaluated_watermark: Option<i64>,
+    pending_range: Option<SnapshotRange>,
 }
 
 #[derive(Clone, Default)]
@@ -228,6 +236,25 @@ impl GbkStateBackend for InMemoryGbkState {
             .lock()
             .expect("gbk state lock not poisoned")
             .last_evaluated_watermark = Some(watermark);
+    }
+
+    async fn pending_range(&self) -> Option<SnapshotRange> {
+        self.inner
+            .lock()
+            .expect("gbk state lock not poisoned")
+            .pending_range
+    }
+
+    async fn pin_range(&self, range: SnapshotRange) {
+        let mut inner = self.inner.lock().expect("gbk state lock not poisoned");
+        inner.pending_range.get_or_insert(range);
+    }
+
+    async fn clear_range(&self) {
+        self.inner
+            .lock()
+            .expect("gbk state lock not poisoned")
+            .pending_range = None;
     }
 
     async fn apply_group(
@@ -485,6 +512,7 @@ impl FlareTransform for GroupByKey {
             cursor,
             window_prune_before,
             &config,
+            &self.state,
         )
         .await?;
         let mut writer =
@@ -498,8 +526,10 @@ impl FlareTransform for GroupByKey {
         let mut decode_time = std::time::Duration::ZERO;
         let mut group_time = std::time::Duration::ZERO;
         let mut write_time = std::time::Duration::ZERO;
-        for (bucket, mut sorted_input) in sorted_inputs {
-            info!("GroupByKey: processing bucket {bucket} for {input_pcollection_id}");
+        for (partition, mut sorted_input) in sorted_inputs {
+            info!(
+                "GroupByKey: processing provider partition {partition} for {input_pcollection_id}"
+            );
             let sort_result: Result<()> = async {
                 let mut decoder = SortedGroupDecoder::default();
                 while let Some(batch) = sorted_input.stream.next().await {
@@ -554,12 +584,12 @@ impl FlareTransform for GroupByKey {
                 let actual_spill_bytes = directory_size_bytes(sorted_input._temp_dir.path());
                 let configured_spill_limit = GbkSortConfig::from_env().spill_limit_bytes;
                 warn!(
-                    "GroupByKey: external sort failed for bucket {bucket} \
+                    "GroupByKey: external sort failed for provider partition {partition} \
                      (configured_spill_limit={configured_spill_limit} bytes, \
                      actual_spill_bytes={actual_spill_bytes}): {error:#}"
                 );
                 return Err(anyhow!(
-                    "GroupByKey external sort failed for bucket {bucket} \
+                    "GroupByKey external sort failed for provider partition {partition} \
                      (configured_spill_limit={configured_spill_limit} bytes, \
                      actual_spill_bytes={actual_spill_bytes}): {error:#}"
                 ));
@@ -597,6 +627,7 @@ impl FlareTransform for GroupByKey {
                 .set_cursor(&ctx.stage_id, &input_pcollection_id, latest)
                 .await?;
         }
+        self.state.clear_range().await;
         // A runner stage can be scheduled once with no input at the bounded
         // sentinel watermark. Recording that watermark would make rows produced
         // afterward look late. Only arm pruning after input has been observed.
@@ -687,14 +718,12 @@ struct SortedInputStream {
     table_schema: Arc<RecordTableSchema>,
     /// DataFusion removes its spill files when the runtime is dropped, but the
     /// directory itself is owned here so it also disappears on error paths.
-    _temp_dir: TempDir,
+    _temp_dir: Arc<TempDir>,
 }
 
 struct OneShotPaimonPartition {
     schema: SchemaRef,
-    stream: Mutex<Option<ArrowRecordBatchStream>>,
-    rows_seen: Arc<AtomicU64>,
-    started: Instant,
+    stream: Mutex<Option<SendableRecordBatchStream>>,
 }
 
 impl std::fmt::Debug for OneShotPaimonPartition {
@@ -718,30 +747,7 @@ impl PartitionStream for OneShotPaimonPartition {
             .expect("gbk paimon stream lock not poisoned")
             .take()
             .expect("GroupByKey input stream may only be executed once");
-        let rows_seen = Arc::clone(&self.rows_seen);
-        let started = self.started;
-        let stream = futures::StreamExt::flat_map(stream, move |batch| {
-            let batches = match batch {
-                Ok(batch) => {
-                    let previous = rows_seen.fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
-                    let current = previous + batch.num_rows() as u64;
-                    if previous / 1_000_000 != current / 1_000_000 {
-                        info!(
-                            "GroupByKey: sorted {current} input rows in {:?}",
-                            started.elapsed()
-                        );
-                    }
-                    match add_encoded_key_column(batch).and_then(flatten_window_batch) {
-                        Ok(batches) => batches.into_iter().map(Ok).collect(),
-                        Err(error) => {
-                            vec![Err(DataFusionError::Execution(error.to_string()))]
-                        }
-                    }
-                }
-                Err(error) => vec![Err(DataFusionError::External(Box::new(error)))],
-            };
-            tokio_stream::iter(batches)
-        });
+
         Box::pin(RecordBatchStreamAdapter::new(
             Arc::clone(&self.schema),
             stream,
@@ -763,8 +769,48 @@ async fn open_sorted_input_streams(
     cursor: Option<i64>,
     window_prune_before: Option<i64>,
     config: &GbkSortConfig,
-) -> Result<(Vec<(i32, SortedInputStream)>, Option<i64>)> {
-    let projection = [
+    state_backend: &dyn GbkStateBackend,
+) -> Result<(Vec<(usize, SortedInputStream)>, Option<i64>)> {
+    let Some(table_schema) = store.registry.get(pcollection_id) else {
+        return Ok((Vec::new(), cursor));
+    };
+    let table = store.get_table(pcollection_id, &table_schema).await?;
+    let range = match state_backend.pending_range().await {
+        Some(range) => range,
+        None => {
+            let Some(range) = SnapshotRange::resolve(&table, cursor).await? else {
+                let latest = table.snapshot_manager().get_latest_snapshot_id().await?;
+                return Ok((Vec::new(), latest.or(cursor)));
+            };
+            state_backend.pin_range(range).await;
+            range
+        }
+    };
+    let latest = Some(range.end);
+
+    let spill_parent = Path::new(store.catalog.warehouse()).join(".gbk-spill");
+    std::fs::create_dir_all(&spill_parent)?;
+    let temp_dir = Arc::new(
+        tempfile::Builder::new()
+            .prefix("group-by-key-run-")
+            .tempdir_in(&spill_parent)?,
+    );
+    let provider = Arc::new(FlareTableProvider::new(
+        table,
+        &table_schema.arrow_schema,
+        range,
+        Some(KEY_COLUMN.to_string()),
+        std::thread::available_parallelism().map_or(1, usize::from),
+    ));
+    info!(
+        "GroupByKey: provider planned snapshots ({}, {}]; using semantics-preserving Arrow sort \
+         with one shared pool across {} partitions",
+        range.start,
+        range.end,
+        provider.max_partitions()
+    );
+
+    let projection_names = [
         KEY_COLUMN,
         VALUE_COLUMN,
         WINDOW_TIMESTAMP_COLUMN,
@@ -772,80 +818,117 @@ async fn open_sorted_input_streams(
         WINDOW_EXTRA_KEYS_COLUMN,
         WINDOW_COUNT_COLUMN,
     ];
-    let (streams, latest) = store
-        .open_incremental_arrow_by_bucket(
-            pcollection_id,
-            cursor,
-            Some(&projection),
-            window_prune_before,
-        )
+    let projection = projection_names
+        .iter()
+        .map(|name| {
+            provider
+                .schema()
+                .index_of(name)
+                .map_err(anyhow::Error::from)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut filters: Vec<Expr> = Vec::new();
+    if let Some(cutoff) = window_prune_before {
+        filters.push(
+            col(WINDOW_MAX_END_COLUMN)
+                .gt(lit(cutoff))
+                .or(col(WINDOW_MAX_END_COLUMN).is_null()),
+        );
+    }
+    let session = gbk_session(
+        config.memory_limit_bytes,
+        temp_dir.path(),
+        config.spill_limit_bytes,
+        provider.max_partitions(),
+        8192,
+        config.spill_reservation_bytes,
+    )?;
+    let state = session.state();
+    let scan = provider
+        .scan(&state, Some(&projection), &filters, None)
         .await?;
-    if streams.is_empty() {
+    let input_schema = gbk_input_schema(&table_schema.arrow_schema)?;
+    let flattened_schema = gbk_flattened_schema(&input_schema);
+    let partition_count = scan.output_partitioning().partition_count();
+    if partition_count == 0 {
         return Ok((Vec::new(), latest));
     }
 
-    let table_schema = store.registry.get(pcollection_id).ok_or_else(|| {
-        anyhow!("GroupByKey input PCollection {pcollection_id} has no registered schema")
-    })?;
-    let input_schema = gbk_input_schema(&table_schema.arrow_schema)?;
-    let schema = gbk_flattened_schema(&input_schema);
-    let spill_parent = Path::new(store.catalog.warehouse()).join(".gbk-spill");
-    std::fs::create_dir_all(&spill_parent)?;
-    let mut sorted_streams = Vec::with_capacity(streams.len());
-    for (bucket, stream) in streams {
-        let temp_dir = tempfile::Builder::new()
-            .prefix(&format!("group-by-key-bucket-{bucket}-"))
-            .tempdir_in(&spill_parent)?;
-        info!(
-            "GroupByKey: starting external sort for {pcollection_id} bucket {bucket} \
-             (memory={} bytes, spill_limit={} bytes, spill_reservation={} bytes)",
-            config.memory_limit_bytes, config.spill_limit_bytes, config.spill_reservation_bytes
-        );
-
-        let runtime = Arc::new(
-            RuntimeEnvBuilder::new()
-                .with_memory_pool(Arc::new(FairSpillPool::new(config.memory_limit_bytes)))
-                .with_temp_file_path(temp_dir.path())
-                .with_max_temp_directory_size(config.spill_limit_bytes)
-                .build()?,
-        );
-        let session = SessionContext::new_with_config_rt(
-            SessionConfig::new()
-                .with_target_partitions(1)
-                .with_sort_spill_reservation_bytes(config.spill_reservation_bytes),
-            runtime,
-        );
-        let partition: Arc<dyn PartitionStream> = Arc::new(OneShotPaimonPartition {
-            schema: Arc::clone(&schema),
-            stream: Mutex::new(Some(stream)),
-            rows_seen: Arc::new(AtomicU64::new(0)),
-            started: Instant::now(),
+    let task_ctx = session.task_ctx();
+    let mut source_partitions: Vec<Arc<dyn PartitionStream>> = Vec::with_capacity(partition_count);
+    for partition in 0..partition_count {
+        let source = scan.execute(partition, Arc::clone(&task_ctx))?;
+        let transformed = source.flat_map(|batch| {
+            let batches = match batch {
+                Ok(batch) => add_encoded_key_column(batch)
+                    .and_then(flatten_window_batch)
+                    .map(|batches| batches.into_iter().map(Ok).collect::<Vec<_>>())
+                    .unwrap_or_else(|error| {
+                        vec![Err(DataFusionError::Execution(error.to_string()))]
+                    }),
+                Err(error) => vec![Err(error)],
+            };
+            futures::stream::iter(batches)
         });
-        session.register_table(
-            "gbk_input",
-            Arc::new(StreamingTable::try_new(
-                Arc::clone(&schema),
-                vec![partition],
-            )?),
-        )?;
-
-        let df = session.table("gbk_input").await?;
-        let df = df.sort(vec![
-            col(GROUP_KEY_COLUMN).sort(true, false),
-            col(WINDOW_KEY_COLUMN).sort(true, false),
-        ])?;
-        let stream = df.execute_stream().await?;
-        sorted_streams.push((
-            bucket,
-            SortedInputStream {
-                stream,
-                table_schema: table_schema.clone(),
-                _temp_dir: temp_dir,
-            },
-        ));
+        source_partitions.push(Arc::new(OneShotPaimonPartition {
+            schema: Arc::clone(&flattened_schema),
+            stream: Mutex::new(Some(Box::pin(RecordBatchStreamAdapter::new(
+                Arc::clone(&flattened_schema),
+                transformed,
+            )))),
+        }));
     }
+    session.register_table(
+        "gbk_input",
+        Arc::new(StreamingTable::try_new(
+            Arc::clone(&flattened_schema),
+            source_partitions,
+        )?),
+    )?;
 
-    Ok((sorted_streams, latest))
+    let table = session.table("gbk_input").await?;
+    let physical = table.create_physical_plan().await?;
+    let order = datafusion::physical_expr::LexOrdering::new(vec![
+        datafusion::physical_expr::PhysicalSortExpr::new(
+            Arc::new(datafusion::physical_expr::expressions::Column::new(
+                GROUP_KEY_COLUMN,
+                flattened_schema.index_of(GROUP_KEY_COLUMN)?,
+            )),
+            arrow_schema::SortOptions {
+                descending: false,
+                nulls_first: false,
+            },
+        ),
+        datafusion::physical_expr::PhysicalSortExpr::new(
+            Arc::new(datafusion::physical_expr::expressions::Column::new(
+                WINDOW_KEY_COLUMN,
+                flattened_schema.index_of(WINDOW_KEY_COLUMN)?,
+            )),
+            arrow_schema::SortOptions {
+                descending: false,
+                nulls_first: false,
+            },
+        ),
+    ])
+    .ok_or_else(|| anyhow!("GroupByKey sort requires at least one ordering expression"))?;
+    let sorted: Arc<dyn ExecutionPlan> =
+        Arc::new(SortExec::new(order, physical).with_preserve_partitioning(true));
+    let task_ctx = session.task_ctx();
+    let count = sorted.properties().output_partitioning().partition_count();
+    let streams = (0..count)
+        .map(|partition| {
+            let stream = spawn_buffered(sorted.execute(partition, Arc::clone(&task_ctx))?, 2);
+            Ok((
+                partition,
+                SortedInputStream {
+                    stream,
+                    table_schema: table_schema.clone(),
+                    _temp_dir: Arc::clone(&temp_dir),
+                },
+            ))
+        })
+        .collect::<datafusion::common::Result<Vec<_>>>()?;
+    Ok((streams, latest))
 }
 
 fn directory_size_bytes(path: &Path) -> u64 {
@@ -2329,9 +2412,11 @@ mod tests {
             spill_limit_bytes: 128 * 1024 * 1024,
             spill_reservation_bytes: 256 * 1024,
         };
-        let (mut sorted, latest) = open_sorted_input_streams(&store, input, None, None, &config)
-            .await
-            .unwrap();
+        let state = InMemoryGbkState::default();
+        let (mut sorted, latest) =
+            open_sorted_input_streams(&store, input, None, None, &config, &state)
+                .await
+                .unwrap();
         assert_eq!(sorted.len(), 1, "one hot key belongs to one bucket");
         let sorted = &mut sorted[0].1;
         let mut observed = 0usize;
