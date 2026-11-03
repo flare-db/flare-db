@@ -1057,6 +1057,67 @@ impl PCollectionWriter {
         Ok(())
     }
 
+    /// Append an Arrow batch with already-decoded Beam window metadata.
+    ///
+    /// Runner-native transforms can build nested Arrow outputs directly and avoid
+    /// constructing an intermediate `Vec<WindowedValue>` solely for persistence.
+    pub async fn write_arrow_batch_with_window_metadata(
+        &mut self,
+        batch: RecordBatch,
+        table_schema: Arc<RecordTableSchema>,
+        metadata: Vec<WindowMetadata>,
+    ) -> Result<()> {
+        if batch.num_rows() != metadata.len() {
+            return Err(anyhow!(
+                "WindowMetadata count {} does not match output row count {} for {}",
+                metadata.len(),
+                batch.num_rows(),
+                self.pcollection_id
+            ));
+        }
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
+
+        if let Some(min_ts) = metadata.iter().map(|value| value.timestamp_millis).min() {
+            self.min_ts = Some(self.min_ts.map_or(min_ts, |current| current.min(min_ts)));
+        }
+        let batch = if has_typed_window_metadata(&batch.schema()) {
+            batch
+        } else {
+            append_window_metadata(batch, &metadata)?
+        };
+        let batch = materialize_void_columns(batch)?;
+        let schema = Arc::new(RecordTableSchema {
+            table_type: table_schema.table_type,
+            arrow_schema: batch.schema(),
+            has_windowed_metadata: true,
+        });
+        self.store
+            .registry
+            .register_if_absent(&self.pcollection_id, schema.clone());
+
+        if self.writer.is_none() {
+            self.write_guard = Some(
+                self.store
+                    .table_write_lock(&self.pcollection_id)
+                    .lock_owned()
+                    .await,
+            );
+            let table = self.store.get_table(&self.pcollection_id, &schema).await?;
+            let writer = table.new_write_builder().new_write()?;
+            self.table = Some(table);
+            self.writer = Some(writer);
+        }
+
+        self.writer
+            .as_mut()
+            .expect("writer initialized above")
+            .write_arrow_batch(&batch)
+            .await?;
+        Ok(())
+    }
+
     /// Commit all appended batches and fold the bundle's minimum event-time
     /// into the store's running minimum.
     pub async fn commit(mut self) -> Result<()> {

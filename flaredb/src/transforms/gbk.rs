@@ -10,10 +10,11 @@ use arrow_array::{
     Array, ArrayRef, BinaryArray, Int16Array, Int64Array, ListArray, RecordBatch, UInt32Array,
     builder::BinaryBuilder,
 };
+use arrow_buffer::{OffsetBuffer, ScalarBuffer};
 use arrow_schema::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef,
 };
-use arrow_select::take::take;
+use arrow_select::{concat::concat, take::take};
 use async_trait::async_trait;
 use beam_model_rs::v1::{
     Coder, Components, Environment, FunctionSpec, PCollection, PTransform, WindowingStrategy,
@@ -37,7 +38,7 @@ use log::{info, warn};
 use tempfile::TempDir;
 
 use crate::{
-    coders::primitives::{BeamWindow, WindowedValue},
+    coders::primitives::{BeamWindow, PaneInfo},
     engine::{
         trigger::{
             AccumulationMode, OutputTime, Trigger, TriggerContext, TriggerRunner, TriggerSpec,
@@ -54,8 +55,8 @@ use crate::{
         },
         provider::{FlareTableProvider, SnapshotRange, gbk_session},
         record::{
-            BeamKV, BeamRecord, IterableValue, PrimitiveValue, RecordTableSchema,
-            primitive_value_from_array_row, record_batch_to_beamrecords,
+            PrimitiveValue, RecordTableSchema, TableType, WindowMetadata,
+            primitive_value_from_array_row,
         },
     },
     transforms::{ExecutionContext, FlareTransform},
@@ -121,10 +122,10 @@ fn parse_env_u64(name: &str, default: u64) -> u64 {
 /// Holds the values seen so far, the trigger state machine for this group, and
 /// the pane bookkeeping needed to describe the next firing.
 struct WindowState {
-    key: PrimitiveValue,
     window: BeamWindow,
-    elements: Vec<PaneElement>,
-    pane_timestamps: Vec<i64>,
+    elements: Vec<ArrowValueChunk>,
+    pane_timestamp_min: Option<i64>,
+    pane_timestamp_max: Option<i64>,
     trigger: TriggerRunner,
     pane_index: i64,
     /// A firing has happened for this window.
@@ -142,12 +143,12 @@ struct GroupIdentity {
 }
 
 impl WindowState {
-    fn new(key: PrimitiveValue, window: BeamWindow, trigger: TriggerRunner) -> Self {
+    fn new(window: BeamWindow, trigger: TriggerRunner) -> Self {
         Self {
-            key,
             window,
             elements: Vec::new(),
-            pane_timestamps: Vec::new(),
+            pane_timestamp_min: None,
+            pane_timestamp_max: None,
             trigger,
             pane_index: 0,
             fired: false,
@@ -157,10 +158,21 @@ impl WindowState {
     }
 }
 
+/// A contiguous group slice from a sorted Arrow batch. Cloning a chunk clones
+/// Arrow references, not each element's Beam value.
 #[derive(Debug, Clone)]
-struct PaneElement {
-    value: BeamRecord,
+struct ArrowValueChunk {
+    batch: RecordBatch,
+    timestamp_min: i64,
+    timestamp_max: i64,
+}
+
+#[derive(Debug)]
+struct ArrowPane {
+    chunks: Vec<ArrowValueChunk>,
     timestamp_millis: i64,
+    window: BeamWindow,
+    pane: PaneInfo,
 }
 
 /// Storage boundary for accumulated GroupByKey state.
@@ -186,11 +198,11 @@ trait GbkStateBackend: Send + Sync {
         &self,
         key: PrimitiveValue,
         window: BeamWindow,
-        elements: Vec<PaneElement>,
+        elements: Vec<ArrowValueChunk>,
         spec: &TriggerSpec,
         input_watermark: i64,
         processing_time: i64,
-    ) -> Result<Option<WindowedValue>>;
+    ) -> Result<Option<ArrowPane>>;
 
     async fn take_ready(
         &self,
@@ -198,7 +210,7 @@ trait GbkStateBackend: Send + Sync {
         input_watermark: i64,
         processing_time: i64,
         limit: usize,
-    ) -> Result<Vec<WindowedValue>>;
+    ) -> Result<Vec<ArrowPane>>;
 }
 
 #[derive(Default)]
@@ -261,11 +273,11 @@ impl GbkStateBackend for InMemoryGbkState {
         &self,
         key: PrimitiveValue,
         window: BeamWindow,
-        elements: Vec<PaneElement>,
+        elements: Vec<ArrowValueChunk>,
         spec: &TriggerSpec,
         input_watermark: i64,
         processing_time: i64,
-    ) -> Result<Option<WindowedValue>> {
+    ) -> Result<Option<ArrowPane>> {
         let end = window.max_timestamp_millis();
         let expired = spec.earliest_completion(end) < input_watermark;
         let mut inner = self.inner.lock().expect("gbk state lock not poisoned");
@@ -274,44 +286,32 @@ impl GbkStateBackend for InMemoryGbkState {
             && spec.trigger == Trigger::Default
             && spec.accumulation == AccumulationMode::Discarding
         {
-            let timestamp_millis = output_timestamp(
-                spec.output_time,
-                &window,
-                &elements
-                    .iter()
-                    .map(|element| element.timestamp_millis)
-                    .collect::<Vec<_>>(),
-            );
-            return Ok(Some(WindowedValue {
-                value: BeamRecord::KV(BeamKV {
-                    key,
-                    value: Box::new(BeamRecord::ITERABLE(IterableValue::from_records(
-                        elements.into_iter().map(|element| element.value).collect(),
-                    ))),
-                }),
+            let (timestamp_min, timestamp_max) = chunk_timestamp_extrema(&elements);
+            let timestamp_millis =
+                output_timestamp(spec.output_time, &window, timestamp_min, timestamp_max);
+            return Ok(Some(ArrowPane {
+                chunks: elements,
                 timestamp_millis,
-                windows: vec![window],
+                window,
                 pane: pane_info(crate::coders::primitives::PaneTiming::OnTime, 0, true, true),
             }));
         }
 
         let identity = group_identity(&key, &window);
         let state = inner.states.entry(identity.clone()).or_insert_with(|| {
-            WindowState::new(
-                key,
-                window.clone(),
-                TriggerRunner::new(spec.trigger.clone()),
-            )
+            WindowState::new(window.clone(), TriggerRunner::new(spec.trigger.clone()))
         });
-        for _ in 0..elements.len() {
-            state.trigger.on_element(processing_time);
+        for element in &elements {
+            for _ in 0..element.batch.num_rows() {
+                state.trigger.on_element(processing_time);
+            }
         }
-        state
-            .pane_timestamps
-            .extend(elements.iter().map(|element| element.timestamp_millis));
+        let (timestamp_min, timestamp_max) = chunk_timestamp_extrema(&elements);
+        state.pane_timestamp_min = min_option(state.pane_timestamp_min, timestamp_min);
+        state.pane_timestamp_max = max_option(state.pane_timestamp_max, timestamp_max);
         state.elements.extend(elements);
 
-        let output = fire_state(state, spec, input_watermark, processing_time);
+        let output = fire_state(state, spec, input_watermark, processing_time)?;
         if state.closed {
             inner.states.remove(&identity);
         }
@@ -324,7 +324,7 @@ impl GbkStateBackend for InMemoryGbkState {
         input_watermark: i64,
         processing_time: i64,
         limit: usize,
-    ) -> Result<Vec<WindowedValue>> {
+    ) -> Result<Vec<ArrowPane>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -343,7 +343,7 @@ impl GbkStateBackend for InMemoryGbkState {
             if state.evaluated_this_run {
                 continue;
             }
-            if let Some(value) = fire_state(state, spec, input_watermark, processing_time) {
+            if let Some(value) = fire_state(state, spec, input_watermark, processing_time)? {
                 output.push(value);
             }
             if state.closed {
@@ -357,20 +357,147 @@ impl GbkStateBackend for InMemoryGbkState {
     }
 }
 
-fn output_timestamp(output_time: OutputTime, window: &BeamWindow, pane_timestamps: &[i64]) -> i64 {
+fn output_timestamp(
+    output_time: OutputTime,
+    window: &BeamWindow,
+    pane_timestamp_min: Option<i64>,
+    pane_timestamp_max: Option<i64>,
+) -> i64 {
     match output_time {
-        OutputTime::LatestInPane => pane_timestamps
-            .iter()
-            .copied()
-            .max()
-            .unwrap_or_else(|| window.max_timestamp_millis()),
-        OutputTime::EarliestInPane => pane_timestamps
-            .iter()
-            .copied()
-            .min()
-            .unwrap_or_else(|| window.max_timestamp_millis()),
+        OutputTime::LatestInPane => {
+            pane_timestamp_max.unwrap_or_else(|| window.max_timestamp_millis())
+        }
+        OutputTime::EarliestInPane => {
+            pane_timestamp_min.unwrap_or_else(|| window.max_timestamp_millis())
+        }
         OutputTime::EndOfWindow => window.max_timestamp_millis(),
     }
+}
+
+fn chunk_timestamp_extrema(chunks: &[ArrowValueChunk]) -> (Option<i64>, Option<i64>) {
+    chunks
+        .iter()
+        .fold((None, None), |(minimum, maximum), chunk| {
+            (
+                min_option(minimum, Some(chunk.timestamp_min)),
+                max_option(maximum, Some(chunk.timestamp_max)),
+            )
+        })
+}
+
+fn min_option(current: Option<i64>, next: Option<i64>) -> Option<i64> {
+    match (current, next) {
+        (Some(current), Some(next)) => Some(current.min(next)),
+        (current, next) => current.or(next),
+    }
+}
+
+fn max_option(current: Option<i64>, next: Option<i64>) -> Option<i64> {
+    match (current, next) {
+        (Some(current), Some(next)) => Some(current.max(next)),
+        (current, next) => current.or(next),
+    }
+}
+
+fn arrow_panes_to_batch(
+    panes: &[ArrowPane],
+) -> Result<(RecordBatch, Arc<RecordTableSchema>, Vec<WindowMetadata>)> {
+    let first = panes
+        .first()
+        .ok_or_else(|| anyhow!("cannot build an Arrow batch from no GBK panes"))?;
+    let first_chunk = first
+        .chunks
+        .first()
+        .ok_or_else(|| anyhow!("GBK emitted a pane without input values"))?;
+    let key_field = first_chunk
+        .batch
+        .schema()
+        .field_with_name(KEY_COLUMN)?
+        .clone();
+    let input_batch_schema = first_chunk.batch.schema();
+    let value_field = input_batch_schema.field_with_name(VALUE_COLUMN)?;
+
+    let mut key_arrays = Vec::with_capacity(panes.len());
+    let mut value_arrays = Vec::new();
+    let mut offsets = Vec::with_capacity(panes.len() + 1);
+    offsets.push(0_i32);
+    let mut offset = 0_i32;
+    for pane in panes {
+        let first_chunk = pane
+            .chunks
+            .first()
+            .ok_or_else(|| anyhow!("GBK emitted a pane without input values"))?;
+        let key = first_chunk
+            .batch
+            .column_by_name(KEY_COLUMN)
+            .ok_or_else(|| anyhow!("GBK pane is missing '{KEY_COLUMN}'"))?;
+        key_arrays.push(key.slice(0, 1));
+
+        let mut value_count = 0_i32;
+        for chunk in &pane.chunks {
+            let values = chunk
+                .batch
+                .column_by_name(VALUE_COLUMN)
+                .ok_or_else(|| anyhow!("GBK pane is missing '{VALUE_COLUMN}'"))?;
+            value_count = value_count
+                .checked_add(i32::try_from(values.len())?)
+                .ok_or_else(|| anyhow!("GBK pane exceeds Arrow List offset capacity"))?;
+            value_arrays.push(Arc::clone(values));
+        }
+        offset = offset
+            .checked_add(value_count)
+            .ok_or_else(|| anyhow!("GBK output exceeds Arrow List offset capacity"))?;
+        offsets.push(offset);
+    }
+
+    let key_refs: Vec<&dyn Array> = key_arrays.iter().map(AsRef::as_ref).collect();
+    let key_array = concat(&key_refs)?;
+    let value_refs: Vec<&dyn Array> = value_arrays.iter().map(AsRef::as_ref).collect();
+    let values = concat(&value_refs)?;
+    let item_nullable = matches!(
+        value_field.data_type(),
+        ArrowDataType::Null | ArrowDataType::Boolean
+    );
+    let item_field = Arc::new(ArrowField::new(
+        "item",
+        values.data_type().clone(),
+        item_nullable,
+    ));
+    let list = ListArray::try_new(
+        item_field,
+        OffsetBuffer::new(ScalarBuffer::from(offsets)),
+        values,
+        None,
+    )?;
+    let output_schema = Arc::new(ArrowSchema::new(vec![
+        key_field,
+        ArrowField::new(VALUE_COLUMN, list.data_type().clone(), false),
+    ]));
+    let batch = RecordBatch::try_new(output_schema.clone(), vec![key_array, Arc::new(list)])?;
+    let table_schema = Arc::new(RecordTableSchema {
+        table_type: TableType::Kv,
+        arrow_schema: output_schema,
+        has_windowed_metadata: false,
+    });
+    let metadata = panes
+        .iter()
+        .map(|pane| WindowMetadata {
+            timestamp_millis: pane.timestamp_millis,
+            windows: vec![pane.window.clone()],
+            pane: pane.pane.clone(),
+        })
+        .collect();
+    Ok((batch, table_schema, metadata))
+}
+
+async fn write_arrow_panes(writer: &mut PCollectionWriter, panes: Vec<ArrowPane>) -> Result<()> {
+    if panes.is_empty() {
+        return Ok(());
+    }
+    let (batch, schema, metadata) = arrow_panes_to_batch(&panes)?;
+    writer
+        .write_arrow_batch_with_window_metadata(batch, schema, metadata)
+        .await
 }
 
 /// Identity of a `(key, window)` group, used to key the state map.
@@ -517,7 +644,7 @@ impl FlareTransform for GroupByKey {
         .await?;
         let mut writer =
             PCollectionWriter::new(ctx.store.clone(), ctx.output_pcollection_id.clone());
-        let mut output = Vec::with_capacity(OUTPUT_BATCH_SIZE);
+        let mut output: Vec<ArrowPane> = Vec::with_capacity(OUTPUT_BATCH_SIZE);
         let mut fired = 0usize;
         let mut decoded_rows = 0usize;
 
@@ -536,7 +663,7 @@ impl FlareTransform for GroupByKey {
                     let batch = batch?;
                     decoded_rows += batch.num_rows();
                     let decode_started = Instant::now();
-                    let groups = decoder.push_batch(&batch, &sorted_input.table_schema)?;
+                    let groups = decoder.push_batch(&batch)?;
                     decode_time += decode_started.elapsed();
                     let group_started = Instant::now();
                     fired += process_key_groups_batch(
@@ -612,11 +739,11 @@ impl FlareTransform for GroupByKey {
                 break;
             }
             fired += ready.len();
-            writer.write(ready).await?;
+            write_arrow_panes(&mut writer, ready).await?;
         }
         flush_output_if_full(&mut writer, &mut output).await?;
         if !output.is_empty() {
-            writer.write(std::mem::take(&mut output)).await?;
+            write_arrow_panes(&mut writer, std::mem::take(&mut output)).await?;
         }
 
         // Advance the input cursor only after all emitted panes are durable.
@@ -715,7 +842,6 @@ impl FlareTransform for GroupByKey {
 
 struct SortedInputStream {
     stream: SendableRecordBatchStream,
-    table_schema: Arc<RecordTableSchema>,
     /// DataFusion removes its spill files when the runtime is dropped, but the
     /// directory itself is owned here so it also disappears on error paths.
     _temp_dir: Arc<TempDir>,
@@ -922,7 +1048,6 @@ async fn open_sorted_input_streams(
                 partition,
                 SortedInputStream {
                     stream,
-                    table_schema: table_schema.clone(),
                     _temp_dir: Arc::clone(&temp_dir),
                 },
             ))
@@ -1249,50 +1374,48 @@ struct SortedGroupDecoder {
 }
 
 impl SortedGroupDecoder {
-    fn push_batch(
-        &mut self,
-        batch: &RecordBatch,
-        table_schema: &RecordTableSchema,
-    ) -> Result<Vec<DecodedKeyGroup>> {
-        let window_column = batch.column_by_name(WINDOW_KEY_COLUMN).ok_or_else(|| {
-            anyhow!("GroupByKey result is missing the '{WINDOW_KEY_COLUMN}' column")
-        })?;
-        let window_keys = window_column
+    fn push_batch(&mut self, batch: &RecordBatch) -> Result<Vec<DecodedKeyGroup>> {
+        let window_keys = batch
+            .column_by_name(WINDOW_KEY_COLUMN)
+            .ok_or_else(|| {
+                anyhow!("GroupByKey result is missing the '{WINDOW_KEY_COLUMN}' column")
+            })?
             .as_any()
             .downcast_ref::<BinaryArray>()
             .ok_or_else(|| anyhow!("GroupByKey window key must be a Binary column"))?;
-        let encoded_key_column = batch.column_by_name(GROUP_KEY_COLUMN).ok_or_else(|| {
-            anyhow!("GroupByKey result is missing the '{GROUP_KEY_COLUMN}' column")
-        })?;
-        let encoded_keys = encoded_key_column
+        let encoded_keys = batch
+            .column_by_name(GROUP_KEY_COLUMN)
+            .ok_or_else(|| anyhow!("GroupByKey result is missing the '{GROUP_KEY_COLUMN}' column"))?
             .as_any()
             .downcast_ref::<BinaryArray>()
             .ok_or_else(|| anyhow!("GroupByKey encoded key must be a Binary column"))?;
+        let key_column = batch
+            .column_by_name(KEY_COLUMN)
+            .ok_or_else(|| anyhow!("GroupByKey input is missing '{KEY_COLUMN}'"))?;
+        let value_column = batch
+            .column_by_name(VALUE_COLUMN)
+            .ok_or_else(|| anyhow!("GroupByKey input is missing '{VALUE_COLUMN}'"))?;
         let timestamps = batch
             .column_by_name(WINDOW_TIMESTAMP_COLUMN)
             .ok_or_else(|| anyhow!("GroupByKey is missing '{WINDOW_TIMESTAMP_COLUMN}'"))?
             .as_any()
             .downcast_ref::<Int64Array>()
             .ok_or_else(|| anyhow!("GroupByKey timestamp must be an Int64 column"))?;
-        let records = record_batch_to_beamrecords(batch, table_schema)?;
         let mut completed = Vec::new();
+        let mut start = 0;
 
-        for (row, record) in records.into_iter().enumerate() {
-            let BeamRecord::KV(kv) = record else {
-                return Err(anyhow!(
-                    "GroupByKey expected KV input, found {:?}",
-                    record.record_type()
-                ));
-            };
-            let encoded_key = encoded_keys.value(row).to_vec();
-            let window_key = window_keys.value(row);
-            let window = BeamWindow::from_binary_key(window_key)
-                .ok_or_else(|| anyhow!("GroupByKey encountered a malformed binary window key"))?;
-            let element = PaneElement {
-                value: *kv.value,
-                timestamp_millis: timestamps.value(row),
-            };
+        while start < batch.num_rows() {
+            let encoded_key = encoded_keys.value(start);
+            let window_key = window_keys.value(start);
+            let mut end = start + 1;
+            while end < batch.num_rows()
+                && encoded_keys.value(end) == encoded_key
+                && window_keys.value(end) == window_key
+            {
+                end += 1;
+            }
 
+            let encoded_key = encoded_key.to_vec();
             let replace_key = self
                 .current
                 .as_ref()
@@ -1304,19 +1427,52 @@ impl SortedGroupDecoder {
                 });
             }
 
-            let current = self.current.get_or_insert_with(|| InProgressKeyGroup {
-                encoded_key,
-                key: kv.key,
-                windows: Vec::new(),
-            });
+            if self.current.is_none() {
+                let key = primitive_value_from_array_row(
+                    key_column.as_ref(),
+                    key_column.data_type(),
+                    start,
+                )?;
+                self.current = Some(InProgressKeyGroup {
+                    encoded_key: encoded_key.clone(),
+                    key,
+                    windows: Vec::new(),
+                });
+            }
+
+            let window = BeamWindow::from_binary_key(window_key)
+                .ok_or_else(|| anyhow!("GroupByKey encountered a malformed binary window key"))?;
+            let timestamp_min = (start..end).map(|row| timestamps.value(row)).min().unwrap();
+            let timestamp_max = (start..end).map(|row| timestamps.value(row)).max().unwrap();
+            let chunk_schema = Arc::new(ArrowSchema::new_with_metadata(
+                vec![
+                    batch.schema().field_with_name(KEY_COLUMN)?.clone(),
+                    batch.schema().field_with_name(VALUE_COLUMN)?.clone(),
+                ],
+                batch.schema().metadata().clone(),
+            ));
+            let chunk_batch = RecordBatch::try_new(
+                chunk_schema,
+                vec![
+                    key_column.slice(start, end - start),
+                    value_column.slice(start, end - start),
+                ],
+            )?;
+            let chunk = ArrowValueChunk {
+                batch: chunk_batch,
+                timestamp_min,
+                timestamp_max,
+            };
+            let current = self.current.as_mut().expect("group initialized above");
             match current.windows.last_mut() {
-                Some((current_window, values))
+                Some((current_window, chunks))
                     if current_window.to_binary_key() == window.to_binary_key() =>
                 {
-                    values.push(element);
+                    chunks.push(chunk);
                 }
-                _ => current.windows.push((window, vec![element])),
+                _ => current.windows.push((window, vec![chunk])),
             }
+            start = end;
         }
         Ok(completed)
     }
@@ -1329,13 +1485,13 @@ impl SortedGroupDecoder {
     }
 }
 
-type WindowValues = Vec<(BeamWindow, Vec<PaneElement>)>;
+type WindowValues = Vec<(BeamWindow, Vec<ArrowValueChunk>)>;
 
 fn apply_merge_results(
     key: &PrimitiveValue,
-    original_groups: Vec<(BeamWindow, Vec<PaneElement>)>,
+    original_groups: Vec<(BeamWindow, Vec<ArrowValueChunk>)>,
     merge_results: Vec<MergedWindows>,
-) -> Result<Vec<(PrimitiveValue, BeamWindow, Vec<PaneElement>)>, Error> {
+) -> Result<Vec<(PrimitiveValue, BeamWindow, Vec<ArrowValueChunk>)>, Error> {
     let original_to_merged: HashMap<Vec<u8>, BeamWindow> = merge_results
         .into_iter()
         .flat_map(|result| {
@@ -1347,7 +1503,7 @@ fn apply_merge_results(
         })
         .collect();
 
-    let mut merged_groups: HashMap<Vec<u8>, (BeamWindow, Vec<PaneElement>)> = HashMap::new();
+    let mut merged_groups: HashMap<Vec<u8>, (BeamWindow, Vec<ArrowValueChunk>)> = HashMap::new();
     for (original, values) in original_groups {
         let original_key = original.to_binary_key();
         let merged_window = original_to_merged.get(&original_key).ok_or_else(|| {
@@ -1374,7 +1530,7 @@ async fn process_key_groups_batch(
     input_watermark: i64,
     processing_time: i64,
     state_backend: &dyn GbkStateBackend,
-    output: &mut Vec<WindowedValue>,
+    output: &mut Vec<ArrowPane>,
 ) -> Result<usize> {
     if key_groups.is_empty() {
         return Ok(0);
@@ -1450,9 +1606,9 @@ async fn process_key_groups_batch(
 /// key, merging is deterministic: sort by start time and combine every pair with
 /// a non-empty overlap. Opaque/custom windows still use the SDK WindowFn below.
 fn merge_interval_groups(
-    groups: Vec<(PrimitiveValue, BeamWindow, Vec<PaneElement>)>,
-) -> Result<Vec<(PrimitiveValue, BeamWindow, Vec<PaneElement>)>> {
-    let mut by_key: HashMap<String, (PrimitiveValue, Vec<(i64, i64, Vec<PaneElement>)>)> =
+    groups: Vec<(PrimitiveValue, BeamWindow, Vec<ArrowValueChunk>)>,
+) -> Result<Vec<(PrimitiveValue, BeamWindow, Vec<ArrowValueChunk>)>> {
+    let mut by_key: HashMap<String, (PrimitiveValue, Vec<(i64, i64, Vec<ArrowValueChunk>)>)> =
         HashMap::new();
     for (key, window, values) in groups {
         let BeamWindow::Interval {
@@ -1510,10 +1666,10 @@ fn merge_interval_groups(
 
 async fn flush_output_if_full(
     writer: &mut PCollectionWriter,
-    output: &mut Vec<WindowedValue>,
+    output: &mut Vec<ArrowPane>,
 ) -> Result<()> {
     if output.len() >= OUTPUT_BATCH_SIZE {
-        writer.write(std::mem::take(output)).await?;
+        write_arrow_panes(writer, std::mem::take(output)).await?;
         output.reserve(OUTPUT_BATCH_SIZE);
     }
     Ok(())
@@ -1524,7 +1680,7 @@ fn fire_state(
     spec: &TriggerSpec,
     input_watermark: i64,
     processing_time: i64,
-) -> Option<WindowedValue> {
+) -> Result<Option<ArrowPane>> {
     let end = state.window.max_timestamp_millis();
     // Beam fires the end-of-window timer only after the window's maximum
     // timestamp. For [0, 100) maxTimestamp is 99, so the earliest firing
@@ -1540,7 +1696,7 @@ fn fire_state(
     let closing = expired && !state.closed;
     if !(state.trigger.should_fire(trigger_ctx) || closing) {
         state.evaluated_this_run = true;
-        return None;
+        return Ok(None);
     }
 
     let is_first = !state.fired;
@@ -1551,8 +1707,14 @@ fn fire_state(
         AccumulationMode::Discarding => std::mem::take(&mut state.elements),
         AccumulationMode::Accumulating | AccumulationMode::Retracting => state.elements.clone(),
     };
-    let pane_timestamps = std::mem::take(&mut state.pane_timestamps);
-    let timestamp_millis = output_timestamp(spec.output_time, &state.window, &pane_timestamps);
+    let pane_timestamp_min = state.pane_timestamp_min.take();
+    let pane_timestamp_max = state.pane_timestamp_max.take();
+    let timestamp_millis = output_timestamp(
+        spec.output_time,
+        &state.window,
+        pane_timestamp_min,
+        pane_timestamp_max,
+    );
 
     state.trigger.on_fire(trigger_ctx);
     state.pane_index += 1;
@@ -1565,28 +1727,23 @@ fn fire_state(
     // Beam's `EmitIfNonempty` closing behavior: a firing whose pane has no
     // accumulated values carries no data and must not be emitted.
     if elements.is_empty() {
-        return None;
+        return Ok(None);
     }
 
-    Some(WindowedValue {
-        value: BeamRecord::KV(BeamKV {
-            key: state.key.clone(),
-            value: Box::new(BeamRecord::ITERABLE(IterableValue::from_records(
-                elements.into_iter().map(|element| element.value).collect(),
-            ))),
-        }),
+    Ok(Some(ArrowPane {
+        chunks: elements,
         timestamp_millis,
-        windows: vec![state.window.clone()],
+        window: state.window.clone(),
         pane,
-    })
+    }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::coders::primitives::{PaneInfo, PaneTiming};
+    use crate::coders::primitives::{PaneInfo, PaneTiming, WindowedValue};
     use crate::store::element_store::{FlareElementStore, ScanCollectionRequest};
-    use crate::store::record::BeamKV;
+    use crate::store::record::{BeamKV, BeamRecord};
     use std::sync::Arc;
     use tempfile::tempdir;
 
@@ -2358,9 +2515,25 @@ mod tests {
             .apply_group(
                 PrimitiveValue::String("a".to_string()),
                 interval(0, 100),
-                vec![PaneElement {
-                    value: BeamRecord::PRIMITIVE(PrimitiveValue::Int64(1)),
-                    timestamp_millis: 10,
+                vec![{
+                    let input_schema = Arc::new(ArrowSchema::new(vec![
+                        ArrowField::new(KEY_COLUMN, ArrowDataType::Utf8, false),
+                        ArrowField::new(VALUE_COLUMN, ArrowDataType::Int64, false),
+                    ]));
+                    let batch = RecordBatch::try_new(
+                        Arc::clone(&input_schema),
+                        vec![
+                            Arc::new(arrow_array::StringArray::from(vec!["a"])),
+                            Arc::new(Int64Array::from(vec![1])),
+                        ],
+                    )
+                    .unwrap();
+                    ArrowValueChunk {
+                        batch,
+
+                        timestamp_min: 10,
+                        timestamp_max: 10,
+                    }
                 }],
                 &spec,
                 0,
