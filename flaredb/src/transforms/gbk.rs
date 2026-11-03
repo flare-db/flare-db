@@ -1,7 +1,11 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    io::Cursor,
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicI64, Ordering},
+    },
     time::Instant,
 };
 
@@ -52,6 +56,7 @@ use crate::{
         element_store::{
             FlareElementStore, PCollectionWriter, WINDOW_COUNT_COLUMN, WINDOW_EXTRA_KEYS_COLUMN,
             WINDOW_KEY_COLUMN, WINDOW_MAX_END_COLUMN, WINDOW_TIMESTAMP_COLUMN,
+            arrow_schema_to_paimon,
         },
         provider::{FlareTableProvider, SnapshotRange, gbk_session},
         record::{
@@ -63,18 +68,26 @@ use crate::{
 };
 
 const GROUP_KEY_COLUMN: &str = "flare_gbk_group_key";
+const GBK_STATE_TABLE: &str = "_flare_gbk_state_values";
+const GBK_STATE_GROUP_COLUMN: &str = "group_identity";
+const GBK_STATE_WINDOW_COLUMN: &str = "window_identity";
+const GBK_STATE_GENERATION_COLUMN: &str = "generation";
+const GBK_STATE_CHUNK_COLUMN: &str = "chunk_id";
+const GBK_STATE_PAYLOAD_COLUMN: &str = "arrow_ipc_payload";
 const DEFAULT_SORT_MEMORY_LIMIT_BYTES: usize = 1024 * 1024 * 1024;
 const DEFAULT_SORT_SPILL_LIMIT_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const DEFAULT_SORT_SPILL_RESERVATION_BYTES: usize = 10 * 1024 * 1024;
+const DEFAULT_GBK_STATE_MEMORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+const GBK_STATE_MEMORY_LIMIT_ENV: &str = "FLAREDB_GBK_STATE_MEMORY_LIMIT_BYTES";
+static NEXT_GBK_SPILL_CHUNK_ID: AtomicI64 = AtomicI64::new(1);
 // Match the normal Arrow batch scale instead of paying Paimon/Arrow setup costs
 // for every 1,024 generated groups.
 const OUTPUT_BATCH_SIZE: usize = 8 * 1024;
 
 /// DataFusion resources used to externally sort one bundle's input.
 ///
-/// These are deliberately process-level knobs for now. Durable streaming state
-/// will have its own configuration; this only controls the bounded external sort
-/// used by the current runner-native GroupByKey.
+/// These process-level knobs bound the external sort used by runner-native
+/// GroupByKey. Accumulated GBK values have a separate Paimon spill threshold.
 #[derive(Debug, Clone, Copy)]
 struct GbkSortConfig {
     memory_limit_bytes: usize,
@@ -124,6 +137,8 @@ fn parse_env_u64(name: &str, default: u64) -> u64 {
 struct WindowState {
     window: BeamWindow,
     elements: Vec<ArrowValueChunk>,
+    spilled: Vec<SpilledChunkRef>,
+    generation: i64,
     pane_timestamp_min: Option<i64>,
     pane_timestamp_max: Option<i64>,
     trigger: TriggerRunner,
@@ -147,6 +162,8 @@ impl WindowState {
         Self {
             window,
             elements: Vec::new(),
+            spilled: Vec::new(),
+            generation: 0,
             pane_timestamp_min: None,
             pane_timestamp_max: None,
             trigger,
@@ -167,19 +184,190 @@ struct ArrowValueChunk {
     timestamp_max: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SpilledChunkRef {
+    group: GroupIdentity,
+    generation: i64,
+    chunk_id: i64,
+}
+
+struct SpillRow {
+    reference: SpilledChunkRef,
+    payload: Vec<u8>,
+}
+
 #[derive(Debug)]
 struct ArrowPane {
     chunks: Vec<ArrowValueChunk>,
+    spilled: Vec<SpilledChunkRef>,
     timestamp_millis: i64,
     window: BeamWindow,
     pane: PaneInfo,
 }
 
-/// Storage boundary for accumulated GroupByKey state.
-///
-/// The current implementation is intentionally in-memory. This boundary keeps
-/// sorting/group formation separate from state retention so a future Paimon +
-/// SlateDB implementation can replace it without changing the bounded sort loop.
+fn gbk_state_arrow_schema() -> Arc<ArrowSchema> {
+    Arc::new(ArrowSchema::new(vec![
+        ArrowField::new(GBK_STATE_GROUP_COLUMN, ArrowDataType::Binary, false),
+        ArrowField::new(GBK_STATE_WINDOW_COLUMN, ArrowDataType::Binary, false),
+        ArrowField::new(GBK_STATE_GENERATION_COLUMN, ArrowDataType::Int64, false),
+        ArrowField::new(GBK_STATE_CHUNK_COLUMN, ArrowDataType::Int64, false),
+        ArrowField::new(GBK_STATE_PAYLOAD_COLUMN, ArrowDataType::Binary, false),
+    ]))
+}
+
+fn encode_arrow_chunk(batch: &RecordBatch) -> Result<Vec<u8>> {
+    let mut payload = Vec::new();
+    {
+        let mut writer = arrow_ipc::writer::StreamWriter::try_new(&mut payload, &batch.schema())?;
+        writer.write(batch)?;
+        writer.finish()?;
+    }
+    Ok(payload)
+}
+
+fn decode_arrow_chunk(payload: &[u8]) -> Result<RecordBatch> {
+    let mut reader = arrow_ipc::reader::StreamReader::try_new(Cursor::new(payload), None)?;
+    reader
+        .next()
+        .transpose()?
+        .ok_or_else(|| anyhow!("GBK spill payload contained no Arrow batch"))
+}
+
+fn spill_rows_to_batch(rows: &[SpillRow]) -> Result<RecordBatch> {
+    let schema = gbk_state_arrow_schema();
+    let mut groups = BinaryBuilder::new();
+    let mut windows = BinaryBuilder::new();
+    let mut payloads = BinaryBuilder::new();
+    let mut generations = Vec::with_capacity(rows.len());
+    let mut chunk_ids = Vec::with_capacity(rows.len());
+    for row in rows {
+        groups.append_value(&row.reference.group.key);
+        windows.append_value(&row.reference.group.window);
+        generations.push(row.reference.generation);
+        chunk_ids.push(row.reference.chunk_id);
+        payloads.append_value(&row.payload);
+    }
+    Ok(RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(groups.finish()),
+            Arc::new(windows.finish()),
+            Arc::new(Int64Array::from(generations)),
+            Arc::new(Int64Array::from(chunk_ids)),
+            Arc::new(payloads.finish()),
+        ],
+    )?)
+}
+
+/// Append spilled chunks to a Paimon table. There are no primary keys, so equal
+/// payloads remain distinct rows; references identify the exact appended chunks.
+async fn append_gbk_spill_rows(store: &FlareElementStore, rows: &[SpillRow]) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let schema = arrow_schema_to_paimon(&gbk_state_arrow_schema())?;
+    let table = store.get_or_create_table(GBK_STATE_TABLE, schema).await?;
+    let batch = spill_rows_to_batch(rows)?;
+    store.write_table_batches(&table, &[batch]).await
+}
+
+async fn read_gbk_spill_chunks(
+    store: &FlareElementStore,
+    references: &[SpilledChunkRef],
+) -> Result<Vec<ArrowValueChunk>> {
+    if references.is_empty() {
+        return Ok(Vec::new());
+    }
+    let wanted: HashSet<_> = references.iter().cloned().collect();
+    let mut chunks = HashMap::with_capacity(references.len());
+    let Some(mut stream) = store.scan_table_batches(GBK_STATE_TABLE).await? else {
+        return Err(anyhow!(
+            "GBK spill table is missing for active chunk references"
+        ));
+    };
+    while let Some(batch) = stream.next().await {
+        let batch = batch?;
+        let groups = batch
+            .column_by_name(GBK_STATE_GROUP_COLUMN)
+            .and_then(|column| column.as_any().downcast_ref::<BinaryArray>())
+            .ok_or_else(|| anyhow!("GBK state table has invalid group identity column"))?;
+        let windows = batch
+            .column_by_name(GBK_STATE_WINDOW_COLUMN)
+            .and_then(|column| column.as_any().downcast_ref::<BinaryArray>())
+            .ok_or_else(|| anyhow!("GBK state table has invalid window identity column"))?;
+        let generations = batch
+            .column_by_name(GBK_STATE_GENERATION_COLUMN)
+            .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
+            .ok_or_else(|| anyhow!("GBK state table has invalid generation column"))?;
+        let chunk_ids = batch
+            .column_by_name(GBK_STATE_CHUNK_COLUMN)
+            .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
+            .ok_or_else(|| anyhow!("GBK state table has invalid chunk id column"))?;
+        let payloads = batch
+            .column_by_name(GBK_STATE_PAYLOAD_COLUMN)
+            .and_then(|column| column.as_any().downcast_ref::<BinaryArray>())
+            .ok_or_else(|| anyhow!("GBK state table has invalid payload column"))?;
+        for row in 0..batch.num_rows() {
+            let reference = SpilledChunkRef {
+                group: GroupIdentity {
+                    key: groups.value(row).to_vec(),
+                    window: windows.value(row).to_vec(),
+                },
+                generation: generations.value(row),
+                chunk_id: chunk_ids.value(row),
+            };
+            if wanted.contains(&reference) {
+                let batch = decode_arrow_chunk(payloads.value(row))?;
+                let timestamps = batch
+                    .column_by_name(WINDOW_TIMESTAMP_COLUMN)
+                    .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
+                    .ok_or_else(|| {
+                        anyhow!("GBK spill payload has invalid event timestamp column")
+                    })?;
+                let (mut timestamp_min, mut timestamp_max) = (i64::MAX, i64::MIN);
+                for index in 0..timestamps.len() {
+                    if !timestamps.is_null(index) {
+                        timestamp_min = timestamp_min.min(timestamps.value(index));
+                        timestamp_max = timestamp_max.max(timestamps.value(index));
+                    }
+                }
+                if timestamp_min == i64::MAX || timestamp_max == i64::MIN {
+                    return Err(anyhow!("GBK spill payload has no event timestamps"));
+                }
+                chunks.insert(
+                    reference,
+                    ArrowValueChunk {
+                        batch,
+                        timestamp_min,
+                        timestamp_max,
+                    },
+                );
+            }
+        }
+        if chunks.len() == references.len() {
+            break;
+        }
+    }
+    if chunks.len() != references.len() {
+        return Err(anyhow!(
+            "GBK spill lookup found {} of {} referenced chunks",
+            chunks.len(),
+            references.len()
+        ));
+    }
+    references
+        .iter()
+        .map(|reference| {
+            chunks
+                .remove(reference)
+                .ok_or_else(|| anyhow!("GBK spill chunk reference disappeared during lookup"))
+        })
+        .collect()
+}
+
+/// Storage boundary for accumulated GroupByKey state. Trigger and pane metadata
+/// remain in memory; Arrow value chunks spill to Paimon above the configured
+/// threshold, without changing sorting, grouping, or trigger evaluation.
 #[async_trait]
 trait GbkStateBackend: Send + Sync {
     async fn begin_run(&self);
@@ -193,6 +381,12 @@ trait GbkStateBackend: Send + Sync {
     async fn pin_range(&self, range: SnapshotRange);
 
     async fn clear_range(&self);
+
+    async fn spill_over_limit(
+        &self,
+        store: &FlareElementStore,
+        memory_limit_bytes: usize,
+    ) -> Result<()>;
 
     async fn apply_group(
         &self,
@@ -269,6 +463,65 @@ impl GbkStateBackend for InMemoryGbkState {
             .pending_range = None;
     }
 
+    async fn spill_over_limit(
+        &self,
+        store: &FlareElementStore,
+        memory_limit_bytes: usize,
+    ) -> Result<()> {
+        let pending = {
+            let inner = self.inner.lock().expect("gbk state lock not poisoned");
+            let mut pending = Vec::new();
+            for (identity, state) in &inner.states {
+                let bytes = state
+                    .elements
+                    .iter()
+                    .map(|chunk| chunk.batch.get_array_memory_size())
+                    .sum::<usize>();
+                if bytes <= memory_limit_bytes || state.elements.is_empty() {
+                    continue;
+                }
+                for chunk in &state.elements {
+                    let reference = SpilledChunkRef {
+                        group: identity.clone(),
+                        generation: state.generation,
+                        chunk_id: NEXT_GBK_SPILL_CHUNK_ID.fetch_add(1, Ordering::Relaxed),
+                    };
+                    pending.push(SpillRow {
+                        reference: reference.clone(),
+                        payload: encode_arrow_chunk(&chunk.batch)?,
+                    });
+                }
+            }
+            pending
+        };
+        if pending.is_empty() {
+            return Ok(());
+        }
+        // Strip internal markers and retain a separate commit map.
+        // The spill rows themselves are grouped by identity and generation.
+        let rows: Vec<_> = pending
+            .into_iter()
+            .filter(|row| !row.payload.is_empty())
+            .collect();
+        append_gbk_spill_rows(store, &rows).await?;
+        let mut inner = self.inner.lock().expect("gbk state lock not poisoned");
+        let mut grouped: HashMap<GroupIdentity, Vec<SpilledChunkRef>> = HashMap::new();
+        for row in rows {
+            grouped
+                .entry(row.reference.group.clone())
+                .or_default()
+                .push(row.reference);
+        }
+        for (identity, references) in grouped {
+            if let Some(state) = inner.states.get_mut(&identity) {
+                let count = references.len().min(state.elements.len());
+                state.elements.drain(..count);
+                state.spilled.extend(references);
+            }
+        }
+        Ok(())
+    }
+
     async fn apply_group(
         &self,
         key: PrimitiveValue,
@@ -291,6 +544,7 @@ impl GbkStateBackend for InMemoryGbkState {
                 output_timestamp(spec.output_time, &window, timestamp_min, timestamp_max);
             return Ok(Some(ArrowPane {
                 chunks: elements,
+                spilled: Vec::new(),
                 timestamp_millis,
                 window,
                 pane: pane_info(crate::coders::primitives::PaneTiming::OnTime, 0, true, true),
@@ -490,9 +744,23 @@ fn arrow_panes_to_batch(
     Ok((batch, table_schema, metadata))
 }
 
-async fn write_arrow_panes(writer: &mut PCollectionWriter, panes: Vec<ArrowPane>) -> Result<()> {
+async fn write_arrow_panes(
+    store: &FlareElementStore,
+    writer: &mut PCollectionWriter,
+    mut panes: Vec<ArrowPane>,
+) -> Result<()> {
     if panes.is_empty() {
         return Ok(());
+    }
+    let references: Vec<_> = panes
+        .iter()
+        .flat_map(|pane| pane.spilled.iter().cloned())
+        .collect();
+    let mut loaded = read_gbk_spill_chunks(store, &references).await?.into_iter();
+    for pane in &mut panes {
+        let mut spilled: Vec<_> = loaded.by_ref().take(pane.spilled.len()).collect();
+        spilled.append(&mut pane.chunks);
+        pane.chunks = spilled;
     }
     let (batch, schema, metadata) = arrow_panes_to_batch(&panes)?;
     writer
@@ -633,6 +901,10 @@ impl FlareTransform for GroupByKey {
             0
         };
         let config = GbkSortConfig::from_env();
+        let state_memory_limit_bytes = parse_env_bytes(
+            GBK_STATE_MEMORY_LIMIT_ENV,
+            DEFAULT_GBK_STATE_MEMORY_LIMIT_BYTES,
+        );
         let (sorted_inputs, latest) = open_sorted_input_streams(
             &ctx.store,
             &input_pcollection_id,
@@ -678,9 +950,12 @@ impl FlareTransform for GroupByKey {
                         &mut output,
                     )
                     .await?;
+                    self.state
+                        .spill_over_limit(&ctx.store, state_memory_limit_bytes)
+                        .await?;
                     group_time += group_started.elapsed();
                     let write_started = Instant::now();
-                    flush_output_if_full(&mut writer, &mut output).await?;
+                    flush_output_if_full(&ctx.store, &mut writer, &mut output).await?;
                     write_time += write_started.elapsed();
                     if decoded_rows >= next_progress {
                         info!(
@@ -703,6 +978,9 @@ impl FlareTransform for GroupByKey {
                         &mut output,
                     )
                     .await?;
+                    self.state
+                        .spill_over_limit(&ctx.store, state_memory_limit_bytes)
+                        .await?;
                 }
                 Ok(())
             }
@@ -739,11 +1017,11 @@ impl FlareTransform for GroupByKey {
                 break;
             }
             fired += ready.len();
-            write_arrow_panes(&mut writer, ready).await?;
+            write_arrow_panes(&ctx.store, &mut writer, ready).await?;
         }
-        flush_output_if_full(&mut writer, &mut output).await?;
+        flush_output_if_full(&ctx.store, &mut writer, &mut output).await?;
         if !output.is_empty() {
-            write_arrow_panes(&mut writer, std::mem::take(&mut output)).await?;
+            write_arrow_panes(&ctx.store, &mut writer, std::mem::take(&mut output)).await?;
         }
 
         // Advance the input cursor only after all emitted panes are durable.
@@ -1448,6 +1726,10 @@ impl SortedGroupDecoder {
                 vec![
                     batch.schema().field_with_name(KEY_COLUMN)?.clone(),
                     batch.schema().field_with_name(VALUE_COLUMN)?.clone(),
+                    batch
+                        .schema()
+                        .field_with_name(WINDOW_TIMESTAMP_COLUMN)?
+                        .clone(),
                 ],
                 batch.schema().metadata().clone(),
             ));
@@ -1456,6 +1738,10 @@ impl SortedGroupDecoder {
                 vec![
                     key_column.slice(start, end - start),
                     value_column.slice(start, end - start),
+                    batch
+                        .column_by_name(WINDOW_TIMESTAMP_COLUMN)
+                        .expect("timestamp column validated above")
+                        .slice(start, end - start),
                 ],
             )?;
             let chunk = ArrowValueChunk {
@@ -1665,11 +1951,12 @@ fn merge_interval_groups(
 }
 
 async fn flush_output_if_full(
+    store: &FlareElementStore,
     writer: &mut PCollectionWriter,
     output: &mut Vec<ArrowPane>,
 ) -> Result<()> {
     if output.len() >= OUTPUT_BATCH_SIZE {
-        write_arrow_panes(writer, std::mem::take(output)).await?;
+        write_arrow_panes(store, writer, std::mem::take(output)).await?;
         output.reserve(OUTPUT_BATCH_SIZE);
     }
     Ok(())
@@ -1703,9 +1990,16 @@ fn fire_state(
     let timing = pane_timing(end_of_window, is_first);
     let pane = pane_info(timing, state.pane_index, is_first, expired);
 
-    let elements = match spec.accumulation {
-        AccumulationMode::Discarding => std::mem::take(&mut state.elements),
-        AccumulationMode::Accumulating | AccumulationMode::Retracting => state.elements.clone(),
+    let (elements, spilled) = match spec.accumulation {
+        AccumulationMode::Discarding => {
+            let elements = std::mem::take(&mut state.elements);
+            let spilled = std::mem::take(&mut state.spilled);
+            state.generation += 1;
+            (elements, spilled)
+        }
+        AccumulationMode::Accumulating | AccumulationMode::Retracting => {
+            (state.elements.clone(), state.spilled.clone())
+        }
     };
     let pane_timestamp_min = state.pane_timestamp_min.take();
     let pane_timestamp_max = state.pane_timestamp_max.take();
@@ -1726,12 +2020,13 @@ fn fire_state(
 
     // Beam's `EmitIfNonempty` closing behavior: a firing whose pane has no
     // accumulated values carries no data and must not be emitted.
-    if elements.is_empty() {
+    if elements.is_empty() && spilled.is_empty() {
         return Ok(None);
     }
 
     Ok(Some(ArrowPane {
         chunks: elements,
+        spilled,
         timestamp_millis,
         window: state.window.clone(),
         pane,
@@ -1754,6 +2049,226 @@ mod tests {
             .await
             .expect("failed to construct FlareElementStore");
         (dir, Arc::new(store))
+    }
+
+    fn spill_test_chunk(value: i64, timestamp: i64) -> ArrowValueChunk {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new(KEY_COLUMN, ArrowDataType::Binary, false),
+            ArrowField::new(VALUE_COLUMN, ArrowDataType::Int64, false),
+            ArrowField::new(WINDOW_TIMESTAMP_COLUMN, ArrowDataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(BinaryArray::from(vec![b"key".as_slice()])),
+                Arc::new(Int64Array::from(vec![value])),
+                Arc::new(Int64Array::from(vec![timestamp])),
+            ],
+        )
+        .unwrap();
+        ArrowValueChunk {
+            batch,
+            timestamp_min: timestamp,
+            timestamp_max: timestamp,
+        }
+    }
+
+    #[test]
+    fn decoded_arrow_chunk_keeps_event_timestamps_for_spill_ipc() {
+        let window = BeamWindow::Global;
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new(KEY_COLUMN, ArrowDataType::Binary, false),
+            ArrowField::new(VALUE_COLUMN, ArrowDataType::Int64, false),
+            ArrowField::new(WINDOW_TIMESTAMP_COLUMN, ArrowDataType::Int64, false),
+            ArrowField::new(WINDOW_KEY_COLUMN, ArrowDataType::Binary, false),
+            ArrowField::new(GROUP_KEY_COLUMN, ArrowDataType::Binary, false),
+        ]));
+        let window_key = window.to_binary_key();
+        let encoded_key = encoded_primitive_sort_key(&PrimitiveValue::Bytes(b"key".to_vec()));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(BinaryArray::from(vec![b"key".as_slice()])),
+                Arc::new(Int64Array::from(vec![9])),
+                Arc::new(Int64Array::from(vec![1234])),
+                Arc::new(BinaryArray::from(vec![window_key.as_slice()])),
+                Arc::new(BinaryArray::from(vec![encoded_key.as_slice()])),
+            ],
+        )
+        .unwrap();
+        let mut decoder = SortedGroupDecoder::default();
+        decoder.push_batch(&batch).unwrap();
+        let decoded = decoder.finish().unwrap();
+        let chunk = &decoded.windows[0].1[0];
+        let restored = decode_arrow_chunk(&encode_arrow_chunk(&chunk.batch).unwrap()).unwrap();
+        let timestamps = restored
+            .column_by_name(WINDOW_TIMESTAMP_COLUMN)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(timestamps.value(0), 1234);
+    }
+
+    #[tokio::test]
+    async fn gbk_state_spill_releases_chunks_and_pane_combines_spilled_and_memory_values() {
+        let (_dir, store) = make_store().await;
+        let state = InMemoryGbkState::default();
+        let mut spec = TriggerSpec::from_windowing_strategy(None);
+        spec.accumulation = AccumulationMode::Accumulating;
+        let window = BeamWindow::Global;
+        let key = PrimitiveValue::String("key".to_string());
+
+        state
+            .apply_group(
+                key.clone(),
+                window.clone(),
+                vec![spill_test_chunk(3, 10)],
+                &spec,
+                i64::MIN,
+                0,
+            )
+            .await
+            .unwrap();
+        state.spill_over_limit(&store, 1).await.unwrap();
+        {
+            let inner = state.inner.lock().unwrap();
+            let group = inner.states.values().next().unwrap();
+            assert!(
+                group.elements.is_empty(),
+                "successful spill releases Arrow buffers"
+            );
+            assert_eq!(group.spilled.len(), 1);
+        }
+
+        state
+            .apply_group(
+                key,
+                window,
+                vec![spill_test_chunk(5, 15)],
+                &spec,
+                i64::MIN,
+                0,
+            )
+            .await
+            .unwrap();
+        state.begin_run().await;
+        let mut panes = state.take_ready(&spec, i64::MAX, 0, 1).await.unwrap();
+        assert_eq!(panes.len(), 1);
+        let mut spilled = read_gbk_spill_chunks(&store, &panes[0].spilled)
+            .await
+            .unwrap();
+        spilled.append(&mut panes[0].chunks);
+        let values: Vec<i64> = spilled
+            .iter()
+            .flat_map(|chunk| {
+                chunk
+                    .batch
+                    .column_by_name(VALUE_COLUMN)
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        assert_eq!(values, vec![3, 5]);
+        let timestamps: Vec<i64> = spilled
+            .iter()
+            .flat_map(|chunk| {
+                chunk
+                    .batch
+                    .column_by_name(WINDOW_TIMESTAMP_COLUMN)
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        assert_eq!(timestamps, vec![10, 15]);
+    }
+
+    #[test]
+    fn discarding_fire_advances_spill_generation_without_reusing_old_chunks() {
+        let reference = SpilledChunkRef {
+            group: GroupIdentity {
+                key: b"key".to_vec(),
+                window: interval(0, 10).to_binary_key(),
+            },
+            generation: 6,
+            chunk_id: 91,
+        };
+        let mut state = WindowState::new(interval(0, 10), TriggerRunner::new(Trigger::Default));
+        state.generation = 6;
+        state.spilled.push(reference.clone());
+        let mut spec = TriggerSpec::from_windowing_strategy(None);
+        spec.accumulation = AccumulationMode::Discarding;
+
+        let pane = fire_state(&mut state, &spec, 10, 0).unwrap().unwrap();
+        assert_eq!(pane.spilled, vec![reference]);
+        assert!(state.spilled.is_empty());
+        assert_eq!(state.generation, 7);
+    }
+
+    #[tokio::test]
+    async fn gbk_spill_table_round_trips_chunks_timestamps_and_duplicates() {
+        let (_dir, store) = make_store().await;
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new(KEY_COLUMN, ArrowDataType::Binary, false),
+            ArrowField::new(VALUE_COLUMN, ArrowDataType::Int64, false),
+            ArrowField::new(WINDOW_TIMESTAMP_COLUMN, ArrowDataType::Int64, false),
+        ]));
+        let input = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(BinaryArray::from(vec![
+                    b"key".as_slice(),
+                    b"key".as_slice(),
+                ])),
+                Arc::new(Int64Array::from(vec![7, 7])),
+                Arc::new(Int64Array::from(vec![11, 13])),
+            ],
+        )
+        .unwrap();
+        let group = GroupIdentity {
+            key: b"encoded-key".to_vec(),
+            window: b"encoded-window".to_vec(),
+        };
+        let payload = encode_arrow_chunk(&input).unwrap();
+        let references = [1_i64, 2_i64].map(|chunk_id| SpilledChunkRef {
+            group: group.clone(),
+            generation: 4,
+            chunk_id,
+        });
+        let rows = references
+            .iter()
+            .cloned()
+            .map(|reference| SpillRow {
+                reference,
+                payload: payload.clone(),
+            })
+            .collect::<Vec<_>>();
+
+        append_gbk_spill_rows(&store, &rows).await.unwrap();
+        let chunks = read_gbk_spill_chunks(&store, &references).await.unwrap();
+        assert_eq!(chunks.len(), 2, "equal values must not be deduplicated");
+        for chunk in chunks {
+            assert_eq!(chunk.timestamp_min, 11);
+            assert_eq!(chunk.timestamp_max, 13);
+            let values = chunk
+                .batch
+                .column_by_name(VALUE_COLUMN)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            assert_eq!(values.values(), &[7, 7]);
+        }
     }
 
     fn interval(start: i64, end: i64) -> BeamWindow {

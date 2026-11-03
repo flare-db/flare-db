@@ -960,30 +960,54 @@ impl FlareElementStore {
         Ok(self.catalog.get_table(&identifier).await?)
     }
 
-    /// Commit a single Arrow [`RecordBatch`] to `table`.
-    pub async fn write_table_batch(&self, table: &Table, batch: &RecordBatch) -> Result<()> {
+    /// Commit one or more Arrow [`RecordBatch`]es to `table` in a single
+    /// Paimon snapshot. Callers that spill data should use this batch form so a
+    /// set of chunks (potentially from several groups) shares one commit.
+    pub async fn write_table_batches(&self, table: &Table, batches: &[RecordBatch]) -> Result<()> {
+        if batches.is_empty() {
+            return Ok(());
+        }
         let builder = table.new_write_builder();
         let mut writer = builder.new_write()?;
-        writer.write_arrow_batch(batch).await?;
+        for batch in batches {
+            writer.write_arrow_batch(batch).await?;
+        }
         let messages = writer.prepare_commit().await?;
         builder.new_commit().commit(messages).await?;
         Ok(())
     }
 
-    /// Read all committed batches of `table_name`, or an empty `Vec` when the
-    /// table does not exist (zero committed rows).
-    pub async fn read_table_batches(&self, table_name: &str) -> Result<Vec<RecordBatch>> {
+    /// Commit a single Arrow [`RecordBatch`] to `table`.
+    pub async fn write_table_batch(&self, table: &Table, batch: &RecordBatch) -> Result<()> {
+        self.write_table_batches(table, std::slice::from_ref(batch))
+            .await
+    }
+
+    /// Open a streaming Arrow scan over all committed batches of `table_name`.
+    /// Returns `None` when the table does not exist.
+    pub async fn scan_table_batches(
+        &self,
+        table_name: &str,
+    ) -> Result<Option<ArrowRecordBatchStream>> {
         let identifier = Identifier::new(self.db_name.as_str(), table_name);
         let table = match self.catalog.get_table(&identifier).await {
             Ok(table) => table,
-            Err(paimon::Error::TableNotExist { .. }) => return Ok(Vec::new()),
+            Err(paimon::Error::TableNotExist { .. }) => return Ok(None),
             Err(err) => return Err(err.into()),
         };
 
         let read_builder = table.new_read_builder();
         let plan = read_builder.new_scan().plan().await?;
         let read = read_builder.new_read()?;
-        let mut stream = read.to_arrow(plan.splits())?;
+        Ok(Some(read.to_arrow(plan.splits())?))
+    }
+
+    /// Read all committed batches of `table_name`, or an empty `Vec` when the
+    /// table does not exist (zero committed rows).
+    pub async fn read_table_batches(&self, table_name: &str) -> Result<Vec<RecordBatch>> {
+        let Some(mut stream) = self.scan_table_batches(table_name).await? else {
+            return Ok(Vec::new());
+        };
         let mut batches = Vec::new();
         while let Some(batch) = stream.next().await {
             batches.push(batch?);
