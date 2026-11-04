@@ -68,22 +68,45 @@ def assign_event_timestamp(record):
     )
 
 
+class HourlyStatsCombineFn(beam.CombineFn):
+    """Combine each group into compact statistics before the final GBK."""
+
+    def create_accumulator(self):
+        return 0, 0.0, float("inf"), float("-inf"), frozenset()
+
+    def add_input(self, accumulator, measurement):
+        count, total, minimum, maximum, sources = accumulator
+        value, source = measurement
+        return (
+            count + 1,
+            total + value,
+            min(minimum, value),
+            max(maximum, value),
+            sources | {source},
+        )
+
+    def merge_accumulators(self, accumulators):
+        count = 0
+        total = 0.0
+        minimum = float("inf")
+        maximum = float("-inf")
+        sources = set()
+        for other_count, other_total, other_min, other_max, other_sources in accumulators:
+            count += other_count
+            total += other_total
+            minimum = min(minimum, other_min)
+            maximum = max(maximum, other_max)
+            sources.update(other_sources)
+        return count, total, minimum, maximum, frozenset(sources)
+
+    def extract_output(self, accumulator):
+        return accumulator
+
+
 def format_hourly_result(element, window=beam.DoFn.WindowParam):
-    """Produce hourly statistics for a station and pollutant."""
-    (station_id, parameter_name, unit), records = element
-
-    count = 0
-    total = 0.0
-    minimum = float("inf")
-    maximum = float("-inf")
-    sources = set()
-
-    for value, source in records:
-        count += 1
-        total += value
-        minimum = min(minimum, value)
-        maximum = max(maximum, value)
-        sources.add(source)
+    """Format already-combined statistics for a station and pollutant."""
+    (station_id, parameter_name, unit), stats = element
+    count, total, minimum, maximum, sources = stats
 
     if count == 0:
         return None
@@ -166,8 +189,8 @@ def run(argv=None):
             measurements
             | "Window measurements"
             >> beam.WindowInto(FixedWindows(args.window_seconds))
-            | "Group by station and pollutant"
-            >> beam.GroupByKey()
+            | "Combine hourly statistics"
+            >> beam.CombinePerKey(HourlyStatsCombineFn())
         )
 
         hourly_results = (

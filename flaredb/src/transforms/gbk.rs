@@ -157,6 +157,12 @@ struct GroupIdentity {
     window: Vec<u8>,
 }
 
+fn arrow_chunks_memory_bytes(chunks: &[ArrowValueChunk]) -> usize {
+    chunks.iter().fold(0usize, |total, chunk| {
+        total.saturating_add(chunk.batch.get_array_memory_size())
+    })
+}
+
 impl WindowState {
     fn new(window: BeamWindow, trigger: TriggerRunner) -> Self {
         Self {
@@ -194,6 +200,7 @@ struct SpilledChunkRef {
 struct SpillRow {
     reference: SpilledChunkRef,
     payload: Vec<u8>,
+    memory_bytes: usize,
 }
 
 #[derive(Debug)]
@@ -410,6 +417,9 @@ trait GbkStateBackend: Send + Sync {
 #[derive(Default)]
 struct InMemoryGbkStateInner {
     states: HashMap<GroupIdentity, WindowState>,
+    in_memory_bytes: usize,
+    total_spilled_arrow_bytes_estimate: usize,
+    total_spilled_chunks: usize,
     ready_scan: Option<VecDeque<GroupIdentity>>,
     last_evaluated_watermark: Option<i64>,
     pending_range: Option<SnapshotRange>,
@@ -418,6 +428,18 @@ struct InMemoryGbkStateInner {
 #[derive(Clone, Default)]
 struct InMemoryGbkState {
     inner: Arc<Mutex<InMemoryGbkStateInner>>,
+}
+
+impl InMemoryGbkState {
+    fn memory_snapshot(&self) -> (usize, usize, usize, usize) {
+        let inner = self.inner.lock().expect("gbk state lock not poisoned");
+        (
+            inner.in_memory_bytes,
+            inner.states.len(),
+            inner.total_spilled_arrow_bytes_estimate,
+            inner.total_spilled_chunks,
+        )
+    }
 }
 
 #[async_trait]
@@ -470,26 +492,38 @@ impl GbkStateBackend for InMemoryGbkState {
     ) -> Result<()> {
         let pending = {
             let inner = self.inner.lock().expect("gbk state lock not poisoned");
+            if inner.in_memory_bytes <= memory_limit_bytes {
+                return Ok(());
+            }
+
+            // Spill toward a lower watermark so the next batch does not trigger
+            // another full scan/write immediately after crossing the limit.
+            let target_bytes = memory_limit_bytes / 2;
+            let mut remaining_bytes = inner.in_memory_bytes;
             let mut pending = Vec::new();
             for (identity, state) in &inner.states {
-                let bytes = state
-                    .elements
-                    .iter()
-                    .map(|chunk| chunk.batch.get_array_memory_size())
-                    .sum::<usize>();
-                if bytes <= memory_limit_bytes || state.elements.is_empty() {
-                    continue;
-                }
                 for chunk in &state.elements {
+                    if remaining_bytes <= target_bytes {
+                        break;
+                    }
+                    let memory_bytes = chunk.batch.get_array_memory_size();
                     let reference = SpilledChunkRef {
                         group: identity.clone(),
                         generation: state.generation,
                         chunk_id: NEXT_GBK_SPILL_CHUNK_ID.fetch_add(1, Ordering::Relaxed),
                     };
-                    pending.push(SpillRow {
-                        reference: reference.clone(),
-                        payload: encode_arrow_chunk(&chunk.batch)?,
-                    });
+                    let payload = encode_arrow_chunk(&chunk.batch)?;
+                    if !payload.is_empty() {
+                        pending.push(SpillRow {
+                            reference,
+                            payload,
+                            memory_bytes,
+                        });
+                        remaining_bytes = remaining_bytes.saturating_sub(memory_bytes);
+                    }
+                }
+                if remaining_bytes <= target_bytes {
+                    break;
                 }
             }
             pending
@@ -497,28 +531,43 @@ impl GbkStateBackend for InMemoryGbkState {
         if pending.is_empty() {
             return Ok(());
         }
-        // Strip internal markers and retain a separate commit map.
-        // The spill rows themselves are grouped by identity and generation.
-        let rows: Vec<_> = pending
-            .into_iter()
-            .filter(|row| !row.payload.is_empty())
-            .collect();
-        append_gbk_spill_rows(store, &rows).await?;
+
+        append_gbk_spill_rows(store, &pending).await?;
         let mut inner = self.inner.lock().expect("gbk state lock not poisoned");
-        let mut grouped: HashMap<GroupIdentity, Vec<SpilledChunkRef>> = HashMap::new();
-        for row in rows {
+        let mut grouped: HashMap<GroupIdentity, Vec<(SpilledChunkRef, usize)>> = HashMap::new();
+        for row in pending {
             grouped
                 .entry(row.reference.group.clone())
                 .or_default()
-                .push(row.reference);
+                .push((row.reference, row.memory_bytes));
         }
+        let mut freed_bytes = 0usize;
+        let mut freed_chunks = 0usize;
         for (identity, references) in grouped {
             if let Some(state) = inner.states.get_mut(&identity) {
                 let count = references.len().min(state.elements.len());
+                freed_bytes = freed_bytes.saturating_add(
+                    references
+                        .iter()
+                        .take(count)
+                        .map(|(_, bytes)| *bytes)
+                        .sum::<usize>(),
+                );
+                freed_chunks = freed_chunks.saturating_add(count);
                 state.elements.drain(..count);
-                state.spilled.extend(references);
+                state.spilled.extend(
+                    references
+                        .into_iter()
+                        .take(count)
+                        .map(|(reference, _)| reference),
+                );
             }
         }
+        inner.in_memory_bytes = inner.in_memory_bytes.saturating_sub(freed_bytes);
+        inner.total_spilled_arrow_bytes_estimate = inner
+            .total_spilled_arrow_bytes_estimate
+            .saturating_add(freed_bytes);
+        inner.total_spilled_chunks = inner.total_spilled_chunks.saturating_add(freed_chunks);
         Ok(())
     }
 
@@ -552,22 +601,36 @@ impl GbkStateBackend for InMemoryGbkState {
         }
 
         let identity = group_identity(&key, &window);
-        let state = inner.states.entry(identity.clone()).or_insert_with(|| {
-            WindowState::new(window.clone(), TriggerRunner::new(spec.trigger.clone()))
-        });
-        for element in &elements {
-            for _ in 0..element.batch.num_rows() {
-                state.trigger.on_element(processing_time);
+        let (bytes_before, bytes_after, closed, output) = {
+            let state = inner.states.entry(identity.clone()).or_insert_with(|| {
+                WindowState::new(window.clone(), TriggerRunner::new(spec.trigger.clone()))
+            });
+            let bytes_before = arrow_chunks_memory_bytes(&state.elements);
+            for element in &elements {
+                for _ in 0..element.batch.num_rows() {
+                    state.trigger.on_element(processing_time);
+                }
             }
-        }
-        let (timestamp_min, timestamp_max) = chunk_timestamp_extrema(&elements);
-        state.pane_timestamp_min = min_option(state.pane_timestamp_min, timestamp_min);
-        state.pane_timestamp_max = max_option(state.pane_timestamp_max, timestamp_max);
-        state.elements.extend(elements);
+            let (timestamp_min, timestamp_max) = chunk_timestamp_extrema(&elements);
+            state.pane_timestamp_min = min_option(state.pane_timestamp_min, timestamp_min);
+            state.pane_timestamp_max = max_option(state.pane_timestamp_max, timestamp_max);
+            state.elements.extend(elements);
 
-        let output = fire_state(state, spec, input_watermark, processing_time)?;
-        if state.closed {
+            let output = fire_state(state, spec, input_watermark, processing_time)?;
+            (
+                bytes_before,
+                arrow_chunks_memory_bytes(&state.elements),
+                state.closed,
+                output,
+            )
+        };
+        inner.in_memory_bytes = inner
+            .in_memory_bytes
+            .saturating_sub(bytes_before)
+            .saturating_add(bytes_after);
+        if closed {
             inner.states.remove(&identity);
+            inner.in_memory_bytes = inner.in_memory_bytes.saturating_sub(bytes_after);
         }
         Ok(output)
     }
@@ -591,17 +654,32 @@ impl GbkStateBackend for InMemoryGbkState {
             let Some(identity) = inner.ready_scan.as_mut().and_then(VecDeque::pop_front) else {
                 break;
             };
-            let Some(state) = inner.states.get_mut(&identity) else {
-                continue;
+            let (bytes_before, bytes_after, closed, pane) = {
+                let Some(state) = inner.states.get_mut(&identity) else {
+                    continue;
+                };
+                if state.evaluated_this_run {
+                    continue;
+                }
+                let bytes_before = arrow_chunks_memory_bytes(&state.elements);
+                let pane = fire_state(state, spec, input_watermark, processing_time)?;
+                (
+                    bytes_before,
+                    arrow_chunks_memory_bytes(&state.elements),
+                    state.closed,
+                    pane,
+                )
             };
-            if state.evaluated_this_run {
-                continue;
-            }
-            if let Some(value) = fire_state(state, spec, input_watermark, processing_time)? {
+            inner.in_memory_bytes = inner
+                .in_memory_bytes
+                .saturating_sub(bytes_before)
+                .saturating_add(bytes_after);
+            if let Some(value) = pane {
                 output.push(value);
             }
-            if state.closed {
+            if closed {
                 inner.states.remove(&identity);
+                inner.in_memory_bytes = inner.in_memory_bytes.saturating_sub(bytes_after);
             }
         }
         if inner.ready_scan.as_ref().is_some_and(VecDeque::is_empty) {
@@ -958,8 +1036,13 @@ impl FlareTransform for GroupByKey {
                     flush_output_if_full(&ctx.store, &mut writer, &mut output).await?;
                     write_time += write_started.elapsed();
                     if decoded_rows >= next_progress {
+                        let (state_bytes, state_groups, spilled_bytes, spilled_chunks) =
+                            self.state.memory_snapshot();
                         info!(
-                            "GroupByKey: decoded {decoded_rows} rows, fired {fired} panes in {:?} (decode={decode_time:?}, group/merge={group_time:?}, output_write={write_time:?})",
+                            "GroupByKey: decoded {decoded_rows} rows, fired {fired} panes in {:?} \
+                             (decode={decode_time:?}, group/merge={group_time:?}, output_write={write_time:?}, \
+                             state_arrow_bytes={state_bytes}, state_groups={state_groups}, \
+                             cumulative_spilled_arrow_bytes_estimate={spilled_bytes}, cumulative_spilled_chunks={spilled_chunks})",
                             sort_started.elapsed(),
                         );
                         next_progress = (decoded_rows / 1_000_000 + 1) * 1_000_000;
@@ -2073,6 +2156,63 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn gbk_spill_limit_applies_across_many_small_groups() {
+        let (_dir, store) = make_store().await;
+        let state = InMemoryGbkState::default();
+        let spec = TriggerSpec::from_windowing_strategy(None);
+        let window = BeamWindow::Global;
+        let mut total_bytes = 0usize;
+        let mut group_bytes = Vec::new();
+
+        for index in 0..3 {
+            let chunk = spill_test_chunk(index, index);
+            let bytes = chunk.batch.get_array_memory_size();
+            total_bytes += bytes;
+            group_bytes.push(bytes);
+            state
+                .apply_group(
+                    PrimitiveValue::String(format!("key-{index}")),
+                    window.clone(),
+                    vec![chunk],
+                    &spec,
+                    i64::MIN,
+                    0,
+                )
+                .await
+                .unwrap();
+        }
+
+        let limit = total_bytes / 2;
+        assert!(group_bytes.iter().all(|bytes| *bytes < limit));
+        assert_eq!(state.inner.lock().unwrap().in_memory_bytes, total_bytes);
+
+        state.spill_over_limit(&store, limit).await.unwrap();
+
+        let inner = state.inner.lock().unwrap();
+        let remaining_bytes = inner
+            .states
+            .values()
+            .map(|group| arrow_chunks_memory_bytes(&group.elements))
+            .sum::<usize>();
+        assert!(
+            remaining_bytes <= limit / 2,
+            "aggregate retained bytes {remaining_bytes} should be below spill target {}",
+            limit / 2
+        );
+        assert_eq!(inner.in_memory_bytes, remaining_bytes);
+        assert_eq!(inner.total_spilled_arrow_bytes_estimate, total_bytes);
+        assert_eq!(inner.total_spilled_chunks, 3);
+        assert_eq!(
+            inner
+                .states
+                .values()
+                .map(|group| group.spilled.len())
+                .sum::<usize>(),
+            3
+        );
+    }
+
     #[test]
     fn decoded_arrow_chunk_keeps_event_timestamps_for_spill_ipc() {
         let window = BeamWindow::Global;
@@ -2108,6 +2248,33 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
         assert_eq!(timestamps.value(0), 1234);
+    }
+
+    #[tokio::test]
+    async fn completed_default_window_group_emits_without_retaining_state() {
+        let state = InMemoryGbkState::default();
+        let spec = TriggerSpec::from_windowing_strategy(None);
+        let window = BeamWindow::Interval {
+            start_millis: 0,
+            end_millis: 1_000,
+        };
+        let pane = state
+            .apply_group(
+                PrimitiveValue::String("key".to_string()),
+                window,
+                vec![spill_test_chunk(3, 10), spill_test_chunk(5, 15)],
+                &spec,
+                i64::MAX,
+                0,
+            )
+            .await
+            .unwrap()
+            .expect("final watermark fires a completed default-trigger group");
+
+        assert_eq!(pane.chunks.len(), 2);
+        let inner = state.inner.lock().unwrap();
+        assert!(inner.states.is_empty());
+        assert_eq!(inner.in_memory_bytes, 0);
     }
 
     #[tokio::test]
@@ -2251,6 +2418,7 @@ mod tests {
             .map(|reference| SpillRow {
                 reference,
                 payload: payload.clone(),
+                memory_bytes: input.get_array_memory_size(),
             })
             .collect::<Vec<_>>();
 
