@@ -339,6 +339,14 @@ trait GbkStateBackend: Send + Sync {
         processing_time: i64,
         limit: usize,
     ) -> Result<Vec<ArrowPane>>;
+
+    async fn drain_window(
+        &self,
+        window: &BeamWindow,
+        spec: &TriggerSpec,
+        input_watermark: i64,
+        processing_time: i64,
+    ) -> Result<Vec<ArrowPane>>;
 }
 
 #[derive(Default)]
@@ -611,6 +619,52 @@ impl GbkStateBackend for InMemoryGbkState {
         }
         if inner.ready_scan.as_ref().is_some_and(VecDeque::is_empty) {
             inner.ready_scan = None;
+        }
+        Ok(output)
+    }
+
+    async fn drain_window(
+        &self,
+        window: &BeamWindow,
+        spec: &TriggerSpec,
+        input_watermark: i64,
+        processing_time: i64,
+    ) -> Result<Vec<ArrowPane>> {
+        let mut inner = self.inner.lock().expect("gbk state lock not poisoned");
+        inner.ready_scan = None;
+        let window_binary = window.to_binary_key();
+        let matching_identities: Vec<GroupIdentity> = inner
+            .states
+            .keys()
+            .filter(|id| id.window == window_binary)
+            .cloned()
+            .collect();
+        let mut output = Vec::with_capacity(matching_identities.len());
+        for identity in matching_identities {
+            let (bytes_before, bytes_after, closed, pane) = {
+                let Some(state) = inner.states.get_mut(&identity) else {
+                    continue;
+                };
+                let bytes_before = arrow_chunks_memory_bytes(&state.elements);
+                let pane = fire_state(state, spec, input_watermark, processing_time)?;
+                (
+                    bytes_before,
+                    arrow_chunks_memory_bytes(&state.elements),
+                    state.closed,
+                    pane,
+                )
+            };
+            inner.in_memory_bytes = inner
+                .in_memory_bytes
+                .saturating_sub(bytes_before)
+                .saturating_add(bytes_after);
+            if let Some(value) = pane {
+                output.push(value);
+            }
+            if closed {
+                inner.states.remove(&identity);
+                inner.in_memory_bytes = inner.in_memory_bytes.saturating_sub(bytes_after);
+            }
         }
         Ok(output)
     }
@@ -919,6 +973,8 @@ impl FlareTransform for GroupByKey {
             GBK_STATE_MEMORY_LIMIT_ENV,
             DEFAULT_GBK_STATE_MEMORY_LIMIT_BYTES,
         );
+        let window_major = !needs_merge && !is_global_window;
+        let mut current_watermark = ctx.input_watermark;
         let (sorted_inputs, latest) = open_sorted_input_streams(
             &ctx.store,
             &input_pcollection_id,
@@ -926,6 +982,7 @@ impl FlareTransform for GroupByKey {
             window_prune_before,
             &config,
             &self.state,
+            window_major,
         )
         .await?;
         let mut writer =
@@ -944,26 +1001,47 @@ impl FlareTransform for GroupByKey {
                 "GroupByKey: processing provider partition {partition} for {input_pcollection_id}"
             );
             let sort_result: Result<()> = async {
-                let mut decoder = SortedGroupDecoder::default();
+                let mut decoder = SortedGroupDecoder::new(window_major);
                 while let Some(batch) = sorted_input.stream.next().await {
                     let batch = batch?;
                     decoded_rows += batch.num_rows();
                     let decode_started = Instant::now();
-                    let groups = decoder.push_batch(&batch)?;
+                    let decoded = decoder.push_batch(&batch)?;
                     decode_time += decode_started.elapsed();
                     let group_started = Instant::now();
                     fired += process_key_groups_batch(
-                        groups,
+                        decoded.groups,
                         needs_merge,
                         ctx.window_merger.as_deref(),
                         &input_pcollection_id,
                         &spec,
-                        ctx.input_watermark,
+                        current_watermark,
                         ctx.processing_time,
                         &self.state,
                         &mut output,
                     )
                     .await?;
+                    for window in decoded.completed_windows {
+                        let end = window.max_timestamp_millis();
+                        let expiry_watermark = spec.earliest_completion(end).saturating_add(1);
+                        let target_watermark = if ctx.input_is_bounded {
+                            expiry_watermark
+                        } else {
+                            end.saturating_add(1)
+                        };
+                        current_watermark = current_watermark.max(target_watermark);
+                        let panes = self
+                            .state
+                            .drain_window(
+                                &window,
+                                &spec,
+                                current_watermark,
+                                ctx.processing_time,
+                            )
+                            .await?;
+                        fired += panes.len();
+                        output.extend(panes);
+                    }
                     self.state
                         .spill_over_limit(&ctx.store, state_memory_limit_bytes)
                         .await?;
@@ -984,23 +1062,46 @@ impl FlareTransform for GroupByKey {
                         next_progress = (decoded_rows / 1_000_000 + 1) * 1_000_000;
                     }
                 }
-                if let Some(key_group) = decoder.finish() {
+                let (last_group, last_window) = decoder.finish();
+                if let Some(key_group) = last_group {
                     fired += process_key_groups_batch(
                         vec![key_group],
                         needs_merge,
                         ctx.window_merger.as_deref(),
                         &input_pcollection_id,
                         &spec,
-                        ctx.input_watermark,
+                        current_watermark,
                         ctx.processing_time,
                         &self.state,
                         &mut output,
                     )
                     .await?;
-                    self.state
-                        .spill_over_limit(&ctx.store, state_memory_limit_bytes)
-                        .await?;
                 }
+                if let Some(last_window) = last_window {
+                    let end = last_window.max_timestamp_millis();
+                    let expiry_watermark = spec.earliest_completion(end).saturating_add(1);
+                    let target_watermark = if ctx.input_is_bounded {
+                        expiry_watermark
+                    } else {
+                        end.saturating_add(1)
+                    };
+                    current_watermark = current_watermark.max(target_watermark);
+                    let panes = self
+                        .state
+                        .drain_window(
+                            &last_window,
+                            &spec,
+                            current_watermark,
+                            ctx.processing_time,
+                        )
+                        .await?;
+                    fired += panes.len();
+                    output.extend(panes);
+                }
+                self.state
+                    .spill_over_limit(&ctx.store, state_memory_limit_bytes)
+                    .await?;
+                flush_output_if_full(&ctx.store, &mut writer, &mut output).await?;
                 Ok(())
             }
             .await;
@@ -1027,7 +1128,7 @@ impl FlareTransform for GroupByKey {
                 .state
                 .take_ready(
                     &spec,
-                    ctx.input_watermark,
+                    current_watermark,
                     ctx.processing_time,
                     OUTPUT_BATCH_SIZE,
                 )
@@ -1057,20 +1158,20 @@ impl FlareTransform for GroupByKey {
         // afterward look late. Only arm pruning after input has been observed.
         if decoded_rows > 0 || previous_watermark.is_some() {
             self.state
-                .mark_watermark_evaluated(ctx.input_watermark)
+                .mark_watermark_evaluated(ctx.input_watermark.max(current_watermark))
                 .await;
         }
 
         if fired == 0 {
             info!(
                 "GroupByKey: no window fired at input watermark {} (dropped_due_to_lateness={})",
-                ctx.input_watermark, dropped_due_to_lateness
+                current_watermark, dropped_due_to_lateness
             );
         } else {
             info!(
                 "Executed GroupByKey: {} pane(s) fired at input watermark {} \
                  (dropped_due_to_lateness={})",
-                fired, ctx.input_watermark, dropped_due_to_lateness
+                fired, current_watermark, dropped_due_to_lateness
             );
         }
 
@@ -1193,6 +1294,7 @@ async fn open_sorted_input_streams(
     window_prune_before: Option<i64>,
     config: &GbkSortConfig,
     state_backend: &dyn GbkStateBackend,
+    window_major: bool,
 ) -> Result<(Vec<(usize, SortedInputStream)>, Option<i64>)> {
     let Some(table_schema) = store.registry.get(pcollection_id) else {
         return Ok((Vec::new(), cursor));
@@ -1311,11 +1413,16 @@ async fn open_sorted_input_streams(
 
     let table = session.table("gbk_input").await?;
     let physical = table.create_physical_plan().await?;
+    let (first_col, second_col) = if window_major {
+        (WINDOW_KEY_COLUMN, GROUP_KEY_COLUMN)
+    } else {
+        (GROUP_KEY_COLUMN, WINDOW_KEY_COLUMN)
+    };
     let order = datafusion::physical_expr::LexOrdering::new(vec![
         datafusion::physical_expr::PhysicalSortExpr::new(
             Arc::new(datafusion::physical_expr::expressions::Column::new(
-                GROUP_KEY_COLUMN,
-                flattened_schema.index_of(GROUP_KEY_COLUMN)?,
+                first_col,
+                flattened_schema.index_of(first_col)?,
             )),
             arrow_schema::SortOptions {
                 descending: false,
@@ -1324,8 +1431,8 @@ async fn open_sorted_input_streams(
         ),
         datafusion::physical_expr::PhysicalSortExpr::new(
             Arc::new(datafusion::physical_expr::expressions::Column::new(
-                WINDOW_KEY_COLUMN,
-                flattened_schema.index_of(WINDOW_KEY_COLUMN)?,
+                second_col,
+                flattened_schema.index_of(second_col)?,
             )),
             arrow_schema::SortOptions {
                 descending: false,
@@ -1665,13 +1772,30 @@ struct InProgressKeyGroup {
     windows: WindowValues,
 }
 
+struct DecodedBatch {
+    groups: Vec<DecodedKeyGroup>,
+    completed_windows: Vec<BeamWindow>,
+}
+
 #[derive(Default)]
 struct SortedGroupDecoder {
     current: Option<InProgressKeyGroup>,
+    current_window_bytes: Option<Vec<u8>>,
+    current_window: Option<BeamWindow>,
+    window_major: bool,
 }
 
 impl SortedGroupDecoder {
-    fn push_batch(&mut self, batch: &RecordBatch) -> Result<Vec<DecodedKeyGroup>> {
+    fn new(window_major: bool) -> Self {
+        Self {
+            current: None,
+            current_window_bytes: None,
+            current_window: None,
+            window_major,
+        }
+    }
+
+    fn push_batch(&mut self, batch: &RecordBatch) -> Result<DecodedBatch> {
         let window_keys = batch
             .column_by_name(WINDOW_KEY_COLUMN)
             .ok_or_else(|| {
@@ -1698,7 +1822,8 @@ impl SortedGroupDecoder {
             .as_any()
             .downcast_ref::<Int64Array>()
             .ok_or_else(|| anyhow!("GroupByKey timestamp must be an Int64 column"))?;
-        let mut completed = Vec::new();
+        let mut completed_groups = Vec::new();
+        let mut completed_windows = Vec::new();
         let mut start = 0;
 
         while start < batch.num_rows() {
@@ -1713,12 +1838,37 @@ impl SortedGroupDecoder {
             }
 
             let encoded_key = encoded_key.to_vec();
+            if self.window_major {
+                if let Some(ref current_bytes) = self.current_window_bytes {
+                    if current_bytes.as_slice() != window_key {
+                        if let Some(finished) = self.current.take() {
+                            completed_groups.push(DecodedKeyGroup {
+                                key: finished.key,
+                                windows: finished.windows,
+                            });
+                        }
+                        if let Some(prev_window) = self.current_window.take() {
+                            completed_windows.push(prev_window);
+                        }
+                        let window = BeamWindow::from_binary_key(window_key)
+                            .ok_or_else(|| anyhow!("GroupByKey encountered a malformed binary window key"))?;
+                        self.current_window = Some(window);
+                        self.current_window_bytes = Some(window_key.to_vec());
+                    }
+                } else {
+                    let window = BeamWindow::from_binary_key(window_key)
+                        .ok_or_else(|| anyhow!("GroupByKey encountered a malformed binary window key"))?;
+                    self.current_window = Some(window);
+                    self.current_window_bytes = Some(window_key.to_vec());
+                }
+            }
+
             let replace_key = self
                 .current
                 .as_ref()
                 .is_some_and(|current| current.encoded_key != encoded_key);
             if replace_key && let Some(finished) = self.current.take() {
-                completed.push(DecodedKeyGroup {
+                completed_groups.push(DecodedKeyGroup {
                     key: finished.key,
                     windows: finished.windows,
                 });
@@ -1779,14 +1929,23 @@ impl SortedGroupDecoder {
             }
             start = end;
         }
-        Ok(completed)
+        Ok(DecodedBatch {
+            groups: completed_groups,
+            completed_windows,
+        })
     }
 
-    fn finish(&mut self) -> Option<DecodedKeyGroup> {
-        self.current.take().map(|finished| DecodedKeyGroup {
+    fn finish(&mut self) -> (Option<DecodedKeyGroup>, Option<BeamWindow>) {
+        let last_group = self.current.take().map(|finished| DecodedKeyGroup {
             key: finished.key,
             windows: finished.windows,
-        })
+        });
+        let last_window = if self.window_major {
+            self.current_window.take()
+        } else {
+            None
+        };
+        (last_group, last_window)
     }
 }
 
@@ -2174,7 +2333,8 @@ mod tests {
         .unwrap();
         let mut decoder = SortedGroupDecoder::default();
         decoder.push_batch(&batch).unwrap();
-        let decoded = decoder.finish().unwrap();
+        let (decoded, _) = decoder.finish();
+        let decoded = decoded.unwrap();
         let chunk = &decoded.windows[0].1[0];
         let restored = decode_arrow_chunk(&encode_arrow_chunk(&chunk.batch).unwrap()).unwrap();
         let timestamps = restored
@@ -3263,7 +3423,7 @@ mod tests {
         };
         let state = InMemoryGbkState::default();
         let (mut sorted, latest) =
-            open_sorted_input_streams(&store, input, None, None, &config, &state)
+            open_sorted_input_streams(&store, input, None, None, &config, &state, false)
                 .await
                 .unwrap();
         assert_eq!(sorted.len(), 1, "one hot key belongs to one bucket");
@@ -3284,6 +3444,86 @@ mod tests {
         assert!(
             latest.is_some(),
             "the incremental input snapshot is tracked"
+        );
+    }
+
+    #[tokio::test]
+    async fn window_major_scan_advances_watermark_and_frees_group_state() {
+        let (_dir, store) = make_store().await;
+        let input = "gbk-in-window-major";
+        let output = "gbk-out-window-major";
+        let transform = GroupByKey::with(
+            "gbk-window-major-step".to_string(),
+            HashMap::from([("in".to_string(), input.to_string())]),
+            HashMap::from([("out".to_string(), output.to_string())]),
+            "GroupByKey".to_string(),
+        );
+
+        let w1 = interval(0, 1000);
+        let w2 = interval(1000, 2000);
+        let w3 = interval(2000, 3000);
+
+        // Multiple keys across multiple windows
+        store
+            .write_windowed_value_batch(
+                input,
+                vec![
+                    kv_windowed("k1", 10, vec![w1.clone()], 100),
+                    kv_windowed("k2", 20, vec![w1.clone()], 200),
+                    kv_windowed("k1", 30, vec![w2.clone()], 1100),
+                    kv_windowed("k3", 40, vec![w2.clone()], 1200),
+                    kv_windowed("k2", 50, vec![w3.clone()], 2100),
+                    kv_windowed("k4", 60, vec![w3.clone()], 2200),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let strategy = WindowingStrategy {
+            window_fn: Some(FunctionSpec {
+                urn: beam_urns::FIXED_WINDOWS_FN.to_string(),
+                payload: Vec::new(),
+            }),
+            ..WindowingStrategy::default()
+        };
+
+        // Run with input_watermark at MIN_TIMESTAMP.
+        // Under window-major scanning, as each window section completes,
+        // the watermark advances, on-time panes fire, and state is freed incrementally.
+        run_gbk_with_strategy(
+            &transform,
+            &store,
+            input,
+            output,
+            Some(strategy),
+            crate::engine::watermark::MIN_TIMESTAMP,
+        )
+        .await;
+
+        let output_records = scan_output(&store, output).await;
+        assert_eq!(
+            output_records.len(),
+            6,
+            "expected 6 groups across the 3 windows"
+        );
+        for record in &output_records {
+            assert_eq!(record.pane.timing, PaneTiming::OnTime);
+            assert!(record.pane.is_last, "closing pane must have is_last=true");
+        }
+
+        // Verify that all groups were closed and incrementally freed from memory
+        let (state_bytes, state_groups, _, _) = transform.state.memory_snapshot();
+        assert_eq!(
+            state_groups, 0,
+            "all window states must be freed incrementally, but found {state_groups} groups ({state_bytes} bytes)"
+        );
+        assert_eq!(state_bytes, 0);
+
+        // Verify that evaluated watermark was advanced past the completed windows
+        let evaluated_watermark = transform.state.last_evaluated_watermark().await;
+        assert!(
+            evaluated_watermark.unwrap_or(i64::MIN) >= 3000,
+            "evaluated watermark must advance past the last completed window (3000), got {evaluated_watermark:?}"
         );
     }
 }
