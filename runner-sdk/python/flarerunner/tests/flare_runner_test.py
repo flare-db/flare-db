@@ -31,6 +31,8 @@ class _FakeJobService(object):
         artifact_staging_endpoint=SimpleNamespace(url='127.0.0.1:8099'),
         staging_session_token='token')
     self.last_metrics_job_id = None
+    self.last_state_stream_timeout = 'UNSET'
+    self.last_message_stream_timeout = 'UNSET'
 
   def DescribePipelineOptions(self, request, timeout=None):
     return SimpleNamespace(options=[])
@@ -39,9 +41,11 @@ class _FakeJobService(object):
     return self.prepare_response
 
   def GetStateStream(self, request, timeout=None):
+    self.last_state_stream_timeout = timeout
     return iter([SimpleNamespace(state=beam_job_api_pb2.JobState.RUNNING)])
 
   def GetMessageStream(self, request, timeout=None):
+    self.last_message_stream_timeout = timeout
     return iter([])
 
   def Run(self, request, timeout=None):
@@ -148,6 +152,16 @@ class FlareRunnerTest(unittest.TestCase):
 
     self.assertEqual('jobid-1234', job_service.last_metrics_job_id)
     self.assertEqual([7], [result.attempted for result in counters])
+
+  def test_state_and_message_streams_do_not_use_job_server_timeout(self):
+    options = PipelineOptions(['--job_server_timeout=60'], job_endpoint='x:1')
+    job_service = _FakeJobService()
+    handle = JobServiceHandle(job_service, options)
+
+    handle.run('jobid-1234')
+
+    self.assertIsNone(job_service.last_state_stream_timeout)
+    self.assertIsNone(job_service.last_message_stream_timeout)
 
 
 if __name__ == '__main__':

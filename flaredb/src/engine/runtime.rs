@@ -198,6 +198,11 @@ impl BundleRuntime {
             self.pipeline_components.as_ref(),
         );
 
+        for pcollection in components.pcollections.values_mut() {
+            pcollection.coder_id =
+                resolve_length_prefixed_coder_id(&pcollection.coder_id, &components.coders);
+        }
+
         // ToDo: validate if we need to pass stage scoped or pipeline scoped values
         let descriptor = ProcessBundleDescriptor {
             id: stage.id().to_string(),

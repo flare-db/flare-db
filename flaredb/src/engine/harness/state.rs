@@ -26,6 +26,7 @@ use crate::{
     coders::{
         StandardBeamCoders,
         primitives::{BeamWindow, IterableCoder, WindowCoder},
+        resolve_length_prefixed_coder_id,
     },
     engine::{
         kv::SlateKvStore,
@@ -266,7 +267,10 @@ impl SideInputRegistry {
                         pcollection_id
                     ));
                 }
-                let coder_id = pcollection.node().coder_id.clone();
+                let coder_id = resolve_length_prefixed_coder_id(
+                    &pcollection.node().coder_id,
+                    pipeline_coders,
+                );
                 let access_pattern = side_input_access_pattern(&side_input)?;
                 let materialization = match access_pattern.as_str() {
                     beam_urns::ITERABLE_SIDE_INPUT_ACCESS => SideInputMaterialization::Iterable {
@@ -2172,6 +2176,42 @@ mod tests {
         .unwrap();
 
         assert_eq!(get_response_data(response), vec![1, 0x2a]);
+    }
+
+    #[tokio::test]
+    async fn iterable_side_input_resolves_pickled_leaf_to_length_prefixed_wrapper() {
+        let (_dir, store, resolver) =
+            make_side_input_resolver(StandardBeamCoders::LengthPrefix(LengthPrefixCoder)).await;
+        let window = BeamWindow::Interval {
+            start_millis: 0,
+            end_millis: 1_000,
+        };
+        let mut payload = vec![0x04];
+        payload.resize(112, 0xaa);
+
+        store
+            .write_windowed_value_batch(
+                "side-input-pc",
+                vec![windowed(
+                    BeamRecord::PRIMITIVE(PrimitiveValue::Bytes(payload.clone())),
+                    window.clone(),
+                )],
+            )
+            .await
+            .unwrap();
+
+        let backend = build_state_backend(store).await.unwrap();
+        let response = handle_state_request_with_side_inputs(
+            &backend,
+            Some(&resolver),
+            iterable_side_input_request("side-2", &encoded_window(&window), get_op()),
+        )
+        .await
+        .unwrap();
+
+        let mut expected = vec![112];
+        expected.extend_from_slice(&payload);
+        assert_eq!(get_response_data(response), expected);
     }
 
     #[tokio::test]
