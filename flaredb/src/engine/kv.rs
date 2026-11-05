@@ -68,16 +68,18 @@ impl KvStore for SlateKvStore {
     }
 
     async fn apply(&self, writes: &[(Vec<u8>, Option<Vec<u8>>)]) -> Result<()> {
+        let mut batch = slatedb::WriteBatch::new();
         for (key, value) in writes {
             match value {
                 Some(value) => {
-                    self.db.put(key, value.clone()).await?;
+                    batch.put(key.as_slice(), value.as_slice());
                 }
                 None => {
-                    self.db.delete(key).await?;
+                    batch.delete(key.as_slice());
                 }
             }
         }
+        self.db.write(batch).await?;
         self.db.flush().await?;
         Ok(())
     }
